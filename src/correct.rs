@@ -72,8 +72,18 @@ pub fn start (graph_file: &PathBuf, bwt_file: &String, output_file: &PathBuf, qu
 
     // remove discarded edges from graph
     println!("Removing discarded edges from graph");
-    for edge in discarded_edges {
-        graph.edges.remove(&edge);
+    println!("Number of discarded edges: {}", discarded_edges.len());
+    //compute total number of bases in discarded edges
+    let mut total_bp = 0;
+    for edge in discarded_edges.clone(){
+        let edge_data = graph.edges.get(&edge).unwrap();
+        let edge_seq = edge_data.get("seq").unwrap().as_str().expect("edge seq is not a string").to_string();
+        total_bp += edge_seq.len();
+    }
+    println!("Total number of bases in discarded edges: {}", total_bp);
+    // remove from graph
+    for dedge in discarded_edges {
+        graph.edges.remove(&dedge);
     }
 
     // write graph to gfa file

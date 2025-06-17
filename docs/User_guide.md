@@ -22,6 +22,7 @@ Himito is a specialized tool for building mitochondrial anchor-based graphical g
 - Rust programming language
 - Long-read sequencing data (BAM format)
 - Mitochondrial reference genome (FASTA format)
+- (Optional) Paired short-read sequencing data (BAM or FASTA format)
 
 ### Step 1: Install Rust
 
@@ -111,7 +112,15 @@ Required Parameters:
 - -b --bwt_file <File>: msBWT file (.npy) constructed using srWGS reads aligned to chrM
 - -o --outputfile <File>: Output GFA file for downstream analysis
 - -m --min_support_counts <INT>: the minimal number of short reads supporting each path, paths with supports less than this threshold will be trimmed.
-- -q --query_length <INT>: the Kmer length for querying the short read msBWT, path with length less than K will not be kmerized
+- -q --query_length <INT>: the Kmer length for querying the short read msBWT, path with length less than K will not be kmerized. K should be less than the short read length.
+
+Example:
+```
+msbwt2-build -o sr_msbwt.npy srWGS.chrM.fasta.gz
+
+./target/release/Himito correct -g HG002_mt.gfa -b sr_msbwt.npy -o HG002_mt_sr.gfa -m 10 -q 99
+
+```
 
 ### call - Variant Calling
 Identifies homoplasmic and heteroplasmic variants from the mitochondrial graph.
@@ -184,7 +193,7 @@ Basic Analysis Pipeline (wdl/Himito_methyl.wdl)
 
 
 ## Input Requirements
-### BAM File Requirements
+### lrWGS BAM File 
 - Must be coordinate-sorted and indexed (.bai file)
 
 - Should contain long reads (PacBio, Oxford Nanopore)
@@ -192,6 +201,18 @@ Basic Analysis Pipeline (wdl/Himito_methyl.wdl)
 - Reads should be mapped to a reference genome including mitochondrial chromosome
 
 - For methylation analysis: BAM should contain modification tags (MM, ML tags)
+
+### (Optional) srWGS BAM File
+- BAM file should be sorted and indexed
+
+- (Recommended) Subset to reads aligned to chrM, convert BAM to FASTA/FASTA.gz
+
+- Construct msBWT using [rust-msBWT](https://github.com/HudsonAlpha/rust-msbwt)
+
+- Run ```Himito correct``` with proper parameters according to the srWGS data features
+
+
+
 
 ### Reference Genome
 - Mitochondrial reference in FASTA format

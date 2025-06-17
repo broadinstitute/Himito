@@ -28,7 +28,7 @@ cargo build --release
 ./target/release/Himito build -i <mt_output.bam> -k <kmer_size> -r <NC_012920.1.fasta> -o <output.gfa>
 
 ```
-### (Optional) refine the graph using paired srWGS data
+### (Optional) Prune the Himito graph using paired srWGS data
 The graph served as the foundation for downstream assembly, variant calling and methylation analysis.
 If you have paired short reads data, you can optional refine the graph by using ```Himito correct```.
 (Optional) trim graph paths using short reads, short reads aligned to chrM should be firstly compressed into a [msBWT](https://github.com/HudsonAlpha/rust-msbwt).

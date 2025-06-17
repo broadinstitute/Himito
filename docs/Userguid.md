@@ -49,6 +49,10 @@ Here's a basic workflow to get started with Himito:
 # construct graph
 ./target/release/Himito build -i <mt_output.bam> -k <kmer_size> -r <NC_012920.1.fasta> -o <output.gfa> 
 
+# (Optional) prune graph using short read sequence data
+msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
+./target/release/Himito correct -g <output.gfa> -b <bwt_file, e.g. sr_msbwt.npy> -o <corrected.gfa> -m <minimal_supporting_sr> -q <query_length, should be less than short read length>
+
 # call variants from graph
 ./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf>
 
@@ -95,6 +99,20 @@ Example:
 ```
 ./target/release/Himito build -i HG002_mt.bam -k 21 -r rCRS.fasta -o HG002_mt.gfa
 ```
+### correct - Prune graph paths using short read sequence data
+Prune paths in the raw graph based on its kmer-counts in the short reads data
+
+```
+msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
+./target/release/Himito correct [OPTIONS]
+```
+Required Parameters:
+- -g --graphfile <File>: Input GFA file for short read correction
+- -b --bwt_file <File>: msBWT file (.npy) constructed using srWGS reads aligned to chrM
+- -o --outputfile <File>: Output GFA file for downstream analysis
+- -m --min_support_counts <INT>: the minimal number of short reads supporting each path, paths with supports less than this threshold will be trimmed.
+- -q --query_length <INT>: the Kmer length for querying the short read msBWT, path with length less than K will not be kmerized
+
 ### call - Variant Calling
 Identifies homoplasmic and heteroplasmic variants from the mitochondrial graph.
 

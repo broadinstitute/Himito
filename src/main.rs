@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use crate::agg::GraphicalGenome;
 
 mod agg;
 mod asm;
@@ -8,6 +9,7 @@ mod build;
 mod call;
 mod filter;
 mod methyl;
+mod correct;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
@@ -72,6 +74,25 @@ enum Commands {
         input_read_path: PathBuf,
     },
 
+    /// Correct graph based on srWGS data
+    #[clap(arg_required_else_help = true)]
+    Correct {
+        /// path for anchor graph.
+        #[clap(short, long, value_parser)]
+        graphfile: PathBuf,
+        /// path for bwt file of srWGS reads, fasta or fasta.gz file
+        #[clap(short, long, value_parser)]
+        bwt_file: String,
+        /// path for corrected graph gfa file
+        #[clap(short, long, value_parser)]
+        outputfile: PathBuf,
+        /// query length for kmerizing graph, should be less than the short read length
+        #[clap(short, long, value_parser, default_value_t = 99)]
+        query_length: usize,
+        /// min support counts for a read to be considered
+        #[clap(short, long, value_parser, default_value_t = 10)]
+        min_support_counts: usize,
+    },
     ///Call Variants from Sequence Graph
     #[clap(arg_required_else_help = true)]
     Call {
@@ -164,6 +185,16 @@ fn main() {
             reference_path,
         } => {
             build::start(&output, kmer_size, &input_read_path, &reference_path);
+        }
+
+        Commands::Correct {
+            graphfile,
+            bwt_file,
+            outputfile,
+            query_length,
+            min_support_counts
+        } => {
+            let _ = correct::start(&graphfile, &bwt_file, &outputfile, query_length, min_support_counts);
         }
 
         Commands::Call {

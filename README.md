@@ -30,8 +30,10 @@ cargo build --release
 ```
 ### (Optional) Prune the Himito graph using paired srWGS data
 The graph served as the foundation for downstream assembly, variant calling and methylation analysis.
-If you have paired short reads data, you can optional refine the graph by using ```Himito correct```.
-(Optional) trim graph paths using short reads, short reads aligned to chrM should be firstly compressed into a [msBWT](https://github.com/HudsonAlpha/rust-msbwt).
+
+If you have paired short reads data, you can refine the graph by using ```Himito correct```.
+
+```Himito correct``` trims graph paths according to the occurrence counts of path kmers in the paired srWGS data. We recommend to first subset the srWGS BAM file to reads aligned to chrM, then compressed these reads into a [msBWT](https://github.com/HudsonAlpha/rust-msbwt).
 ```
 msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ./target/release/Himito correct -g <output.gfa> -b <bwt_file, e.g. sr_msbwt.npy> -o <corrected.gfa> -m <minimal_supporting_sr> -q <query_length, should be less than short read length>

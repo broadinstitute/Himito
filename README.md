@@ -15,7 +15,7 @@ Building Mitochondrial anchor-based graphical genome from long reads. Filter Num
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-### install and run Himito
+### install and build Himito graph
 ```
 git clone https://github.com/broadinstitute/Himito.git
 cd Himito
@@ -25,8 +25,19 @@ cargo build --release
 ./target/release/Himito filter -i <input.bam> -c <chromosome in bam, e.g. "chrM"> -m <mt_output.bam> -n <numts_output.bam>
 
 # construct graph
-./target/release/Himito build -i <mt_output.bam> -k <kmer_size> -r <NC_012920.1.fasta> -o <output.gfa> 
+./target/release/Himito build -i <mt_output.bam> -k <kmer_size> -r <NC_012920.1.fasta> -o <output.gfa>
 
+```
+### (Optional) refine the graph using paired srWGS data
+The graph served as the foundation for downstream assembly, variant calling and methylation analysis.
+If you have paired short reads data, you can optional refine the graph by using ```Himito correct```.
+(Optional) trim graph paths using short reads, short reads aligned to chrM should be firstly compressed into a [msBWT](https://github.com/HudsonAlpha/rust-msbwt).
+```
+msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
+./target/release/Himito correct -g <output.gfa> -b <bwt_file, e.g. sr_msbwt.npy> -o <corrected.gfa> -m <minimal_supporting_sr> -q <query_length, should be less than short read length>
+```
+### Downstream analysis
+```
 # call variants from graph
 ./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf>
 

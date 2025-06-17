@@ -1,5 +1,9 @@
-# Himito
 
+<p align="center">
+<img src="https://github.com/user-attachments/assets/3129d44f-f69a-4491-a0cf-29fab5ee88a9" alt="logo" style="width: 30%; height: auto;">
+</p>
+
+# Himito 
 Building Mitochondrial anchor-based graphical genome from long reads. Filter Numts reads, assemble major haplotypes, call homoplasmic and heteroplasmic variants, analyze methylation signals
 
 ## Documentation

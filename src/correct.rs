@@ -4,15 +4,21 @@ use msbwt2::dynamic_bwt::{create_from_fastx,DynamicBWT};
 use msbwt2::msbwt_core::BWT;
 use msbwt2::string_util;
 use msbwt2::rle_bwt::RleBWT;
+use rust_htslib::htslib::fai_load_options_FAI_CREATE;
 
 use crate::{agg::*};
 use std::{path::PathBuf, fs::File, io::{self, Write}};
 use std::collections::{HashMap, HashSet};
+use bio::io::fasta::{Reader, Record};
 
 
 
-pub fn start (graph_file: &PathBuf, bwt_file: &String, output_file: &PathBuf, query_length:usize, min_support_counts: usize) {
+pub fn start (graph_file: &PathBuf, bwt_file: &String, reference_file: &PathBuf, output_file: &PathBuf, query_length:usize, min_support_counts: usize) {
     println!("Correcting graph based on srWGS data");
+    // get reference path name
+    let ref_reader = Reader::from_file(reference_file).unwrap();
+    let reference_sequence: Vec<Record> = ref_reader.records().map(|r| r.unwrap()).collect();
+    let ref_header = reference_sequence[0].id().to_string();
     
     // construct msbwt
     println!("Loading msbwt");
@@ -26,7 +32,7 @@ pub fn start (graph_file: &PathBuf, bwt_file: &String, output_file: &PathBuf, qu
     // kmerize graph and check sr support counts
     println!("Kmerizing graph and checking sr support counts");
     let edgelist = graph.edges.keys().collect::<Vec<&String>>();
-    let mut kmer_graph: HashMap<String, String> = HashMap::new(); // kmer_graph[kmer] = edge_id
+    
     for edge in edgelist {
         let mut status: bool = false; // not discarded
         let edge_data = graph.edges.get(edge).unwrap();
@@ -65,6 +71,15 @@ pub fn start (graph_file: &PathBuf, bwt_file: &String, output_file: &PathBuf, qu
             }
         }
 
+        //keep reference paths
+        let reads_list = edge_data.get("reads").unwrap().as_array().unwrap();
+        for read in reads_list{
+            if read.as_str().unwrap() == ref_header{
+                status = false; //keep reference path
+                break;
+            }
+        }
+
         if status == true{
             discarded_edges.push(edge.clone());
         }
@@ -73,7 +88,7 @@ pub fn start (graph_file: &PathBuf, bwt_file: &String, output_file: &PathBuf, qu
     // remove discarded edges from graph
     println!("Removing discarded edges from graph");
     println!("Number of discarded edges: {}", discarded_edges.len());
-    //compute total number of bases in discarded edges
+    // compute total number of bases in discarded edges
     let mut total_bp = 0;
     for edge in discarded_edges.clone(){
         let edge_data = graph.edges.get(&edge).unwrap();

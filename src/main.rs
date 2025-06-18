@@ -86,6 +86,9 @@ enum Commands {
         /// path for corrected graph gfa file
         #[clap(short, long, value_parser)]
         outputfile: PathBuf,
+        /// path for standard linear reference FASTA file
+        #[clap(short, long, value_parser)]
+        reference_file: PathBuf,
         /// query length for kmerizing graph, should be less than the short read length
         #[clap(short, long, value_parser, default_value_t = 99)]
         query_length: usize,
@@ -191,10 +194,11 @@ fn main() {
             graphfile,
             bwt_file,
             outputfile,
+            reference_file,
             query_length,
             min_support_counts
         } => {
-            let _ = correct::start(&graphfile, &bwt_file, &outputfile, query_length, min_support_counts);
+            let _ = correct::start(&graphfile, &bwt_file, &reference_file, &outputfile, query_length, min_support_counts);
         }
 
         Commands::Call {

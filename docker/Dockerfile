@@ -9,3 +9,5 @@ RUN git clone https://github.com/broadinstitute/Himito.git \
     && cd Himito \
     && cargo build --release
 
+RUN cargo install msbwt2 \
+    && msbwt2-build --help

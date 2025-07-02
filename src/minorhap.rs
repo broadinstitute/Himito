@@ -390,6 +390,7 @@ pub fn start (graph_file: &PathBuf, ref_length:i64, bin_size:i32, pad_size:i64, 
     let readset = find_all_reads(&graph);
 
     let minimal_read_number = readset.len() as f64 * min_read_ratio;
+    println!("Minimal read number: {}", minimal_read_number);
     // let mut sp_anchor = graph.anchor.keys().collect::<Vec<&String>>();
     // sp_anchor.sort();
     let graph_intervals_dict = get_graph_intervals(&graph, ref_length);

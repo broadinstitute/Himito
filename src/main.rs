@@ -169,7 +169,7 @@ enum Commands {
 
     /// Extract Minor Haplotype as Fasta file from Graph
     #[clap(arg_required_else_help = true)]
-    Minor {
+    Minorhap {
         /// path for anchor graph.
         #[clap(short, long, value_parser)]
         graphfile: PathBuf,
@@ -270,7 +270,7 @@ fn main() {
         } => {
             methyl::start(&graphfile, &bamfile, &outputfile, prob_min, major_haplotype);
         }
-        Commands::Minor {
+        Commands::Minorhap {
                 graphfile,
                 ref_length,
                 bin_size,

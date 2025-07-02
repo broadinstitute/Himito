@@ -10,7 +10,7 @@ mod call;
 mod filter;
 mod methyl;
 mod correct;
-mod minor;
+mod minorhap;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
@@ -279,7 +279,7 @@ fn main() {
                 outputfile,
                 sample,
             } => {
-                minor::start(&graphfile, ref_length, bin_size,  pad_size, min_read_ratio,&outputfile, &sample);
+                minorhap::start(&graphfile, ref_length, bin_size,  pad_size, min_read_ratio,&outputfile, &sample);
         }
     }
 

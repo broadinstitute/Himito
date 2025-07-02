@@ -10,6 +10,7 @@ mod call;
 mod filter;
 mod methyl;
 mod correct;
+mod minor;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
@@ -164,7 +165,36 @@ enum Commands {
         /// extract the per-read level methylation signals on major haplotype or all the reads 
         #[clap(short, long, value_parser, default_value_t = false)]
         major_haplotype:bool
-    }
+    },
+
+    /// Extract Minor Haplotype as Fasta file from Graph
+    #[clap(arg_required_else_help = true)]
+    Minor {
+        /// path for anchor graph.
+        #[clap(short, long, value_parser)]
+        graphfile: PathBuf,
+        /// length of the linear reference genome, e.g.rCRS length is 16569 (default)
+        #[clap(short, long, value_parser, default_value_t = 16569)]
+        ref_length: i64,
+        /// bin size for the each haplotype window, default is 1000bp
+        #[clap(short, long, value_parser, default_value_t = 1000)]
+        bin_size: i32,
+        /// pad size for the each haplotype window, default is 100bp
+        #[clap(short, long, value_parser, default_value_t = 100)]
+        pad_size: i64,
+
+        /// minimal read ratio supporting each haplotype in a given window, default is 0.01
+        #[clap(short, long, value_parser, default_value_t = 0.01)]
+        min_read_ratio: f64,
+
+        /// path for output fasta file
+        #[clap(short, long, value_parser)]
+        outputfile: PathBuf,
+
+        /// header for the major haplotype, usually the sample name
+        #[clap(short, long, value_parser)]
+        sample: String,
+    },
 }
 
 fn main() {
@@ -240,5 +270,18 @@ fn main() {
         } => {
             methyl::start(&graphfile, &bamfile, &outputfile, prob_min, major_haplotype);
         }
+        Commands::Minor {
+                graphfile,
+                ref_length,
+                bin_size,
+                pad_size,
+                min_read_ratio,
+                outputfile,
+                sample,
+            } => {
+                minor::start(&graphfile, ref_length, bin_size,  pad_size, min_read_ratio,&outputfile, &sample);
+        }
     }
+
+    
 }

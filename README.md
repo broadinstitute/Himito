@@ -48,4 +48,7 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 
 # call methylation signals
 ./target/release/Himito methyl -g <output.annotated.gfa> -p <min_prob> -b <mt_test.bam> -o <methyl.bed>
+
+# enumerate all possible haplotypes within windows
+./target/release/Himito minorhap -g <output.gfa> -o <output.allhaplotype.fasta> -s <sample_id>
 ```

@@ -81,7 +81,7 @@ task Build {
     command <<<
         set -euxo pipefail
 
-        /Himito/target/release/Himito build -k ~{kmer_size} -r ~{reference} -o ~{sampleid}.~{prefix}.gfa ~{bam}
+        /Himito/target/release/Himito build -k ~{kmer_size} -r ~{reference} -i ~{bam} -o ~{sampleid}.~{prefix}.gfa
 
     >>>
 

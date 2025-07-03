@@ -81,7 +81,7 @@ task Build {
     command <<<
         set -euxo pipefail
 
-        /Himito/target/release/Himito build -k ~{kmer_size} -r ~{reference} -o ~{sampleid}.~{prefix}.gfa ~{bam}
+        /Himito/target/release/Himito build -k ~{kmer_size} -r ~{reference} -i ~{bam} -o ~{sampleid}.~{prefix}.gfa
 
     >>>
 
@@ -90,7 +90,7 @@ task Build {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
+        docker: "hangsuunc/himito:v3"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"

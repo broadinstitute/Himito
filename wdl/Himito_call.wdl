@@ -65,7 +65,7 @@ task Filter {
         docker: "hangsuunc/himito:v1"
         memory: "1 GB"
         cpu: 1
-        disks: "local-disk 100 SSD"
+        disks: "local-disk 300 SSD"
     }
 }
 

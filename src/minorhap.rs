@@ -389,14 +389,17 @@ pub fn start (graph_file: &PathBuf, ref_length:i64, bin_size:i32, pad_size:i64, 
     let graph = GraphicalGenome::load_graph(graph_file).unwrap();
     let readset = find_all_reads(&graph);
 
-    let minimal_read_number = readset.len() as f64 * min_read_ratio;
+    let mut minimal_read_number = readset.len() as f64 * min_read_ratio;
+    if minimal_read_number < 1.0 {
+        minimal_read_number = 1.0;
+    }
     println!("Minimal read number: {}", minimal_read_number);
     // let mut sp_anchor = graph.anchor.keys().collect::<Vec<&String>>();
     // sp_anchor.sort();
     let graph_intervals_dict = get_graph_intervals(&graph, ref_length);
     let interval_list: Vec<i64> = (1..ref_length).step_by(bin_size as usize).map(|x| x as i64).collect();
     let mut haplotype_dict: HashMap<i64, HashMap<String, Vec<String>>> = HashMap::new();
-    
+    let mut failed_interval = 0;
     for i in 1..interval_list.len()-1 {
         let startpos = interval_list[i] - pad_size;
         let endpos = interval_list[i+1] + pad_size;
@@ -408,8 +411,18 @@ pub fn start (graph_file: &PathBuf, ref_length:i64, bin_size:i32, pad_size:i64, 
                 survival_path_dict.insert(key, value);
             }
         }
+        println!("{}, Number of paths:{}", startpos, survival_path_dict.len());
+        if survival_path_dict.len() == 0 {
+            failed_interval += 1;
+        }
         haplotype_dict.insert(startpos, survival_path_dict);
     }
+    println!("Number of failed intervals: {}", failed_interval);
+    if failed_interval > 0 {
+        println!("Failed to assemble haplotypes for {} intervals", failed_interval);
+        return;
+    }
+
 
     let results = dfs(&haplotype_dict, minimal_read_number as usize);
     let haplotypes = reconstruct_haplotypes(&results, &graph);

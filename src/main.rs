@@ -184,8 +184,12 @@ enum Commands {
         pad_size: i64,
 
         /// minimal read ratio supporting each haplotype in a given window, default is 0.01
-        #[clap(short, long, value_parser, default_value_t = 0.005)]
+        #[clap(short, long, value_parser, default_value_t = 0.01)]
         min_read_ratio: f64,
+
+        /// minimal read count supporting each haplotype in a given window, default is 1
+        #[clap(short, long, value_parser, default_value_t = 1)]
+        count_support: usize,
 
         /// path for output fasta file
         #[clap(short, long, value_parser)]
@@ -276,10 +280,11 @@ fn main() {
                 bin_size,
                 pad_size,
                 min_read_ratio,
+                count_support,
                 outputfile,
                 sample,
             } => {
-                minorhap::start(&graphfile, ref_length, bin_size,  pad_size, min_read_ratio,&outputfile, &sample);
+                minorhap::start(&graphfile, ref_length, bin_size,  pad_size, min_read_ratio, count_support,&outputfile, &sample);
         }
     }
 

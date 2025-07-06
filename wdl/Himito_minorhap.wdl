@@ -1,6 +1,6 @@
 version 1.0
 
-workflow Himito_call {
+workflow Himito_minorhap {
     input {
         File whole_genome_bam
         File whole_genome_bai

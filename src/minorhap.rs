@@ -385,15 +385,15 @@ fn write_multipleseq_fasta(outputfile: &PathBuf, sequence: Vec<String>, header: 
 }
 
 
-pub fn start (graph_file: &PathBuf, ref_length:i64, bin_size:i32, pad_size:i64, min_read_ratio:f64, output_file: &PathBuf, header:&str) {
+pub fn start (graph_file: &PathBuf, ref_length:i64, bin_size:i32, pad_size:i64, min_read_ratio:f64, count_support:usize, output_file: &PathBuf, header:&str) {
     let graph = GraphicalGenome::load_graph(graph_file).unwrap();
     let readset = find_all_reads(&graph);
 
     let mut minimal_read_number = readset.len() as f64 * min_read_ratio;
-    if minimal_read_number < 1.0 {
-        minimal_read_number = 1.0;
+    if minimal_read_number < count_support as f64{
+        minimal_read_number = count_support as f64;
     }
-    println!("Minimal read number: {}", minimal_read_number);
+    println!("Total read number: {}, Minimal read number: {}", readset.len(), minimal_read_number);
     // let mut sp_anchor = graph.anchor.keys().collect::<Vec<&String>>();
     // sp_anchor.sort();
     let graph_intervals_dict = get_graph_intervals(&graph, ref_length);

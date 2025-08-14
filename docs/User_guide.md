@@ -92,7 +92,7 @@ Creates a graph representation of the mitochondrial genome from filtered reads.
 ```
 Required Parameters:
 - -i, --input <FILE>: Input BAM file (mitochondrial reads only)
-- -k, --kmer-size <INT>: K-mer size for graph construction
+- -k, --kmer-size <INT>: K-mer size for graph construction, please choose your k carefully: too small k will give you a hair ball and mess up the downstream assembly; too large k will not compress the reads. Maybe draw your graph and make sure it is a circle.
 - -r, --reference <FILE>: Mitochondrial reference genome (FASTA)
 - -o, --output <FILE>: Output graph file (GFA format)
 

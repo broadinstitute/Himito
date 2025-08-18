@@ -344,8 +344,8 @@ task downsampleBam {
     set -eo pipefail
     echo scalingFactor1
     echo scalingFactor2
-    gatk DownsampleSam -I ~{first_input_bam} -O ~{basename}_~{desiredCoverage}x_~{fraction}.bam -R 7 -P ~{scalingFactor1} -S ConstantMemory --VALIDATION_STRINGENCY LENIENT --CREATE_INDEX true
-    gatk DownsampleSam -I ~{second_input_bam} -O ~{basename}_~{desiredCoverage}x_~{second_fraction}.bam -R 7 -P ~{scalingFactor2} -S ConstantMemory --VALIDATION_STRINGENCY LENIENT --CREATE_INDEX true
+    gatk DownsampleSam -I ~{first_input_bam} -O ~{basename}_~{desiredCoverage}x_~{fraction}.bam -R 1 -P ~{scalingFactor1} -S ConstantMemory --VALIDATION_STRINGENCY LENIENT --CREATE_INDEX true
+    gatk DownsampleSam -I ~{second_input_bam} -O ~{basename}_~{desiredCoverage}x_~{second_fraction}.bam -R 1 -P ~{scalingFactor2} -S ConstantMemory --VALIDATION_STRINGENCY LENIENT --CREATE_INDEX true
 
 
   >>>

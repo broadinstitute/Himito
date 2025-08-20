@@ -167,7 +167,7 @@ Analyzes methylation signals from the mitochondrial reads.
 ```
 
 Required Parameters:
-- -g, --graph <FILE>: Input annotated graph file (GFA format)
+- -g, --graph <FILE>: Input annotated graph file (GFA format), should be the output of Himito call
 - -p, --min-prob <FLOAT>: Minimum probability threshold for methylation calls
 - -b, --bam <FILE>: Input BAM file with methylation tags
 - -o, --output <FILE>: Output BED file

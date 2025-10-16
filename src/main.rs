@@ -130,6 +130,10 @@ enum Commands {
         /// sample name of the bam file
         #[clap(short, long, value_parser, required = true)]
         sample_id: String,
+
+        /// data type, pacbio, ont
+        #[clap(short, long, value_parser, default_value = "pacbio")]
+        data_type: String,
     },
 
     /// Extract Major Haplotype as Fasta file from Graph
@@ -244,6 +248,7 @@ fn main() {
             output_file,
             sample_id,
             vaf_threshold,
+            data_type,
         } => {
             call::start(
                 &graphfile,
@@ -254,6 +259,7 @@ fn main() {
                 &output_file,
                 &sample_id,
                 vaf_threshold,
+                &data_type,
             );
         }
 

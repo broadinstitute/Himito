@@ -866,7 +866,8 @@ fn permutation_test(
     p_value_threshold: f64,
     permutation_round: usize,
     filtered_var: &Vec<Variant>,
-    frequency_threshold:f64
+    frequency_threshold:f64,
+    data_type: &str
 ) -> (Vec<Variant>, Array2<f64>, Vec<String>) {
 
     let re = Regex::new(r"m\.(\d+)([A-Za-z-]+)>([A-Za-z-]+)").unwrap();
@@ -885,9 +886,11 @@ fn permutation_test(
             let pos = caps.get(1).unwrap().as_str().parse::<usize>().unwrap();
             let ref_allele = caps.get(2).unwrap().as_str();
             let alt_allele = caps.get(3).unwrap().as_str();
-            if ref_allele.len() == alt_allele.len() {
+
+            if (ref_allele.len() == alt_allele.len()) && (data_type == "pacbio") {
                 return (Ok(i), None);
             }
+
         }
 
         let observation = calculate_observation_statistics(&records, i, &matrix);
@@ -968,7 +971,12 @@ pub fn start(
     output_file: &PathBuf,
     sample_id: &str,
     hf_threshold: f32,
+    data_type: &str,
 ) {
+    if data_type != "pacbio" && data_type != "ont" {
+        eprintln!("Error: data type must be pacbio or ont");
+        std::process::exit(1);
+    }
     // reference fasta information
     let ref_reader = Reader::from_file(fasta_reference).unwrap();
     let reference_sequence: Vec<Record> = ref_reader.records().map(|r| r.unwrap()).collect();
@@ -991,7 +999,7 @@ pub fn start(
     let (matrix, var_record, read_set) = construct_matrix(&read_record, &filtered_var);
 
     // use matrix information to filter vcf
-    let (permu_filtered_var, filtered_matrix, filtered_name) = permutation_test(&matrix, var_record, 0.001, 100, &filtered_var, 0.2 );
+    let (permu_filtered_var, filtered_matrix, filtered_name) = permutation_test(&matrix, var_record, 0.001, 100, &filtered_var, 0.2, data_type);
 
     
     // write filtered vcf

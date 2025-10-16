@@ -134,6 +134,7 @@ Required Parameters:
 - -r, --reference <FILE>: Mitochondrial reference genome (FASTA)
 - -k, --kmer-size <INT>: K-mer size (should match build step)
 - -s, --sample-id <STRING>: Sample identifier
+- -d, --data-type <String>: Long Read Sequencing technology (pacbio or ont)
 - -o, --output <FILE>: Output VCF file
 
 Example:

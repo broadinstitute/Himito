@@ -40,7 +40,7 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ```
 ### Downstream analysis
 ```
-# call variants from graph
+# call variants from graph, default for pacbio, change <-d ont> to ont data
 ./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf>
 
 # extract major haplotype from graph

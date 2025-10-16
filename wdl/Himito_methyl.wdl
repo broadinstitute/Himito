@@ -7,6 +7,7 @@ workflow Himito_methyl {
         File reference_fa
         String prefix
         String sampleid
+        String data_type
         Int kmer_size
 
     }
@@ -32,7 +33,8 @@ workflow Himito_methyl {
             reference_fa = reference_fa,
             prefix = prefix,
             kmer_size = kmer_size,
-            sampleid=sampleid
+            sampleid=sampleid,
+            data_type = data_type
     }
     
     call Methyl {
@@ -122,6 +124,7 @@ task Call {
         File reference_fa
         String prefix
         String sampleid
+        String data_type = "pacbio"
         Int kmer_size
     }
     
@@ -129,7 +132,7 @@ task Call {
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_fa} -k ~{kmer_size} -s ~{sampleid} -o ~{sampleid}.~{prefix}.vcf
+        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_fa} -k ~{kmer_size} -s ~{sampleid} -d ~{data_type} -o ~{sampleid}.~{prefix}.vcf
         ls
 
     >>>

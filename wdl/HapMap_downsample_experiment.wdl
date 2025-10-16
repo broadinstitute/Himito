@@ -14,6 +14,7 @@ workflow DownsampleExperiment {
         Int kmer_size = 21
 
         String sampleid
+        String data_type
         String region = "chrM"
 
     }
@@ -69,6 +70,7 @@ workflow DownsampleExperiment {
                 reference_fa = reference_fa,
                 prefix = desiredCoverage,
                 kmer_size = kmer_size,
+                data_type = data_type,
                 sampleid=sampleid
         }
 
@@ -290,6 +292,7 @@ task Call {
         File reference_fa
         String prefix
         String sampleid
+        String data_type
         Int kmer_size
     }
     
@@ -297,7 +300,7 @@ task Call {
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_fa} -k ~{kmer_size} -s ~{sampleid} -o ~{sampleid}.~{prefix}.vcf
+        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_fa} -k ~{kmer_size} -s ~{sampleid} -d ~{data_type} -o ~{sampleid}.~{prefix}.vcf
         ls
 
     >>>

@@ -8,6 +8,7 @@ workflow Himito_call {
         String prefix
         String reference_header
         String sampleid
+        String data_type
         Int kmer_size
 
     }
@@ -34,7 +35,8 @@ workflow Himito_call {
             reference_name = reference_header,
             prefix = prefix,
             kmer_size = kmer_size,
-            sampleid=sampleid
+            sampleid=sampleid,
+            data_type = data_type
     }
 
 
@@ -105,12 +107,13 @@ task Call {
         String reference_name
         String prefix
         String sampleid
+        String data_type
         Int kmer_size
     }
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_name} -k ~{kmer_size} -s ~{sampleid} -o ~{sampleid}.~{prefix}.vcf
+        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_name} -k ~{kmer_size} -d ~{data_type} -s ~{sampleid} -o ~{sampleid}.~{prefix}.vcf
 
     >>>
 

@@ -299,9 +299,9 @@ fn main() {
                 vaf_threshold,
                 &data_type,
             );
-
+            let annotated_graph_output = output_prefix.with_extension("annotated.gfa");
             let methyl_output = output_prefix.with_extension("bed");
-            methyl::start(&graph_output, &mt_output, &methyl_output, prob_min, false);
+            methyl::start(&annotated_graph_output, &mt_output, &methyl_output, prob_min, false);
         }
         Commands::Filter {
             input_bam,

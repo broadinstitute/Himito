@@ -1,55 +1,54 @@
 version 1.0
-workflow VCF_Evaluation {
+
+workflow DownsampleExperiment {
     input {
-        File whole_read_bam
-        File whole_read_bai
+        File whole_genome_bam
+        File whole_genome_bai
+        File truth_vcf
+        File truth_tbi
+
         File reference_fa
         File reference_fai
-        File truth_vcf
-        File truth_vcf_tbi
-        String prefix
-        String sampleid
-        Int kmer_size
-        Float currentCoverage
+        File reference_dict
         Array[Int] desiredCoverages
-        String query_field
-        String? base_field
-        Float threshold
+        Int kmer_size = 21
+
+        String sampleid
+        String region = "chrM"
 
     }
-    
-    call SubsetBam as SubsetReads {
-            input:
-                bam = whole_read_bam,
-                bai = whole_read_bai,
-                locus = "chrM",
-                prefix = sampleid
+
+    call CalculateCoverage as coverage{
+        input:
+            bam = whole_genome_bam,
+            bai = whole_genome_bai,
+            locus = region,
+            prefix = sampleid
     }
-    
-    # downsample Coverage
+
     scatter (desiredCoverage in desiredCoverages) {
+        
         call downsampleBam {input:
-            input_bam = SubsetReads.subset_bam,
-            input_bam_bai = SubsetReads.subset_bai,
+            input_bam = coverage.subsetbam,
+            input_bam_bai = coverage.subsetbai,
             basename = sampleid,
             desiredCoverage = desiredCoverage,
-            currentCoverage = currentCoverage,
+            currentCoverage = coverage.coverage,
             preemptible_tries = 0
         }
 
-        # call mitograph assembly
         call Filter {
-                input:
-                    bam = downsampleBam.downsampled_bam,
-                    bai = downsampleBam.downsampled_bai,
-                    prefix = sampleid
-            }
+            input:
+                bam = downsampleBam.downsampled_bam,
+                bai = downsampleBam.downsampled_bai,
+                prefix = sampleid
+        }
 
         call Build {
             input:
                 bam = Filter.mt_bam,
                 reference = reference_fa,
-                prefix = prefix,
+                prefix = desiredCoverage,
                 kmer_size = kmer_size,
                 sampleid = sampleid
         }
@@ -63,67 +62,152 @@ workflow VCF_Evaluation {
                 sampleid=sampleid
         }
 
-        call VCFEval {
+        call VCFEval as Himito_Eval {
             input:
                 query_vcf = Call.vcf,
                 reference_fa = reference_fa,
                 reference_fai = reference_fai,
-                query_output_sample_name = desiredCoverage,
                 base_vcf = truth_vcf,
-                base_vcf_index = truth_vcf_tbi,
-                query_field = query_field,
-                base_field = base_field,
-                threshold = threshold
+                base_vcf_index = truth_tbi,
+                query_output_sample_name = sampleid + "_" + desiredCoverage + "_Himito",
         }
-
+        
 
     }
+    output {
+        Array[File] Himito_summary_file = Himito_Eval.summary_statistics
+        Array[File] Himito_vcf = Call.vcf
+        
+    }
+}
+
+struct RuntimeAttr {
+    Float? mem_gb
+    Int? cpu_cores
+    Int? disk_gb
+    Int? boot_disk_gb
+    Int? preemptible_tries
+    Int? max_retries
+    String? docker
+}
+
+struct DataTypeParameters {
+    Int num_shards
+    String map_preset
+}
+
+task CalculateCoverage {
+
+    meta {
+        description : "Subset a BAM file to a specified locus."
+    }
+
+    parameter_meta {
+        bam: {
+            description: "bam to subset",
+            localization_optional: true
+        }
+        bai:    "index for bam file"
+        locus:  "genomic locus to select"
+        prefix: "prefix for output bam and bai file names"
+        runtime_attr_override: "Override the default runtime attributes."
+    }
+
+    input {
+        File bam
+        File bai
+        String locus
+        String prefix = "subset"
+
+        RuntimeAttr? runtime_attr_override
+    }
+
+
+
+    Int disk_size = 4*ceil(size([bam, bai], "GB"))
+
+    command <<<
+        set -euxo pipefail
+
+        export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
+
+        samtools view -bhX ~{bam} ~{bai} ~{locus} > ~{prefix}.bam
+        samtools index ~{prefix}.bam
+        samtools depth -r ~{locus} ~{prefix}.bam | awk '{sum+=$3} END {print sum/NR}' > coverage.txt
+
+    >>>
 
     output {
-        Array[File] summary_statistics = VCFEval.summary_statistics
-        Array[File] vcf = Call.vcf
+        Float coverage = read_float("coverage.txt")
+        File subsetbam =  "~{prefix}.bam"
+        File subsetbai = " ~{prefix}.bam.bai"
+    }
+
+    #########################
+    RuntimeAttr default_attr = object {
+        cpu_cores:          1,
+        mem_gb:             10,
+        disk_gb:            disk_size,
+        boot_disk_gb:       10,
+        preemptible_tries:  2,
+        max_retries:        1,
+        docker:             "us.gcr.io/broad-dsp-lrma/lr-utils:0.1.9"
+    }
+    RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])
+    runtime {
+        cpu:                    select_first([runtime_attr.cpu_cores,         default_attr.cpu_cores])
+        memory:                 select_first([runtime_attr.mem_gb,            default_attr.mem_gb]) + " GiB"
+        disks: "local-disk " +  select_first([runtime_attr.disk_gb,           default_attr.disk_gb]) + " HDD"
+        bootDiskSizeGb:         select_first([runtime_attr.boot_disk_gb,      default_attr.boot_disk_gb])
+        preemptible:            select_first([runtime_attr.preemptible_tries, default_attr.preemptible_tries])
+        maxRetries:             select_first([runtime_attr.max_retries,       default_attr.max_retries])
+        docker:                 select_first([runtime_attr.docker,            default_attr.docker])
     }
 }
 
+
 task downsampleBam {
-  input {
-    File input_bam
-    File input_bam_bai
-    String basename
-    Int desiredCoverage
-    Float currentCoverage
+
+    input {
+        File input_bam
+        File input_bam_bai
+        String basename
+        Int desiredCoverage
+        Float currentCoverage
+        Int? preemptible_tries
+    }
+
+    meta {
+        description: "Uses Picard to downsample to desired coverage based on provided estimate of coverage."
+    }
+
+    parameter_meta {
+    }
+
     Float scalingFactor = desiredCoverage / currentCoverage
 
-    Int? preemptible_tries
-  }
 
-  meta {
-    description: "Uses Picard to downsample to desired coverage based on provided estimate of coverage."
-  }
-  parameter_meta {
-    basename: "Input is a string specifying the sample name which will be used to locate the file on gs."
-    downsampled_bam: "Output is a bam file downsampled to the specified mean coverage."
-    downsampled_bai: "Output is the index file for a bam file downsampled to the specified mean coverage."
-    desiredCoverage: "Input is an integer of the desired approximate coverage in the output bam file."
-  }
-  command <<<
-    set -eo pipefail
-    gatk DownsampleSam -I ~{input_bam} -O ~{basename}_~{desiredCoverage}x.bam -R 1 -P ~{scalingFactor} -S ConstantMemory --VALIDATION_STRINGENCY LENIENT --CREATE_INDEX true
+    command <<<
+        set -eo pipefail
+
+        gatk DownsampleSam -I ~{input_bam} -O ~{basename}_~{desiredCoverage}x.bam -R 7 -P ~{scalingFactor} -S ConstantMemory --VALIDATION_STRINGENCY LENIENT --CREATE_INDEX true
 
 
-  >>>
-  runtime {
-    preemptible: select_first([preemptible_tries, 5])
-    memory: "8 GB"
-    cpu: "2"
-    disks: "local-disk 500 HDD"
-    docker: "us.gcr.io/broad-gatk/gatk"
-  }
-  output {
-    File downsampled_bam = "~{basename}_~{desiredCoverage}x.bam"
-    File downsampled_bai = "~{basename}_~{desiredCoverage}x.bai"
-  }
+    >>>
+    runtime {
+        preemptible: select_first([preemptible_tries, 5])
+        memory: "8 GB"
+        cpu: "2"
+        disks: "local-disk 500 HDD"
+        docker: "us.gcr.io/broad-gatk/gatk"
+    }
+    output {
+        File downsampled_bam = "~{basename}_~{desiredCoverage}x.bam"
+        File downsampled_bai = "~{basename}_~{desiredCoverage}x.bai"
+    }
 }
+
+
 
 task Filter {
     input {
@@ -143,7 +227,7 @@ task Filter {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
         memory: "1 GB"
         cpu: 1
         disks: "local-disk 300 SSD"
@@ -171,7 +255,7 @@ task Build {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"
@@ -186,13 +270,14 @@ task Call {
         String prefix
         String sampleid
         Int kmer_size
+        String data_type
     }
     
     
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_fa} -k ~{kmer_size} -s ~{sampleid} -o ~{sampleid}.~{prefix}.vcf
+        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_fa} -k ~{kmer_size} -s ~{sampleid} -d ~{data_type} -o ~{sampleid}.~{prefix}.vcf
         ls
 
     >>>
@@ -211,120 +296,128 @@ task Call {
     }
 }
 
-task Methyl {
-
-    input {
-        File graph_gfa
-        File bam
-        String sampleid
-        String prefix = "methyl"
-        Float min_prob
-    }
-
-    command <<<
-        set -euxo pipefail
-        /Himito/target/release/Himito methyl -g ~{graph_gfa} -p ~{min_prob} -b ~{bam} -o ~{sampleid}.~{prefix}.bed
-
-    >>>
-
-    output {
-        File graph = "~{sampleid}.~{prefix}.methyl.gfa"
-        File matrix = "~{sampleid}.~{prefix}.methylation_per_read.csv"
-        File bed = "~{sampleid}.~{prefix}.bed"
-    }
-
-    runtime {
-        docker: "hangsuunc/himito:v1"
-        memory: "2 GB"
-        cpu: 1
-        disks: "local-disk 10 SSD"
-    }
-}
-
-task Asm {
-
-    input {
-        File graph_gfa
-        String prefix
-        String sampleid
-    }
-
-    command <<<
-        set -euxo pipefail
-        /Himito/target/release/Himito asm -g ~{graph_gfa} -s ~{sampleid} -o ~{sampleid}.~{prefix}.fasta
-
-    >>>
-
-    output {
-        File fasta = "~{sampleid}.~{prefix}.fasta"
-    }
-
-    runtime {
-        docker: "hangsuunc/himito:v1"
-        memory: "2 GB"
-        cpu: 1
-        disks: "local-disk 10 SSD"
-    }
-}
-
-task SubsetBam {
-
-    meta {
-        description : "Subset a BAM file to a specified locus, and extract sequence into fa"
-    }
-
-    parameter_meta {
-        bam: {
-            description: "bam to subset",
-            localization_optional: true
-        }
-        bai:    "index for bam file"
-        locus:  "genomic locus to select"
-        prefix: "prefix for output bam and bai file names"
-    }
-
-    input {
-        File bam
-        File bai
-        String locus
-        String prefix
-    }
-
-    command <<<
-        set -euxo pipefail
-
-        export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
-
-        samtools view -bhX ~{bam} ~{bai} ~{locus} > ~{prefix}.bam
-        samtools index ~{prefix}.bam
-
-        samtools fasta ~{prefix}.bam > ~{prefix}.fasta
-        samtools fastq ~{prefix}.bam > ~{prefix}.fastq
-    >>>
-
-    output {
-        File subset_fasta = "~{prefix}.fasta"
-        File subset_fastq = "~{prefix}.fastq"
-        File subset_bam = "~{prefix}.bam"
-        File subset_bai = "~{prefix}.bam.bai"
-    }
-    
-    runtime {
-        cpu: 1
-        memory: 4 + " GiB"
-        disks: "local-disk 375 LOCAL"
-        bootDiskSizeGb: 10
-        preemptible_tries:     1
-        max_retries:           0
-        docker:"us.gcr.io/broad-dsp-lrma/lr-gcloud-samtools:0.1.20"
-    }
-
-}
 
 struct RuntimeAttributes {
     Int disk_size
     Int cpu
     Int memory
+}
+
+
+
+
+
+task Mutect2 {
+
+    meta {
+        description : "Call Mitochondrial variants using mutect2"
+    }
+
+    input {
+        File bam
+        File bai
+        File reference_fasta
+        File reference_fasta_fai
+        File reference_fasta_dict
+        String prefix
+
+        RuntimeAttr? runtime_attr_override
+    }
+
+    Int disk_size = 4*ceil(size([bam, bai], "GB"))
+
+    command <<<
+        set -euxo pipefail
+        # samtools faidx ~{reference_fasta}
+        # gatk CreateSequenceDictionary -R ~{reference_fasta} -O ~{reference_fasta}.dict
+        gatk Mutect2 -R ~{reference_fasta} -L chrM --mitochondria-mode -I ~{bam} -O ~{prefix}.mutect2.vcf.gz
+
+    >>>
+
+    output {
+        File vcf = "~{prefix}.mutect2.vcf.gz"
+        File tbi = "~{prefix}.mutect2.vcf.gz.tbi"
+    }
+
+    #########################
+    RuntimeAttr default_attr = object {
+        cpu_cores:          1,
+        mem_gb:             10,
+        disk_gb:            disk_size,
+        boot_disk_gb:       10,
+        preemptible_tries:  2,
+        max_retries:        1,
+        docker:             "broadinstitute/gatk:4.6.1.0"
+    }
+    RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])
+    runtime {
+        cpu:                    select_first([runtime_attr.cpu_cores,         default_attr.cpu_cores])
+        memory:                 select_first([runtime_attr.mem_gb,            default_attr.mem_gb]) + " GiB"
+        disks: "local-disk " +  select_first([runtime_attr.disk_gb,           default_attr.disk_gb]) + " HDD"
+        bootDiskSizeGb:         select_first([runtime_attr.boot_disk_gb,      default_attr.boot_disk_gb])
+        preemptible:            select_first([runtime_attr.preemptible_tries, default_attr.preemptible_tries])
+        maxRetries:             select_first([runtime_attr.max_retries,       default_attr.max_retries])
+        docker:                 select_first([runtime_attr.docker,            default_attr.docker])
+    }
+}
+
+task Mitorsaw {
+
+    meta {
+        description : "Call Mitochondrial variants using mitorsaw"
+    }
+
+    input {
+        File bam
+        File bai
+        File reference_fasta
+        File reference_fasta_fai
+        String prefix
+        Float min_af = 0.01
+        RuntimeAttr? runtime_attr_override
+    }
+
+    Int disk_size = 4*ceil(size([bam, bai], "GB"))
+
+    command <<<
+        set -euxo pipefail
+        cp ~{bam} ~{prefix}.bam
+        cp ~{bai} ~{prefix}.bam.bai
+        /mitorsaw-v0.2.0-x86_64-unknown-linux-gnu/mitorsaw haplotype \
+            --reference ~{reference_fasta} \
+            --bam  ~{prefix}.bam \
+            --minimum-maf ~{min_af} \
+            --output-vcf ~{prefix}.mitorsaw.vcf.gz \
+            --output-hap-stats ~{prefix}.mitorsaw.stat
+
+    >>>
+
+    output {
+        File vcf = "~{prefix}.mitorsaw.vcf.gz"
+        File tbi = "~{prefix}.mitorsaw.vcf.gz.tbi"
+        File stats = "~{prefix}.mitorsaw.stat"
+    }
+
+    #########################
+    RuntimeAttr default_attr = object {
+        cpu_cores:          4,
+        mem_gb:             16,
+        disk_gb:            disk_size,
+        boot_disk_gb:       10,
+        preemptible_tries:  2,
+        max_retries:        1,
+        docker:             "hangsuunc/mitorsaw:v1"
+    }
+    RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])
+    runtime {
+        cpu:                    select_first([runtime_attr.cpu_cores,         default_attr.cpu_cores])
+        memory:                 select_first([runtime_attr.mem_gb,            default_attr.mem_gb]) + " GiB"
+        disks: "local-disk " +  select_first([runtime_attr.disk_gb,           default_attr.disk_gb]) + " HDD"
+        bootDiskSizeGb:         select_first([runtime_attr.boot_disk_gb,      default_attr.boot_disk_gb])
+        preemptible:            select_first([runtime_attr.preemptible_tries, default_attr.preemptible_tries])
+        maxRetries:             select_first([runtime_attr.max_retries,       default_attr.max_retries])
+        docker:                 select_first([runtime_attr.docker,            default_attr.docker])
+    }
 }
 
 task VCFEval {
@@ -333,54 +426,44 @@ task VCFEval {
         File query_vcf
         File reference_fa
         File reference_fai
-        String query_output_sample_name
         File base_vcf
         File base_vcf_index
-        String query_field
-        String? base_field
-        Float threshold
+        String query_output_sample_name
 
         # Runtime params
         Int? preemptible
         RuntimeAttributes runtimeAttributes = {"disk_size": ceil(2 * size(query_vcf, "GB") + 2 * size(base_vcf, "GB") + size(reference_fa, "GB")) + 50,
                                                   "cpu": 8, "memory": 16}
     }
-    String query_info = "${query_field}\\>${threshold}"
-    String base_info = if defined(base_field) then "${base_field}\\>${threshold}" else ""
 
     command <<<
         set -xeuo pipefail
 
         # Compress and Index vcf files
-        bcftools view ~{query_vcf} -O z -o ~{query_vcf}.vcf.gz
-        bcftools index -t ~{query_vcf}.vcf.gz
+        bcftools view ~{query_vcf} -O z -o ~{query_output_sample_name}.vcf.gz
+        bcftools index -t ~{query_output_sample_name}.vcf.gz
 
-        # extract AF from query vcf file
-        bcftools view -i  ~{query_info} ~{query_vcf}.vcf.gz -O z -o ~{query_output_sample_name}.query.~{threshold}.vcf.gz
-        bcftools index -t ~{query_output_sample_name}.query.~{threshold}.vcf.gz
-
-        # Check if base_field is defined and apply filter if it is
-        if [ "~{default='' base_field}" != "" ]; then
-            bcftools view -i ~{base_info} ~{base_vcf} -O z -o ~{query_output_sample_name}.base.~{threshold}.vcf.gz
-        else
-            cp ~{base_vcf} ~{query_output_sample_name}.base.~{threshold}.vcf.gz
-        fi
-        bcftools index -t ~{query_output_sample_name}.base.~{threshold}.vcf.gz
-
-        
         # split multiallelic sites in the base_vcf
         bcftools norm \
                 -f ~{reference_fa} \
-                -m -both ~{query_output_sample_name}.base.~{threshold}.vcf.gz \
+                -m -both ~{query_output_sample_name}.vcf.gz \
                 -O z \
-                -o ~{query_output_sample_name}.base.~{threshold}.normed.vcf.gz 
-        bcftools index -t ~{query_output_sample_name}.base.~{threshold}.normed.vcf.gz 
+                -o ~{query_output_sample_name}.query.normed.vcf.gz 
+        bcftools index -t ~{query_output_sample_name}.query.normed.vcf.gz 
+
+        # split multiallelic sites in the base_vcf
+        bcftools norm \
+                -f ~{reference_fa} \
+                -m -both ~{base_vcf} \
+                -O z \
+                -o ~{query_output_sample_name}.base.normed.vcf.gz 
+        bcftools index -t ~{query_output_sample_name}.base.normed.vcf.gz 
         
         # rtg vcfeval
         rtg format -o rtg_ref ~{reference_fa}
         rtg vcfeval \
-            -b ~{query_output_sample_name}.base.~{threshold}.normed.vcf.gz  \
-            -c ~{query_output_sample_name}.query.~{threshold}.vcf.gz \
+            -b ~{query_output_sample_name}.base.normed.vcf.gz  \
+            -c ~{query_output_sample_name}.query.normed.vcf.gz  \
             -o reg \
             -t rtg_ref \
             --squash-ploidy \
@@ -388,11 +471,7 @@ task VCFEval {
 
         mkdir output_dir
         cp reg/summary.txt output_dir/~{query_output_sample_name}_summary.txt
-        # cp reg/weighted_roc.tsv.gz output_dir/
-        # cp reg/*.vcf.gz* output_dir/
-        # cp output_dir/output.vcf.gz output_dir/~{query_output_sample_name}.vcf.gz
-        # cp output_dir/output.vcf.gz.tbi output_dir/~{query_output_sample_name}.vcf.gz.tbi
-
+        
     
     >>>
 
@@ -406,8 +485,6 @@ task VCFEval {
 
     output {
         File summary_statistics = "output_dir/~{query_output_sample_name}_summary.txt"
-        # File weighted_roc = "output_dir/weighted_roc.tsv.gz"
-        # Array[File] combined_output = glob("output_dir/*.vcf.gz")
-        # Array[File] combined_output_index = glob("output_dir/*.vcf.gz.tbi")
+        
     }
 }

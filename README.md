@@ -22,7 +22,11 @@ cargo build --release
 ```
 ### Quick start (Filter-Build-Asm-Call-Methyl)
 ```
-./target/release/Himito quick-start -i <lrWGS.bam> -o <output_prefix> -r <rCRS.fa> -s <HG002> -d pacbio
+./target/release/Himito quick-start -i <lrWGS.bam> \
+                                    -o <output_prefix> \
+                                    -r <rCRS.fa> \
+                                    -s <HG002> \
+                                    -d pacbio
 
 ```
 ## Details

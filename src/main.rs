@@ -21,11 +21,64 @@ struct Cli {
     command: Commands,
 }
 
-const DEFAULT_KMER_SIZE: usize = 21;
 
 #[derive(Debug, Subcommand)]
 
 enum Commands {
+    /// Quick start pipeline for mitochondrial assembly, variant calling and methylation aggregation
+    #[clap(arg_required_else_help = true)]
+    QuickStart {
+        /// input path for bam file.
+        #[clap(short, long, value_parser, required = true)]
+        input_bam: PathBuf,
+
+        /// contig name in the bam file
+        #[clap(short, long, value_parser, default_value = "chrM")]
+        chromo: String,
+
+        /// output prefix
+        #[clap(short, long, value_parser, required = true)]
+        output_prefix: PathBuf,
+
+        /// min_probability to determine a C is methylated
+        #[clap(short, long, value_parser, default_value_t = 0.5)]
+        prob_min: f64,
+
+        /// max fraction to keep a read as mtDNA derived
+         #[clap(short, long, value_parser, default_value_t = 0.2)]
+        filter_max_methylation: f64,
+
+        /// Kmer-size
+        #[clap(short, long, value_parser, default_value_t = 21)]
+        kmer_size: usize,
+
+        /// Reference Fasta file, rCRS
+        #[clap(short, long, value_parser, required = true)]
+        reference_path: PathBuf,
+
+        /// minimal allele count for variants
+        #[clap(short, long, value_parser, default_value_t = 1)]
+        minimal_ac: usize,
+
+        /// max Length to do alignment
+        #[clap(short, long, value_parser, default_value_t = 3000)]
+        length_max: usize,
+
+        /// minimal heteroplasmic frequency for variants
+        #[clap(short, long, value_parser, default_value_t = 0.01)]
+        vaf_threshold: f32,
+
+        /// sample name of the bam file
+        #[clap(short, long, value_parser, required = true)]
+        sample_id: String,
+
+        /// data type, pacbio, ont
+        #[clap(short, long, value_parser, default_value = "pacbio")]
+        data_type: String,
+
+
+    },
+
     /// Filter reads derived from Numts
     #[clap(arg_required_else_help = true)]
     Filter {
@@ -63,7 +116,7 @@ enum Commands {
         output: PathBuf,
 
         /// Kmer-size
-        #[clap(short, long, value_parser, default_value_t = DEFAULT_KMER_SIZE)]
+        #[clap(short, long, value_parser, default_value_t = 21)]
         kmer_size: usize,
 
         /// Reference Fasta file, rCRS
@@ -97,6 +150,7 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 10)]
         min_support_counts: usize,
     },
+
     ///Call Variants from Sequence Graph
     #[clap(arg_required_else_help = true)]
     Call {
@@ -109,8 +163,9 @@ enum Commands {
         reference_fasta: PathBuf,
 
         /// Kmer-size
-        #[clap(short, long, value_parser, default_value_t = DEFAULT_KMER_SIZE)]
+        #[clap(short, long, value_parser, default_value_t = 21)]
         k: usize,
+
         /// max Length to do alignment
         #[clap(short, long, value_parser, default_value_t = 3000)]
         length_max: usize,
@@ -168,7 +223,7 @@ enum Commands {
         prob_min: f64,
         /// extract the per-read level methylation signals on major haplotype or all the reads 
         #[clap(short, long, value_parser, default_value_t = false)]
-        major_haplotype:bool
+        major_haplotype: bool
     },
 
     /// Extract Minor Haplotype as Fasta file from Graph
@@ -208,6 +263,46 @@ enum Commands {
 fn main() {
     let args = Cli::parse();
     match args.command {
+        Commands::QuickStart {
+            input_bam,
+            chromo,
+            output_prefix,
+            prob_min,
+            filter_max_methylation,
+            length_max,
+            kmer_size,
+            reference_path,
+            minimal_ac,
+            vaf_threshold,
+            sample_id,
+            data_type,
+        } => {
+            let mt_output = output_prefix.with_extension("mt.bam");
+            let numts_output = output_prefix.with_extension("numts.bam");
+            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, prob_min, filter_max_methylation);
+            
+            let graph_output = output_prefix.with_extension("gfa");
+            let _ = build::start(&graph_output, kmer_size, &mt_output, &reference_path);
+
+            let assemble_output = output_prefix.with_extension("fasta");
+            asm::start(&graph_output, &assemble_output, &sample_id);
+            
+            let vcf_output = output_prefix.with_extension("vcf");
+            call::start(
+                &graph_output,
+                &reference_path,
+                kmer_size,
+                length_max,
+                minimal_ac,
+                &vcf_output,
+                &sample_id,
+                vaf_threshold,
+                &data_type,
+            );
+
+            let methyl_output = output_prefix.with_extension("bed");
+            methyl::start(&graph_output, &mt_output, &methyl_output, prob_min, false);
+        }
         Commands::Filter {
             input_bam,
             chromo,

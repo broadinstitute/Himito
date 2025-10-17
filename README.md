@@ -14,13 +14,20 @@ Building Mitochondrial anchor-based graphical genome from long reads. Filter Num
 ```
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
-
-### install and build Himito graph
+### install Himito
 ```
 git clone https://github.com/broadinstitute/Himito.git
 cd Himito
 cargo build --release
+```
+### quick start
+```
+./target/release/Himito quick-start -i <lrWGS.bam> -o <output_prefix> -r <rCRS.fa> -s <HG002> -d pacbio
 
+```
+
+### build Himito graph
+```
 # filter NUMTs-derived reads
 ./target/release/Himito filter -i <input.bam> -c <chromosome in bam, e.g. "chrM"> -m <mt_output.bam> -n <numts_output.bam>
 

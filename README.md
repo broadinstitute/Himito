@@ -25,7 +25,7 @@ cargo build --release
 ./target/release/Himito quick-start -i <lrWGS.bam> -o <output_prefix> -r <rCRS.fa> -s <HG002> -d pacbio
 
 ```
-
+## Details
 ### build Himito graph
 ```
 # filter NUMTs-derived reads

@@ -11,6 +11,7 @@ mod filter;
 mod methyl;
 mod correct;
 mod minorhap;
+mod phylo;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
@@ -258,6 +259,21 @@ enum Commands {
         #[clap(short, long, value_parser)]
         sample: String,
     },
+    /// Construct Phylogenetic Tree from Variant Matrix
+    #[clap(arg_required_else_help = true)]
+    Phylo {
+        /// path for binary variant matrix.
+        #[clap(short, long, value_parser)]
+        variant_matrix: PathBuf,
+
+        /// prefix for output newick file
+        #[clap(short, long, value_parser)]
+        outputfile: PathBuf,
+
+        /// minimal allele frequency for variants to be considered
+        #[clap(short, long, value_parser, default_value_t = 0.1)]
+        min_vaf: f64,
+    },
 }
 
 fn main() {
@@ -386,6 +402,13 @@ fn main() {
                 sample,
             } => {
                 minorhap::start(&graphfile, ref_length, bin_size,  pad_size, min_read_ratio, count_support,&outputfile, &sample);
+        }
+        Commands::Phylo {
+            variant_matrix,
+            outputfile,
+            min_vaf,
+        } => {
+            phylo::start(&variant_matrix, &outputfile, min_vaf);
         }
     }
 

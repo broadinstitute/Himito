@@ -733,7 +733,7 @@ fn write_matrix_to_csv<P: AsRef<Path>>(
     Ok(())
 }
 
-fn jaccard_distance(vector1: &[bool], vector2: &[bool]) -> f64 {
+pub fn jaccard_distance(vector1: &[bool], vector2: &[bool]) -> f64 {
     assert_eq!(vector1.len(), vector2.len(), "Vectors must have the same length");
     
     let mut intersection_count = 0;

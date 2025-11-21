@@ -458,7 +458,7 @@ pub fn get_variant(
     (var, coverage, read_record)
 }
 
-fn collapse_identical_records(variants: Vec<Variant>) -> Vec<Variant> {
+fn collapse_identical_records(variants: Vec<Variant>, ref_length: usize) -> Vec<Variant> {
     if variants.is_empty() {
         return Vec::new();
     }
@@ -466,7 +466,7 @@ fn collapse_identical_records(variants: Vec<Variant>) -> Vec<Variant> {
     let mut collapsed = HashMap::new();
 
     for current_var in variants {
-        let pos = current_var.pos;
+        let pos = if current_var.pos < ref_length {current_var.pos} else {current_var.pos - ref_length};
         let ref_allele = current_var.ref_allele;
         let alt_allele = current_var.alt_allele;
         let variant_type = current_var.variant_type;
@@ -988,7 +988,7 @@ pub fn start(
     // generate cigar
     let mut graph_with_cigar = generate_cigar(graph, &ref_header, k, maxlength, 2);
     let (variants, coverage, read_record) = get_variant(&mut graph_with_cigar, k, &ref_header);
-    let collapsed_var = collapse_identical_records(variants);
+    let collapsed_var = collapse_identical_records(variants, ref_seq.len());
     let filtered_var = filter_vcf_record(&collapsed_var, &coverage, minimal_ac, hf_threshold);
     // modified, exclude filtered data for FPs
 

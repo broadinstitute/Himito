@@ -355,11 +355,29 @@ pub fn get_variants_from_cigar(
     }
     (variants, poscount)
 }
+fn circuliarize_variants(variants: Vec<Variant>, ref_length: usize) -> Vec<Variant> {
+    let mut circular_variants = Vec::new();
+    for variant in variants {
+        if variant.pos < ref_length {
+            circular_variants.push(variant);
+        }else{
+            circular_variants.push(Variant {
+                pos: variant.pos - ref_length,
+                ref_allele: variant.ref_allele,
+                alt_allele: variant.alt_allele,
+                variant_type: variant.variant_type,
+                allele_count: variant.allele_count,
+            });
+        }
+    }
+    circular_variants
+}
 
 pub fn get_variant(
     graph: &mut GraphicalGenome,
     k: usize,
     ref_name: &str,
+    ref_length: usize,
 ) -> (Vec<Variant>, HashMap<usize, usize>, HashMap<String, Vec<serde_json::Value> > ) {
     let mut coverage = HashMap::new();
     let mut read_record = HashMap::new();
@@ -425,10 +443,15 @@ pub fn get_variant(
             refstart as usize,
             allele_count,
         );
-        var.extend(variants.clone());
+        let variants_circular = circuliarize_variants(variants.clone(), ref_length);
+        var.extend(variants_circular.clone());
 
         for (pos, count) in poscounts.iter() {
-            *coverage.entry(*pos).or_insert(0) += count;
+            if pos < &ref_length {
+                *coverage.entry(*pos).or_insert(0) += count;
+            }else{
+                *coverage.entry(*pos - &ref_length).or_insert(0) += count;
+            }
         }
         let readlist = graph
             .edges
@@ -437,7 +460,7 @@ pub fn get_variant(
             .map_or(Vec::new(), |reads| {
                 reads.as_array().unwrap_or(&Vec::new()).to_vec()
             });
-        for v in &variants{
+        for v in &variants_circular{
             if v.variant_type == "SNP"{
                 let key = format!("m.{}{}>{}",
                 v.pos + 1,
@@ -458,7 +481,7 @@ pub fn get_variant(
     (var, coverage, read_record)
 }
 
-fn collapse_identical_records(variants: Vec<Variant>) -> Vec<Variant> {
+fn collapse_identical_records(variants: Vec<Variant>, ref_length: usize) -> Vec<Variant> {
     if variants.is_empty() {
         return Vec::new();
     }
@@ -466,7 +489,7 @@ fn collapse_identical_records(variants: Vec<Variant>) -> Vec<Variant> {
     let mut collapsed = HashMap::new();
 
     for current_var in variants {
-        let pos = current_var.pos;
+        let pos = if current_var.pos < ref_length {current_var.pos} else {current_var.pos - ref_length};
         let ref_allele = current_var.ref_allele;
         let alt_allele = current_var.alt_allele;
         let variant_type = current_var.variant_type;
@@ -987,8 +1010,8 @@ pub fn start(
     let graph = agg::GraphicalGenome::load_graph(graph_file).unwrap();
     // generate cigar
     let mut graph_with_cigar = generate_cigar(graph, &ref_header, k, maxlength, 2);
-    let (variants, coverage, read_record) = get_variant(&mut graph_with_cigar, k, &ref_header);
-    let collapsed_var = collapse_identical_records(variants);
+    let (variants, coverage, read_record) = get_variant(&mut graph_with_cigar, k, &ref_header, ref_seq.len());
+    let collapsed_var = collapse_identical_records(variants, ref_seq.len());
     let filtered_var = filter_vcf_record(&collapsed_var, &coverage, minimal_ac, hf_threshold);
     // modified, exclude filtered data for FPs
 

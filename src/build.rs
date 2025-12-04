@@ -530,20 +530,36 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
     }
     // insert reference sequence to the read dictionary
     let reference_id = String::from_utf8_lossy(reference_sequence[0].id().as_bytes()).to_string();
-    read_dictionary.insert(reference_id, ref_seq);
+    read_dictionary.insert(reference_id.clone(), ref_seq);
 
     // construct edge information
     let dereferenced_anchor: HashMap<String, &AnchorInfo> = unadjacent_anchor
         .iter()
         .map(|(k, v)| (k.clone(), v)) 
         .collect();
-    let (edge_info, _outgoing) = create_edge_file(&read_dictionary, &dereferenced_anchor, k, 1);
-    
+    let (n_edge_info, _outgoing) = create_edge_file(&read_dictionary, &dereferenced_anchor, k, 1);
+    let mut edge_info = n_edge_info.clone();
     // find final anchor set in the src and dst of edges
     let mut final_anchor_list = HashSet::new();
+    
+    let mut f_ref_edge = String::new();
+    let mut f_dst_anchor = String::new();
+    let mut l_ref_edge = String::new();
+    let mut f_src_anchor = String::new();
     for (edgename, edge_info) in edge_info.iter(){
         let src = edge_info.src.clone();
         let dst = edge_info.dst.clone();
+        let reads = edge_info.reads.clone();
+        if reads.contains(&reference_id) {
+            if src == "SOURCE".to_string() {
+                f_ref_edge = edgename.clone();
+                f_dst_anchor = dst.clone();
+            }
+            if dst == "SINK".to_string() {
+                l_ref_edge = edgename.clone();
+                f_src_anchor = src.clone();
+            }
+        }
         final_anchor_list.insert(src);
         final_anchor_list.insert(dst);
     }
@@ -557,9 +573,26 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
         }
     }
 
-    // Filter edges with little read support.
-    // let filtered_edges = filter_undersupported_edges(&edge_info, &stem, 0);
-    // println!("filtered number: {}", filtered_edges.len());
+    // circularize the reference path
+    let mut l_ref_seq = String::new();
+    let mut l_ref_reads = HashSet::new();
+    if let Some(edge) = edge_info.get(&l_ref_edge) {
+        l_ref_seq.push_str(&edge.seq.clone());
+        l_ref_reads.extend(edge.reads.clone().iter().cloned());
+    }
+    if let Some(edge) = edge_info.get(&f_ref_edge) {
+        l_ref_seq.push_str(&edge.seq.clone());
+        l_ref_reads.intersection(&edge.reads.clone().iter().cloned().collect::<HashSet<_>>());
+    }
+    edge_info.remove(&l_ref_edge);
+    edge_info.remove(&f_ref_edge);
+    edge_info.insert(l_ref_edge.clone(), EdgeInfo {
+        seq: l_ref_seq,
+        src: f_src_anchor.clone(),
+        dst: f_dst_anchor.clone(),
+        reads: l_ref_reads.iter().cloned().collect(),
+        samples: HashSet::new(),
+    });
 
     // Write final graph to disk.
     let _ = write_gfa(

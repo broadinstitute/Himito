@@ -13,39 +13,18 @@ workflow AlignONT {
         String prefix
         String gcs_out_root_dir
         File ref_fa
-        Int split_num
-        Int mergebam_threads
         String map_preset  # r10 for "lr:hq", r9 for "map-ont"
     }
 
-    call split_fastq {
+
+    call Minimap2_ONT {
         input:
             read_fastq = fastq,
-            number_of_files = split_num,
-            disk_size = 500,
-            output_prefix = prefix
-
+            prefix = prefix,
+            ref_fasta = ref_fa,
+            gcs_out_root_dir = gcs_out_root_dir,
+            map_preset = map_preset
     }
-
-    scatter (fq in split_fastq.output_fastqs) {
-        call Minimap2_ONT {
-            input:
-                read_fastq = fastq,
-                prefix = prefix,
-                ref_fasta = ref_fa,
-                gcs_out_root_dir = gcs_out_root_dir,
-                map_preset = map_preset
-        }
-    }
-
-    call MergeBams { input:
-        bam_input = Minimap2_ONT.aligned_bam,
-        bai_input = Minimap2_ONT.aligned_bam_index,
-        prefix = prefix,
-        threads_num = mergebam_threads
-    }
-
-
 
 }
 
@@ -151,7 +130,10 @@ task Minimap2_ONT {
         time \
         samtools calmd -@"${NUM_CPUS}" -b ~{prefix}.pre.bam ~{ref_fasta} > ~{prefix}.bam
         time \
-        samtools index -@"${NUM_CPUS}" ~{prefix}.bam        
+        samtools index -@"${NUM_CPUS}" ~{prefix}.bam  
+
+        gsutil cp ~{prefix}.bam ~{gcs_out_root_dir}
+        gsutil cp ~{prefix}.bam.bai ~{gcs_out_root_dir}      
 
     >>>
 

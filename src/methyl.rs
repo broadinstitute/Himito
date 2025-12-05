@@ -509,17 +509,17 @@ fn find_methylation_signal_on_major_haplotype(graph: &GraphicalGenome) -> HashMa
                 
                 let currentpos = startpos + pos;
                 let referencepos = reference_position_mapping.get(&pos).cloned();
-                let motif = major_haplotype_sequence[currentpos..currentpos + 2].to_string();
-                
                 if currentpos >= major_haplotype_sequence.len() || 
                    major_haplotype_sequence.chars().nth(currentpos).unwrap() != 'C' {
                     continue;
                 }
-                
                 if currentpos + 1 >= major_haplotype_sequence.len() || 
                    major_haplotype_sequence.chars().nth(currentpos + 1).unwrap() != 'G' {
                     continue;
                 }
+
+                let motif = major_haplotype_sequence[currentpos..currentpos + 2].to_string();
+                
                 if let Some(referencepos_value) = referencepos {
                     methyl.entry((currentpos, referencepos_value, motif)).or_insert_with(HashMap::new)
                      .insert(read.clone(), likelihood);

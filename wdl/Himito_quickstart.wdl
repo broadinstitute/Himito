@@ -65,8 +65,8 @@ task QuickStart {
 
     runtime {
         docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
-        memory: "4 GB"
-        cpu: 1
+        memory: "16 GB"
+        cpu: 4
         disks: "local-disk 100 SSD"
     }
 }

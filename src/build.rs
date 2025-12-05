@@ -1,14 +1,9 @@
 // Import necessary standard library modules
 use std::collections::HashSet;
 use std::path::PathBuf;
-
 use bio::io::fasta::{Reader, Record};
 use rust_htslib::bam::{self, Read};
 use indicatif::ProgressBar;
-
-
-
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -445,25 +440,20 @@ pub fn write_gfa(
 
         let json_string =
             serde_json::to_string(&edge_data_clone).unwrap_or_else(|_| "{}".to_string());
-        let formatted_string = if !edge_data.reads.is_empty() {
-            format!(
+        if !edge_data.reads.is_empty() {
+            let formatted_string = format!(
                 "S\t{}\t{}\tPG:J:{}\tRC:i:{}",
                 edge,
                 seq,
                 json_string,
                 edge_data.reads.len()
-            )
-            // writeln!(file, "S\t{}\t{}\tPG:J:{}\tRC:i:{}\n", edge, seq, json_string, edge_data.reads.len())?;
-        } else {
-            format!("S\t{}\t{}", edge, seq)
-            // writeln!(file, "S\t{}\t{}\n", edge, seq)?;
+            );
+            edge_output.push(formatted_string);
         };
-        edge_output.push(formatted_string);
-
+        
         link_output.push(format!("L\t{}\t+\t{}\t+\t0M", src, edge));
         link_output.push(format!("L\t{}\t+\t{}\t+\t0M", edge, dst));
-        // writeln!(file, "L\t{}\t+\t{}\t+\t0M", src, edge)?;
-        // writeln!(file, "L\t{}\t+\t{}\t+\t0M", edge, dst)?;
+
     }
 
     for s in anchor_output {
@@ -510,7 +500,7 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
                 let contig_name = record.id().to_string();
                 let contig = String::from_utf8_lossy(record.seq()).to_string();
                 read_dictionary.insert(contig_name, contig);
-                }
+            }
         }
         Some("bam") => {
             // Handle BAM files

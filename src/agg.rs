@@ -89,6 +89,10 @@ impl GraphicalGenome {
             let line = line?.trim_end().to_string();
             if line.starts_with('S') {
                 let itemlist: Vec<&str> = line.split('\t').collect();
+                if itemlist.len() < 4 {
+                    println!("Invalid line: {}", line);
+                    continue;
+                }
                 let name = itemlist[1];
                 let seq = itemlist[2];
                 let annotation = &itemlist[3][5..];

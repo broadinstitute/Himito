@@ -59,7 +59,7 @@ task QuickStart {
         File asm = "~{prefix}.fasta"
         File read_var_mat = "~{prefix}.matrix.csv"
         File read_methyl_mat = "~{prefix}.methylation_per_read.csv" 
-        File numts_bam = "~{prefix}_numts.bam"
+        File numts_bam = "~{prefix}.numts.bam"
         File vcf = "~{prefix}.vcf"
     }
 

@@ -942,7 +942,7 @@ fn permutation_test(
         }
     }
 
-    println!("{:?}", excluded_index);
+    // println!("{:?}", excluded_index);
     bar.finish();
 
 

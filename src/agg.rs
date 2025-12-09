@@ -130,16 +130,7 @@ impl GraphicalGenome {
         })
     }
 
-    /// Method to extract a single sample graph
-    ///
-    /// # Arguments
-    ///
-    /// * `df_single_sample` - A 2D array containing the imputed data matrix
-    /// * `anchorlist` - A vector of strings containing the anchor names
-    /// * `readset` - A vector of strings containing the read names
-    /// * `sample` - A string slice containing the sample name
-    ///
-    /// # Returns
+ 
     ///
     /// A Result containing the graphical genome of the single sample
     ///
@@ -254,11 +245,32 @@ impl FindAllPathBetweenAnchors {
         let mut finder = FindAllPathBetweenAnchors {
             subpath: Vec::new(),
         };
-        finder.find_path(graph, start, end, &Vec::new(), 0, read_sets);
+        let mut visited = HashSet::new();
+        finder.find_path(graph, start, end, &Vec::new(), 0, read_sets, &mut visited, 1000);
         finder
     }
 
-    pub fn find_path(&mut self, g: &GraphicalGenome, start: &str, end: &str, sofar: &Vec<String>, depth: usize, readset: HashSet<String>) {
+    pub fn find_path(
+        &mut self, 
+        g: &GraphicalGenome, 
+        start: &str, 
+        end: &str, 
+        sofar: &Vec<String>, 
+        depth: usize, 
+        readset: HashSet<String>,
+        visited: &mut HashSet<String>,
+        max_depth: usize,
+    ) {
+        // Check depth limit to prevent stack overflow
+        if depth > max_depth {
+            return;
+        }
+
+        // Cycle detection: if we've visited this node in the current path, skip it
+        if visited.contains(start) {
+            return;
+        }
+
         if start == end {
             let mut sofar1 = sofar.clone();
             sofar1.push(end.to_string());
@@ -276,6 +288,8 @@ impl FindAllPathBetweenAnchors {
             return;
         }
 
+        // Mark current node as visited
+        visited.insert(start.to_string());
         let depth1 = depth + 1;
 
         if let Some(outgoing) = g.outgoing.get(start) {
@@ -290,9 +304,12 @@ impl FindAllPathBetweenAnchors {
                 }
                 let mut sofar1 = sofar.clone();
                 sofar1.push(start.to_string());
-                self.find_path(g, dst, end, &sofar1, depth1, readset1);
+                self.find_path(g, dst, end, &sofar1, depth1, readset1, visited, max_depth);
             }
         }
+
+        // Unmark current node when backtracking
+        visited.remove(start);
     }
 }
 

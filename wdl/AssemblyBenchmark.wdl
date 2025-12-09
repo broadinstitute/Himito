@@ -171,7 +171,7 @@ task Filter {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
         memory: "1 GB"
         cpu: 1
         disks: "local-disk 300 SSD"
@@ -199,7 +199,7 @@ task Build {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"
@@ -232,7 +232,7 @@ task Call {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"
@@ -262,7 +262,7 @@ task Methyl {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"
@@ -288,7 +288,7 @@ task Asm {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"

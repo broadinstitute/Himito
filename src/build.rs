@@ -440,16 +440,24 @@ pub fn write_gfa(
 
         let json_string =
             serde_json::to_string(&edge_data_clone).unwrap_or_else(|_| "{}".to_string());
-        if !edge_data.reads.is_empty() {
-            let formatted_string = format!(
+        let formatted_string = if !edge_data.reads.is_empty() {
+            format!(
                 "S\t{}\t{}\tPG:J:{}\tRC:i:{}",
                 edge,
                 seq,
                 json_string,
                 edge_data.reads.len()
-            );
-            edge_output.push(formatted_string);
+            )
+        } else {
+            format!(
+                "S\t{}\t{}\tPG:J:{}\tRC:i:{}",
+                edge,
+                seq,
+                json_string,
+                edge_data.reads.len()
+            )
         };
+        edge_output.push(formatted_string);
         
         link_output.push(format!("L\t{}\t+\t{}\t+\t0M", src, edge));
         link_output.push(format!("L\t{}\t+\t{}\t+\t0M", edge, dst));

@@ -64,7 +64,7 @@ task Filter {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
         memory: "1 GB"
         cpu: 1
         disks: "local-disk 300 SSD"
@@ -92,7 +92,7 @@ task Build {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v3"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"
@@ -104,7 +104,6 @@ task Call {
     input {
         File graph_gfa
         File reference
-        String reference_name
         String prefix
         String sampleid
         String data_type
@@ -113,7 +112,7 @@ task Call {
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_name} -k ~{kmer_size} -d ~{data_type} -s ~{sampleid} -o ~{sampleid}.~{prefix}.vcf
+        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference} -k ~{kmer_size} -d ~{data_type} -s ~{sampleid} -o ~{sampleid}.~{prefix}.vcf
 
     >>>
 
@@ -123,7 +122,7 @@ task Call {
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"

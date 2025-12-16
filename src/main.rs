@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use crate::agg::GraphicalGenome;
 
 mod agg;
 mod asm;
@@ -12,6 +11,7 @@ mod methyl;
 mod correct;
 mod minorhap;
 mod phylo;
+mod util;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]

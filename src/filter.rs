@@ -1,6 +1,6 @@
 
 use std::{collections::HashSet, path::PathBuf};
-use rust_htslib::bam::{self, Read, Writer,IndexedReader, Header, Record, record::{Aux, AuxArray}};
+use rust_htslib::bam::{self, Read,IndexedReader, Header, record::Aux};
 
 
 

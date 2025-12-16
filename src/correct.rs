@@ -1,14 +1,10 @@
 // correct graph based on srWGS data
-use std::process::Command;
-use msbwt2::dynamic_bwt::{create_from_fastx,DynamicBWT};
 use msbwt2::msbwt_core::BWT;
 use msbwt2::string_util;
 use msbwt2::rle_bwt::RleBWT;
-use rust_htslib::htslib::fai_load_options_FAI_CREATE;
 
 use crate::{agg::*};
-use std::{path::PathBuf, fs::File, io::{self, Write}};
-use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use bio::io::fasta::{Reader, Record};
 
 

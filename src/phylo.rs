@@ -6,6 +6,8 @@ use speedytree::DistanceMatrix;
 use speedytree::{NeighborJoiningSolver, Hybrid, Tree, to_newick};
 use csv::Reader;
 use std::fs;
+use crate::util;
+
 
 pub fn read_var_matrix(var_matrix: &PathBuf, min_vaf: f64) -> (Vec<String>, Vec<String>, Vec<Vec<f64>>) {
     let mut var_matrix = Reader::from_path(var_matrix).unwrap();
@@ -57,7 +59,8 @@ pub fn get_distance_matrix(var_matrix: &Vec<Vec<f64>>) -> Vec<Vec<f64>> {
     distance_matrix
 }
 
-pub fn build_phylogenetic_tree(distance_matrix:Vec<Vec<f64>>, read_names: Vec<String>) -> Result<Tree, Box<dyn Error>> {
+
+pub fn build_distance_phylogenetic_tree(distance_matrix:Vec<Vec<f64>>, read_names: Vec<String>) -> Result<Tree, Box<dyn Error>> {
     let distance_matrix = DistanceMatrix::build(distance_matrix, read_names).unwrap();
     let tree = NeighborJoiningSolver::<Hybrid>::default(distance_matrix.clone())
                                                             .set_canonical_steps(2)
@@ -66,20 +69,228 @@ pub fn build_phylogenetic_tree(distance_matrix:Vec<Vec<f64>>, read_names: Vec<St
     Ok(tree)
 }
 
+/// Converts a speedytree::Tree to an integer list representation
+/// that matches the number of taxa in the variant matrix
+/// Format: Newick string converted to a compact integer representation
+/// or parent-child array where indices correspond to taxa order
+pub fn tree_to_integer_list(tree: &Tree, read_names: &[String]) -> Vec<i32> {
+    // Get the Newick representation which is the standard format
+    let newick_str = to_newick(tree);
+    println!("Newick representation: {}", newick_str);
+    
+    // Convert Newick to parent array format
+    // where position i contains the parent node index of taxa i
+    newick_to_parent_array(&newick_str, read_names)
+}
+
+/// Convert Newick string to parent vector representation
+/// 
+/// The parent vector has length n (number of reads/samples).
+/// parent[i] = parent of read i, where:
+/// - Parent values are 0..n-1 (other reads) or n (root)
+/// - The root is n and has no parent
+/// 
+/// Returns a Vec<i32> of length n where each element is the parent index
+fn newick_to_parent_array(newick: &str, read_names: &[String]) -> Vec<i32> {
+    let n = read_names.len();
+    let root = n as i32;
+    let mut parent_vec = vec![root; n]; // Initialize all to root
+    
+    // Create mapping from read name to index
+    let name_to_index: HashMap<String, usize> = read_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name.clone(), i))
+        .collect();
+    
+    // Parse Newick string to build tree structure
+    // Stack tracks the parent for each nesting level
+    // Each level stores: (parent_read_idx, first_child_read_idx)
+    // parent_read_idx: None = root, Some(idx) = parent is read idx
+    // first_child_read_idx: first read encountered in this clade (becomes parent for siblings)
+    let mut stack: Vec<(Option<usize>, Option<usize>)> = Vec::new();
+    let mut current_name = String::new();
+    let mut skip_branch_length = false;
+    
+    for ch in newick.chars() {
+        match ch {
+            '(' => {
+                // Start of a new clade - process any pending name first
+                if !current_name.is_empty() {
+                    process_read_name(&current_name, &name_to_index, &mut parent_vec, &mut stack);
+                    current_name.clear();
+                }
+                // Push new level: parent is determined by previous level's first_child
+                let parent = if stack.is_empty() {
+                    None // Root level
+                } else {
+                    // Parent is the first child of the previous level (representative)
+                    stack.last().and_then(|(_, first_child)| *first_child)
+                };
+                stack.push((parent, None)); // (parent, first_child_in_this_clade)
+            }
+            ')' => {
+                // End of a clade - process any pending name
+                if !current_name.is_empty() {
+                    process_read_name(&current_name, &name_to_index, &mut parent_vec, &mut stack);
+                    current_name.clear();
+                }
+                skip_branch_length = false;
+                stack.pop();
+            }
+            ',' => {
+                // Separator between siblings - process any pending name
+                if !current_name.is_empty() {
+                    process_read_name(&current_name, &name_to_index, &mut parent_vec, &mut stack);
+                    current_name.clear();
+                }
+                skip_branch_length = false;
+            }
+            ':' => {
+                // Branch length follows - process name and skip length
+                if !current_name.is_empty() {
+                    process_read_name(&current_name, &name_to_index, &mut parent_vec, &mut stack);
+                    current_name.clear();
+                }
+                skip_branch_length = true;
+            }
+            ';' => {
+                // End of tree - process any pending name
+                if !current_name.is_empty() {
+                    process_read_name(&current_name, &name_to_index, &mut parent_vec, &mut stack);
+                }
+                break;
+            }
+            _ => {
+                if !skip_branch_length {
+                    current_name.push(ch);
+                }
+            }
+        }
+    }
+    
+    parent_vec
+}
+
+/// Helper function to process a read name and set its parent
+/// Returns the read index if the name was found and processed, None otherwise
+fn process_read_name(
+    name: &str,
+    name_to_index: &HashMap<String, usize>,
+    parent_vec: &mut Vec<i32>,
+    stack: &mut Vec<(Option<usize>, Option<usize>)>,
+) -> Option<usize> {
+    let trimmed_name = name.trim();
+    if trimmed_name.is_empty() {
+        return None;
+    }
+    
+    if let Some(&read_idx) = name_to_index.get(trimmed_name) {
+        // Find the parent for this read from the stack
+        let parent_idx = if stack.is_empty() {
+            parent_vec.len() as i32 // root
+        } else {
+            // Check if this is the first child in the current clade
+            let (parent_read_idx, first_child) = stack.last_mut().unwrap();
+            if let Some(first_child_idx) = *first_child {
+                // Not the first child - parent is the first child (sibling relationship)
+                first_child_idx as i32
+            } else {
+                // This is the first child - parent is the clade's parent
+                // Also set this as the first child for subsequent siblings
+                *first_child = Some(read_idx);
+                match parent_read_idx {
+                    None => parent_vec.len() as i32, // root
+                    Some(parent_idx) => *parent_idx as i32,
+                }
+            }
+        };
+        
+        // Set parent, ensuring node is not its own parent
+        if parent_idx != read_idx as i32 && parent_idx >= 0 && parent_idx <= parent_vec.len() as i32 {
+            parent_vec[read_idx] = parent_idx;
+            Some(read_idx)
+        } else {
+            // Invalid parent assignment - keep as root
+            parent_vec[read_idx] = parent_vec.len() as i32;
+            Some(read_idx)
+        }
+    } else {
+        None
+    }
+}
+
+
 pub fn start (var_matrix: &PathBuf, output_file: &PathBuf, min_vaf:f64) {
     let (read_names, variant_names, var_matrix) = read_var_matrix(var_matrix, min_vaf);
     let distance_matrix = get_distance_matrix(&var_matrix);
     println!("distance_matrix: {:?}", distance_matrix.len());
     println!("read_names: {:?}", read_names.len());
     println!("variant_matrix: {:?}, {:?}", var_matrix.len(), var_matrix[0].len());
+
+    // build NJ phylogenetic tree as the inital proposal
     let read_names_clone = read_names.clone();
-    let tree = build_phylogenetic_tree(distance_matrix, read_names_clone).unwrap();
+    let initial_tree = build_distance_phylogenetic_tree(distance_matrix, read_names_clone).unwrap();
+
+    // Get Newick representation of the initial tree
+    let initial_tree_newick = to_newick(&initial_tree);
+    println!("Initial tree (Newick): {}", initial_tree_newick);
+    println!("Number of taxa: {}", read_names.len());
+
+    // Convert Newick tree to parent vector format for MCMC
+    let initial_tree_parent_vec = newick_to_parent_array(&initial_tree_newick, &read_names);
+    println!("Initial tree parent vector: {:?}", initial_tree_parent_vec);
+    
+    // Debug: Check if all values are still root (indicates parsing issue)
+    let root_value = read_names.len() as i32;
+    let all_root = initial_tree_parent_vec.iter().all(|&p| p == root_value);
+    if all_root {
+        println!("WARNING: All parent values are root ({}) - Newick parser may not have found any read names!", root_value);
+        println!("First few read names: {:?}", &read_names[..read_names.len().min(5)]);
+        println!("Newick string sample: {}", &initial_tree_newick.chars().take(200).collect::<String>());
+    }
+    
+    // Debug: Check for self-parents (should not happen)
+    for (i, &parent) in initial_tree_parent_vec.iter().enumerate() {
+        if parent == i as i32 {
+            println!("ERROR: Node {} is its own parent! This will cause a panic.", i);
+        }
+    }
+
+    // MCMC sampling and find the optimal tree and error correction
+    // Run MCMC to find optimal tree
+    let mut rng = rand::thread_rng();
+    
+    // Convert float matrix to integer matrix (threshold at 0.5)
+    let var_matrix_t = var_matrix.clone();
+    let var_matrix_t_int: Vec<Vec<i32>> = var_matrix_t
+        .iter()
+        .map(|row| row.iter().map(|&val| if val > 0.5 { 1 } else { 0 }).collect())
+        .collect();
+    println!("Variant_matrix_int: {} variants x {} samples", var_matrix_t_int.len(), var_matrix_t_int[0].len());
+    
+    let result = util::find_optimal_tree(
+        &var_matrix_t_int,
+        Some(0.01),  // fd: false discovery rate (0->1 errors)
+        Some(0.1),     // ad1: allelic dropout rate (1->0 errors)
+        Some(10),        // no_of_reps: number of MCMC repetitions
+        Some(50000),    // no_of_loops: chain length per repetition
+        Some(1.0),      // gamma: scaling factor
+        None,           // move_probs: use defaults [0.0, 0.55, 0.4, 0.05]
+        Some('m'),      // score_type: 'm' for max
+        Some(true),     // use_tree_list: maintain list of optimal trees
+        Some(&initial_tree_parent_vec), // initial_tree: use the NJ tree as the starting point (converted to parent vector)
+        &mut rng,         // rng: use default RNG
+    );
+    let best_tree: Vec<i32> = result.best_tree;
+    
+    // save the optimal tree in Newick format
     let newick_file = output_file.with_extension("newick");
-    let newick_string = to_newick(&tree);
+    let newick_string = to_newick(&initial_tree);
     let _ = fs::write(newick_file.to_str().unwrap(), newick_string);
 
     // map variants back to the tree
-    let variant_mappings = map_variants_to_tree(&tree, &read_names, &variant_names, &var_matrix);
+    let variant_mappings = map_variants_to_tree(&initial_tree, &read_names, &variant_names, &var_matrix);
     
     // output variant mappings
     let mapping_file = output_file.with_extension("variant_mappings.csv");
@@ -87,6 +298,7 @@ pub fn start (var_matrix: &PathBuf, output_file: &PathBuf, min_vaf:f64) {
     
     println!("Variant mappings saved to: {:?}", mapping_file);
 }
+
 
 #[derive(Debug, Clone)]
 pub struct VariantMapping {
@@ -327,3 +539,4 @@ fn find_best_tree_node_advanced(
         ("internal_node".to_string(), confidence)
     }
 }
+

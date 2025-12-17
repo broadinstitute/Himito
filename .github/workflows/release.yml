@@ -1,0 +1,74 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version'
+        required: true
+
+jobs:
+  build-release:
+    name: Build Release Artifacts
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            artifact_name: haplograph-linux-x86_64
+            binary_name: haplograph
+          - os: macos-latest
+            artifact_name: haplograph-macos-x86_64
+            binary_name: haplograph
+          - os: windows-latest
+            artifact_name: haplograph-windows-x86_64
+            binary_name: haplograph.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libcurl4-openssl-dev \
+            libssl-dev \
+            zlib1g-dev \
+            libbz2-dev \
+            liblzma-dev
+
+      - name: Install system dependencies (macOS)
+        if: matrix.os == 'macos-latest'
+        run: |
+          brew install openssl || true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Create release archive
+        shell: bash
+        run: |
+          mkdir -p release
+          cp target/release/${{ matrix.binary_name }} release/
+          tar czf ${{ matrix.artifact_name }}.tar.gz -C release ${{ matrix.binary_name }}
+          
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            zip -r ${{ matrix.artifact_name }}.zip release/
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: |
+            ${{ matrix.artifact_name }}.tar.gz
+            ${{ matrix.artifact_name }}.zip
+

@@ -18,14 +18,14 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         include:
           - os: ubuntu-latest
-            artifact_name: haplograph-linux-x86_64
-            binary_name: haplograph
+            artifact_name: Himito-linux-x86_64
+            binary_name: Himito
           - os: macos-latest
-            artifact_name: haplograph-macos-x86_64
-            binary_name: haplograph
+            artifact_name: Himito-macos-x86_64
+            binary_name: Himito
           - os: windows-latest
-            artifact_name: haplograph-windows-x86_64
-            binary_name: haplograph.exe
+            artifact_name: Himito-windows-x86_64
+            binary_name: Himito.exe
 
     steps:
       - name: Checkout code

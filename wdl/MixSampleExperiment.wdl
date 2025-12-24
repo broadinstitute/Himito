@@ -24,6 +24,8 @@ workflow MixSamples {
         String query_field_mitograph
         String vcf_score_field_mitorsaw
         String query_field_mitorsaw
+        String data_type
+        Boolean run_mitosaw
 
     }
 
@@ -75,46 +77,48 @@ workflow MixSamples {
                     second_donor_bai = downsampleBam.downsampled_bam_2,
                     prefix = sampleid
             }
-
-            call Mitorsaw {
-                input:
-                    bam = mix_sample.merged_bam,
-                    bai = mix_sample.merged_bai,
-                    reference_fasta = reference_fa,
-                    reference_fasta_fai = reference_fai,
-                    prefix = sampleid
+            if (run_mitosaw) {
+                # call mitorsaw
+                call Mitorsaw {
+                    input:
+                        bam = mix_sample.merged_bam,
+                        bai = mix_sample.merged_bai,
+                        reference_fasta = reference_fa,
+                        reference_fasta_fai = reference_fai,
+                        prefix = sampleid
+                }
+                call VCFEval as Mitorsaw_Eval {
+                    input:
+                        query_vcf = Mitorsaw.vcf,
+                        reference_fa = reference_fa,
+                        reference_fai = reference_fai,
+                        query_output_sample_name = sampleid + "_" + desiredCoverage + "_" + first_proportion,
+                        base_vcf = merge_vcf.truth_vcf,
+                        base_vcf_index = merge_vcf.truth_tbi,
+                        vcf_score_field = vcf_score_field_mitorsaw,
+                        query_field = query_field_mitorsaw,
+                        threshold = 0,
+                        fraction = first_proportion
+                }
             }
 
             # call mitograph assembly
-            call Filter {
-                    input:
-                        bam = mix_sample.merged_bam,
-                        bai =  mix_sample.merged_bai,
-                        prefix = sampleid
-                }
-
-            call Build {
+            call QuickStart {
                 input:
-                    bam = Filter.mt_bam,
-                    reference = reference_fa,
+                    bam = mix_sample.merged_bam,
+                    bai = mix_sample.merged_bai,
+                    reference_fa = reference_fa,
                     prefix = sampleid,
                     kmer_size = kmer_size,
-                    sampleid = sampleid
-            }
+                    sample_id = sampleid,
+                    chromo = region,
+                    data_type = data_type,
 
-            call Call {
-                input:
-                    graph_gfa = Build.graph,
-                    reference_fa = reference_fa,
-                    prefix = desiredCoverage,
-                    kmer_size = kmer_size,
-                    sampleid=sampleid
             }
-
 
             call VCFEval as Mitograph_Eval {
                 input:
-                    query_vcf = Call.vcf,
+                    query_vcf = QuickStart.vcf,
                     reference_fa = reference_fa,
                     reference_fai = reference_fai,
                     query_output_sample_name = sampleid + "_" + desiredCoverage + "_" + first_proportion,
@@ -126,25 +130,13 @@ workflow MixSamples {
                     fraction = first_proportion
             }
 
-            call VCFEval as Mitorsaw_Eval {
-                input:
-                    query_vcf = Mitorsaw.vcf,
-                    reference_fa = reference_fa,
-                    reference_fai = reference_fai,
-                    query_output_sample_name = sampleid + "_" + desiredCoverage + "_" + first_proportion,
-                    base_vcf = merge_vcf.truth_vcf,
-                    base_vcf_index = merge_vcf.truth_tbi,
-                    vcf_score_field = vcf_score_field_mitorsaw,
-                    query_field = query_field_mitorsaw,
-                    threshold = 0,
-                    fraction = first_proportion
-            }
+
         }
 
     }
     output {
         Array[Array[File]] mitograph_summary_file = Mitograph_Eval.summary_statistics
-        Array[Array[File]] mitorsaw_summary_file = Mitorsaw_Eval.summary_statistics
+        Array[Array[File?]] mitorsaw_summary_file = Mitorsaw_Eval.summary_statistics
     }
 }
 
@@ -355,89 +347,39 @@ task mix_sample {
         docker:                 select_first([runtime_attr.docker,            default_attr.docker])
     }
 }
-task Filter {
+
+task QuickStart {
     input {
         File bam
         File bai
-        String prefix
-    }
-
-    command <<<
-        set -euxo pipefail
-        /Himito/target/release/Himito filter -i ~{bam} -c chrM -m ~{prefix}_mt.bam -n ~{prefix}_numts.bam
-    >>>
-
-    output {
-        File mt_bam = "~{prefix}_mt.bam"
-        File numts_bam = "~{prefix}_numts.bam"
-    }
-
-    runtime {
-        docker: "hangsuunc/himito:v1"
-        memory: "1 GB"
-        cpu: 1
-        disks: "local-disk 300 SSD"
-    }
-}
-
-task Build {
-    input {
-        File bam
-        File reference
-        String prefix
-        String sampleid
-        Int kmer_size
-    }
-
-    command <<<
-        set -euxo pipefail
-
-        /Himito/target/release/Himito build -i ~{bam} -k ~{kmer_size} -r ~{reference} -o ~{sampleid}.~{prefix}.gfa 
-
-    >>>
-
-    output {
-        File graph = "~{sampleid}.~{prefix}.gfa"
-    }
-
-    runtime {
-        docker: "hangsuunc/himito:v1"
-        memory: "2 GB"
-        cpu: 1
-        disks: "local-disk 10 SSD"
-    }
-}
-
-task Call {
-
-    input {
-        File graph_gfa
         File reference_fa
         String prefix
-        String sampleid
         Int kmer_size
+        String sample_id
+        String chromo = "chrM"
+        String data_type = "pacbio"
     }
-    
-    
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_fa} -k ~{kmer_size} -s ~{sampleid} -o ~{sampleid}.~{prefix}.vcf
-        ls
-
-    >>>
+        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type}
+    >>>  
 
     output {
-        File graph = "~{sampleid}.~{prefix}.annotated.gfa"
-        File matrix = "~{sampleid}.~{prefix}.matrix.csv"
-        File vcf = "~{sampleid}.~{prefix}.vcf"
+        File graph = "~{prefix}.methyl.gfa"
+        File methyl_bed = "~{prefix}.bed"
+        File asm = "~{prefix}.fasta"
+        File read_var_mat = "~{prefix}.matrix.csv"
+        File read_methyl_mat = "~{prefix}.methylation_per_read.csv" 
+        File numts_bam = "~{prefix}.numts.bam"
+        File vcf = "~{prefix}.vcf"
     }
 
     runtime {
-        docker: "hangsuunc/himito:v1"
-        memory: "2 GB"
-        cpu: 1
-        disks: "local-disk 10 SSD"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
+        memory: "16 GB"
+        cpu: 4
+        disks: "local-disk 200 SSD"
     }
 }
 
@@ -503,11 +445,6 @@ task VCFEval {
 
         mkdir output_dir
         cp reg/summary.txt output_dir/~{query_output_sample_name}.~{fraction}.summary.txt
-        # cp reg/weighted_roc.tsv.gz output_dir/
-        # cp reg/*.vcf.gz* output_dir/
-        # cp output_dir/output.vcf.gz output_dir/~{query_output_sample_name}.vcf.gz
-        # cp output_dir/output.vcf.gz.tbi output_dir/~{query_output_sample_name}.vcf.gz.tbi
-
     
     >>>
 

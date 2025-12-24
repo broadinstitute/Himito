@@ -16,6 +16,7 @@ workflow DownsampleExperiment {
         String sampleid
         String data_type
         String region = "chrM"
+        Boolean run_mitosaw
 
     }
 
@@ -38,45 +39,43 @@ workflow DownsampleExperiment {
             preemptible_tries = 0
         }
 
+        if (run_mitosaw) {
+            call Mitorsaw {
+                input:
+                    bam = downsampleBam.downsampled_bam,
+                    bai = downsampleBam.downsampled_bai,
+                    reference_fasta = reference_fa,
+                    reference_fasta_fai = reference_fai,
+                    prefix = sampleid + "_" + desiredCoverage
+            }
+            call VCFEval as Mitorsaw_Eval {
+                input:
+                    query_vcf = Mitorsaw.vcf,
+                    reference_fa = reference_fa,
+                    reference_fai = reference_fai,
+                    base_vcf = truth_vcf,
+                    base_vcf_index = truth_tbi,
+                    query_output_sample_name = sampleid + "_" + desiredCoverage + "_Mitorsaw",
+            }
+        }
 
-        call Mitorsaw {
+
+        call QuickStart {
             input:
                 bam = downsampleBam.downsampled_bam,
                 bai = downsampleBam.downsampled_bai,
-                reference_fasta = reference_fa,
-                reference_fasta_fai = reference_fai,
-                prefix = sampleid + "_" + desiredCoverage
-        }
-
-        call Filter {
-            input:
-                bam = downsampleBam.downsampled_bam,
-                bai = downsampleBam.downsampled_bai,
-                prefix = sampleid
-        }
-
-        call Build {
-            input:
-                bam = Filter.mt_bam,
-                reference = reference_fa,
-                prefix = desiredCoverage,
-                kmer_size = kmer_size,
-                sampleid = sampleid
-        }
-
-        call Call {
-            input:
-                graph_gfa = Build.graph,
                 reference_fa = reference_fa,
-                prefix = desiredCoverage,
+                prefix = sampleid,
                 kmer_size = kmer_size,
+                sample_id = sampleid,
+                chromo = region,
                 data_type = data_type,
-                sampleid=sampleid
+
         }
 
         call VCFEval as Himito_Eval {
             input:
-                query_vcf = Call.vcf,
+                query_vcf = QuickStart.vcf,
                 reference_fa = reference_fa,
                 reference_fai = reference_fai,
                 base_vcf = truth_vcf,
@@ -84,23 +83,15 @@ workflow DownsampleExperiment {
                 query_output_sample_name = sampleid + "_" + desiredCoverage + "_Himito",
         }
     
-        call VCFEval as Mitorsaw_Eval {
-            input:
-                query_vcf = Mitorsaw.vcf,
-                reference_fa = reference_fa,
-                reference_fai = reference_fai,
-                base_vcf = truth_vcf,
-                base_vcf_index = truth_tbi,
-                query_output_sample_name = sampleid + "_" + desiredCoverage + "_Mitorsaw",
-        }
+
         
 
     }
     output {
         Array[File] Himito_summary_file = Himito_Eval.summary_statistics
-        Array[File] mitorsaw_summary_file = Mitorsaw_Eval.summary_statistics
-        Array[File] Himito_vcf = Call.vcf
-        Array[File] Mitorsaw_vcf = Mitorsaw.vcf
+        Array[File?] mitorsaw_summary_file = Mitorsaw_Eval.summary_statistics
+        Array[File] Himito_vcf = QuickStart.vcf
+        Array[File?] Mitorsaw_vcf = Mitorsaw.vcf
     }
 }
 
@@ -501,5 +492,40 @@ task VCFEval {
     output {
         File summary_statistics = "output_dir/~{query_output_sample_name}_summary.txt"
         
+    }
+}
+
+task QuickStart {
+    input {
+        File bam
+        File bai
+        File reference_fa
+        String prefix
+        Int kmer_size
+        String sample_id
+        String chromo = "chrM"
+        String data_type = "pacbio"
+    }
+
+    command <<<
+        set -euxo pipefail
+        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type}
+    >>>  
+
+    output {
+        File graph = "~{prefix}.methyl.gfa"
+        File methyl_bed = "~{prefix}.bed"
+        File asm = "~{prefix}.fasta"
+        File read_var_mat = "~{prefix}.matrix.csv"
+        File read_methyl_mat = "~{prefix}.methylation_per_read.csv" 
+        File numts_bam = "~{prefix}.numts.bam"
+        File vcf = "~{prefix}.vcf"
+    }
+
+    runtime {
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
+        memory: "16 GB"
+        cpu: 4
+        disks: "local-disk 200 SSD"
     }
 }

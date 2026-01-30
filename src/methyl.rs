@@ -2,10 +2,10 @@ use ndarray::Array2;
 use rust_htslib::bam::ext::BamRecordExtensions;
 use rust_htslib::bam::{Read, Reader, Record};
 use std::path::Path;
-use std::{path::PathBuf, fs::File, io::{self, Write}};
-use crate::{agg::*, methyl};
+use std::{path::PathBuf, fs::File, io::Write};
+use crate::agg::*;
 use std::collections::{HashMap, HashSet};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::error::Error;
 use csv::Writer;
 
@@ -368,7 +368,7 @@ pub fn get_reference_coordinates(cigar: &str, ref_start: usize) -> HashMap<usize
 }
 
 pub fn add_methylation_to_graph(
-    mut graph: &mut GraphicalGenome, 
+    graph: &mut GraphicalGenome, 
     methyl_pos_dict: &HashMap<usize, f32>, 
     mapping_position: &HashMap<usize, (String, usize)>, 
     read_name: &str

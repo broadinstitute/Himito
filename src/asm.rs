@@ -4,7 +4,7 @@ use std::{path::PathBuf, fs::File, io::{self, Write}};
 
 
 fn write_fasta(outputfile: &PathBuf, sequence: String, header: &str) -> io::Result<()>{
-    let mut index = 0;
+    let index = 0;
     let mut file = File::create(outputfile)?;
 
     let header = format!(">{} \n", header);

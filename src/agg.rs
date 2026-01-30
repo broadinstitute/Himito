@@ -418,7 +418,7 @@ pub fn construct_major_haplotype(graph:&GraphicalGenome) -> String {
     anchorlist.sort();
     let mut src = anchorlist.first().unwrap().to_string();
     let mut next_edge = "".to_string();
-    let mut dst = anchorlist.last().unwrap().to_string();
+    let dst = anchorlist.last().unwrap().to_string();
     let mut haplotype = String::new();
     // println!("{}", src);
     let mut entity_set = HashSet::new();
@@ -475,7 +475,7 @@ pub fn construct_major_haplotype_entitylist(graph:&GraphicalGenome) -> Vec<Strin
     anchorlist.sort();
     let mut src = anchorlist.first().unwrap().to_string();
     let mut next_edge = "".to_string();
-    let mut dst = anchorlist.last().unwrap().to_string();
+    let dst = anchorlist.last().unwrap().to_string();
     let mut haplotype = Vec::new();
     // println!("{}", src);
     let mut entity_set = HashSet::new();

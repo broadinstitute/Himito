@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, Write};
 
 
 pub fn reverse_complement(kmer: &str) -> String {
@@ -334,7 +334,7 @@ pub fn create_edge_file(
                 edgeindex += 1;
             }
             // debuging why edge sequence are empty
-            let mut edge_seq = if src_pos == 0 {
+            let edge_seq = if src_pos == 0 {
             let seq = contig.get(0..dst_pos).unwrap_or_default().to_string();
                 if seq.is_empty() {
                     println!("Warning: Empty edge sequence created for SOURCE. dst_pos: {}, contig_len: {}", dst_pos, contig.len());

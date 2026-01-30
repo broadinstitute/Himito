@@ -1,5 +1,5 @@
-use std::{collections::{HashMap, HashSet}, path::PathBuf, io::Write};
-use rust_htslib::bam::{self, Read, Writer,IndexedReader, Header, Record, record::{Aux, AuxArray}};
+use std::{collections::HashMap, path::PathBuf, io::Write};
+use rust_htslib::bam::{Read,IndexedReader, record::Aux};
 use bio::io::fasta::{Reader as FastaReader, Record as FastaRecord};
 
 

@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use crate::agg::GraphicalGenome;
 
 mod agg;
 mod asm;
@@ -15,6 +14,7 @@ mod callnumts;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
+#[clap(version = env!("CARGO_PKG_VERSION"))]
 #[clap(about = "Analysis of mitochondrial genome using long reads.", long_about = None)]
 
 struct Cli {

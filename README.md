@@ -72,7 +72,7 @@ Himito can identify and call NUMTs (Nuclear Mitochondrial DNA segments) breakpoi
    - Primary alignment to mitochondrial DNA (chrM) and supplementary alignment to nuclear chromosomes, OR
    - Primary alignment to nuclear chromosomes and supplementary alignment to mitochondrial DNA
 
-2. **Merging breakpoints**: Groups breakpoints by chromosome and merges consecutive breakpoints within a specified gap threshold (`max_gap_threshold`) to create intervals. This helps reduce noise and identify true NUMT insertion sites.
+2. **Merging breakpoints**: Groups breakpoints by chromosome and merges consecutive breakpoints within a specified gap threshold (`max_gap_threshold`) to create intervals. 
 
 3. **Writing BND records**: Outputs breakend (BND) structural variant records in VCF format, representing the NUMT breakpoints. Each BND record includes:
    - Breakpoint positions on both the nuclear chromosome and mitochondrial genome

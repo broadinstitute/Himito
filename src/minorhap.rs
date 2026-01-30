@@ -1,7 +1,7 @@
 use crate::agg::*;
 use std::{path::PathBuf, fs::File, io::{self, Write}};
 use std::collections::{HashMap, HashSet};
-use intervals::{Interval, Open};
+use intervals::Interval;
 
 fn find_all_reads(graph:&GraphicalGenome) -> HashSet<String> {
     let mut readset = HashSet::new();

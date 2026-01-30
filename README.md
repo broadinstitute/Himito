@@ -63,3 +63,41 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 # enumerate all possible haplotypes within windows
 ./target/release/Himito minorhap -g <output.gfa> -o <output.allhaplotype.fasta> -s <sample_id>
 ```
+
+### Jan 20th 2026 Updates: NUMTs Breakpoint Calling
+
+Himito can identify and call NUMTs (Nuclear Mitochondrial DNA segments) breakpoints from long-read BAM files. NUMTs are segments of mitochondrial DNA that have been inserted into the nuclear genome. The NUMTs calling functionality (`callnumts.rs`) works by:
+
+1. **Identifying NUMT reads**: Parses supplementary alignment (SA) tags in BAM files to identify reads that have:
+   - Primary alignment to mitochondrial DNA (chrM) and supplementary alignment to nuclear chromosomes, OR
+   - Primary alignment to nuclear chromosomes and supplementary alignment to mitochondrial DNA
+
+2. **Merging breakpoints**: Groups breakpoints by chromosome and merges consecutive breakpoints within a specified gap threshold (`max_gap_threshold`) to create intervals. This helps reduce noise and identify true NUMT insertion sites.
+
+3. **Writing BND records**: Outputs breakend (BND) structural variant records in VCF format, representing the NUMT breakpoints. Each BND record includes:
+   - Breakpoint positions on both the nuclear chromosome and mitochondrial genome
+   - Strand orientation information
+   - Supporting read counts (allele depth)
+   - Properly formatted BND ALT fields based on strand orientations
+
+**Usage:**
+```bash
+./target/release/Himito call-numts -i sample.bam \
+                               -c chrM \
+                               -m 10000 \
+                               -r hg38.fa \
+                               -o numts_breakpoints.vcf \
+                               -s HG002 \
+                               -a 2
+```
+**Output format:**
+The output VCF file contains BND (breakend) records in standard VCFv4.3 format. Each record represents a NUMT breakpoint with:
+- `CHROM`: Nuclear chromosome where the breakpoint occurs
+- `POS`: Breakpoint position (1-based)
+- `ALT`: BND format string indicating the connection to mitochondrial DNA
+- `INFO`: Contains `SVTYPE=BND`
+- `FORMAT`: GT (genotype) and AD (allele depth/supporting read count)
+
+This will identify NUMT breakpoints where reads have alignments spanning both mitochondrial and nuclear genomes, merge breakpoints within 10kb, and output only those with at least 2 supporting reads. If you want to examine all possible NUMTs BND, adjust -a to <=1.
+
+ToDo: may perform local assembly to find sequence resolved NUMTs insertions

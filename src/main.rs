@@ -11,6 +11,7 @@ mod filter;
 mod methyl;
 mod correct;
 mod minorhap;
+mod callnumts;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
@@ -75,7 +76,6 @@ enum Commands {
         /// data type, pacbio, ont
         #[clap(short, long, value_parser, default_value = "pacbio")]
         data_type: String,
-
 
     },
 
@@ -258,6 +258,32 @@ enum Commands {
         #[clap(short, long, value_parser)]
         sample: String,
     },
+
+    /// Call Numts from BAM file
+    #[clap(arg_required_else_help = true)]
+    CallNumts {
+        /// input path for bam file.
+        #[clap(short, long, value_parser, required = true)]
+        input_bam: PathBuf,
+        /// contig name in the bam file
+        #[clap(short, long, value_parser)]
+        chromo: String,
+        /// max gap threshold for merging numts breakpoints, default is 10000bp
+        #[clap(short, long, value_parser, default_value_t = 10000)]
+        max_gap_threshold: i32,
+        /// output path for numts vcf file
+        #[clap(short, long, value_parser, required = true)]
+        output_vcf: PathBuf,
+        /// path for standard linear reference FASTA file
+        #[clap(short, long, value_parser, required = true)]
+        reference_file: PathBuf,
+        /// sample name of the bam file
+        #[clap(short, long, value_parser, required = true)]
+        sample_name: String,
+        /// minimal allele count for variants
+        #[clap(short, long, value_parser, default_value_t = 2)]
+        ac_threshold: i32,
+    },
 }
 
 fn main() {
@@ -386,6 +412,17 @@ fn main() {
                 sample,
             } => {
                 minorhap::start(&graphfile, ref_length, bin_size,  pad_size, min_read_ratio, count_support,&outputfile, &sample);
+        }
+        Commands::CallNumts {
+            input_bam,
+            chromo,
+            max_gap_threshold,
+            output_vcf,
+            reference_file,
+            sample_name,
+            ac_threshold,
+        } => {
+            callnumts::start(&input_bam, &chromo, max_gap_threshold, &output_vcf, &reference_file, &sample_name, ac_threshold);
         }
     }
 

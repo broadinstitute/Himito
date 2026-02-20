@@ -913,7 +913,7 @@ fn permutation_test(
             // For PacBio: exclude SNPs from permutation test (PacBio has high accuracy for SNPs)
             // For ONT: include SNPs in permutation test but with stricter filtering
             // ONT has higher error rates, so we need the permutation test to filter false positives
-            if (ref_allele.len() == alt_allele.len()) && (data_type == "pacbio") {
+            if (ref_allele.len() == 1 && alt_allele.len() == 1) && (data_type == "pacbio") {
                 return (Ok(i), None);
             }
             // Note: For ONT, SNPs go through permutation test which should help filter false positives
@@ -1000,6 +1000,8 @@ pub fn start(
     sample_id: &str,
     hf_threshold: f32,
     data_type: &str,
+    p_value_threshold: f64,
+    frequency_threshold: f64,
 ) {
     if data_type != "pacbio" && data_type != "ont" {
         eprintln!("Error: data type must be pacbio or ont");
@@ -1028,11 +1030,11 @@ pub fn start(
 
     // use matrix information to filter vcf
     // Use stricter thresholds for ONT data due to higher error rates
-    let (p_value_threshold, frequency_threshold) = if data_type == "ont" {
-        (0.0001, 0.15)  // Stricter: lower p-value threshold, lower frequency threshold
-    } else {
-        (0.001, 0.2)    // PacBio: original thresholds
-    };
+    // let (p_value_threshold, frequency_threshold) = if data_type == "ont" {
+    //     (0.0001, 0.15)  // Stricter: lower p-value threshold, lower frequency threshold
+    // } else {
+    //     (0.001, 0.2)    // PacBio: original thresholds
+    // };
     let (permu_filtered_var, filtered_matrix, filtered_name) = permutation_test(&matrix, var_record, p_value_threshold, 100, &filtered_var, frequency_threshold, data_type);
 
     

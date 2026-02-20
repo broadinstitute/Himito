@@ -161,12 +161,14 @@ fn format_bnd_alt(
 /// Writes BND records to a VCF file from SA tag information
 pub fn write_bnd_vcf(
     output_vcf: &PathBuf,
-    numts_intervals: &Vec<(String, (i32, String, String, i32, String), (i32, String, String, i32, String), i32)>,
+    numts_intervals_: &Vec<(String, (i32, String, String, i32, String), (i32, String, String, i32, String), i32)>,
     reference_file: &PathBuf,
     sample_name: &str,
     minimal_ac: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::fs::File;
+    let mut numts_intervals = numts_intervals_.clone();
+    numts_intervals.sort_by_key(|(auto_chrom, (auto_start, _, _, _, _), _, _)| (auto_chrom.clone(), auto_start.clone()));
     let mut vcf_file = File::create(output_vcf)?;
     
     // reference fasta information
@@ -202,12 +204,12 @@ pub fn write_bnd_vcf(
         // Format BND ALT field
         let alt = format_bnd_alt(
             &ref_base,
-            mt_chrom,
-            *mt_pos,
-            mt_strand,
-            auto_chrom,
-            *auto_start,
-            auto_strand,
+            &mt_chrom,
+            mt_pos,
+            &mt_strand,
+            &auto_chrom,
+            auto_start,
+            &auto_strand,
         );
         
         // Create variant ID
@@ -217,7 +219,7 @@ pub fn write_bnd_vcf(
         let info = "SVTYPE=BND".to_string();
         
         // Write the record
-        if counts >= &minimal_ac {
+        if counts >= minimal_ac {
             writeln!(
                 vcf_file,
                 "{}\t{}\t{}\t{}\t{}\t.\t.\t{}\tGT:AD\t0/1:{}",
@@ -234,7 +236,7 @@ pub fn start(input_bam:&PathBuf, chromo: &str, max_gap_threshold: i32, output_vc
     
     let numts_mapping =  find_numts(input_bam, chromo).expect("Error finding numts");
     let numts_intervals = get_numts_intervals(&numts_mapping, max_gap_threshold);
-
+    println!("numts_intervals: {:?}", numts_intervals);
     write_bnd_vcf(&output_vcf, &numts_intervals, &reference_file, &sample_name, minimal_ac).expect("Error writing BND VCF");
     
     Ok(())

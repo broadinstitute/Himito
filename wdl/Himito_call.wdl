@@ -6,7 +6,6 @@ workflow Himito_call {
         File whole_genome_bai
         File reference_fa
         String prefix
-        String reference_header
         String sampleid
         String data_type
         Int kmer_size
@@ -32,7 +31,6 @@ workflow Himito_call {
         input:
             graph_gfa = Build.graph,
             reference = reference_fa,
-            reference_name = reference_header,
             prefix = prefix,
             kmer_size = kmer_size,
             sampleid=sampleid,

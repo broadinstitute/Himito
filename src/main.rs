@@ -77,6 +77,14 @@ enum Commands {
         #[clap(short, long, value_parser, default_value = "pacbio")]
         data_type: String,
 
+        /// p-value threshold for permutation test
+        #[clap(short, long, value_parser, default_value_t = 0.001)]
+        p_value_threshold: f64,
+
+        /// frequency threshold for permutation test
+        #[clap(short, long, value_parser, default_value_t = 0.2)]
+        frequency_threshold: f64,
+
     },
 
     /// Filter reads derived from Numts
@@ -189,6 +197,14 @@ enum Commands {
         /// data type, pacbio, ont
         #[clap(short, long, value_parser, default_value = "pacbio")]
         data_type: String,
+
+        /// p-value threshold for permutation test
+        #[clap(short, long, value_parser, default_value_t = 0.001)]
+        p_value_threshold: f64,
+
+        /// frequency threshold for permutation test
+        #[clap(short, long, value_parser, default_value_t = 0.2)]
+        frequency_threshold: f64,
     },
 
     /// Extract Major Haplotype as Fasta file from Graph
@@ -302,6 +318,8 @@ fn main() {
             vaf_threshold,
             sample_id,
             data_type,
+            p_value_threshold,
+            frequency_threshold,
         } => {
             let mt_output = output_prefix.with_extension("mt.bam");
             let numts_output = output_prefix.with_extension("numts.bam");
@@ -324,6 +342,8 @@ fn main() {
                 &sample_id,
                 vaf_threshold,
                 &data_type,
+                p_value_threshold,
+                frequency_threshold,
             );
             let annotated_graph_output = output_prefix.with_extension("annotated.gfa");
             let methyl_output = output_prefix.with_extension("bed");
@@ -370,6 +390,8 @@ fn main() {
             sample_id,
             vaf_threshold,
             data_type,
+            p_value_threshold,
+            frequency_threshold,
         } => {
             call::start(
                 &graphfile,
@@ -381,6 +403,8 @@ fn main() {
                 &sample_id,
                 vaf_threshold,
                 &data_type,
+                p_value_threshold,
+                frequency_threshold,
             );
         }
 

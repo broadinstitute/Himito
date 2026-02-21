@@ -1027,6 +1027,8 @@ pub fn start(
     
     // modified, exclude filtered data
     let (matrix, var_record, read_set) = construct_matrix(&read_record, &filtered_var);
+    let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
+    let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
 
     // use matrix information to filter vcf
     // Use stricter thresholds for ONT data due to higher error rates

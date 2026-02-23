@@ -990,6 +990,23 @@ fn permutation_test(
     
 }
 
+pub fn resolve_thresholds(
+    data_type: &str,
+    p_value_threshold: Option<f64>,
+    frequency_threshold: Option<f64>,
+) -> (f64, f64) {
+    let (default_p, default_f) = if data_type == "ont" {
+        (0.0001, 0.3)
+    } else {
+        (0.001, 0.5)
+    };
+
+    (
+        p_value_threshold.unwrap_or(default_p),
+        frequency_threshold.unwrap_or(default_f),
+    )
+}
+
 pub fn start(
     graph_file: &PathBuf,
     fasta_reference: &PathBuf,

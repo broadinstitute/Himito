@@ -37,13 +37,25 @@ enum Commands {
         #[clap(short, long, value_parser, default_value = "chrM")]
         chromo: String,
 
+        /// Reference Fasta file, rCRS
+        #[clap(short, long, value_parser, required = true)]
+        reference_path: PathBuf,
+
+        /// sample name of the bam file
+        #[clap(short, long, value_parser, required = true)]
+        sample_id: String,
+
+        /// data type, pacbio, ont
+        #[clap(short, long, value_parser, default_value = "pacbio")]
+        data_type: String,
+
         /// output prefix
         #[clap(short, long, value_parser, required = true)]
         output_prefix: PathBuf,
 
         /// min_probability to determine a C is methylated
         #[clap(short, long, value_parser, default_value_t = 0.5)]
-        prob_min: f64,
+        threshold_methylation_prob: f64,
 
         /// max fraction to keep a read as mtDNA derived
          #[clap(short, long, value_parser, default_value_t = 0.2)]
@@ -52,10 +64,6 @@ enum Commands {
         /// Kmer-size
         #[clap(short, long, value_parser, default_value_t = 21)]
         kmer_size: usize,
-
-        /// Reference Fasta file, rCRS
-        #[clap(short, long, value_parser, required = true)]
-        reference_path: PathBuf,
 
         /// minimal allele count for variants
         #[clap(short, long, value_parser, default_value_t = 1)]
@@ -69,13 +77,13 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 0.01)]
         vaf_threshold: f32,
 
-        /// sample name of the bam file
-        #[clap(short, long, value_parser, required = true)]
-        sample_id: String,
+        /// p-value threshold for permutation test (optional, preset by data-type,lower is more stringent)
+        #[clap(long, value_parser)]
+        p_value_threshold: Option<f64>,
 
-        /// data type, pacbio, ont
-        #[clap(short, long, value_parser, default_value = "pacbio")]
-        data_type: String,
+        /// heteroplasmic frequency threshold for permutation test (optional, preset by data-type,higher is more stringent)
+        #[clap(long, value_parser)]
+        heteroplasmic_frequency_threshold: Option<f64>,
 
     },
 
@@ -100,7 +108,7 @@ enum Commands {
 
         /// min_probability to determine a C is methylated
         #[clap(short, long, value_parser, default_value_t = 0.5)]
-        prob_min: f64,
+        threshold_methylation_prob: f64,
 
         /// max fraction to keep a read as mtDNA derived
          #[clap(short, long, value_parser, default_value_t = 0.2)]
@@ -111,21 +119,22 @@ enum Commands {
     /// Build graph from long-read data in FASTA or Bam file.
     #[clap(arg_required_else_help = true)]
     Build {
-        /// Output path for anchor graph.
-        #[clap(short, long, value_parser, default_value = "/dev/stdout")]
-        output: PathBuf,
-
-        /// Kmer-size
-        #[clap(short, long, value_parser, default_value_t = 21)]
-        kmer_size: usize,
+        /// bam or fasta file with reads spanning locus of interest.
+        #[clap(short, long, value_parser,required = true)]
+        input_read_path: PathBuf,
 
         /// Reference Fasta file, rCRS
         #[clap(short, long, value_parser, required = true)]
         reference_path: PathBuf,
 
-        /// bam or fasta file with reads spanning locus of interest.
-        #[clap(short, long, value_parser,required = true)]
-        input_read_path: PathBuf,
+        /// Kmer-size
+        #[clap(short, long, value_parser, default_value_t = 21)]
+        kmer_size: usize,
+
+        /// Output path for anchor graph.
+        #[clap(short, long, value_parser, default_value = "/dev/stdout")]
+        output: PathBuf,
+
     },
 
     /// Correct graph based on srWGS data
@@ -162,6 +171,18 @@ enum Commands {
         #[clap(short, long, value_parser, required = true)]
         reference_fasta: PathBuf,
 
+        /// sample name of the bam file
+        #[clap(short, long, value_parser, required = true)]
+        sample_id: String,
+
+        /// data type, pacbio, ont
+        #[clap(short, long, value_parser, default_value = "pacbio")]
+        data_type: String,
+
+        /// output file name
+        #[clap(short, long, value_parser, required = true)]
+        output_file: PathBuf,
+
         /// Kmer-size
         #[clap(short, long, value_parser, default_value_t = 21)]
         k: usize,
@@ -178,17 +199,13 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 0.01)]
         vaf_threshold: f32,
 
-        /// output file name
-        #[clap(short, long, value_parser, required = true)]
-        output_file: PathBuf,
+        /// p-value threshold for permutation test (optional)
+        #[clap(short, long, value_parser)]
+        p_value_threshold: Option<f64>,
 
-        /// sample name of the bam file
-        #[clap(short, long, value_parser, required = true)]
-        sample_id: String,
-
-        /// data type, pacbio, ont
-        #[clap(short, long, value_parser, default_value = "pacbio")]
-        data_type: String,
+        /// frequency threshold for permutation test (optional)
+        #[clap(short, long, value_parser)]
+        frequency_threshold: Option<f64>,
     },
 
     /// Extract Major Haplotype as Fasta file from Graph
@@ -292,20 +309,24 @@ fn main() {
         Commands::QuickStart {
             input_bam,
             chromo,
+            sample_id,
+            reference_path,
+            data_type,
             output_prefix,
-            prob_min,
+            threshold_methylation_prob,
             filter_max_methylation,
             length_max,
             kmer_size,
-            reference_path,
             minimal_ac,
             vaf_threshold,
-            sample_id,
-            data_type,
+            p_value_threshold,
+            heteroplasmic_frequency_threshold,
         } => {
+            let (p_value_threshold, frequency_threshold) =
+                call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold);
             let mt_output = output_prefix.with_extension("mt.bam");
             let numts_output = output_prefix.with_extension("numts.bam");
-            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, prob_min, filter_max_methylation);
+            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, threshold_methylation_prob, filter_max_methylation);
             
             let graph_output = output_prefix.with_extension("gfa");
             let _ = build::start(&graph_output, kmer_size, &mt_output, &reference_path);
@@ -324,20 +345,22 @@ fn main() {
                 &sample_id,
                 vaf_threshold,
                 &data_type,
+                p_value_threshold,
+                frequency_threshold,
             );
             let annotated_graph_output = output_prefix.with_extension("annotated.gfa");
             let methyl_output = output_prefix.with_extension("bed");
-            methyl::start(&annotated_graph_output, &mt_output, &methyl_output, prob_min, false);
+            methyl::start(&annotated_graph_output, &mt_output, &methyl_output, threshold_methylation_prob, false);
         }
         Commands::Filter {
             input_bam,
             chromo,
             mt_output,
             numts_output,
-            prob_min,
+            threshold_methylation_prob,
             fraction_max_methylation
         } => {
-            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, prob_min, fraction_max_methylation);
+            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, threshold_methylation_prob, fraction_max_methylation);
         }
 
         Commands::Build {
@@ -370,7 +393,11 @@ fn main() {
             sample_id,
             vaf_threshold,
             data_type,
+            p_value_threshold,
+            frequency_threshold,
         } => {
+            let (p_value_threshold, frequency_threshold) =
+                call::resolve_thresholds(&data_type, p_value_threshold, frequency_threshold);
             call::start(
                 &graphfile,
                 &reference_fasta,
@@ -381,6 +408,8 @@ fn main() {
                 &sample_id,
                 vaf_threshold,
                 &data_type,
+                p_value_threshold,
+                frequency_threshold,
             );
         }
 

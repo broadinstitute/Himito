@@ -998,7 +998,7 @@ pub fn resolve_thresholds(
     let (default_p, default_f) = if data_type == "ont" {
         (0.0001, 0.3)
     } else {
-        (0.001, 0.5)
+        (0.0001, 0.5)
     };
 
     (

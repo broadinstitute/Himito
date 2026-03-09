@@ -1,7 +1,6 @@
 use crate::agg;
 use agg::*;
-use bio::alignment::pairwise::*;
-use bio::alignment::AlignmentOperation;
+use crate::build;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 use std::collections::{HashMap};
@@ -18,197 +17,6 @@ use statrs::distribution::{Normal, ContinuousCDF};
 use regex::Regex;
 use adjustp::{adjust, Procedure};
 use bio::io::fasta::{Reader, Record};
-
-
-pub fn find_ref_edge(
-    graph: &GraphicalGenome,
-    src: &str,
-    dst: &str,
-    refstrain: &str,
-    k: usize,
-) -> String {
-    // Create HashSet with single refstrain
-    let strains = HashSet::from([refstrain.to_string()]);
-
-    // Find all paths between anchors
-    let paths = agg::FindAllPathBetweenAnchors::new(&graph, &src, &dst, strains);
-    let subpaths = &paths.subpath;
-
-    // Return empty string if no paths found
-    if subpaths.is_empty() {
-        return String::new();
-    }
-
-    // Get sequence from first path
-    let (path, _strain) = &subpaths[0];
-    let seq = agg::reconstruct_path_seq(&graph, path);
-
-    // Return sequence with src anchor and ref_edge sequence
-    seq[..seq.len() - k].to_string()
-}
-
-fn mask_ns(seq: &str) -> String {
-    seq.chars()
-        .map(|c| {
-            let upper_c = c.to_ascii_uppercase();
-            if !['A', 'G', 'C', 'T'].contains(&upper_c) {
-                c.to_ascii_lowercase()
-            } else {
-                upper_c
-            }
-        })
-        .collect()
-}
-
-fn alignment_to_cigar(operations: &[AlignmentOperation]) -> String {
-    let mut cigar: Vec<(usize, char)> = Vec::new();
-
-    for op in operations {
-        let cigar_op = match op {
-            AlignmentOperation::Match => '=',
-            AlignmentOperation::Subst => 'X',
-            AlignmentOperation::Del => 'D',
-            AlignmentOperation::Ins => 'I',
-            AlignmentOperation::Xclip(_) => 'S',
-            AlignmentOperation::Yclip(_) => 'S',
-        };
-
-        if !cigar.is_empty() && cigar.last().unwrap().1 == cigar_op {
-            cigar.last_mut().unwrap().0 += 1;
-        } else {
-            cigar.push((1, cigar_op));
-        }
-    }
-
-    cigar
-        .iter()
-        .map(|(count, op)| format!("{}{}", count, op))
-        .collect()
-}
-
-fn gap_open_aligner(reference: &str, sequence: &str) -> String {
-    let score = |a: u8, b: u8| if a == b { 1i32 } else { -1i32 };
-    // Create an aligner with the same scoring parameters
-    let mut aligner = Aligner::with_capacity(sequence.len(), reference.len(), -5, -1, &score); // match_score=0, mismatch_score=-6, gap_open=-5, gap_extend=-3
-
-    // Perform the alignment
-    let alignment = aligner.global(sequence.as_bytes(), reference.as_bytes());
-
-    // Get the aligned sequences
-    let cigar = alignment_to_cigar(&alignment.operations);
-    // println!("{:?}", cigar);
-
-    cigar
-}
-
-pub fn generate_cigar(
-    mut graph: GraphicalGenome,
-    ref_strain: &str,
-    k: usize,
-    maxlength: usize,
-    minimal_read_count: usize,
-) -> GraphicalGenome {
-    let mut edgelist: Vec<_> = graph.edges.keys().cloned().collect();
-    edgelist.sort();
-    let bar = ProgressBar::new(edgelist.len() as u64);
-
-    let updates: Vec<_> = edgelist
-        .par_iter()
-        .map(|edge| {
-            bar.inc(1);
-            let allele_count = graph
-                .edges
-                .get(edge)
-                .and_then(|e| e.get("reads"))
-                .map_or(Vec::new(), |reads| {
-                    reads.as_array().unwrap_or(&Vec::new()).to_vec()
-                })
-                .len();
-
-            if allele_count <= minimal_read_count {
-                return (edge.clone(), None);
-            }
-
-            let src = &graph
-                .edges
-                .get(edge)
-                .expect("Edge not found")
-                .get("src")
-                .expect("No src in this edge!")
-                .as_array()
-                .expect("not an array")
-                .first()
-                .expect("no vallue in src list")
-                .as_str()
-                .expect("src not a string");
-            let src_seq = if *src == "SOURCE" {
-                ""
-            } else {
-                graph
-                    .anchor
-                    .get(*src)
-                    .and_then(|anchor| anchor.get("seq").and_then(|seq| seq.as_str()))
-                    .unwrap_or("")
-            };
-
-            let dst = &graph
-                .edges
-                .get(edge)
-                .expect("Edge not found")
-                .get("dst")
-                .expect("No dst in this edge!")
-                .as_array()
-                .expect("not an array")
-                .first()
-                .expect("no value in dst list")
-                .as_str()
-                .expect("dst not a string");
-            // println!("src, {}, dst, {}", src, dst);
-            let ref_seq = find_ref_edge(&graph, src, dst, ref_strain, k);
-            let ref_length = ref_seq.len();
-            let alt_sequence = src_seq.to_string()
-                + &graph
-                    .edges
-                    .get(edge)
-                    .expect("edge not found")
-                    .get("seq")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-            let alt_seq = mask_ns(&alt_sequence);
-            let alt_length = alt_seq.len();
-
-            if ref_length > maxlength || ref_length < k {
-                return (edge.clone(), None);
-            }
-
-            if alt_seq == ref_seq {
-                return (edge.clone(), Some(format!("{}=", ref_length)));
-            }
-
-            if alt_length > maxlength {
-                return (edge.clone(), None);
-            }
-            let cigar = gap_open_aligner(&ref_seq, &alt_seq);
-            std::thread::sleep(std::time::Duration::from_millis(50));
-
-            (edge.clone(), Some(cigar))
-        })
-        .collect();
-
-    // Apply the updates sequentially after parallel computation
-    for (edge, maybe_variant) in updates {
-        if let Some(variant) = maybe_variant {
-            if let Some(edge_data) = graph.edges.get_mut(&edge) {
-                edge_data
-                    .as_object_mut()
-                    .expect("Edge data is not an object")
-                    .insert("variants".to_string(), serde_json::Value::String(variant));
-            }
-        }
-    }
-    bar.finish();
-    graph
-}
 
 #[derive(Debug, Clone)]
 pub struct Variant {
@@ -422,7 +230,7 @@ pub fn get_variant(
             .as_i64()
             .expect("Position should be a integer");
 
-        let ref_seq = find_ref_edge(&graph, src, dst, ref_name, k);
+        let ref_seq = build::find_ref_edge(&graph, src, dst, ref_name, k);
         let src_seq = graph
             .anchor
             .get(src)
@@ -1032,15 +840,11 @@ pub fn start(
     
     // read in graphical genome
     let graph = agg::GraphicalGenome::load_graph(graph_file).unwrap();
-    // generate cigar
-    let mut graph_with_cigar = generate_cigar(graph, &ref_header, k, maxlength, 2);
-    let (variants, coverage, read_record) = get_variant(&mut graph_with_cigar, k, &ref_header, ref_seq.len());
+    
+    let (variants, coverage, read_record) = get_variant(&mut graph.clone(), k, &ref_header, ref_seq.len());
     let collapsed_var = collapse_identical_records(variants, ref_seq.len());
     let filtered_var = filter_vcf_record(&collapsed_var, &coverage, minimal_ac, hf_threshold);
     // modified, exclude filtered data for FPs
-
-    let graph_output = output_file.with_extension("annotated.gfa");
-    let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph_with_cigar);
     
     // modified, exclude filtered data
     let (matrix, var_record, read_set) = construct_matrix(&read_record, &filtered_var);

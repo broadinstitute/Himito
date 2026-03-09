@@ -85,6 +85,10 @@ enum Commands {
         #[clap(long, value_parser)]
         heteroplasmic_frequency_threshold: Option<f64>,
 
+        /// maximal reads to keep from mtDNA 
+        #[clap(long, value_parser, default_value_t = 2000)]
+        maximal_mt_depth: usize,
+
     },
 
     /// Filter reads derived from Numts
@@ -114,6 +118,10 @@ enum Commands {
          #[clap(short, long, value_parser, default_value_t = 0.2)]
         fraction_max_methylation: f64,
 
+        /// maximal reads to keep from mtDNA 
+        #[clap(long, value_parser, default_value_t = 2000)]
+        maximal_mt_depth: usize,
+
     },
 
     /// Build graph from long-read data in FASTA or Bam file.
@@ -134,6 +142,10 @@ enum Commands {
         /// Output path for anchor graph.
         #[clap(short, long, value_parser, default_value = "/dev/stdout")]
         output: PathBuf,
+
+        /// max Length to do alignment
+        #[clap(short, long, value_parser, default_value_t = 3000)]
+        length_max: usize,
 
     },
 
@@ -221,6 +233,7 @@ enum Commands {
         /// header for the major haplotype, usually the sample name
         #[clap(short, long, value_parser)]
         sample: String,
+
     },
 
     /// Annotate Methylation signals to the Graph
@@ -300,7 +313,7 @@ enum Commands {
         /// minimal allele count for variants
         #[clap(short, long, value_parser, default_value_t = 2)]
         ac_threshold: i32,
-    },
+    }
 }
 
 fn main() {
@@ -321,15 +334,16 @@ fn main() {
             vaf_threshold,
             p_value_threshold,
             heteroplasmic_frequency_threshold,
+            maximal_mt_depth,
         } => {
             let (p_value_threshold, frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold);
             let mt_output = output_prefix.with_extension("mt.bam");
             let numts_output = output_prefix.with_extension("numts.bam");
-            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, threshold_methylation_prob, filter_max_methylation);
+            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, threshold_methylation_prob, filter_max_methylation, maximal_mt_depth);
             
             let graph_output = output_prefix.with_extension("gfa");
-            let _ = build::start(&graph_output, kmer_size, &mt_output, &reference_path);
+            let _ = build::start(&graph_output, kmer_size, &mt_output, &reference_path, length_max);
 
             let assemble_output = output_prefix.with_extension("fasta");
             asm::start(&graph_output, &assemble_output, &sample_id);
@@ -358,9 +372,10 @@ fn main() {
             mt_output,
             numts_output,
             threshold_methylation_prob,
-            fraction_max_methylation
+            fraction_max_methylation,
+            maximal_mt_depth,
         } => {
-            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, threshold_methylation_prob, fraction_max_methylation);
+            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, threshold_methylation_prob, fraction_max_methylation, maximal_mt_depth);
         }
 
         Commands::Build {
@@ -368,8 +383,9 @@ fn main() {
             kmer_size,
             input_read_path,
             reference_path,
+            length_max,
         } => {
-            build::start(&output, kmer_size, &input_read_path, &reference_path);
+            build::start(&output, kmer_size, &input_read_path, &reference_path, length_max);
         }
 
         Commands::Correct {

@@ -22,9 +22,7 @@ struct Cli {
     command: Commands,
 }
 
-
 #[derive(Debug, Subcommand)]
-
 enum Commands {
     /// Quick start pipeline for mitochondrial assembly, variant calling and methylation aggregation
     #[clap(arg_required_else_help = true)]
@@ -66,7 +64,7 @@ enum Commands {
         kmer_size: usize,
 
         /// minimal allele count for variants
-        #[clap(short, long, value_parser, default_value_t = 1)]
+        #[clap(short, long, value_parser, default_value_t = 2)]
         minimal_ac: usize,
 
         /// max Length to do alignment
@@ -204,7 +202,7 @@ enum Commands {
         length_max: usize,
 
         /// minimal allele count for variants
-        #[clap(short, long, value_parser, default_value_t = 1)]
+        #[clap(short, long, value_parser, default_value_t = 2)]
         minimal_ac: usize,
 
         /// minimal heteroplasmic frequency for variants

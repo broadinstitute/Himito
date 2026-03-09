@@ -801,6 +801,6 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
     
     // generate cigar
     let mut graph_with_cigar = generate_cigar(&mut graph, &ref_header, k, maxlength, 2);
-    let graph_output = output.with_extension("annotated.gfa");
+    let graph_output = output.with_extension("gfa");
     let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph_with_cigar);
 }

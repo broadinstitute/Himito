@@ -184,13 +184,10 @@ impl GraphicalGenome {
                         add_unique(outgoing_edgename_list, dst.to_string());
                     }
                     else{
-                        panic!("edge do not have outgoing anchor")
-                            
-                        }
-
+                        panic!("edge do not have outgoing anchor")    
+                    }
                 }
             }
-
         }
     let new_graph = GraphicalGenome {
             anchor: self.anchor.clone(), 
@@ -361,7 +358,7 @@ pub fn write_graph_from_graph(filename: &str, graph: &GraphicalGenome) -> std::i
     Ok(())
 }
 
-pub fn edit_distance(cigar: &str) -> usize {
+pub fn edit_distance(cigar: &String) -> usize {
     let mut edit_distance = 0;
     let mut num: usize = 0;
     for ch in cigar.chars() {
@@ -388,18 +385,27 @@ pub fn find_most_supported_edge(graph: &GraphicalGenome, src: String) -> String 
     let outgoinglist = &graph.outgoing.get(&src).unwrap_or(&empty_vec);
     let mut m = 0;
     let mut most_supported_edge = "".to_string();
+    let mut nm_value = usize::MAX;
     for edge in outgoinglist.iter(){
         let edge_dst = graph.edges[edge]["dst"].as_array().unwrap().first().unwrap().as_str().unwrap().to_string();
         if edge_dst == "SINK".to_string(){
             continue
         }
         let read_count = graph.edges[edge]["reads"].as_array().unwrap_or(&Vec::new()).len();
+        let cigar = graph.edges[edge]["variants"].as_str().unwrap_or("");
         if read_count > m {
             m = read_count;
             most_supported_edge = edge.clone();
+            nm_value = edit_distance(&cigar.to_string());
         } else if read_count == m {
-           // select the edge with the minimal edit distance
-           let edit_distance_new = graph.edges[edge][""].as_u64().unwrap_or(0);
+            /// define lexicographical order
+            if edge.to_string() < most_supported_edge.to_string() {
+                most_supported_edge = edge.clone();
+            }else{
+                continue
+            }
+        }else{
+            continue
         }
     }
     most_supported_edge

@@ -158,7 +158,7 @@ pub fn start(input_bam:&PathBuf, chromo: &str, mt_output:&PathBuf, numts_output:
     
     match find_numts(input_bam, chromo, 'm', min_prob, fraction_max_methylation) {
         Ok(numts) => {
-            println!("Found {} numts", numts.len());
+            println!("Found {} potential NUMTS reads", numts.len());
             // Then split into separate BAM files
             write_bams(input_bam, mt_output, numts_output, max_mt_reads, chromo, &numts)?;
         },

@@ -6,6 +6,7 @@ RUN apt-get install -y --no-install-recommends git ssh build-essential make cmak
 
 RUN git config --global http.sslverify false
 RUN git clone https://github.com/broadinstitute/Himito.git \ 
+    && git checkout hangsu_breaktie \
     && cd Himito \
     && cargo build --release
 

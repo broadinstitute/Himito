@@ -360,7 +360,7 @@ fn main() {
                 p_value_threshold,
                 frequency_threshold,
             );
-            let annotated_graph_output = output_prefix.with_extension("annotated.gfa");
+            let annotated_graph_output = output_prefix.with_extension("gfa");
             let methyl_output = output_prefix.with_extension("bed");
             methyl::start(&annotated_graph_output, &mt_output, &methyl_output, threshold_methylation_prob, false);
         }

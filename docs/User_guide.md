@@ -271,6 +271,9 @@ Basic Analysis Pipeline (wdl/Himito_methyl.wdl)
 - Verify graph file integrity
 - Check reference file is identical to the Himito Build process
 - Consider lowering variant calling thresholds
+#### Too many false positive (e.g. short indels)
+- Adjust parameter --heteroplasmic-frequency-threshold to a larger value (e.g. 0.9 or 0.95)
+- Adjust parameter --p-value-threshold to a smaller value (e.g. 0.00001)
 
 ## Getting Help
 For additional support: Please submit an issue in the Himito GitHub repository

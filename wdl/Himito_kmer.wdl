@@ -8,36 +8,40 @@ workflow Himito_kmer {
         File reference_fai
         File truth_vcf
         File truth_tbi
+        Float currentCoverage
+        Int desiredCoverage
         String prefix
         String sampleid
         String data_type
         Array[Int] kmer_list
-
     }
 
+    call SubsetBam as SubsetReads {input:
+        bam = whole_genome_bam,
+        bai = whole_genome_bai,
+        locus = "chrM",
+        prefix = sampleid + "reads"
+    }
+    
+    call downsampleBam {input:
+        input_bam = SubsetReads.subset_bam,
+        input_bam_bai = SubsetReads.subset_bai,
+        basename = sampleid,
+        desiredCoverage = desiredCoverage,
+        currentCoverage = currentCoverage,
+        preemptible_tries = 0
+    }
     scatter (k in kmer_list) {
         call QuickStart {
             input:
-                bam = whole_genome_bam,
-                bai = whole_genome_bai,
+                bam = downsampleBam.downsampled_bam,
+                bai = downsampleBam.downsampled_bai,
                 reference_fa = reference_fa,
-                prefix = prefix + "_" + k,
+                prefix = prefix + "_" + k + "_",
                 kmer_size = k,
                 sample_id = sampleid,
                 chromo = "chrM",
-                data_type = data_type,
-
-        }
-
-
-        call VCFEval as Himito_Eval {
-            input:
-                query_vcf = QuickStart.vcf,
-                reference_fa = reference_fa,
-                reference_fai = reference_fai,
-                base_vcf = truth_vcf,
-                base_vcf_index = truth_tbi,
-                query_output_sample_name = sampleid + "_" + k + "_Himito",
+                data_type = data_type
         }
 
     }
@@ -46,7 +50,6 @@ workflow Himito_kmer {
 
     output {
         Array[File] fasta_file = QuickStart.asm
-        Array[File] Himito_summary_file = Himito_Eval.summary_statistics
     }
 }
 
@@ -65,6 +68,103 @@ struct RuntimeAttributes {
     Int disk_size
     Int cpu
     Int memory
+}
+
+
+task downsampleBam {
+  input {
+    File input_bam
+    File input_bam_bai
+    String basename
+    Int desiredCoverage
+    Float currentCoverage
+    Float scalingFactor = desiredCoverage / currentCoverage
+
+    Int? preemptible_tries
+  }
+
+  meta {
+    description: "Uses Picard to downsample to desired coverage based on provided estimate of coverage."
+  }
+  parameter_meta {
+    basename: "Input is a string specifying the sample name which will be used to locate the file on gs."
+    downsampled_bam: "Output is a bam file downsampled to the specified mean coverage."
+    downsampled_bai: "Output is the index file for a bam file downsampled to the specified mean coverage."
+    desiredCoverage: "Input is an integer of the desired approximate coverage in the output bam file."
+  }
+  command <<<
+    set -eo pipefail
+    gatk DownsampleSam -I ~{input_bam} -O ~{basename}_~{desiredCoverage}x.bam -R 7 -P ~{scalingFactor} -S ConstantMemory --VALIDATION_STRINGENCY LENIENT --CREATE_INDEX true
+
+
+  >>>
+  runtime {
+    preemptible: select_first([preemptible_tries, 5])
+    memory: "8 GB"
+    cpu: "2"
+    disks: "local-disk 500 HDD"
+    docker: "us.gcr.io/broad-gatk/gatk"
+  }
+  output {
+    File downsampled_bam = "~{basename}_~{desiredCoverage}x.bam"
+    File downsampled_bai = "~{basename}_~{desiredCoverage}x.bai"
+  }
+}
+
+
+
+task SubsetBam {
+
+    meta {
+        description : "Subset a BAM file to a specified locus, and extract sequence into fa"
+    }
+
+    parameter_meta {
+        bam: {
+            description: "bam to subset",
+            localization_optional: true
+        }
+        bai:    "index for bam file"
+        locus:  "genomic locus to select"
+        prefix: "prefix for output bam and bai file names"
+    }
+
+    input {
+        File bam
+        File bai
+        String locus
+        String prefix
+    }
+
+    command <<<
+        set -euxo pipefail
+
+        export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
+
+        samtools view -bhX ~{bam} ~{bai} ~{locus} > ~{prefix}.bam
+        samtools index ~{prefix}.bam
+
+        samtools fasta ~{prefix}.bam > ~{prefix}.fasta
+        samtools fastq ~{prefix}.bam > ~{prefix}.fastq
+    >>>
+
+    output {
+        File subset_fasta = "~{prefix}.fasta"
+        File subset_fastq = "~{prefix}.fastq"
+        File subset_bam = "~{prefix}.bam"
+        File subset_bai = "~{prefix}.bam.bai"
+    }
+    
+    runtime {
+        cpu: 1
+        memory: 4 + " GiB"
+        disks: "local-disk 375 LOCAL"
+        bootDiskSizeGb: 10
+        preemptible_tries:     1
+        max_retries:           0
+        docker:"us.gcr.io/broad-dsp-lrma/lr-gcloud-samtools:0.1.20"
+    }
+
 }
 
 
@@ -96,7 +196,7 @@ task QuickStart {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
         memory: "16 GB"
         cpu: 4
         disks: "local-disk 200 SSD"

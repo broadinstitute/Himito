@@ -1,0 +1,11 @@
+        call QuickStart {
+            input:
+                bam = downsampleBam.downsampled_bam,
+                bai = downsampleBam.downsampled_bai,
+                reference_fa = reference_fa,
+                prefix = prefix + "_" + desiredCoverage + "x",
+                kmer_size = kmer_size,
+                sample_id = sampleid,
+                chromo = "chrM",
+                data_type = "ont"
+        }

@@ -60,27 +60,17 @@ workflow CompareFasta {
             preemptible_tries = 0
         }
 
-        # call mitograph assembly
-        call Filter {
-                input:
-                    bam = downsampleBam.downsampled_bam,
-                    bai = downsampleBam.downsampled_bai,
-                    prefix = sampleid
-            }
-
-        call Build {
+        # call Himito 
+        call QuickStart {
             input:
-                bam = Filter.mt_bam,
-                reference = reference_fa,
-                prefix = prefix,
+                bam = downsampleBam.downsampled_bam,
+                bai = downsampleBam.downsampled_bai,
+                reference_fa = reference_fa,
+                prefix = prefix + "_" + desiredCoverage + "x",
                 kmer_size = kmer_size,
-                sampleid = sampleid
-        }
-        call Asm {
-            input:
-                graph_gfa = Build.graph,
-                prefix = prefix + "_mitograph${desiredCoverage}",
-                sampleid=sampleid
+                sample_id = sampleid,
+                chromo = "chrM",
+                data_type = "pacbio"
         }
 
         # call mitohifi assembly
@@ -100,15 +90,10 @@ workflow CompareFasta {
 
         }
     }
-    
-    
-    
-    
-
 
     output {
         File truth_fasta = MergeFasta.merged_fasta
-        Array[File] mitograph_fasta = Asm.fasta
+        Array[File] Himito_fasta = QuickStart.asm
         Array[File] mitohifi_fasta = MitoHifiAsm.final_fa
     }
 }
@@ -153,147 +138,41 @@ task downsampleBam {
   }
 }
 
-task Filter {
+task QuickStart {
     input {
         File bam
         File bai
-        String prefix
-    }
-
-    command <<<
-        set -euxo pipefail
-        /Himito/target/release/Himito filter -i ~{bam} -c chrM -m ~{prefix}_mt.bam -n ~{prefix}_numts.bam
-    >>>
-
-    output {
-        File mt_bam = "~{prefix}_mt.bam"
-        File numts_bam = "~{prefix}_numts.bam"
-    }
-
-    runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
-        memory: "1 GB"
-        cpu: 1
-        disks: "local-disk 300 SSD"
-    }
-}
-
-task Build {
-    input {
-        File bam
-        File reference
-        String prefix
-        String sampleid
-        Int kmer_size
-    }
-
-    command <<<
-        set -euxo pipefail
-
-        /Himito/target/release/Himito build -i ~{bam} -k ~{kmer_size} -r ~{reference} -o ~{sampleid}.~{prefix}.gfa 
-
-    >>>
-
-    output {
-        File graph = "~{sampleid}.~{prefix}.gfa"
-    }
-
-    runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
-        memory: "2 GB"
-        cpu: 1
-        disks: "local-disk 10 SSD"
-    }
-}
-
-task Call {
-
-    input {
-        File graph_gfa
         File reference_fa
         String prefix
-        String sampleid
         Int kmer_size
-    }
-    
-    
-
-    command <<<
-        set -euxo pipefail
-        /Himito/target/release/Himito call -g ~{graph_gfa} -r ~{reference_fa} -k ~{kmer_size} -s ~{sampleid} -o ~{sampleid}.~{prefix}.vcf
-        ls
-
-    >>>
-
-    output {
-        File graph = "~{sampleid}.~{prefix}.annotated.gfa"
-        File matrix = "~{sampleid}.~{prefix}.matrix.csv"
-        File vcf = "~{sampleid}.~{prefix}.vcf"
-    }
-
-    runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
-        memory: "2 GB"
-        cpu: 1
-        disks: "local-disk 10 SSD"
-    }
-}
-
-task Methyl {
-
-    input {
-        File graph_gfa
-        File bam
-        String sampleid
-        String prefix = "methyl"
-        Float min_prob
+        String sample_id
+        String chromo
+        String data_type
     }
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito methyl -g ~{graph_gfa} -p ~{min_prob} -b ~{bam} -o ~{sampleid}.~{prefix}.bed
-
-    >>>
+        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type}
+    >>>  
 
     output {
-        File graph = "~{sampleid}.~{prefix}.methyl.gfa"
-        File matrix = "~{sampleid}.~{prefix}.methylation_per_read.csv"
-        File bed = "~{sampleid}.~{prefix}.bed"
+        File graph = "~{prefix}.methyl.gfa"
+        File methyl_bed = "~{prefix}.bed"
+        File asm = "~{prefix}.fasta"
+        File read_var_mat = "~{prefix}.matrix.csv"
+        File read_methyl_mat = "~{prefix}.methylation_per_read.csv" 
+        File numts_bam = "~{prefix}.numts.bam"
+        File vcf = "~{prefix}.vcf"
     }
 
     runtime {
         docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
-        memory: "2 GB"
-        cpu: 1
-        disks: "local-disk 10 SSD"
+        memory: "16 GB"
+        cpu: 4
+        disks: "local-disk 200 SSD"
     }
 }
 
-task Asm {
-
-    input {
-        File graph_gfa
-        String prefix
-        String sampleid
-    }
-
-    command <<<
-        set -euxo pipefail
-        /Himito/target/release/Himito asm -g ~{graph_gfa} -s ~{sampleid} -o ~{sampleid}.~{prefix}.fasta
-
-    >>>
-
-    output {
-        File fasta = "~{sampleid}.~{prefix}.fasta"
-    }
-
-    runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
-        memory: "2 GB"
-        cpu: 1
-        disks: "local-disk 10 SSD"
-    }
-}
 
 task SubsetBam {
 

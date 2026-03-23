@@ -11,8 +11,9 @@ workflow DownsampleExperiment {
         File reference_fai
         File reference_dict
         Array[Int] desiredCoverages
-        Int kmer_size = 21
-
+        Int kmer_size
+        Float p
+        Float f
         String sampleid
         String data_type
         String region = "chrM"
@@ -60,7 +61,7 @@ workflow DownsampleExperiment {
         }
 
 
-        call QuickStart {
+        call QuickStart_dev {
             input:
                 bam = downsampleBam.downsampled_bam,
                 bai = downsampleBam.downsampled_bai,
@@ -68,14 +69,16 @@ workflow DownsampleExperiment {
                 prefix = sampleid,
                 kmer_size = kmer_size,
                 sample_id = sampleid,
-                chromo = region,
+                chromo = "chrM",
                 data_type = data_type,
+                p_value_threshold = p,
+                frequency_threshold = f
 
         }
 
         call VCFEval as Himito_Eval {
             input:
-                query_vcf = QuickStart.vcf,
+                query_vcf = QuickStart_dev.vcf,
                 reference_fa = reference_fa,
                 reference_fai = reference_fai,
                 base_vcf = truth_vcf,
@@ -90,7 +93,7 @@ workflow DownsampleExperiment {
     output {
         Array[File] Himito_summary_file = Himito_Eval.summary_statistics
         Array[File?] mitorsaw_summary_file = Mitorsaw_Eval.summary_statistics
-        Array[File] Himito_vcf = QuickStart.vcf
+        Array[File] Himito_vcf = QuickStart_dev.vcf
         Array[File?] Mitorsaw_vcf = Mitorsaw.vcf
     }
 }
@@ -527,5 +530,38 @@ task QuickStart {
         memory: "16 GB"
         cpu: 4
         disks: "local-disk 200 SSD"
+    }
+}
+
+task QuickStart_dev {
+    input {
+        File bam
+        File bai
+        File reference_fa
+        String prefix
+        Int kmer_size
+        String sample_id
+        String chromo = "chrM"
+        String data_type = "pacbio"
+        Float p_value_threshold
+        Float frequency_threshold
+    }
+
+    command <<<
+        set -euxo pipefail
+        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type} --p-value-threshold ~{p_value_threshold} --frequency-threshold ~{frequency_threshold}
+        ls
+    >>>  
+
+    output {
+        File asm = "~{prefix}.fasta"
+        File vcf = "~{prefix}.vcf"
+    }
+
+    runtime {
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
+        memory: "16 GB"
+        cpu: 4
+        disks: "local-disk 500 SSD"
     }
 }

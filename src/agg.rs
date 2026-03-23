@@ -10,7 +10,7 @@ use std::{path::PathBuf};
 use std::io::Write;
 
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct GraphicalGenome {
     pub anchor: HashMap<String, Value>,
     pub edges: HashMap<String, Value>,
@@ -24,19 +24,7 @@ pub fn add_unique(vec: &mut Vec<String>, item: String) {
     }
 }
 
-/// Reverse complement of a k-mer
-///
-/// # Arguments
-///
-/// * `kmer` - A string representing the k-mer.
-///
-/// # Returns
-///
-/// A string containing the reverse complement of the k-mer.
-///
-/// # Panics
-///
-/// If the k-mer contains an unexpected character.
+
 #[must_use]
 pub fn reverse_complement(kmer: &str) -> String {
     kmer.chars()
@@ -53,27 +41,7 @@ pub fn reverse_complement(kmer: &str) -> String {
 }
 
 impl GraphicalGenome {
-    /// Load a graphical genome from a file
-    ///
-    /// # Arguments
-    ///
-    /// * `filename` - A string slice that holds the name of the file to be loaded
-    ///
-    /// # Returns
-    ///
-    /// A Result containing the graphical genome if the file was successfully loaded
-    ///
-    /// # Errors
-    ///
-    /// * The file cannot be opened (e.g., permission issues, file not found).
-    /// * The file format is invalid (e.g., not a valid GZIP file or has unexpected content).
-    ///
-    /// # Panics
-    ///
-    /// - The file cannot be opened.
-    /// - The file is not a valid GZIP-compressed file.
-    /// - The annotation string is not valid JSON.
-    /// - There is a memory allocation error or other unexpected issue with the `HashMap` operations.
+
     pub fn load_graph(filename: &PathBuf) -> io::Result<GraphicalGenome> {
         let file = File::open(filename)?;
         let reader: Box<dyn BufRead> = if filename.ends_with(".gz") {
@@ -216,13 +184,10 @@ impl GraphicalGenome {
                         add_unique(outgoing_edgename_list, dst.to_string());
                     }
                     else{
-                        panic!("edge do not have outgoing anchor")
-                            
-                        }
-
+                        panic!("edge do not have outgoing anchor")    
+                    }
                 }
             }
-
         }
     let new_graph = GraphicalGenome {
             anchor: self.anchor.clone(), 
@@ -393,20 +358,54 @@ pub fn write_graph_from_graph(filename: &str, graph: &GraphicalGenome) -> std::i
     Ok(())
 }
 
+pub fn edit_distance(cigar: &String) -> usize {
+    let mut edit_distance = 0;
+    let mut num: usize = 0;
+    for ch in cigar.chars() {
+        if ch.is_ascii_digit() {
+            num = num * 10 + ch.to_digit(10).unwrap() as usize;
+            continue;
+        }
+        // ch is an op
+        match ch {
+            // count edits
+            'I' | 'D' | 'X' | 'N' => {
+                edit_distance += num;
+            }
+            'M' | '=' | 'S' | 'H' | 'P' => {}
+            _ => {}
+        }
+        num = 0;
+    }
+    edit_distance
+}
+
 pub fn find_most_supported_edge(graph: &GraphicalGenome, src: String) -> String {
     let empty_vec = Vec::new();
     let outgoinglist = &graph.outgoing.get(&src).unwrap_or(&empty_vec);
     let mut m = 0;
     let mut most_supported_edge = "".to_string();
+    let mut nm_value = usize::MAX;
     for edge in outgoinglist.iter(){
         let edge_dst = graph.edges[edge]["dst"].as_array().unwrap().first().unwrap().as_str().unwrap().to_string();
         if edge_dst == "SINK".to_string(){
             continue
         }
         let read_count = graph.edges[edge]["reads"].as_array().unwrap_or(&Vec::new()).len();
+        let cigar = graph.edges[edge]["variants"].as_str().unwrap_or("");
         if read_count > m {
             m = read_count;
             most_supported_edge = edge.clone();
+            nm_value = edit_distance(&cigar.to_string());
+        } else if read_count == m {
+            /// define lexicographical order
+            if edge.to_string() < most_supported_edge.to_string() {
+                most_supported_edge = edge.clone();
+            }else{
+                continue
+            }
+        }else{
+            continue
         }
     }
     most_supported_edge

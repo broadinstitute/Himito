@@ -1,8 +1,23 @@
 
 use std::{collections::HashSet, path::PathBuf};
 use rust_htslib::bam::{self, Read,IndexedReader, Header, record::Aux};
+use rand::seq::IteratorRandom;
 
 
+pub fn downsample_list(mt_readnames: &Vec<String>, max_reads:usize) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    if mt_readnames.len() <= max_reads {
+        return Ok(mt_readnames.clone());
+    }
+    let mut rng = rand::thread_rng();
+    let downsampled_mt_readnames: Vec<String> = mt_readnames
+        .iter()
+        .choose_multiple(&mut rng, max_reads)
+        .into_iter()
+        .cloned()
+        .collect();
+    Ok(downsampled_mt_readnames)
+
+}
 
 
 pub fn find_numts(bam_file: &PathBuf, chromo: &str, mod_char:char, min_methyl_prob:f64, fraction_threshold:f64) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
@@ -37,7 +52,6 @@ pub fn find_numts(bam_file: &PathBuf, chromo: &str, mod_char:char, min_methyl_pr
         
         // Check for secondary alignments
         if record.is_secondary() {
-            numts_readnames.insert(query_name);
             continue;
         }
         
@@ -100,12 +114,12 @@ fn write_bams(
     bam_file: &PathBuf, 
     mt_bam: &PathBuf, 
     numts_bam: &PathBuf, 
+    max_reads:usize,
     chromo: &str,
     numts_readnames: &HashSet<String>
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Open input BAM
     let mut bam = IndexedReader::from_path(bam_file).unwrap();
-
 
     // Get the header from input BAM
     let header = Header::from_template(bam.header());
@@ -118,34 +132,35 @@ fn write_bams(
     let tid = bam.header().tid(chromo.as_bytes())
         .ok_or("Chromosome not found in BAM header")?;
     
-        // Set region to fetch
+    // Set region to fetch
     bam.fetch((tid, 0, 17000))?;
+
+    let mut mt_read_names = HashSet::new();
     
-    // Iterate through reads and write to appropriate output
     for read in bam.records() {
         let record = read?;
         let query_name = String::from_utf8_lossy(record.qname()).to_string();
         
         if numts_readnames.contains(&query_name) {
             numt_out.write(&record)?;
-        } else {
+        } else if mt_read_names.len() < max_reads {
             mt_out.write(&record)?;
+            mt_read_names.insert(query_name);
         }
     }
-    
-    // Writers will be automatically closed when they go out of scope
     Ok(())
 }
 
+
 // Example usage
-pub fn start(input_bam:&PathBuf, chromo: &str, mt_output:&PathBuf, numts_output:&PathBuf, min_prob:f64, fraction_max_methylation:f64 ) -> Result<(), Box<dyn std::error::Error>> {
+pub fn start(input_bam:&PathBuf, chromo: &str, mt_output:&PathBuf, numts_output:&PathBuf, min_prob:f64, fraction_max_methylation:f64, max_mt_reads:usize ) -> Result<(), Box<dyn std::error::Error>> {
     
     
     match find_numts(input_bam, chromo, 'm', min_prob, fraction_max_methylation) {
         Ok(numts) => {
+            println!("Found {} potential NUMTS reads", numts.len());
             // Then split into separate BAM files
-            write_bams(input_bam, mt_output, numts_output, chromo, &numts)?;
-    
+            write_bams(input_bam, mt_output, numts_output, max_mt_reads, chromo, &numts)?;
         },
         Err(e) => eprintln!("Error: {}", e),
     }

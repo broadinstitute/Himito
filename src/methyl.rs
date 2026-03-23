@@ -762,6 +762,7 @@ fn write_methylation_alignment_to_csv<P: AsRef<Path>>(
 pub fn start (graph_file: &PathBuf, bam_file: &PathBuf, output_file: &PathBuf, min_prob: f64, major_haploype: bool) {
     println!("Add Methylation Signals!");
     // annotate graph
+    println!("Annotated graph output: {}", graph_file.display());
     let mut graph = GraphicalGenome::load_graph(graph_file).unwrap();
     println!("Processing BAM file");
     let mut bam = Reader::from_path(bam_file).unwrap();

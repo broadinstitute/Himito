@@ -64,7 +64,7 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ./target/release/Himito methyl -g <output.annotated.gfa> -p <min_prob> -b <mt_test.bam> -o <methyl.bed>
 ```
 
-Himito Docker can be downloaded at docker hub: [hangsuunc/Himito:v1](https://hub.docker.com/r/hangsuunc/himito).
+Himito Docker can be downloaded at docker hub: [us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0](us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0).
 
 ## Commands
 ### filter - Remove NUMTs Reads

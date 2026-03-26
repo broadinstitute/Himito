@@ -1,14 +1,19 @@
 
 use std::{collections::HashSet, path::PathBuf};
 use rust_htslib::bam::{self, Read,IndexedReader, Header, record::Aux};
+use rand::rngs::StdRng;
 use rand::seq::IteratorRandom;
+use rand::SeedableRng;
 
-
-pub fn downsample_list(mt_readnames: &HashSet<String>, max_reads:usize) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+pub fn downsample_list(
+    mt_readnames: &HashSet<String>,
+    max_reads: usize,
+    seed: u64,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     if mt_readnames.len() <= max_reads {
         return Ok(mt_readnames.iter().cloned().collect());
     }
-    let mut rng = rand::thread_rng();
+    let mut rng = StdRng::seed_from_u64(seed);
     let downsampled_mt_readnames: Vec<String> = mt_readnames
         .iter()
         .choose_multiple(&mut rng, max_reads)
@@ -117,13 +122,14 @@ pub fn find_numts(bam_file: &PathBuf, chromo: &str, mod_char:char, min_methyl_pr
 }
 
 fn write_bams(
-    bam_file: &PathBuf, 
-    mt_bam: &PathBuf, 
-    numts_bam: &PathBuf, 
-    max_reads:usize,
+    bam_file: &PathBuf,
+    mt_bam: &PathBuf,
+    numts_bam: &PathBuf,
+    max_reads: usize,
+    downsample_seed: u64,
     chromo: &str,
     numts_readnames: &HashSet<String>,
-    mt_readnames: &HashSet<String>
+    mt_readnames: &HashSet<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Open input BAM
     let mut bam = IndexedReader::from_path(bam_file).unwrap();
@@ -135,14 +141,17 @@ fn write_bams(
     let mut mt_out = bam::Writer::from_path(mt_bam, &header, bam::Format::Bam)?;
     let mut numt_out = bam::Writer::from_path(numts_bam, &header, bam::Format::Bam)?;
     
-    // Get chromosome ID
+    // Get chromosome ID and length (same region as find_numts)
     let tid = bam.header().tid(chromo.as_bytes())
         .ok_or("Chromosome not found in BAM header")?;
-    
-    // Set region to fetch
-    bam.fetch((tid, 0, 17000))?;
+    let chrom_length = bam
+        .header()
+        .target_len(tid)
+        .ok_or("Could not get chromosome length")?;
 
-    let downsampled_mt_readnames = downsample_list(mt_readnames, max_reads)?;
+    bam.fetch((tid, 0, chrom_length))?;
+
+    let downsampled_mt_readnames = downsample_list(mt_readnames, max_reads, downsample_seed)?;
 
     
     for read in bam.records() {
@@ -160,14 +169,30 @@ fn write_bams(
 
 
 // Example usage
-pub fn start(input_bam:&PathBuf, chromo: &str, mt_output:&PathBuf, numts_output:&PathBuf, min_prob:f64, fraction_max_methylation:f64, max_mt_reads:usize ) -> Result<(), Box<dyn std::error::Error>> {
-    
-    
+pub fn start(
+    input_bam: &PathBuf,
+    chromo: &str,
+    mt_output: &PathBuf,
+    numts_output: &PathBuf,
+    min_prob: f64,
+    fraction_max_methylation: f64,
+    max_mt_reads: usize,
+    downsample_seed: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
     match find_numts(input_bam, chromo, 'm', min_prob, fraction_max_methylation) {
         Ok((numts, mts)) => {
             println!("Found {} potential NUMTS reads", numts.len());
             // Then split into separate BAM files
-            write_bams(input_bam, mt_output, numts_output, max_mt_reads, chromo, &numts, &mts)?;
+            write_bams(
+                input_bam,
+                mt_output,
+                numts_output,
+                max_mt_reads,
+                downsample_seed,
+                chromo,
+                &numts,
+                &mts,
+            )?;
         },
         Err(e) => eprintln!("Error: {}", e),
     }

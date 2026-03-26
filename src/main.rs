@@ -87,6 +87,10 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 2000)]
         maximal_mt_depth: usize,
 
+        /// RNG seed for mt read downsampling (reproducible subsampling)
+        #[clap(long, value_parser, default_value_t = 42)]
+        downsample_seed: u64,
+
     },
 
     /// Filter reads derived from Numts
@@ -119,6 +123,10 @@ enum Commands {
         /// maximal reads to keep from mtDNA 
         #[clap(long, value_parser, default_value_t = 2000)]
         maximal_mt_depth: usize,
+
+        /// RNG seed for mt read downsampling (reproducible subsampling)
+        #[clap(long, value_parser, default_value_t = 42)]
+        downsample_seed: u64,
 
     },
 
@@ -333,12 +341,22 @@ fn main() {
             p_value_threshold,
             heteroplasmic_frequency_threshold,
             maximal_mt_depth,
+            downsample_seed,
         } => {
             let (p_value_threshold, frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold);
             let mt_output = output_prefix.with_extension("mt.bam");
             let numts_output = output_prefix.with_extension("numts.bam");
-            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, threshold_methylation_prob, filter_max_methylation, maximal_mt_depth);
+            let _ = filter::start(
+                &input_bam,
+                &chromo,
+                &mt_output,
+                &numts_output,
+                threshold_methylation_prob,
+                filter_max_methylation,
+                maximal_mt_depth,
+                downsample_seed,
+            );
             
             let graph_output = output_prefix.with_extension("gfa");
             let _ = build::start(&graph_output, kmer_size, &mt_output, &reference_path, length_max);
@@ -372,8 +390,18 @@ fn main() {
             threshold_methylation_prob,
             fraction_max_methylation,
             maximal_mt_depth,
+            downsample_seed,
         } => {
-            let _ = filter::start(&input_bam, &chromo, &mt_output, &numts_output, threshold_methylation_prob, fraction_max_methylation, maximal_mt_depth);
+            let _ = filter::start(
+                &input_bam,
+                &chromo,
+                &mt_output,
+                &numts_output,
+                threshold_methylation_prob,
+                fraction_max_methylation,
+                maximal_mt_depth,
+                downsample_seed,
+            );
         }
 
         Commands::Build {

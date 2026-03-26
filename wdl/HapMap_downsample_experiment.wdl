@@ -36,7 +36,7 @@ workflow DownsampleExperiment {
             input_bam_bai = coverage.subsetbai,
             basename = sampleid,
             desiredCoverage = desiredCoverage,
-            currentCoverage = coverage.readnum,
+            currentCoverage = coverage.coverage,
             preemptible_tries = 0
         }
 

@@ -44,12 +44,23 @@ workflow Himito_kmer {
                 data_type = data_type
         }
 
+        call VCFEval as Himito_Eval {
+            input:
+                query_vcf = QuickStart.vcf,
+                reference_fa = reference_fa,
+                reference_fai = reference_fai,
+                base_vcf = truth_vcf,
+                base_vcf_index = truth_tbi,
+                query_output_sample_name = sampleid + "_" + k + "_Himito",
+        }
+
     }
     
 
 
     output {
         Array[File] fasta_file = QuickStart.asm
+        Array[File] evaluation_file = Himito_Eval.summary_statistics
     }
 }
 
@@ -196,9 +207,9 @@ task QuickStart {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
-        memory: "16 GB"
-        cpu: 4
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
+        memory: "4 GB"
+        cpu: 1
         disks: "local-disk 200 SSD"
     }
 }

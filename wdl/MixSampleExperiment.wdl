@@ -358,11 +358,14 @@ task QuickStart {
         String sample_id
         String chromo = "chrM"
         String data_type = "pacbio"
+        Float p_value_threshold
+        Float frequency_threshold
     }
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type}
+        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type} --p-value-threshold ~{p_value_threshold} --heteroplasmic-frequency-threshold ~{frequency_threshold}
+        ls
     >>>  
 
     output {
@@ -376,10 +379,10 @@ task QuickStart {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
-        memory: "16 GB"
-        cpu: 4
-        disks: "local-disk 200 SSD"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
+        memory: "4 GB"
+        cpu: 1
+        disks: "local-disk 500 SSD"
     }
 }
 

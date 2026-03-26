@@ -36,7 +36,7 @@ workflow DownsampleExperiment {
             input_bam_bai = coverage.subsetbai,
             basename = sampleid,
             desiredCoverage = desiredCoverage,
-            currentCoverage = coverage.coverage,
+            currentCoverage = coverage.readnum,
             preemptible_tries = 0
         }
 
@@ -151,11 +151,14 @@ task CalculateCoverage {
         samtools view -bhX ~{bam} ~{bai} ~{locus} > ~{prefix}.bam
         samtools index ~{prefix}.bam
         samtools depth -r ~{locus} ~{prefix}.bam | awk '{sum+=$3} END {print sum/NR}' > coverage.txt
+        samtools view -c ~{prefix}.bam > readnum.txt
+
 
     >>>
 
     output {
         Float coverage = read_float("coverage.txt")
+        Float readnum = read_float("readnum.txt")
         File subsetbam =  "~{prefix}.bam"
         File subsetbai = " ~{prefix}.bam.bai"
     }
@@ -508,11 +511,12 @@ task QuickStart {
         String sample_id
         String chromo = "chrM"
         String data_type = "pacbio"
+        Float frequency_threshold
     }
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type}
+        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type} --heteroplasmic-frequency-threshold ~{frequency_threshold}
     >>>  
 
     output {
@@ -526,9 +530,9 @@ task QuickStart {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
-        memory: "16 GB"
-        cpu: 4
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
+        memory: "4 GB"
+        cpu: 1
         disks: "local-disk 200 SSD"
     }
 }
@@ -549,7 +553,7 @@ task QuickStart_dev {
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type} --p-value-threshold ~{p_value_threshold} --frequency-threshold ~{frequency_threshold}
+        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type} --p-value-threshold ~{p_value_threshold} --heteroplasmic-frequency-threshold ~{frequency_threshold}
         ls
     >>>  
 
@@ -559,9 +563,9 @@ task QuickStart_dev {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
-        memory: "16 GB"
-        cpu: 4
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
+        memory: "4 GB"
+        cpu: 1
         disks: "local-disk 500 SSD"
     }
 }

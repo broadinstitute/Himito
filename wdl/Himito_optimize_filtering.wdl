@@ -14,7 +14,8 @@ workflow Himito_filtering_optimization {
         Int desiredCoverage
         Array[Float] flist
         Array[Float] p_value_list
-
+        # Must match the sample column in truth_vcf (baseline); calls use `sampleid`
+        String? truth_vcf_sample
     }
 
     call CalculateCoverage as coverage{
@@ -129,7 +130,8 @@ task CalculateCoverage {
 
         samtools view -bhX ~{bam} ~{bai} ~{locus} > ~{prefix}.bam
         samtools index ~{prefix}.bam
-        samtools depth -r ~{locus} ~{prefix}.bam | awk '{sum+=$3} END {print sum/NR}' > coverage.txt
+        # -a: include zero-depth positions so mean depth matches chrM-wide average (not mean over covered sites only)
+        samtools depth -a -r ~{locus} ~{prefix}.bam | awk 'NR>0 {s+=$3; n++} END { if (n>0) print s/n; else print "0" }' > coverage.txt
         samtools view -c ~{prefix}.bam > readnum.txt
 
 
@@ -138,8 +140,8 @@ task CalculateCoverage {
     output {
         Float coverage = read_float("coverage.txt")
         Float readnum = read_float("readnum.txt")
-        File subsetbam =  "~{prefix}.bam"
-        File subsetbai = " ~{prefix}.bam.bai"
+        File subsetbam = "~{prefix}.bam"
+        File subsetbai = "~{prefix}.bam.bai"
     }
 
     #########################
@@ -183,8 +185,8 @@ task downsampleBam {
     parameter_meta {
     }
 
-    Float scalingFactor = desiredCoverage / currentCoverage
-
+    # Picard retention probability (0–1); cap at 1 when desired coverage ≥ current (no upsampling)
+    Float scalingFactor = if currentCoverage > 0.0 then min(1.0, desiredCoverage / currentCoverage) else 1.0
 
     command <<<
         set -eo pipefail
@@ -250,6 +252,8 @@ task VCFEval {
         File base_vcf
         File base_vcf_index
         String query_output_sample_name
+        String baseline_sample
+        String calls_sample
 
         # Runtime params
         Int? preemptible

@@ -102,7 +102,9 @@ pub fn find_numts(bam_file: &PathBuf, chromo: &str, mod_char:char, min_methyl_pr
             }
 
             if methylation_signal.len() == 0{
-                mt_readnames.insert(query_name.clone());
+                if is_mt{
+                    mt_readnames.insert(query_name.clone());
+                }
                 continue
             }
 

@@ -804,9 +804,9 @@ pub fn resolve_thresholds(
     frequency_threshold: Option<f64>,
 ) -> (f64, f64) {
     let (default_p, default_f) = if data_type == "ont" {
-        (0.0001, 0.8)
+        (0.01, 0.8)
     } else {
-        (0.0001, 0.8)
+        (0.01, 0.8)
     };
 
     (

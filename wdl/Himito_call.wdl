@@ -9,18 +9,23 @@ workflow Himito_call {
         String sampleid
         String data_type
         Int kmer_size
+        Boolean filter
 
     }
-    call Filter {
-        input:
-            bam = whole_genome_bam,
-            bai = whole_genome_bai,
-            prefix = prefix
+
+    if filter {
+        call Filter {
+            input:
+                bam = whole_genome_bam,
+                bai = whole_genome_bai,
+                prefix = prefix
+        }
     }
+
 
     call Build {
         input:
-            bam = Filter.mt_bam,
+            bam = select_first([Filter.mt_bam, whole_genome_bam]),
             reference = reference_fa,
             prefix = prefix,
             kmer_size = kmer_size,
@@ -62,8 +67,8 @@ task Filter {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
-        memory: "1 GB"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
+        memory: "4 GB"
         cpu: 1
         disks: "local-disk 300 SSD"
     }
@@ -90,7 +95,7 @@ task Build {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"
@@ -120,7 +125,7 @@ task Call {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"

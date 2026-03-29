@@ -84,7 +84,7 @@ enum Commands {
         heteroplasmic_frequency_threshold: Option<f64>,
 
         /// maximal reads to keep from mtDNA 
-        #[clap(long, value_parser, default_value_t = 2000)]
+        #[clap(long, value_parser, default_value_t = 10000)]
         maximal_mt_depth: usize,
 
         /// RNG seed for mt read downsampling (reproducible subsampling)
@@ -121,7 +121,7 @@ enum Commands {
         fraction_max_methylation: f64,
 
         /// maximal reads to keep from mtDNA 
-        #[clap(long, value_parser, default_value_t = 2000)]
+        #[clap(long, value_parser, default_value_t = 10000)]
         maximal_mt_depth: usize,
 
         /// RNG seed for mt read downsampling (reproducible subsampling)

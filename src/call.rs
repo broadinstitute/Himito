@@ -803,8 +803,10 @@ pub fn resolve_thresholds(
     p_value_threshold: Option<f64>,
     frequency_threshold: Option<f64>,
 ) -> (f64, f64) {
-    let (default_p, default_f) = if data_type == "ont" {
-        (0.01, 0.8)
+    let (default_p, default_f) = if data_type == "ont-r9" {
+        (0.0001, 0.8)
+    } else if data_type == "ont-r10" {
+        (0.001, 0.8)
     } else {
         (0.01, 0.8)
     };
@@ -819,7 +821,6 @@ pub fn start(
     graph_file: &PathBuf,
     fasta_reference: &PathBuf,
     k: usize,
-    maxlength: usize,
     minimal_ac: usize,
     output_file: &PathBuf,
     sample_id: &str,
@@ -828,8 +829,8 @@ pub fn start(
     p_value_threshold: f64,
     frequency_threshold: f64,
 ) {
-    if data_type != "pacbio" && data_type != "ont" {
-        eprintln!("Error: data type must be pacbio or ont");
+    if data_type != "pacbio" && data_type != "ont-r9" && data_type != "ont-r10" {
+        eprintln!("Error: data type must be pacbio or ont-r9 or ont-r10");
         std::process::exit(1);
     }
     // reference fasta information

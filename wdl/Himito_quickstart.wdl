@@ -1,6 +1,6 @@
 version 1.0
 
-workflow Himito {
+workflow Himito_quickstart {
     input {
         File whole_genome_bam
         File whole_genome_bai
@@ -35,7 +35,6 @@ workflow Himito {
         File vcf = QuickStart.vcf
     }
 }
-
 task QuickStart {
     input {
         File bam
@@ -44,8 +43,8 @@ task QuickStart {
         String prefix
         Int kmer_size
         String sample_id
+        String data_type
         String chromo = "chrM"
-        String data_type = "pacbio"
     }
 
     command <<<
@@ -64,9 +63,9 @@ task QuickStart {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
-        memory: "16 GB"
-        cpu: 4
-        disks: "local-disk 300 SSD"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
+        memory: "4 GB"
+        cpu: 1
+        disks: "local-disk 200 SSD"
     }
 }

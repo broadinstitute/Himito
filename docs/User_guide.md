@@ -12,6 +12,7 @@ Himito is a specialized tool for building mitochondrial anchor-based graphical g
 - [Workflows](#workflows)
 - [Input Requirements](#input-requirements)
 - [Output Files](#output-files)
+- [VCF output schema](#vcf-output-schema)
 - [Best Practices](#best-practices)
 - [Troubleshooting](#troubleshooting)
 
@@ -221,20 +222,71 @@ Basic Analysis Pipeline (wdl/Himito_methyl.wdl)
 - Should match the reference used for initial read mapping
 
 ## Output Files
+
+### Default file naming (`quick-start` and stepwise runs)
+
+Many outputs share the same basename you pass with `-o` / `--output-prefix` (`quick-start`) or the explicit paths you pass to each subcommand. Typical artifacts:
+
+| Extension / pattern | Description |
+| --------------------- | ----------- |
+| `.mt.bam`, `.numts.bam` | Mitochondrial and NUMT-partitioned reads (`filter` / `quick-start`) |
+| `.gfa` | Sequence graph (`build` / `quick-start`; methylation step may update annotated graph) |
+| `.fasta` | Major-haplotype assembly (`asm` / `quick-start`) |
+| `.vcf` | Variant calls after graph-based calling and permutation filtering (`call` / `quick-start`) |
+| `.bed` | Methylation summary (`methyl` / `quick-start`) |
+| `.raw_matrix.csv`, `.matrix.csv` | Per-read variant support matrices written next to the VCF basename (`call` / `quick-start`) |
+
+The **matrix CSV** has header `variant`, then one column per read name. Each row is a variant identifier; cell values are non-negative counts of support in that read (see `call` in the codebase). `.raw_matrix.csv` is produced before permutation-based filtering; `.matrix.csv` matches the variants retained in the final VCF.
+
 ### Graph Files (.gfa)
 - Contains the mitochondrial genome graph structure
 - Can be visualized with tools like Bandage
 - Used as input for variant calling and assembly and methylation analysis
+
 ### Variant Files (.vcf)
-- Standard VCF format with mitochondrial variants
-- Includes heteroplasmy frequency estimates
-- Compatible with standard VCF analysis tools
+Himito writes **VCF v4.2** (uncompressed). Records are **sorted by position** (then type, REF, ALT for ties). The final list passed to `write_vcf` is produced after **allele-count / heteroplasmy filtering** and **permutation-based filtering** when you use `call` or `quick-start`.
+
+Standard tools can read the file as a normal single-sample VCF. If your reference contig name in the FASTA header is not `chrM`, note that **data lines still use `CHROM=chrM`** in the emitted VCF body while the header **`##contig=<ID=…>`** reflects the first sequence name and length from your reference FASTA.
+
+### VCF output schema
+
+**Header (meta-lines)**  
+Himito emits at least:
+
+- `##fileformat=VCFv4.2`
+- `##reference=<reference_sequence_name>`
+- `##contig=<ID=…,length=…>` for the mitochondrial reference contig (from your FASTA’s first sequence name and length)
+- `##INFO=<ID=DP,Number=1,Type=Integer,Description="Read Depth">`
+- `##FORMAT=<ID=GT,…>`, `##FORMAT=<ID=AD,…>`, `##FORMAT=<ID=HF,…>` (genotype, allele depth, heteroplasmic fraction)
+
+**Column header**
+
+`#CHROM  POS  ID  REF  ALT  QUAL  FILTER  INFO  FORMAT  <sample_id>`
+
+`<sample_id>` is the value you pass to `-s` / `--sample-id` (`call` or `quick-start`).
+
+**Body fields**
+
+| Field | Content |
+| ----- | ------- |
+| CHROM | `chrM` on each data line |
+| POS | **SNPs:** 1-based position on the reference. |
+| ID | `.` |
+| REF / ALT | Reference and alternate alleles (SNP or symbolic indel representation as produced by the caller) |
+| QUAL | `.` |
+| FILTER | `.` |
+| INFO | `DP=<integer>` total read depth at the variant **start** position used for depth lookup |
+| FORMAT | Fixed string `GT:AD:HF` |
+| Sample | `GT:AD:HF` with **GT** `1` for called alternate, **AD** = alternate **allele read count** (supporting reads), **HF** = `AD / DP` at that position (heteroplasmic fraction, 0–1 float).|
+
 ### Binary matrix for Presence of variants in each read (.csv)
-- presence-absence matrix representing variants in each read
+- Rows: variant identifiers; columns: read IDs; values encode per-read support (see table above). Two files: pre- and post-permutation filter (`.raw_matrix.csv` vs `.matrix.csv`).
+
 ### Assembly Files (.fasta)
 - Primary mitochondrial genome sequence
 - Represents the major haplotype
 - Can be used for phylogenetic analysis
+
 ### Methylation Files (.bed)
 - BED format with methylation sites
 - Includes probability scores and coverage information

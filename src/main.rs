@@ -43,7 +43,7 @@ enum Commands {
         #[clap(short, long, value_parser, required = true)]
         sample_id: String,
 
-        /// data type, pacbio, ont
+        /// data type, pacbio, ont-r9, ont-r10
         #[clap(short, long, value_parser, default_value = "pacbio")]
         data_type: String,
 
@@ -84,7 +84,7 @@ enum Commands {
         heteroplasmic_frequency_threshold: Option<f64>,
 
         /// maximal reads to keep from mtDNA 
-        #[clap(long, value_parser, default_value_t = 10000)]
+        #[clap(long, value_parser, default_value_t = 5000)]
         maximal_mt_depth: usize,
 
         /// RNG seed for mt read downsampling (reproducible subsampling)
@@ -121,7 +121,7 @@ enum Commands {
         fraction_max_methylation: f64,
 
         /// maximal reads to keep from mtDNA 
-        #[clap(long, value_parser, default_value_t = 10000)]
+        #[clap(long, value_parser, default_value_t = 5000)]
         maximal_mt_depth: usize,
 
         /// RNG seed for mt read downsampling (reproducible subsampling)
@@ -204,10 +204,6 @@ enum Commands {
         /// Kmer-size
         #[clap(short, long, value_parser, default_value_t = 21)]
         k: usize,
-
-        /// max Length to do alignment
-        #[clap(short, long, value_parser, default_value_t = 3000)]
-        length_max: usize,
 
         /// minimal allele count for variants
         #[clap(short, long, value_parser, default_value_t = 2)]
@@ -369,7 +365,6 @@ fn main() {
                 &graph_output,
                 &reference_path,
                 kmer_size,
-                length_max,
                 minimal_ac,
                 &vcf_output,
                 &sample_id,
@@ -429,7 +424,6 @@ fn main() {
             graphfile,
             reference_fasta,
             k,
-            length_max,
             minimal_ac,
             output_file,
             sample_id,
@@ -444,7 +438,6 @@ fn main() {
                 &graphfile,
                 &reference_fasta,
                 k,
-                length_max,
                 minimal_ac,
                 &output_file,
                 &sample_id,

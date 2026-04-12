@@ -243,6 +243,29 @@ The **matrix CSV** has header `variant`, then one column per read name. Each row
 - Can be visualized with tools like Bandage
 - Used as input for variant calling and assembly and methylation analysis
 
+Example (GFA):
+
+```text
+H	VN:Z:1.0
+S	A000022	TAACCACTCACGGGAGCTCTC	PG:J:{"pos":22}
+S	A000044	ATGCATTTGGTATTTTCGTCT	PG:J:{"pos":44}
+S	A000066	GGGGGTATGCACGCGATAGCA	PG:J:{"pos":66}
+S	A000088	TGCGAGACGCTGGAGCCGGAG	PG:J:{"pos":88}
+S	A000110	ACCCTATGTCGCAGTATCTGT	PG:J:{"pos":110}
+...
+S	E00001.0000	AGAAGTTATTATCTCGAACTGACACTGA	PG:J:{"dst":["A012540"],"reads":["m64012_190920_173625/161154834/ccs"],"src":["SOURCE"]}	RC:i:1
+S	E00001.0001	CTCTCCCTAAGCTTCAACTAGA	PG:J:{"dst":["A012584"],"reads":["m64012_190920_173625/161154834/ccs","m64011_190901_095311/93847814/ccs"], "src":["A012540"],"variants":"36=1D7="}	RC:i:15
+...
+L	A010010	+	E00084.0016	+	0M
+L	E00084.0016	+	A010054	+	0M
+L	A010384	+	E00084.0017	+	0M
+
+```
+
+In this example, `S` lines are graph segments (Anchor nodes, e.g. A010010; edge nodes e.g. E00084.0016) and `L` lines connect segments with an overlap (`0M`).
+
+
+
 ### Variant Files (.vcf)
 Himito writes **VCF v4.2** (uncompressed). Records are **sorted by position** (then type, REF, ALT for ties). The final list passed to `write_vcf` is produced after **allele-count / heteroplasmy filtering** and **permutation-based filtering** when you use `call` or `quick-start`.
 
@@ -279,13 +302,51 @@ Himito emits at least:
 | FORMAT | Fixed string `GT:AD:HF` |
 | Sample | `GT:AD:HF` with **GT** `1` for called alternate, **AD** = alternate **allele read count** (supporting reads), **HF** = `AD / DP` at that position (heteroplasmic fraction, 0–1 float).|
 
+Example (Vcf):
+
+```text
+##fileformat=VCFv4.2
+##reference=chrM
+##contig=<ID=chrM,length=16569>
+##INFO=<ID=DP,Number=1,Type=Integer,Description="Read Depth">
+##FORMAT=<ID=GT,Number=1,Type=String,Description="Genotype">
+##FORMAT=<ID=AD,Number=1,Type=Integer,Description="Allele Depth">
+##FORMAT=<ID=HF,Number=1,Type=Float,Description="Heteroplasmic Frequency">
+#CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO	FORMAT	HG002
+chrM	263	.	A	G	.	.	DP=1792	GT:AD:HF	1:1792:1
+chrM	309	.	C	CCT	.	.	DP=1752	GT:AD:HF	1:1229:0.701484
+chrM	310	.	T	C	.	.	DP=1752	GT:AD:HF	1:1636:0.93378997
+chrM	456	.	C	T	.	.	DP=1753	GT:AD:HF	1:1709:0.9749002
+chrM	457	.	C	T	.	.	DP=1753	GT:AD:HF	1:19:0.010838563
+chrM	750	.	A	G	.	.	DP=1825	GT:AD:HF	1:1815:0.99452055
+...
+```
+
 ### Binary matrix for Presence of variants in each read (.csv)
 - Rows: variant identifiers; columns: read IDs; values encode per-read support (see table above). Two files: pre- and post-permutation filter (`.raw_matrix.csv` vs `.matrix.csv`).
+
+Example (read matrix):
+
+```text
+variant,m64011_190830_220126/100204788/ccs,m64011_190830_220126/100206196/ccs, ...
+m.13376T>C,0,1,...
+m.15175C>T,1,1,...
+```
 
 ### Assembly Files (.fasta)
 - Primary mitochondrial genome sequence
 - Represents the major haplotype
 - Can be used for phylogenetic analysis
+
+Example (assembly fasta)
+```text
+>HG002 
+TAACCACTCACGGGAGCTCTCCATGCATTTGGTATTTTCGTCTGGGGGGTATGCACGCGA
+TAGCATTGCGAGACGCTGGAGCCGGAGCACCCTATGTCGCAGTATCTGTCTTTGATTCCT
+GCCTCATCCTATTATTTATCGCACCTACGTTCAATATTACAGGCGAACATACTTACTAAA
+GTGTGTTAATTAATTAATGCTTGTAGGACATAATAATAACAATTGAATGTCTGCACAGCC
+...
+```
 
 ### Methylation Files (.bed)
 - BED format with methylation sites
@@ -293,6 +354,16 @@ Himito emits at least:
 - Compatible with methylation analysis tools
 ### read-level methylation matrix (.csv)
 - Element is the methylation likelihood of each CpG site
+
+```text
+##fileformat=BED
+##haplotype=majorhaplotype
+#CHROM	Ref_start	Ref_end	Asm_start	Asm_end	Motif	Mod_rate	Unmod_rate	Cov	Mod_count	Unmod_count
+ChrM	33	34	11	12	CG	0.23796498905908095	0.7620350109409191	1828	435	1393
+ChrM	61	62	39	40	CG	0.20044419766796223	0.7995558023320377	1801	361	1440
+ChrM	78	79	56	57	CG	0.047592695074709465	0.9524073049252906	1807	86	1721
+...
+```
 
 ## Best Practices
 ### Data Preparation

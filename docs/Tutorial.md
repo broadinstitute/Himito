@@ -11,7 +11,7 @@ It is designed to be easy to reproduce and adapt into Snakemake/Nextflow later.
 
 - Docker installed and running.
 - Input BAM and index (`.bai`).
-- Mitochondrial reference FASTA (for example `NC_012920.1.fasta`).
+- Mitochondrial reference FASTA (for example `NC_012920.1.fasta` or `rCRS.fasta`).
 
 Himito Docker image used in this tutorial:
 

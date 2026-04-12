@@ -25,6 +25,7 @@ workflow MixSamples {
         String vcf_score_field_mitorsaw
         String query_field_mitorsaw
         String data_type
+        String? vcfeval_locus
         Boolean run_mitosaw
 
     }
@@ -97,6 +98,7 @@ workflow MixSamples {
                         base_vcf_index = merge_vcf.truth_tbi,
                         vcf_score_field = vcf_score_field_mitorsaw,
                         query_field = query_field_mitorsaw,
+                        locus = vcfeval_locus,
                         threshold = 0,
                         fraction = first_proportion
                 }
@@ -126,6 +128,7 @@ workflow MixSamples {
                     base_vcf_index = merge_vcf.truth_tbi,
                     vcf_score_field = vcf_score_field_mitograph,
                     query_field = query_field_mitograph,
+                    locus = vcfeval_locus,
                     threshold = 0,
                     fraction = first_proportion
             }
@@ -404,6 +407,7 @@ task VCFEval {
         File base_vcf_index
         String vcf_score_field
         String query_field
+        String? locus
         Float threshold = 0
         Float fraction
 
@@ -420,25 +424,29 @@ task VCFEval {
         set -xeuo pipefail
 
         # Compress and Index vcf files
-        bcftools view ~{query_vcf} -O z -o ~{query_vcf}.vcf.gz
-        bcftools index -t ~{query_vcf}.vcf.gz
+        bcftools view ~{query_vcf} ~{if defined(locus) then "-r " + select_first([locus]) else ""} -O z -o ~{query_output_sample_name}.vcf.gz
+        bcftools index -t ~{query_output_sample_name}.vcf.gz
 
         # extract AF from query vcf file
         bcftools view -i  ~{query_info} ~{query_vcf}.vcf.gz -O z -o ~{query_output_sample_name}.query.~{fraction}.vcf.gz
         bcftools index -t ~{query_output_sample_name}.query.~{fraction}.vcf.gz
-        
+
+
         # split multiallelic sites in the base_vcf
         bcftools norm \
                 -f ~{reference_fa} \
                 -m -both ~{base_vcf} \
                 -O z \
-                -o ~{base_vcf}.normed.vcf.gz 
-        bcftools index -t ~{base_vcf}.normed.vcf.gz 
+                -o ~{query_output_sample_name}.base.normed.vcf.gz 
+        bcftools index -t ~{query_output_sample_name}.base.normed.vcf.gz 
+
+        bcftools view ~{query_output_sample_name}.base.normed.vcf.gz ~{if defined(locus) then "-r " + select_first([locus]) else ""} -O z -o ~{query_output_sample_name}.base.normed.subset.vcf.gz
+        bcftools index -t ~{query_output_sample_name}.base.normed.subset.vcf.gz
         
         # rtg vcfeval
         rtg format -o rtg_ref ~{reference_fa}
         rtg vcfeval \
-            -b ~{base_vcf}.normed.vcf.gz  \
+            -b ~{query_output_sample_name}.base.normed.subset.vcf.gz  \
             -c ~{query_output_sample_name}.query.~{fraction}.vcf.gz \
             -o reg \
             -t rtg_ref \

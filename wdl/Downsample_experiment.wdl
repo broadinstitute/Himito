@@ -17,6 +17,7 @@ workflow DownsampleExperiment {
         String sampleid
         String data_type
         String region = "chrM"
+        String? vcfdist_locus
         Boolean run_mitosaw
 
     }
@@ -56,6 +57,7 @@ workflow DownsampleExperiment {
                     reference_fai = reference_fai,
                     base_vcf = truth_vcf,
                     base_vcf_index = truth_tbi,
+                    locus = vcfdist_locus,
                     query_output_sample_name = sampleid + "_" + desiredCoverage + "_Mitorsaw",
             }
         }
@@ -448,6 +450,7 @@ task VCFEval {
         File reference_fai
         File base_vcf
         File base_vcf_index
+        String? locus
         String query_output_sample_name
 
         # Runtime params
@@ -460,7 +463,7 @@ task VCFEval {
         set -xeuo pipefail
 
         # Compress and Index vcf files
-        bcftools view ~{query_vcf} -O z -o ~{query_output_sample_name}.vcf.gz
+        bcftools view ~{query_vcf} ~{if defined(locus) then "-r " + select_first([locus]) else ""} -O z -o ~{query_output_sample_name}.vcf.gz
         bcftools index -t ~{query_output_sample_name}.vcf.gz
 
         # split multiallelic sites in the base_vcf
@@ -470,11 +473,14 @@ task VCFEval {
                 -O z \
                 -o ~{query_output_sample_name}.base.normed.vcf.gz 
         bcftools index -t ~{query_output_sample_name}.base.normed.vcf.gz 
+
+        bcftools view ~{query_output_sample_name}.base.normed.vcf.gz ~{if defined(locus) then "-r " + select_first([locus]) else ""} -O z -o ~{query_output_sample_name}.base.normed.subset.vcf.gz
+        bcftools index -t ~{query_output_sample_name}.base.normed.subset.vcf.gz
         
         # rtg vcfeval
         rtg format -o rtg_ref ~{reference_fa}
         rtg vcfeval \
-            -b ~{query_output_sample_name}.base.normed.vcf.gz  \
+            -b ~{query_output_sample_name}.base.normed.subset.vcf.gz  \
             -c ~{query_output_sample_name}.vcf.gz \
             -o reg \
             -t rtg_ref \

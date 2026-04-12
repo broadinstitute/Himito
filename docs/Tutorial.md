@@ -28,8 +28,8 @@ cd Himito/test_data
 
 Put your files here (or use the test dataset):
 
-- `HG002_chrM.bam`
-- `HG002_chrM.bam.bai`
+- `HG002_chrM_100x.bam`
+- `HG002_chrM_100x.bai`
 - `rCRS.fasta`
 
 Set variables once:
@@ -37,7 +37,7 @@ Set variables once:
 ```bash
 IMG="us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
 WD="$PWD"
-SAMPLE="HG002_chrM"
+SAMPLE="HG002_chrM_100x"
 REF="rCRS.fasta"
 CHR="chrM"
 K=21

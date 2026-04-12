@@ -146,7 +146,9 @@ docker run --rm -u "$(id -u):$(id -g)" -v "$WD":/work -w /work "$IMG" \
 
 Expected output:
 
+- `${SAMPLE}.methyl.gfa`
 - `${SAMPLE}.bed`
+- `${SAMPLE}.methylation_per_read.csv`
 
 ## 5) Summary of inputs and outputs
 

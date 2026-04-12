@@ -270,7 +270,7 @@ Himito emits at least:
 | Field | Content |
 | ----- | ------- |
 | CHROM | `chrM` on each data line |
-| POS | **SNPs:** 1-based position on the reference. |
+| POS | 1-based position on the reference. |
 | ID | `.` |
 | REF / ALT | Reference and alternate alleles (SNP or symbolic indel representation as produced by the caller) |
 | QUAL | `.` |

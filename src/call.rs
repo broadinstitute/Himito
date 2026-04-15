@@ -733,8 +733,7 @@ fn permutation_test(
 
  
     }).unzip(); 
-    println!("collected_values: {:?}", collected_values);
-    println!("Indices: {:?}", indices);
+
 
     let mut raw_p_values = Vec::new();
     let mut test_index = Vec::new();
@@ -743,14 +742,13 @@ fn permutation_test(
         let (p_value, index) = item;
         raw_p_values.push(p_value);
         test_index.push(index.clone());
-        println!("p_value: {:?}, index: {:?}", p_value, index.clone());
     }
 
     // adjust pvalues, create excluded_index list
     let mut excluded_index = Vec::new();
     // println!("{:?}", raw_p_values);
     let qvalues = adjust(&raw_p_values, Procedure::BenjaminiHochberg);
-    println!("{:?}", qvalues);
+
     for (qi, q_value) in qvalues.iter().enumerate(){
         let test_index_value = &test_index[qi];
         if q_value > &p_value_threshold{
@@ -784,8 +782,6 @@ fn permutation_test(
         let key = format!("m.{}{}>{}", v.pos, v.ref_allele, v.alt_allele);
         if excluded_index.contains(&&key.clone()) {
             continue;
-        }else{
-            println!("Included variant, {:?}", v);
         }
         f_variant.push(v.clone());
     }

@@ -193,7 +193,7 @@ enum Commands {
         #[clap(short, long, value_parser, required = true)]
         sample_id: String,
 
-        /// data type, pacbio, ont
+        /// data type, pacbio, ont-r9, ont-r10
         #[clap(short, long, value_parser, default_value = "pacbio")]
         data_type: String,
 

@@ -14,8 +14,12 @@ workflow MixSamples {
         File reference_fa
         File reference_fai
         File reference_dict
-        Array[Int] desiredCoverages
-        Array[Float] first_proportion_list
+        Int desiredCoverage
+        Float first_proportion
+
+        Array[Float] flist
+        Array[Float] p_value_list
+        
         Int kmer_size = 21
 
         String sampleid
@@ -55,91 +59,73 @@ workflow MixSamples {
         prefix = sampleid,
     }
 
-    scatter (desiredCoverage in desiredCoverages) {
-        scatter (first_proportion in first_proportion_list)  {
-            call downsampleBam {input:
-                first_input_bam = first_donor_coverage.subsetbam,
-                first_input_bam_bai = first_donor_coverage.subsetbai,
-                second_input_bam = second_donor_coverage.subsetbam,
-                second_input_bam_bai = second_donor_coverage.subsetbai,
-                basename = sampleid,
-                desiredCoverage = desiredCoverage,
-                fraction = first_proportion,
-                currentCoverage1 = first_donor_coverage.coverage,
-                currentCoverage2 = second_donor_coverage.coverage,
-                preemptible_tries = 0
-            }
 
-            call mix_sample {
-                input:
-                    first_donor_bam = downsampleBam.downsampled_bam_1,
-                    first_donor_bai = downsampleBam.downsampled_bai_1,
-                    second_donor_bam = downsampleBam.downsampled_bam_2,
-                    second_donor_bai = downsampleBam.downsampled_bam_2,
-                    prefix = sampleid
-            }
-            if (run_mitosaw) {
-                # call mitorsaw
-                call Mitorsaw {
-                    input:
-                        bam = mix_sample.merged_bam,
-                        bai = mix_sample.merged_bai,
-                        reference_fasta = reference_fa,
-                        reference_fasta_fai = reference_fai,
-                        prefix = sampleid
-                }
-                call VCFEval as Mitorsaw_Eval {
-                    input:
-                        query_vcf = Mitorsaw.vcf,
-                        reference_fa = reference_fa,
-                        reference_fai = reference_fai,
-                        query_output_sample_name = sampleid + "_" + desiredCoverage + "_" + first_proportion,
-                        base_vcf = merge_vcf.truth_vcf,
-                        base_vcf_index = merge_vcf.truth_tbi,
-                        vcf_score_field = vcf_score_field_mitorsaw,
-                        query_field = query_field_mitorsaw,
-                        locus = vcfeval_locus,
-                        threshold = 0,
-                        fraction = first_proportion
-                }
-            }
+    call downsampleBam {input:
+        first_input_bam = first_donor_coverage.subsetbam,
+        first_input_bam_bai = first_donor_coverage.subsetbai,
+        second_input_bam = second_donor_coverage.subsetbam,
+        second_input_bam_bai = second_donor_coverage.subsetbai,
+        basename = sampleid,
+        desiredCoverage = desiredCoverage,
+        fraction = first_proportion,
+        currentCoverage1 = first_donor_coverage.coverage,
+        currentCoverage2 = second_donor_coverage.coverage,
+        preemptible_tries = 0
+    }
 
-            # call mitograph assembly
+    call mix_sample {
+        input:
+            first_donor_bam = downsampleBam.downsampled_bam_1,
+            first_donor_bai = downsampleBam.downsampled_bai_1,
+            second_donor_bam = downsampleBam.downsampled_bam_2,
+            second_donor_bai = downsampleBam.downsampled_bam_2,
+            prefix = sampleid
+    }
+
+    scatter (i in range(length(flist))) {
+        scatter (j in range(length(p_value_list))) {
+
+            Float f = flist[i]
+            Float p = p_value_list[j]
+            
             call QuickStart {
                 input:
                     bam = mix_sample.merged_bam,
                     bai = mix_sample.merged_bai,
                     reference_fa = reference_fa,
-                    prefix = sampleid,
-                    kmer_size = kmer_size,
+                    prefix = sampleid + "_" + i + "_" + j,
+                    kmer_size = 21,
                     sample_id = sampleid,
-                    chromo = region,
+                    chromo = "chrM",
                     data_type = data_type,
+                    p_value_threshold = p,
+                    frequency_threshold = f
 
             }
 
-            call VCFEval as Mitograph_Eval {
+
+            call VCFEval as Himito_Eval {
                 input:
                     query_vcf = QuickStart.vcf,
                     reference_fa = reference_fa,
                     reference_fai = reference_fai,
-                    query_output_sample_name = sampleid + "_" + desiredCoverage + "_" + first_proportion,
                     base_vcf = merge_vcf.truth_vcf,
                     base_vcf_index = merge_vcf.truth_tbi,
+                    query_output_sample_name = sampleid + "_" + f + "_" + p + "_Himito",
                     vcf_score_field = vcf_score_field_mitograph,
                     query_field = query_field_mitograph,
                     locus = vcfeval_locus,
                     threshold = 0,
                     fraction = first_proportion
-            }
-
-
+                }
         }
 
     }
+
+
+
     output {
-        Array[Array[File]] mitograph_summary_file = Mitograph_Eval.summary_statistics
-        Array[Array[File?]] mitorsaw_summary_file = Mitorsaw_Eval.summary_statistics
+        Array[Array[File]] Himito_summary_file = Himito_Eval.summary_statistics
     }
 }
 
@@ -372,12 +358,7 @@ task QuickStart {
     >>>  
 
     output {
-        File graph = "~{prefix}.methyl.gfa"
-        File methyl_bed = "~{prefix}.bed"
         File asm = "~{prefix}.fasta"
-        File read_var_mat = "~{prefix}.matrix.csv"
-        File read_methyl_mat = "~{prefix}.methylation_per_read.csv" 
-        File numts_bam = "~{prefix}.numts.bam"
         File vcf = "~{prefix}.vcf"
     }
 
@@ -385,7 +366,7 @@ task QuickStart {
         docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
         memory: "4 GB"
         cpu: 1
-        disks: "local-disk 500 SSD"
+        disks: "local-disk 100 SSD"
     }
 }
 

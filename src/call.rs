@@ -455,7 +455,7 @@ fn write_vcf(
 }
 
 
-pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, variants:&[Variant]) -> (Array2<f64>, Vec<String>, Vec<String>) {
+pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, variants:&[Variant]) -> (Array2<f64>, Vec<Variant>, Vec<String>) {
     let mut read_set: HashSet<String> = HashSet::new();
     for (_, readlist) in read_record {
         for read in readlist {
@@ -473,29 +473,18 @@ pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, v
         .map(|(i, read)| (read.clone(), i))
         .collect();
 
-    let mut var_record: HashSet<String> = HashSet::new();
-    for v in variants {
-        let key = if v.variant_type == "SNP" {
-            format!("m.{}{}>{}",
-                v.pos + 1,
-                v.ref_allele, 
-                v.alt_allele)
-        } else {
-            format!("m.{}{}>{}",
-                v.pos,
-                v.ref_allele, 
-                v.alt_allele)
-        };
-        
-        var_record.insert(key);
-    }
-    let mut var_vec: Vec<String> = var_record.into_iter().collect();
-    var_vec.sort();
+    let mut var_vec: Vec<Variant> = variants.to_vec();
+    var_vec.sort_by(|a, b| {
+        a.pos
+            .cmp(&b.pos)
+            .then(a.ref_allele.cmp(&b.ref_allele))
+            .then(a.alt_allele.cmp(&b.alt_allele))
+    });
 
     let var_record_dict: HashMap<String, usize> = var_vec
         .iter()
         .enumerate()
-        .map(|(i, var)| (var.clone(), i))
+        .map(|(i, var)| (format!("m.{}{}>{}", var.pos, var.ref_allele, var.alt_allele), i))
         .collect();
 
 
@@ -503,7 +492,7 @@ pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, v
     let mut matrix = Array2::<f64>::zeros((var_vec.len(), read_vec.len()));
 
     for var in &var_vec {
-        let readlist: HashSet<String> = read_record.get(var)
+        let readlist: HashSet<String> = read_record.get(&format!("m.{}{}>{}", var.pos, var.ref_allele, var.alt_allele))
             .map(|reads| {
                 reads.iter()
                     .filter_map(|read| read.as_str().map(|s| s.to_string()))
@@ -512,7 +501,7 @@ pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, v
             .unwrap_or_else(|| HashSet::new());
         
         // Get row index for this variant
-        let r_index = *var_record_dict.get(var).unwrap();
+        let r_index = *var_record_dict.get(&format!("m.{}{}>{}", var.pos, var.ref_allele, var.alt_allele)).unwrap();
         
         // For each read in the readlist
         for read in readlist {
@@ -532,7 +521,7 @@ pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, v
 
 fn write_matrix_to_csv<P: AsRef<Path>>(
     matrix: &Array2<f64>,
-    var_record: &[String],
+    var_record: &[Variant],
     read_set: &[String],
     path: P
 ) -> Result<(), Box<dyn Error>> {
@@ -548,7 +537,13 @@ fn write_matrix_to_csv<P: AsRef<Path>>(
     writer.write_record(&header)?;
     
     // Write each row with its row name
-    for (row_idx, var_name) in var_record.iter().enumerate() {
+    for (row_idx, variants) in var_record.iter().enumerate() {
+        let var_name = if variants.variant_type == "SNP" {
+            format!("m.{}{}>{}", variants.pos + 1, variants.ref_allele, variants.alt_allele)
+        } else {
+            format!("m.{}{}>{}", variants.pos, variants.ref_allele, variants.alt_allele)
+        };
+
         let mut row = vec![var_name.clone()];
         
         // Add the values from the matrix
@@ -588,7 +583,8 @@ fn jaccard_distance(vector1: &[bool], vector2: &[bool]) -> f64 {
 
 /// Generate a null distribution through permutation testing
 fn get_null_distribution(
-    records: &Vec<String>,
+    filtered_var: &Vec<Variant>,
+    coverage: &HashMap<usize, usize>,
     matrix: &Array2<f64>, 
     permutation_round: usize,
     threshold: f64
@@ -600,11 +596,12 @@ fn get_null_distribution(
         let mut local_stats = Vec::new();
         let mut rng = thread_rng();
 
-        for (i, index) in records.iter().enumerate() {
+        for (i, variant) in filtered_var.iter().enumerate() {
+            let index = format!("m.{}{}>{}", variant.pos, variant.ref_allele, variant.alt_allele);
             let vector = matrix.slice(s![i, ..]);
             
             // Skip vectors with frequency > threshold
-            let frequency = vector.sum() / vector.len() as f64;
+            let frequency = filtered_var[i].allele_count as f64 / *coverage.get(&filtered_var[i].pos).unwrap() as f64;
             if frequency > threshold {
                 continue;
             }
@@ -617,7 +614,8 @@ fn get_null_distribution(
 
             let mut all_coefficients = Vec::new();
             
-            for (j, other_index) in records.iter().enumerate() {
+            for (j, other_variant) in filtered_var.iter().enumerate() {
+                let other_index = format!("m.{}{}>{}", other_variant.pos, other_variant.ref_allele, other_variant.alt_allele);
                 if index == other_index {
                     continue;
                 }
@@ -643,7 +641,7 @@ fn get_null_distribution(
 
 /// Calculate statistics for observed data
 fn calculate_observation_statistics(
-    recordlist: &Vec<String>,
+    filtered_var: &Vec<Variant>,
     index: usize,
     matrix: &Array2<f64>, 
 ) -> f64 {
@@ -651,7 +649,7 @@ fn calculate_observation_statistics(
     let vector = &matrix.slice(s![index, ..]);
     let mut all_coefficients = Vec::new();
     
-    for (i, other_index) in recordlist.iter().enumerate() {
+    for (i, variant) in filtered_var.iter().enumerate() {
         if i == index {
             continue;
         }
@@ -693,48 +691,50 @@ fn calculate_p_value(statistics: &[f64], observation: f64) -> f64 {
 
 fn permutation_test(
     matrix: &Array2<f64>,
-    records: Vec<String>,
     p_value_threshold: f64,
     permutation_round: usize,
     filtered_var: &Vec<Variant>,
+    coverage: &HashMap<usize, usize>,
     frequency_threshold:f64,
     data_type: &str
 ) -> (Vec<Variant>, Array2<f64>, Vec<String>) {
 
     let re = Regex::new(r"m\.(\d+)([A-Za-z-]+)>([A-Za-z-]+)").unwrap();
-    let bar = ProgressBar::new(records.len() as u64);
-    let statistics = get_null_distribution(&records, &matrix, permutation_round, frequency_threshold);
-    // Replace par_iter().enumerate() with this pattern
+    let bar = ProgressBar::new(filtered_var.len() as u64);
+    let statistics = get_null_distribution(filtered_var, coverage, &matrix, permutation_round, frequency_threshold);
     let (indices, collected_values): (Vec<_>, Vec<_>) = (0..filtered_var.len()).into_par_iter().map(|i| {
         bar.inc(1);
-        let index = &records[i];
-        let row = matrix.slice(s![i, ..]);
-        let frequency = row.sum() / row.len() as f64;
+        let index = format!("m.{}{}>{}", filtered_var[i].pos, filtered_var[i].ref_allele, filtered_var[i].alt_allele);
+        // let frequency = filtered_var[i].allele_count as f64 / *coverage.get(&filtered_var[i].pos).unwrap() as f64;
+        // let frequency = row.sum() / row.len() as f64;
+        let frequency = filtered_var[i].allele_count as f64 / *coverage.get(&filtered_var[i].pos).unwrap() as f64;
+
         if frequency > frequency_threshold {
             return (Ok(i), None);
         }
-        if let Some(caps) = re.captures(index) {
-            let pos = caps.get(1).unwrap().as_str().parse::<usize>().unwrap();
-            let ref_allele = caps.get(2).unwrap().as_str();
-            let alt_allele = caps.get(3).unwrap().as_str();
 
-            // For PacBio: exclude SNPs from permutation test (PacBio has high accuracy for SNPs)
-            // For ONT: include SNPs in permutation test but with stricter filtering
-            // ONT has higher error rates, so we need the permutation test to filter false positives
-            if (ref_allele.len() == 1 && alt_allele.len() == 1) && (data_type == "pacbio") {
-                return (Ok(i), None);
-            }
-            // Note: For ONT, SNPs go through permutation test which should help filter false positives
-            // If precision is still low, consider adjusting p_value_threshold or frequency_threshold
+        let variant = filtered_var[i].clone();
+        let pos = variant.pos;
+        let ref_allele = variant.ref_allele;
+        let alt_allele = variant.alt_allele;
 
+        // For PacBio: exclude SNPs from permutation test (PacBio has high accuracy for SNPs)
+        // For ONT: include SNPs in permutation test but with stricter filtering
+        // ONT has higher error rates, so we need the permutation test to filter false positives
+        if (ref_allele.len() == 1 && alt_allele.len() == 1) && (data_type == "pacbio") {
+            return (Ok(i), None);
         }
+        // Note: For ONT, SNPs go through permutation test which should help filter false positives
+        // If precision is still low, consider adjusting p_value_threshold or frequency_threshold
 
-        let observation = calculate_observation_statistics(&records, i, &matrix);
+        let observation = calculate_observation_statistics(&filtered_var, i, &matrix);
         let p_value = calculate_p_value(&statistics, observation);
         (Err(index.clone()), Some((p_value, index.clone())))
 
  
     }).unzip(); 
+    println!("collected_values: {:?}", collected_values);
+    println!("Indices: {:?}", indices);
 
     let mut raw_p_values = Vec::new();
     let mut test_index = Vec::new();
@@ -742,18 +742,24 @@ fn permutation_test(
     for item in collected_values.into_iter().flatten() {
         let (p_value, index) = item;
         raw_p_values.push(p_value);
-        test_index.push(index);
+        test_index.push(index.clone());
+        println!("p_value: {:?}, index: {:?}", p_value, index.clone());
     }
 
     // adjust pvalues, create excluded_index list
     let mut excluded_index = Vec::new();
+    // println!("{:?}", raw_p_values);
     let qvalues = adjust(&raw_p_values, Procedure::BenjaminiHochberg);
+    println!("{:?}", qvalues);
     for (qi, q_value) in qvalues.iter().enumerate(){
         let test_index_value = &test_index[qi];
         if q_value > &p_value_threshold{
             excluded_index.push(test_index_value);
+        }else{
+            println!("Tested index, {:?}, {:?}", test_index_value, q_value);
         }
     }
+    // println!("Excluded index, {:?}", excluded_index);
 
     // println!("{:?}", excluded_index);
     bar.finish();
@@ -764,8 +770,9 @@ fn permutation_test(
     let mut f_variant: Vec<Variant> = Vec::new();
     let mut var_list: Vec<String> = Vec::new();
     // get index list and var_list
-    for (r, rindex) in records.iter().enumerate(){
-        if !excluded_index.contains(&rindex){
+    for (r, rvariant) in filtered_var.iter().enumerate(){
+        let rindex = format!("m.{}{}>{}", rvariant.pos, rvariant.ref_allele, rvariant.alt_allele);
+        if !excluded_index.contains(&&rindex.clone()){
             index_list.push(r);
             var_list.push(rindex.clone());
         }
@@ -774,19 +781,11 @@ fn permutation_test(
     //     var_list.push(records[*idx].clone())
     // }
     for v in filtered_var {
-        let key = if v.variant_type == "SNP" {
-            format!("m.{}{}>{}",
-                v.pos + 1,
-                v.ref_allele, 
-                v.alt_allele)
-        } else {
-            format!("m.{}{}>{}",
-                v.pos,
-                v.ref_allele, 
-                v.alt_allele)
-        };
-        if excluded_index.contains(&&key) {
+        let key = format!("m.{}{}>{}", v.pos, v.ref_allele, v.alt_allele);
+        if excluded_index.contains(&&key.clone()) {
             continue;
+        }else{
+            println!("Included variant, {:?}", v);
         }
         f_variant.push(v.clone());
     }
@@ -859,7 +858,7 @@ pub fn start(
     // } else {
     //     (0.001, 0.2)    // PacBio: original thresholds
     // };
-    let (permu_filtered_var, filtered_matrix, filtered_name) = permutation_test(&matrix, var_record, p_value_threshold, 100, &filtered_var, frequency_threshold, data_type);
+    let (permu_filtered_var, filtered_matrix, filtered_name) = permutation_test(&matrix, p_value_threshold, 100, &var_record, &coverage, frequency_threshold, data_type);
 
     
     // write filtered vcf
@@ -873,6 +872,5 @@ pub fn start(
     );
     // write matrix
     let matrix_output = output_file.with_extension("matrix.csv");
-    let _ = write_matrix_to_csv(&filtered_matrix, &filtered_name, &read_set, matrix_output);
+    let _ = write_matrix_to_csv(&filtered_matrix, &permu_filtered_var, &read_set, matrix_output);
 }
-

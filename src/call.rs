@@ -775,9 +775,7 @@ fn permutation_test(
             var_list.push(rindex.clone());
         }
     }
-    // for idx in &index_list {
-    //     var_list.push(records[*idx].clone())
-    // }
+
     for v in filtered_var {
         let key = format!("m.{}{}>{}", v.pos, v.ref_allele, v.alt_allele);
         if excluded_index.contains(&&key.clone()) {
@@ -799,11 +797,11 @@ pub fn resolve_thresholds(
     frequency_threshold: Option<f64>,
 ) -> (f64, f64) {
     let (default_p, default_f) = if data_type == "ont-r9" {
-        (0.0001, 0.8)
+        (0.001, 0.5)
     } else if data_type == "ont-r10" {
-        (0.001, 0.8)
+        (0.01, 0.5)
     } else {
-        (0.01, 0.8)
+        (0.01, 0.5)
     };
 
     (

@@ -590,11 +590,11 @@ fn get_null_distribution(
             let index = generate_variant_name(variant);
             let vector = matrix.slice(s![i, ..]);
             
-            // Skip vectors with frequency > threshold
-            let frequency = filtered_var[i].allele_count as f64 / *coverage.get(&filtered_var[i].pos).unwrap() as f64;
-            if frequency > threshold {
-                continue;
-            }
+            // // Skip vectors with frequency > threshold
+            // let frequency = vector.sum() / vector.len() as f64;
+            // if frequency > threshold {
+            //     continue;
+            // }
         
             // Create a shuffled copy of the vector
             let vector_data: Vec<f64> = vector.iter().copied().collect();
@@ -609,6 +609,11 @@ fn get_null_distribution(
                 if index == other_index {
                     continue;
                 }
+
+                // let other_frequency = other_variant.allele_count as f64 / *coverage.get(&other_variant.pos).unwrap() as f64;
+                // if other_frequency > threshold {
+                //     continue;
+                // }
 
                 let other_vector = matrix.slice(s![j, ..]);
                 
@@ -632,6 +637,8 @@ fn get_null_distribution(
 /// Calculate statistics for observed data
 fn calculate_observation_statistics(
     filtered_var: &Vec<Variant>,
+    coverage: &HashMap<usize, usize>,
+    threshold: f64,
     index: usize,
     matrix: &Array2<f64>, 
 ) -> f64 {
@@ -643,6 +650,10 @@ fn calculate_observation_statistics(
         if i == index {
             continue;
         }
+        // let other_frequency = variant.allele_count as f64 / *coverage.get(&variant.pos).unwrap() as f64;
+        // if other_frequency > threshold {
+        //     continue;
+        // }
         
         let other_vector =&matrix.slice(s![i, ..]);
         
@@ -692,7 +703,6 @@ fn permutation_test(
     data_type: &str
 ) -> (Vec<Variant>, Array2<f64>, Vec<String>) {
 
-    let re = Regex::new(r"m\.(\d+)([A-Za-z-]+)>([A-Za-z-]+)").unwrap();
     let bar = ProgressBar::new(filtered_var.len() as u64);
     let statistics = get_null_distribution(filtered_var, coverage, &matrix, permutation_round, frequency_threshold);
     let (indices, collected_values): (Vec<_>, Vec<_>) = (0..filtered_var.len()).into_par_iter().map(|i| {
@@ -721,7 +731,7 @@ fn permutation_test(
         // Note: For ONT, SNPs go through permutation test which should help filter false positives
         // If precision is still low, consider adjusting p_value_threshold or frequency_threshold
 
-        let observation = calculate_observation_statistics(&filtered_var, i, &matrix);
+        let observation = calculate_observation_statistics(&filtered_var, coverage, frequency_threshold, i, &matrix);
         let p_value = calculate_p_value(&statistics, observation);
         (Err(index.clone()), Some((p_value, index.clone())))
 
@@ -745,9 +755,10 @@ fn permutation_test(
 
     for (qi, q_value) in qvalues.iter().enumerate(){
         let test_index_value = &test_index[qi];
+        // println!("Tested index, {:?}, {:?}", test_index_value, q_value);
         if q_value > &p_value_threshold{
             excluded_index.push(test_index_value);
-            println!("Excluded index, {:?}, {:?}", test_index_value, q_value);
+            // println!("Excluded index, {:?}, {:?}", test_index_value, q_value);
         }
     }
     // println!("Excluded index, {:?}", excluded_index);

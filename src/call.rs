@@ -269,20 +269,8 @@ pub fn get_variant(
                 reads.as_array().unwrap_or(&Vec::new()).to_vec()
             });
         for v in &variants_circular{
-            if v.variant_type == "SNP"{
-                let key = format!("m.{}{}>{}",
-                v.pos + 1,
-                v.ref_allele, 
-                v.alt_allele);
-                read_record.entry(key).or_insert_with(Vec::new).extend(readlist.clone());
-            }else {
-                let key = format!("m.{}{}>{}",
-                v.pos,
-                v.ref_allele, 
-                v.alt_allele);
-                read_record.entry(key).or_insert_with(Vec::new).extend(readlist.clone());
-            }
-
+            let key = generate_variant_name(&v.clone());
+            read_record.entry(key).or_insert_with(Vec::new).extend(readlist.clone());
         }
             
     }
@@ -454,6 +442,13 @@ fn write_vcf(
     Ok(())
 }
 
+pub fn generate_variant_name(variant: &Variant) -> String {
+    if variant.variant_type == "SNP" {
+        format!("m.{}{}>{}", variant.pos + 1, variant.ref_allele, variant.alt_allele)
+    } else {
+        format!("m.{}{}>{}", variant.pos, variant.ref_allele, variant.alt_allele)
+    }
+}
 
 pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, variants:&[Variant]) -> (Array2<f64>, Vec<Variant>, Vec<String>) {
     let mut read_set: HashSet<String> = HashSet::new();
@@ -484,7 +479,7 @@ pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, v
     let var_record_dict: HashMap<String, usize> = var_vec
         .iter()
         .enumerate()
-        .map(|(i, var)| (format!("m.{}{}>{}", var.pos, var.ref_allele, var.alt_allele), i))
+        .map(|(i, var)| (generate_variant_name(var), i))
         .collect();
 
 
@@ -492,7 +487,7 @@ pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, v
     let mut matrix = Array2::<f64>::zeros((var_vec.len(), read_vec.len()));
 
     for var in &var_vec {
-        let readlist: HashSet<String> = read_record.get(&format!("m.{}{}>{}", var.pos, var.ref_allele, var.alt_allele))
+        let readlist: HashSet<String> = read_record.get(&generate_variant_name(var))
             .map(|reads| {
                 reads.iter()
                     .filter_map(|read| read.as_str().map(|s| s.to_string()))
@@ -501,7 +496,7 @@ pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, v
             .unwrap_or_else(|| HashSet::new());
         
         // Get row index for this variant
-        let r_index = *var_record_dict.get(&format!("m.{}{}>{}", var.pos, var.ref_allele, var.alt_allele)).unwrap();
+        let r_index = *var_record_dict.get(&generate_variant_name(var)).unwrap();
         
         // For each read in the readlist
         for read in readlist {
@@ -538,12 +533,7 @@ fn write_matrix_to_csv<P: AsRef<Path>>(
     
     // Write each row with its row name
     for (row_idx, variants) in var_record.iter().enumerate() {
-        let var_name = if variants.variant_type == "SNP" {
-            format!("m.{}{}>{}", variants.pos + 1, variants.ref_allele, variants.alt_allele)
-        } else {
-            format!("m.{}{}>{}", variants.pos, variants.ref_allele, variants.alt_allele)
-        };
-
+        let var_name = generate_variant_name(variants);
         let mut row = vec![var_name.clone()];
         
         // Add the values from the matrix
@@ -597,7 +587,7 @@ fn get_null_distribution(
         let mut rng = thread_rng();
 
         for (i, variant) in filtered_var.iter().enumerate() {
-            let index = format!("m.{}{}>{}", variant.pos, variant.ref_allele, variant.alt_allele);
+            let index = generate_variant_name(variant);
             let vector = matrix.slice(s![i, ..]);
             
             // Skip vectors with frequency > threshold
@@ -615,7 +605,7 @@ fn get_null_distribution(
             let mut all_coefficients = Vec::new();
             
             for (j, other_variant) in filtered_var.iter().enumerate() {
-                let other_index = format!("m.{}{}>{}", other_variant.pos, other_variant.ref_allele, other_variant.alt_allele);
+                let other_index = generate_variant_name(other_variant);
                 if index == other_index {
                     continue;
                 }
@@ -686,7 +676,10 @@ fn calculate_p_value(statistics: &[f64], observation: f64) -> f64 {
     
     // Calculate p-value using normal distribution CDF
     let normal = Normal::new(0.0, 1.0).unwrap();
-    1.0 - normal.cdf(z_score)
+    if z_score.is_nan() {
+        return 1.0;
+    }
+    return 1.0 - normal.cdf(z_score);
 }
 
 fn permutation_test(
@@ -704,10 +697,11 @@ fn permutation_test(
     let statistics = get_null_distribution(filtered_var, coverage, &matrix, permutation_round, frequency_threshold);
     let (indices, collected_values): (Vec<_>, Vec<_>) = (0..filtered_var.len()).into_par_iter().map(|i| {
         bar.inc(1);
-        let index = format!("m.{}{}>{}", filtered_var[i].pos, filtered_var[i].ref_allele, filtered_var[i].alt_allele);
+        let current_variant = filtered_var[i].clone();
+        let index = generate_variant_name(&current_variant);
         // let frequency = filtered_var[i].allele_count as f64 / *coverage.get(&filtered_var[i].pos).unwrap() as f64;
         // let frequency = row.sum() / row.len() as f64;
-        let frequency = filtered_var[i].allele_count as f64 / *coverage.get(&filtered_var[i].pos).unwrap() as f64;
+        let frequency = current_variant.allele_count as f64 / *coverage.get(&current_variant.pos).unwrap() as f64;
 
         if frequency > frequency_threshold {
             return (Ok(i), None);
@@ -753,8 +747,7 @@ fn permutation_test(
         let test_index_value = &test_index[qi];
         if q_value > &p_value_threshold{
             excluded_index.push(test_index_value);
-        }else{
-            println!("Tested index, {:?}, {:?}", test_index_value, q_value);
+            println!("Excluded index, {:?}, {:?}", test_index_value, q_value);
         }
     }
     // println!("Excluded index, {:?}", excluded_index);
@@ -769,7 +762,7 @@ fn permutation_test(
     let mut var_list: Vec<String> = Vec::new();
     // get index list and var_list
     for (r, rvariant) in filtered_var.iter().enumerate(){
-        let rindex = format!("m.{}{}>{}", rvariant.pos, rvariant.ref_allele, rvariant.alt_allele);
+        let rindex = generate_variant_name(rvariant);
         if !excluded_index.contains(&&rindex.clone()){
             index_list.push(r);
             var_list.push(rindex.clone());
@@ -777,7 +770,7 @@ fn permutation_test(
     }
 
     for v in filtered_var {
-        let key = format!("m.{}{}>{}", v.pos, v.ref_allele, v.alt_allele);
+        let key = generate_variant_name(&v.clone());
         if excluded_index.contains(&&key.clone()) {
             continue;
         }

@@ -12,11 +12,12 @@ workflow DownsampleExperiment {
         File reference_dict
         Array[Int] desiredCoverages
         Int kmer_size
-        Float p
-        Float f
+        Float? p
+        Float? f
         String sampleid
         String data_type
         String region = "chrM"
+        String Himito_docker
         String? vcfdist_locus
         Boolean run_mitosaw
 
@@ -74,7 +75,8 @@ workflow DownsampleExperiment {
                 chromo = "chrM",
                 data_type = data_type,
                 p_value_threshold = p,
-                frequency_threshold = f
+                frequency_threshold = f,
+                Himito_docker = Himito_docker
 
         }
 
@@ -553,14 +555,24 @@ task QuickStart_dev {
         String sample_id
         String chromo = "chrM"
         String data_type = "pacbio"
-        Float p_value_threshold
-        Float frequency_threshold
+        Float? p_value_threshold
+        Float? frequency_threshold
+        String Himito_docker
     }
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type} --p-value-threshold ~{p_value_threshold} --heteroplasmic-frequency-threshold ~{frequency_threshold}
+        /Himito/target/release/Himito quick-start -i ~{bam} \
+                                                -c ~{chromo} \
+                                                -o ~{prefix} \
+                                                -k ~{kmer_size} \
+                                                -r ~{reference_fa} \
+                                                -s ~{sample_id} \
+                                                -d ~{data_type} \
+                                                ~{if defined(p_value_threshold) then "--p-value-threshold " + select_first([p_value_threshold]) else ""} \
+                                                ~{if defined(frequency_threshold) then "--heteroplasmic-frequency-threshold " + select_first([frequency_threshold]) else ""}
         ls
+
     >>>  
 
     output {
@@ -569,7 +581,7 @@ task QuickStart_dev {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
+        docker: Himito_docker
         memory: "4 GB"
         cpu: 1
         disks: "local-disk 500 SSD"

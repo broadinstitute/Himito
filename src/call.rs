@@ -450,7 +450,7 @@ pub fn generate_variant_name(variant: &Variant) -> String {
     }
 }
 
-pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, variants:&[Variant]) -> (Array2<f64>, Vec<Variant>, Vec<String>) {
+pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, variants:&[Variant], minimal_ac: usize) -> (Array2<f64>, Vec<Variant>, Vec<String>) {
     let mut read_set: HashSet<String> = HashSet::new();
     for (_, readlist) in read_record {
         for read in readlist {
@@ -507,8 +507,17 @@ pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, v
             }
         }
     }
-    (matrix, var_vec, read_vec)
 
+    // filter matrix where the sum of the column is less than 2
+    let mut col_index = Vec::new();
+    for i in 0..matrix.ncols() {
+        if matrix.column(i).sum() > minimal_ac as f64 {
+            col_index.push(i);
+        }
+    }
+    let filtered_matrix = matrix.select(Axis(1), &col_index);
+    let filtered_read_vec: Vec<String> = read_vec.iter().filter(|read| col_index.contains(&read_set_dict.get(read.as_str()).unwrap())).map(|read| read.clone()).collect();
+    (filtered_matrix, var_vec, filtered_read_vec)
 
 }
 
@@ -590,11 +599,11 @@ fn get_null_distribution(
             let index = generate_variant_name(variant);
             let vector = matrix.slice(s![i, ..]);
             
-            // // Skip vectors with frequency > threshold
-            // let frequency = vector.sum() / vector.len() as f64;
-            // if frequency > threshold {
-            //     continue;
-            // }
+            // Skip vectors with frequency > threshold
+            let frequency = vector.sum() / vector.len() as f64;
+            if frequency > 0.8 {
+                continue;
+            }
         
             // Create a shuffled copy of the vector
             let vector_data: Vec<f64> = vector.iter().copied().collect();
@@ -845,7 +854,7 @@ pub fn start(
     // modified, exclude filtered data for FPs
     
     // modified, exclude filtered data
-    let (matrix, var_record, read_set) = construct_matrix(&read_record, &filtered_var);
+    let (matrix, var_record, read_set) = construct_matrix(&read_record, &filtered_var, minimal_ac);
     let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
     let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
 

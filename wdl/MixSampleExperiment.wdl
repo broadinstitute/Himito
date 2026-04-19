@@ -27,6 +27,7 @@ workflow MixSamples {
         String data_type
         String? vcfeval_locus
         Boolean run_mitosaw
+        String Himito_docker
 
     }
 
@@ -78,6 +79,7 @@ workflow MixSamples {
                     second_donor_bai = downsampleBam.downsampled_bam_2,
                     prefix = sampleid
             }
+
             if (run_mitosaw) {
                 # call mitorsaw
                 call Mitorsaw {
@@ -115,7 +117,7 @@ workflow MixSamples {
                     sample_id = sampleid,
                     chromo = region,
                     data_type = data_type,
-
+                    docker_image = Himito_docker
             }
 
             call VCFEval as Mitograph_Eval {
@@ -132,8 +134,6 @@ workflow MixSamples {
                     threshold = 0,
                     fraction = first_proportion
             }
-
-
         }
 
     }
@@ -361,13 +361,22 @@ task QuickStart {
         String sample_id
         String chromo = "chrM"
         String data_type = "pacbio"
-        Float p_value_threshold
-        Float frequency_threshold
+        Float? p_value_threshold
+        Float? frequency_threshold
+        String docker_image
     }
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type} --p-value-threshold ~{p_value_threshold} --heteroplasmic-frequency-threshold ~{frequency_threshold}
+        /Himito/target/release/Himito quick-start -i ~{bam} \
+                                                -c ~{chromo} \
+                                                -o ~{prefix} \
+                                                -k ~{kmer_size} \
+                                                -r ~{reference_fa} \
+                                                -s ~{sample_id} \
+                                                -d ~{data_type} \
+                                                ~{if defined(p_value_threshold) then "--p-value-threshold " + select_first([p_value_threshold]) else ""} \
+                                                ~{if defined(frequency_threshold) then "--heteroplasmic-frequency-threshold " + select_first([frequency_threshold]) else ""}
         ls
     >>>  
 
@@ -382,7 +391,7 @@ task QuickStart {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1.1.0"
+        docker: docker_image
         memory: "4 GB"
         cpu: 1
         disks: "local-disk 500 SSD"

@@ -249,11 +249,19 @@ pub fn get_methylation_read(r: &Record, mod_char: char) -> HashMap<usize, f32> {
                 // let strand = mod_metadata.strand;
                 let pos_usize = position as usize;
                 let qual = m.qual as f32 / 255.0;
-                let motif: String = if r.is_reverse(){
-                    forward_sequence[pos_usize-1..pos_usize +1 ].to_string()
-                    
-                }else{
-                    forward_sequence[pos_usize..pos_usize +2 ].to_string()
+                let seq_len = forward_sequence.len();
+                let motif: String = if r.is_reverse() {
+                    // Reverse case needs two bases ending at pos_usize.
+                    if pos_usize == 0 || pos_usize + 1 > seq_len {
+                        continue;
+                    }
+                    forward_sequence[pos_usize - 1..pos_usize + 1].to_string()
+                } else {
+                    // Forward case needs two bases starting at pos_usize.
+                    if pos_usize + 2 > seq_len {
+                        continue;
+                    }
+                    forward_sequence[pos_usize..pos_usize + 2].to_string()
                 };
                     
                 if motif == "CG" {

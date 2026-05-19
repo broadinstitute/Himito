@@ -29,7 +29,7 @@ cargo build --release
                                     -d pacbio
 
 ```
-If you are analyzing high coverage samples, remember to set <--maximal-mt-depth> to a reasonable number
+If you are analyzing high coverage samples, remember to set ```--maximal-mt-depth``` to a reasonable number
 
 ## Details
 ### build Himito graph

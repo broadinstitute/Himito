@@ -725,6 +725,10 @@ fn permutation_test(
         if frequency > frequency_threshold {
             return (Ok(i), None);
         }
+        // exclude variants with large indel
+        if (current_variant.ref_allele.len() as i32 - current_variant.alt_allele.len() as i32).abs() > 50 {
+            return (Ok(i), None);
+        }
 
         let variant = filtered_var[i].clone();
         let pos = variant.pos;

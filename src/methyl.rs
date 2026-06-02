@@ -8,6 +8,71 @@ use std::collections::{HashMap, HashSet};
 use serde_json::json;
 use std::error::Error;
 use csv::Writer;
+use rayon::prelude::*;
+use std::sync::Arc;
+use std::time::Instant;
+use indicatif::ProgressBar;
+
+// #region agent log
+fn debug_log(hypothesis_id: &str, location: &str, message: &str, data: serde_json::Value, run_id: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/Users/suhang/Analysis/.cursor/debug-3d4410.log")
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let line = json!({
+            "sessionId": "3d4410",
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": ts,
+        });
+        let _ = writeln!(f, "{}", line);
+    }
+}
+// #endregion
+
+#[derive(Default, Clone)]
+struct RecordTiming {
+    mapping_ns: u128,
+    validation_ns: u128,
+    methylation_ns: u128,
+    aligned_pairs_ns: u128,
+    graph_collect_ns: u128,
+}
+
+impl RecordTiming {
+    fn merge(&mut self, other: &RecordTiming) {
+        self.mapping_ns += other.mapping_ns;
+        self.validation_ns += other.validation_ns;
+        self.methylation_ns += other.methylation_ns;
+        self.aligned_pairs_ns += other.aligned_pairs_ns;
+        self.graph_collect_ns += other.graph_collect_ns;
+    }
+}
+
+#[derive(Clone)]
+struct GraphMethylUpdate {
+    item: String,
+    is_anchor: bool,
+    read_name: String,
+    offset: usize,
+    likelihood: f32,
+}
+
+struct ProcessedRead {
+    read_name: String,
+    is_reverse: bool,
+    methyl_single_read: HashMap<usize, Vec<f32>>,
+    graph_updates: Vec<GraphMethylUpdate>,
+}
 
 pub fn find_path_on_graph(graph: &GraphicalGenome, read_name: &str) -> Vec<String> {
     let mut node = "SOURCE".to_string();
@@ -375,74 +440,187 @@ pub fn get_reference_coordinates(cigar: &str, ref_start: usize) -> HashMap<usize
     position_mapping
 }
 
-pub fn add_methylation_to_graph(
-    graph: &mut GraphicalGenome, 
-    methyl_pos_dict: &HashMap<usize, f32>, 
-    mapping_position: &HashMap<usize, (String, usize)>, 
-    read_name: &str
-) {
+fn collect_methylation_updates(
+    graph: &GraphicalGenome,
+    methyl_pos_dict: &HashMap<usize, f32>,
+    mapping_position: &HashMap<usize, (String, usize)>,
+    read_name: &str,
+) -> Vec<GraphMethylUpdate> {
+    let mut updates = Vec::new();
     for (pos, likelihood) in methyl_pos_dict {
         if let Some((item, offset)) = mapping_position.get(pos) {
             if item.starts_with("A") {
-                if let Some(anchor_data) = graph.anchor.get_mut(item) {
-                    // Assert for debugging
-                    let seq = anchor_data.get("seq")
+                if let Some(anchor_data) = graph.anchor.get(item) {
+                    let seq = anchor_data
+                        .get("seq")
                         .and_then(|s| s.as_str())
                         .expect(&format!("No seq for anchor {}", item));
-                    let c = seq.chars().nth(*offset)
+                    let c = seq
+                        .chars()
+                        .nth(*offset)
                         .expect(&format!("Offset {} out of bounds in anchor {}", offset, item));
-                    assert_eq!(c, 'C', "Expected C at position {} in anchor {}, found {}", offset, item, c);
-                    
-                    // Update methylation data
-                    if !anchor_data.get("methyl").is_some() {
-                        anchor_data["methyl"] = json!({});
-                    }
-                    
-                    if let Some(methyl) = anchor_data.get_mut("methyl").and_then(|m| m.as_object_mut()) {
-                        if !methyl.contains_key(read_name) {
-                            methyl.insert(read_name.to_string(), json!([]));
-                        }
-                        
-                        if let Some(read_methyl) = methyl.get_mut(read_name).and_then(|rm| rm.as_array_mut()) {
-                            if !read_methyl.contains(&json!([offset, likelihood])){
-                                read_methyl.push(json!([offset, likelihood]));
-                            }
-                            
-                        }
-                    }
+                    assert_eq!(
+                        c, 'C',
+                        "Expected C at position {} in anchor {}, found {}",
+                        offset, item, c
+                    );
+                    updates.push(GraphMethylUpdate {
+                        item: item.clone(),
+                        is_anchor: true,
+                        read_name: read_name.to_string(),
+                        offset: *offset,
+                        likelihood: *likelihood,
+                    });
                 }
             } else if item.starts_with("E") {
-                if let Some(edge_data) = graph.edges.get_mut(item) {
-                    // Assert for debugging
-                    let seq = edge_data.get("seq")
+                if let Some(edge_data) = graph.edges.get(item) {
+                    let seq = edge_data
+                        .get("seq")
                         .and_then(|s| s.as_str())
                         .expect(&format!("No seq for edge {}", item));
-                    let c = seq.chars().nth(*offset)
+                    let c = seq
+                        .chars()
+                        .nth(*offset)
                         .expect(&format!("Offset {} out of bounds in edge {}", offset, item));
-                    assert_eq!(c, 'C', "Expected C at position {} in edge {}, found {}", offset, item, c);
-                    
-                    // Update methylation data
-                    if !edge_data.get("methyl").is_some() {
-                        edge_data["methyl"] = json!({});
-                    }
-                    
-                    if let Some(methyl) = edge_data.get_mut("methyl").and_then(|m| m.as_object_mut()) {
-                        if !methyl.contains_key(read_name) {
-                            methyl.insert(read_name.to_string(), json!([]));
-                        }
-                        
-                        if let Some(read_methyl) = methyl.get_mut(read_name).and_then(|rm| rm.as_array_mut()) {
-                            if !read_methyl.contains(&json!([offset, likelihood])){
-                                read_methyl.push(json!([offset, likelihood]));
-                            }
-                        }
-                    }
+                    assert_eq!(
+                        c, 'C',
+                        "Expected C at position {} in edge {}, found {}",
+                        offset, item, c
+                    );
+                    updates.push(GraphMethylUpdate {
+                        item: item.clone(),
+                        is_anchor: false,
+                        read_name: read_name.to_string(),
+                        offset: *offset,
+                        likelihood: *likelihood,
+                    });
                 }
             } else {
                 println!("{}, {}", item, pos);
             }
         }
     }
+    updates
+}
+
+fn apply_methylation_updates(graph: &mut GraphicalGenome, updates: &[GraphMethylUpdate]) {
+    for update in updates {
+        if update.is_anchor {
+            if let Some(anchor_data) = graph.anchor.get_mut(&update.item) {
+                if !anchor_data.get("methyl").is_some() {
+                    anchor_data["methyl"] = json!({});
+                }
+                if let Some(methyl) = anchor_data.get_mut("methyl").and_then(|m| m.as_object_mut()) {
+                    if !methyl.contains_key(&update.read_name) {
+                        methyl.insert(update.read_name.clone(), json!([]));
+                    }
+                    if let Some(read_methyl) = methyl
+                        .get_mut(&update.read_name)
+                        .and_then(|rm| rm.as_array_mut())
+                    {
+                        let entry = json!([update.offset, update.likelihood]);
+                        if !read_methyl.contains(&entry) {
+                            read_methyl.push(entry);
+                        }
+                    }
+                }
+            }
+        } else if let Some(edge_data) = graph.edges.get_mut(&update.item) {
+            if !edge_data.get("methyl").is_some() {
+                edge_data["methyl"] = json!({});
+            }
+            if let Some(methyl) = edge_data.get_mut("methyl").and_then(|m| m.as_object_mut()) {
+                if !methyl.contains_key(&update.read_name) {
+                    methyl.insert(update.read_name.clone(), json!([]));
+                }
+                if let Some(read_methyl) = methyl
+                    .get_mut(&update.read_name)
+                    .and_then(|rm| rm.as_array_mut())
+                {
+                    let entry = json!([update.offset, update.likelihood]);
+                    if !read_methyl.contains(&entry) {
+                        read_methyl.push(entry);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn add_methylation_to_graph(
+    graph: &mut GraphicalGenome,
+    methyl_pos_dict: &HashMap<usize, f32>,
+    mapping_position: &HashMap<usize, (String, usize)>,
+    read_name: &str,
+) {
+    let updates = collect_methylation_updates(graph, methyl_pos_dict, mapping_position, read_name);
+    apply_methylation_updates(graph, &updates);
+}
+
+fn process_bam_record(graph: &GraphicalGenome, r: &Record) -> (Option<ProcessedRead>, RecordTiming) {
+    let mut timing = RecordTiming::default();
+
+    if r.is_unmapped() || r.is_supplementary() {
+        return (None, timing);
+    }
+
+    let read_name = String::from_utf8_lossy(&r.qname()).to_string();
+    let is_reverse = r.is_reverse();
+
+    let t0 = Instant::now();
+    let read_position_mapping = find_mapping_position(graph, r);
+    timing.mapping_ns = t0.elapsed().as_nanos();
+
+    let t0 = Instant::now();
+    validation(graph, &read_position_mapping, r);
+    timing.validation_ns = t0.elapsed().as_nanos();
+
+    let t0 = Instant::now();
+    let methyl_pos_dict = get_methylation_read(r, 'm');
+    timing.methylation_ns = t0.elapsed().as_nanos();
+
+    let t0 = Instant::now();
+    let aligned_pairs: HashMap<usize, usize> = r
+        .aligned_pairs_full()
+        .into_iter()
+        .filter_map(|pair| match pair {
+            [Some(q), Some(ref_pos)] => Some((q as usize, ref_pos as usize)),
+            _ => None,
+        })
+        .collect();
+    timing.aligned_pairs_ns = t0.elapsed().as_nanos();
+
+    let mut methyl_single_read: HashMap<usize, Vec<f32>> = HashMap::new();
+    for (read_pos, likelihood) in methyl_pos_dict.iter() {
+        if let Some(&ref_pos) = aligned_pairs.get(read_pos) {
+            methyl_single_read
+                .entry(ref_pos)
+                .or_insert_with(Vec::new)
+                .push(*likelihood);
+        }
+    }
+
+    let mut graph_updates = Vec::new();
+    if !read_position_mapping.is_empty() && !methyl_pos_dict.is_empty() {
+        let t0 = Instant::now();
+        graph_updates = collect_methylation_updates(
+            graph,
+            &methyl_pos_dict,
+            &read_position_mapping,
+            &read_name,
+        );
+        timing.graph_collect_ns = t0.elapsed().as_nanos();
+    }
+
+    (
+        Some(ProcessedRead {
+            read_name,
+            is_reverse,
+            methyl_single_read,
+            graph_updates,
+        }),
+        timing,
+    )
 }
 
 fn find_methylation_signal_on_major_haplotype(graph: &GraphicalGenome) -> HashMap<(usize, usize, String), HashMap<String, f64>> {
@@ -771,69 +949,95 @@ pub fn start (graph_file: &PathBuf, bam_file: &PathBuf, output_file: &PathBuf, m
     println!("Add Methylation Signals!");
     // annotate graph
     println!("Annotated graph output: {}", graph_file.display());
-    let mut graph = GraphicalGenome::load_graph(graph_file).unwrap();
+    let graph = GraphicalGenome::load_graph(graph_file).unwrap();
     println!("Processing BAM file");
     let mut bam = Reader::from_path(bam_file).unwrap();
+
+    let collect_start = Instant::now();
+    let records: Vec<Record> = bam
+        .records()
+        .map(|record| record.expect("Failed to read BAM record"))
+        .collect();
+    let bam_collect_ms = collect_start.elapsed().as_millis();
+
+    let graph_arc = Arc::new(graph);
+    let parallel_start = Instant::now();
+    let bar = ProgressBar::new(records.len() as u64);
+    let (processed_reads, aggregate_timing, skip_counts) = records
+        .par_iter()
+        .map(|r| {
+            bar.inc(1);
+            let (processed, timing) = process_bam_record(&graph_arc, r);
+            let skipped_unmapped = r.is_unmapped() as u64;
+            let skipped_supplementary = r.is_supplementary() as u64;
+            (processed, timing, skipped_unmapped, skipped_supplementary)
+        })
+        .fold(
+            || (Vec::new(), RecordTiming::default(), (0u64, 0u64)),
+            |mut acc, (processed, timing, unmapped, supp)| {
+                acc.1.merge(&timing);
+                acc.2.0 += unmapped;
+                acc.2.1 += supp;
+                if let Some(read) = processed {
+                    acc.0.push(read);
+                }
+                acc
+            },
+        )
+        .reduce(
+            || (Vec::new(), RecordTiming::default(), (0u64, 0u64)),
+            |mut a, b| {
+                a.0.extend(b.0);
+                a.1.merge(&b.1);
+                a.2.0 += b.2.0;
+                a.2.1 += b.2.1;
+                a
+            },
+        );
+    let parallel_process_ms = parallel_start.elapsed().as_millis();
+    bar.finish();
+    let mut graph = Arc::try_unwrap(graph_arc).unwrap_or_else(|arc| (*arc).clone());
     let mut read_name_set = HashSet::new();
-    let mut methyl_single_read: HashMap<String,HashMap<usize, Vec<f32>> >= HashMap::new(); // extract directly from reference map
-    let mut strand_dict:HashMap<String, bool> = HashMap::new();
-    for record in bam.records(){
-        let r = record.expect("Failed to read BAM record");
-        // let mut read_sequence = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
-        // if r.is_reverse(){
-        //     read_sequence = reverse_complement(&read_sequence);
-        // }
-        if r.is_unmapped(){
-            continue
-        }
-        if r.is_supplementary(){
-            continue
-        }
-        let read_name = String::from_utf8_lossy(&r.qname()).to_string();
-        // if read_name_set.contains(&read_name) {
-        //     continue
-        // }
-        strand_dict.insert(read_name.clone(), r.is_reverse());
-        read_name_set.insert(read_name.clone());
-        let read_position_mapping = find_mapping_position(&graph, &r);
-        // Validate read_position_mapping
-        validation(&graph, &read_position_mapping, &r);
-        let methyl_pos_dict = get_methylation_read(&r, 'm');
-        
-        // map to reference coordinates
-        let aligned_pairs:HashMap<usize, usize> = r.aligned_pairs_full()
-                                .into_iter()
-                                .filter_map(|pair| {
-                                // Only include pairs where both positions are defined
-                                match pair {
-                                    [Some(q), Some(r)] => Some((q as usize, r as usize)),
-                                    _ => None
-                                }
-                            })
-                            .collect();
+    let mut methyl_single_read: HashMap<String, HashMap<usize, Vec<f32>>> = HashMap::new();
+    let mut strand_dict: HashMap<String, bool> = HashMap::new();
+    let mut all_graph_updates = Vec::new();
 
-        for (read_pos, likelihood) in methyl_pos_dict.iter(){
-            if aligned_pairs.contains_key(read_pos){
-                let ref_pos = aligned_pairs.get(read_pos).copied().unwrap_or(0);
-                methyl_single_read
-                                    .entry(read_name.clone())
-                                    .or_insert_with(HashMap::new)
-                                    .entry(ref_pos)
-                                    .or_insert_with(Vec::new)
-                                    .push(*likelihood);
-            }
-
+    let merge_start = Instant::now();
+    for read in processed_reads {
+        read_name_set.insert(read.read_name.clone());
+        strand_dict.insert(read.read_name.clone(), read.is_reverse);
+        if !read.methyl_single_read.is_empty() {
+            methyl_single_read.insert(read.read_name.clone(), read.methyl_single_read);
         }
-
-        if read_position_mapping.len() == 0 {
-            continue
-        }
-        if methyl_pos_dict.len() == 0 {
-            continue
-        }
-        // println!("{}", read_position_mapping.len());
-        add_methylation_to_graph(&mut graph, &methyl_pos_dict, &read_position_mapping, &read_name);  
+        all_graph_updates.extend(read.graph_updates);
     }
+    apply_methylation_updates(&mut graph, &all_graph_updates);
+    let merge_ms = merge_start.elapsed().as_millis();
+
+    // #region agent log
+    debug_log(
+        "A",
+        "methyl.rs:start",
+        "phase timings and per-step aggregate ns",
+        json!({
+            "total_records": records.len(),
+            "processed_reads": read_name_set.len(),
+            "skipped_unmapped": skip_counts.0,
+            "skipped_supplementary": skip_counts.1,
+            "graph_updates": all_graph_updates.len(),
+            "bam_collect_ms": bam_collect_ms,
+            "parallel_process_ms": parallel_process_ms,
+            "merge_ms": merge_ms,
+            "mapping_ns": aggregate_timing.mapping_ns,
+            "validation_ns": aggregate_timing.validation_ns,
+            "methylation_ns": aggregate_timing.methylation_ns,
+            "aligned_pairs_ns": aggregate_timing.aligned_pairs_ns,
+            "graph_collect_ns": aggregate_timing.graph_collect_ns,
+        }),
+        "parallel-v1",
+    );
+    // #endregion
+
     let graph_output = output_file.with_extension("methyl.gfa");
     let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph);
     
@@ -851,7 +1055,5 @@ pub fn start (graph_file: &PathBuf, bam_file: &PathBuf, output_file: &PathBuf, m
         let _ = write_methylation_alignment_to_csv(methyl_single_read, min_prob as f32, strand_dict, matrix_output, 0.1);
 
     }
-    
-    
 
 }

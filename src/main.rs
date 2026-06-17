@@ -91,6 +91,18 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 42)]
         downsample_seed: u64,
 
+        /// strand bias threshold for filtering variants
+        #[clap(long, value_parser, default_value_t = 0.05)]
+        strand_bias_threshold: f64,
+
+        /// indel false threshold for filtering variants
+        #[clap(long, value_parser, default_value_t = 0.1)]
+        indel_false_threshold: f64,
+
+        /// heteroplasmic frequency threshold for permutation test 
+        #[clap(long, value_parser, default_value_t = 0.8)]
+        permutation_frequency_threshold: f64,
+
     },
 
     /// Filter reads derived from Numts
@@ -220,6 +232,22 @@ enum Commands {
         /// frequency threshold for permutation test (optional)
         #[clap(short, long, value_parser)]
         frequency_threshold: Option<f64>,
+
+        /// optional BAM file; when provided, variants are additionally filtered by strand bias
+        #[clap(long, value_parser)]
+        input_bam: Option<PathBuf>,
+
+        /// p-value threshold for the strand-bias filter (only used with --input-bam)
+        #[clap(long, value_parser, default_value_t = 0.05)]
+        strand_bias_threshold: f64,
+
+        /// indel false threshold for filtering variants
+        #[clap(long, value_parser, default_value_t = 0.1)]
+        indel_false_threshold: f64,
+
+        /// heteroplasmic frequency threshold for permutation test (optional, preset by data-type,higher is more stringent)
+        #[clap(long, value_parser, default_value_t = 0.8)]
+        permutation_frequency_threshold: f64,
     },
 
     /// Extract Major Haplotype as Fasta file from Graph
@@ -338,6 +366,9 @@ fn main() {
             heteroplasmic_frequency_threshold,
             maximal_mt_depth,
             downsample_seed,
+            strand_bias_threshold,
+            indel_false_threshold,
+            permutation_frequency_threshold,
         } => {
             let (p_value_threshold, frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold);
@@ -372,6 +403,10 @@ fn main() {
                 &data_type,
                 p_value_threshold,
                 frequency_threshold,
+                Some(&mt_output),
+                strand_bias_threshold,
+                indel_false_threshold,
+                permutation_frequency_threshold,
             );
             let annotated_graph_output = output_prefix.with_extension("gfa");
             let methyl_output = output_prefix.with_extension("bed");
@@ -431,6 +466,10 @@ fn main() {
             data_type,
             p_value_threshold,
             frequency_threshold,
+            input_bam,
+            strand_bias_threshold,
+            indel_false_threshold,
+            permutation_frequency_threshold,
         } => {
             let (p_value_threshold, frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, frequency_threshold);
@@ -445,6 +484,10 @@ fn main() {
                 &data_type,
                 p_value_threshold,
                 frequency_threshold,
+                input_bam.as_ref(),
+                strand_bias_threshold,
+                indel_false_threshold,
+                permutation_frequency_threshold,
             );
         }
 

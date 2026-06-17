@@ -102,9 +102,8 @@ pub fn find_path_on_graph(graph: &GraphicalGenome, read_name: &str) -> Vec<Strin
     
     path_items
 }
-pub fn find_mapping_position(graph:&GraphicalGenome, r: &Record) -> HashMap<usize, (String, usize)> {
+pub fn find_mapping_position(graph:&GraphicalGenome, r: &Record, forward_contig: &str) -> HashMap<usize, (String, usize)> {
     let read_name = String::from_utf8_lossy(&r.qname()).to_string();
-    let forward_contig = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
     let path_items = find_path_on_graph(&graph, &read_name);
     let mut anchor_list = Vec::new();
     for item in path_items.iter(){
@@ -263,11 +262,9 @@ pub fn find_mapping_position(graph:&GraphicalGenome, r: &Record) -> HashMap<usiz
 
 }
 
-pub fn get_methylation_read(r: &Record, mod_char: char) -> HashMap<usize, f32> {
+pub fn get_methylation_read(r: &Record, mod_char: char, forward_sequence: &str) -> HashMap<usize, f32> {
     let mut methyl_pos_dict: HashMap<usize, f32> = HashMap::new();
-    
-    let forward_sequence = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
-    
+
     // Check for modification data
     if let Ok(mods) = r.basemods_iter() {
         // Iterate over the modification types
@@ -316,29 +313,28 @@ pub fn get_methylation_read(r: &Record, mod_char: char) -> HashMap<usize, f32> {
     methyl_pos_dict
 }
 
-pub fn validation(graph: &GraphicalGenome, read_position_mapping:&HashMap<usize, (String, usize)>, r:&Record){
-    let read_sequence = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
+pub fn validation(graph: &GraphicalGenome, read_position_mapping:&HashMap<usize, (String, usize)>, read_sequence: &str){
+    // DNA is ASCII, so index bytes directly instead of the O(n) chars().nth() scan.
+    let read_bytes = read_sequence.as_bytes();
     for (position, (item, offset)) in read_position_mapping {
         if item.starts_with("A") {
             let anchor_data = graph.anchor.get(item).expect(&format!("Anchor {} not found", item));
             let seq = anchor_data.get("seq").and_then(|s| s.as_str()).expect(&format!("No seq for anchor {}", item));
-            
-            let query_char = read_sequence.chars().nth(*position).expect(&format!("Position {} out of bounds in query", position));
-            let anchor_char = seq.chars().nth(*offset).expect(&format!("Offset {} out of bounds in anchor {}", offset, item));
+
+            let query_char = read_bytes.get(*position).expect(&format!("Position {} out of bounds in query", position));
+            let anchor_char = seq.as_bytes().get(*offset).expect(&format!("Offset {} out of bounds in anchor {}", offset, item));
             if query_char != anchor_char{
                 info!("Mismatch at position {} for item {} offset {}", position, item, offset);
             }
-            // assert_eq!(query_char, anchor_char, "Mismatch at position {} for item {} offset {}", position, item, offset);
         } else if item.starts_with("E") {
             let edge_data = graph.edges.get(item).expect(&format!("Edge {} not found", item));
             let seq = edge_data.get("seq").and_then(|s| s.as_str()).expect(&format!("No seq for edge {}", item));
-            
-            let query_char = read_sequence.chars().nth(*position).expect(&format!("Position {} out of bounds in query", position));
-            let edge_char = seq.chars().nth(*offset).expect(&format!("Offset {} out of bounds in edge {}", offset, item));
+
+            let query_char = read_bytes.get(*position).expect(&format!("Position {} out of bounds in query", position));
+            let edge_char = seq.as_bytes().get(*offset).expect(&format!("Offset {} out of bounds in edge {}", offset, item));
             if query_char != edge_char{
                 info!("Mismatch at position {} for item {} offset {}", position, item, offset);
             }
-            // assert_eq!(query_char, edge_char, "Mismatch at position {} for item {} offset {}", position, item, offset);
         }
     }
 }
@@ -424,7 +420,7 @@ fn collect_methylation_updates(
                         .expect(&format!("No seq for anchor {}", item));
                     // Skip (don't abort) if the mapped base isn't a C. A single
                     // off-by-one or edge mismatch must not kill the whole run.
-                    if seq.chars().nth(*offset) != Some('C') {
+                    if seq.as_bytes().get(*offset) != Some(&b'C') {
                         continue;
                     }
                     updates.push(GraphMethylUpdate {
@@ -442,7 +438,7 @@ fn collect_methylation_updates(
                         .and_then(|s| s.as_str())
                         .expect(&format!("No seq for edge {}", item));
                     // Skip (don't abort) if the mapped base isn't a C.
-                    if seq.chars().nth(*offset) != Some('C') {
+                    if seq.as_bytes().get(*offset) != Some(&b'C') {
                         continue;
                     }
                     updates.push(GraphMethylUpdate {
@@ -462,44 +458,37 @@ fn collect_methylation_updates(
 }
 
 fn apply_methylation_updates(graph: &mut GraphicalGenome, updates: &[GraphMethylUpdate]) {
+    // Deduplicate once by (kind, item, read, offset) so we can drop the per-array
+    // linear `contains` scan that made application O(n^2) at high coverage.
+    let mut seen: HashSet<(bool, &str, &str, usize)> = HashSet::new();
     for update in updates {
-        if update.is_anchor {
-            if let Some(anchor_data) = graph.anchor.get_mut(&update.item) {
-                if !anchor_data.get("methyl").is_some() {
-                    anchor_data["methyl"] = json!({});
-                }
-                if let Some(methyl) = anchor_data.get_mut("methyl").and_then(|m| m.as_object_mut()) {
-                    if !methyl.contains_key(&update.read_name) {
-                        methyl.insert(update.read_name.clone(), json!([]));
-                    }
-                    if let Some(read_methyl) = methyl
-                        .get_mut(&update.read_name)
-                        .and_then(|rm| rm.as_array_mut())
-                    {
-                        let entry = json!([update.offset, update.likelihood]);
-                        if !read_methyl.contains(&entry) {
-                            read_methyl.push(entry);
-                        }
-                    }
-                }
-            }
-        } else if let Some(edge_data) = graph.edges.get_mut(&update.item) {
-            if !edge_data.get("methyl").is_some() {
-                edge_data["methyl"] = json!({});
-            }
-            if let Some(methyl) = edge_data.get_mut("methyl").and_then(|m| m.as_object_mut()) {
-                if !methyl.contains_key(&update.read_name) {
-                    methyl.insert(update.read_name.clone(), json!([]));
-                }
-                if let Some(read_methyl) = methyl
-                    .get_mut(&update.read_name)
-                    .and_then(|rm| rm.as_array_mut())
-                {
-                    let entry = json!([update.offset, update.likelihood]);
-                    if !read_methyl.contains(&entry) {
-                        read_methyl.push(entry);
-                    }
-                }
+        let key = (
+            update.is_anchor,
+            update.item.as_str(),
+            update.read_name.as_str(),
+            update.offset,
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        let container = if update.is_anchor {
+            graph.anchor.get_mut(&update.item)
+        } else {
+            graph.edges.get_mut(&update.item)
+        };
+        let Some(data) = container else { continue };
+        if !data.get("methyl").is_some() {
+            data["methyl"] = json!({});
+        }
+        if let Some(methyl) = data.get_mut("methyl").and_then(|m| m.as_object_mut()) {
+            methyl
+                .entry(update.read_name.clone())
+                .or_insert_with(|| json!([]));
+            if let Some(read_methyl) = methyl
+                .get_mut(&update.read_name)
+                .and_then(|rm| rm.as_array_mut())
+            {
+                read_methyl.push(json!([update.offset, update.likelihood]));
             }
         }
     }
@@ -527,17 +516,20 @@ fn process_bam_record(graph: &GraphicalGenome, r: &Record) -> (Option<ProcessedR
 
     let read_name = String::from_utf8_lossy(&r.qname()).to_string();
     let is_reverse = r.is_reverse();
+    // Decode the read sequence once and share it across the three steps below
+    // (previously each allocated its own copy).
+    let read_seq = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
 
     let t0 = Instant::now();
-    let read_position_mapping = find_mapping_position(graph, r);
+    let read_position_mapping = find_mapping_position(graph, r, &read_seq);
     timing.mapping_ns = t0.elapsed().as_nanos();
 
     let t0 = Instant::now();
-    validation(graph, &read_position_mapping, r);
+    validation(graph, &read_position_mapping, &read_seq);
     timing.validation_ns = t0.elapsed().as_nanos();
 
     let t0 = Instant::now();
-    let methyl_pos_dict = get_methylation_read(r, 'm');
+    let methyl_pos_dict = get_methylation_read(r, 'm', &read_seq);
     timing.methylation_ns = t0.elapsed().as_nanos();
 
     let t0 = Instant::now();
@@ -588,6 +580,8 @@ fn find_methylation_signal_on_major_haplotype(graph: &GraphicalGenome) -> HashMa
     let mut methyl: HashMap<(usize, usize, String), HashMap<String, f64>> = HashMap::new();
     let major_haplotype = construct_major_haplotype_entitylist(graph);
     let major_haplotype_sequence = construct_major_haplotype(graph);
+    // ASCII bytes for O(1) base lookups instead of chars().nth() over a ~16 kb string.
+    let haplotype_bytes = major_haplotype_sequence.as_bytes();
     let mut startpos = 0;
     
     let mut anchor_keys: Vec<_> = graph.anchor.keys().cloned().collect();
@@ -656,12 +650,10 @@ fn find_methylation_signal_on_major_haplotype(graph: &GraphicalGenome) -> HashMa
                 
                 let currentpos = startpos + pos;
                 let referencepos = reference_position_mapping.get(&pos).cloned();
-                if currentpos >= major_haplotype_sequence.len() || 
-                   major_haplotype_sequence.chars().nth(currentpos).unwrap() != 'C' {
+                if haplotype_bytes.get(currentpos) != Some(&b'C') {
                     continue;
                 }
-                if currentpos + 1 >= major_haplotype_sequence.len() || 
-                   major_haplotype_sequence.chars().nth(currentpos + 1).unwrap() != 'G' {
+                if haplotype_bytes.get(currentpos + 1) != Some(&b'G') {
                     continue;
                 }
 

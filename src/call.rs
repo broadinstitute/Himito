@@ -824,6 +824,7 @@ fn filter_strand_bias(
 fn permutation_test(
     matrix: &Array2<f64>,
     p_value_threshold: f64,
+    heteroplasmic_error_threshold:f64,
     permutation_round: usize,
     filtered_var: &Vec<Variant>,
     coverage: &HashMap<usize, usize>,
@@ -841,7 +842,7 @@ fn permutation_test(
         // let frequency = row.sum() / row.len() as f64;
         let frequency = current_variant.allele_count as f64 / *coverage.get(&current_variant.pos).unwrap() as f64;
 
-        if frequency > permutation_frequency_threshold {
+        if frequency > heteroplasmic_error_threshold {
             return (Ok(i), None);
         }
         // exclude large indel
@@ -850,7 +851,6 @@ fn permutation_test(
         }
 
         let variant = filtered_var[i].clone();
-        let pos = variant.pos;
         let ref_allele = variant.ref_allele;
         let alt_allele = variant.alt_allele;
 
@@ -931,18 +931,20 @@ pub fn resolve_thresholds(
     data_type: &str,
     p_value_threshold: Option<f64>,
     frequency_threshold: Option<f64>,
-) -> (f64, f64) {
-    let (default_p, default_f) = if data_type == "ont-r9" {
-        (0.0001, 0.5)
+    permutation_frequency_threshold: Option<f64>,
+) -> (f64, f64, f64) {
+    let (default_p, default_f, default_perm) = if data_type == "ont-r9" {
+        (0.0001, 0.5, 0.7)
     } else if data_type == "ont-r10" {
-        (0.01, 0.5)
+        (0.01, 0.2, 0.7)
     } else {
-        (0.01, 0.5)
+        (0.01, 0.2, 0.8)
     };
 
     (
         p_value_threshold.unwrap_or(default_p),
         frequency_threshold.unwrap_or(default_f),
+        permutation_frequency_threshold.unwrap_or(default_perm),
     )
 }
 
@@ -992,7 +994,7 @@ pub fn start(
     // } else {
     //     (0.001, 0.2)    // PacBio: original thresholds
     // };
-    let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&matrix, p_value_threshold, 100, &var_record, &coverage, permutation_frequency_threshold, data_type);
+    let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&matrix, p_value_threshold, heteroplasmic_frequency_threshold, 100, &var_record, &coverage, permutation_frequency_threshold, data_type);
 
     // strand-bias filter: drop variants whose alt reads are strand-skewed relative to the
     // library composition (only when a BAM is provided so per-read strand is available)

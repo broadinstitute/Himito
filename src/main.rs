@@ -100,8 +100,8 @@ enum Commands {
         indel_false_threshold: f64,
 
         /// heteroplasmic frequency threshold for permutation test 
-        #[clap(long, value_parser, default_value_t = 0.8)]
-        permutation_frequency_threshold: f64,
+        #[clap(long, value_parser )]
+        permutation_frequency_threshold: Option<f64>,
 
     },
 
@@ -245,9 +245,9 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.1)]
         indel_false_threshold: f64,
 
-        /// heteroplasmic frequency threshold for permutation test (optional, preset by data-type,higher is more stringent)
-        #[clap(long, value_parser, default_value_t = 0.8)]
-        permutation_frequency_threshold: f64,
+        /// heteroplasmic frequency threshold for permutation test (optional, preset by data-type)
+        #[clap(long, value_parser)]
+        permutation_frequency_threshold: Option<f64>,
     },
 
     /// Extract Major Haplotype as Fasta file from Graph
@@ -370,8 +370,8 @@ fn main() {
             indel_false_threshold,
             permutation_frequency_threshold,
         } => {
-            let (p_value_threshold, frequency_threshold) =
-                call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold);
+            let (p_value_threshold, frequency_threshold, permutation_frequency_threshold_) =
+                call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold, permutation_frequency_threshold);
             let mt_output = output_prefix.with_extension("mt.bam");
             let numts_output = output_prefix.with_extension("numts.bam");
             let _ = filter::start(
@@ -406,7 +406,7 @@ fn main() {
                 Some(&mt_output),
                 strand_bias_threshold,
                 indel_false_threshold,
-                permutation_frequency_threshold,
+                permutation_frequency_threshold_,
             );
             let annotated_graph_output = output_prefix.with_extension("gfa");
             let methyl_output = output_prefix.with_extension("bed");
@@ -471,8 +471,8 @@ fn main() {
             indel_false_threshold,
             permutation_frequency_threshold,
         } => {
-            let (p_value_threshold, frequency_threshold) =
-                call::resolve_thresholds(&data_type, p_value_threshold, frequency_threshold);
+            let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
+                call::resolve_thresholds(&data_type, p_value_threshold, frequency_threshold, permutation_frequency_threshold);
             call::start(
                 &graphfile,
                 &reference_fasta,

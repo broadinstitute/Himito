@@ -66,7 +66,7 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ./target/release/Himito minorhap -g <output.gfa> -o <output.allhaplotype.fasta> -s <sample_id>
 ```
 
-### Jan 20th 2026 Updates: NUMTs Breakpoint Calling
+### Jan 20th 2026 Updates: NUMTs Breakpoint Calling (Under-construction)
 
 Himito can identify and call NUMTs (Nuclear Mitochondrial DNA segments) breakpoints from long-read BAM files. NUMTs are segments of mitochondrial DNA that have been inserted into the nuclear genome. The NUMTs calling functionality (`callnumts.rs`) works by:
 

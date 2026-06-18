@@ -8,6 +8,46 @@ use std::collections::{HashMap, HashSet};
 use serde_json::json;
 use std::error::Error;
 use csv::Writer;
+use rayon::prelude::*;
+use std::sync::Arc;
+use std::time::Instant;
+use indicatif::ProgressBar;
+use log::{info, warn};
+
+#[derive(Default, Clone)]
+struct RecordTiming {
+    mapping_ns: u128,
+    validation_ns: u128,
+    methylation_ns: u128,
+    aligned_pairs_ns: u128,
+    graph_collect_ns: u128,
+}
+
+impl RecordTiming {
+    fn merge(&mut self, other: &RecordTiming) {
+        self.mapping_ns += other.mapping_ns;
+        self.validation_ns += other.validation_ns;
+        self.methylation_ns += other.methylation_ns;
+        self.aligned_pairs_ns += other.aligned_pairs_ns;
+        self.graph_collect_ns += other.graph_collect_ns;
+    }
+}
+
+#[derive(Clone)]
+struct GraphMethylUpdate {
+    item: String,
+    is_anchor: bool,
+    read_name: String,
+    offset: usize,
+    likelihood: f32,
+}
+
+struct ProcessedRead {
+    read_name: String,
+    is_reverse: bool,
+    methyl_single_read: HashMap<usize, Vec<f32>>,
+    graph_updates: Vec<GraphMethylUpdate>,
+}
 
 pub fn find_path_on_graph(graph: &GraphicalGenome, read_name: &str) -> Vec<String> {
     let mut node = "SOURCE".to_string();
@@ -62,15 +102,8 @@ pub fn find_path_on_graph(graph: &GraphicalGenome, read_name: &str) -> Vec<Strin
     
     path_items
 }
-pub fn find_mapping_position(graph:&GraphicalGenome, r: &Record) -> HashMap<usize, (String, usize)> {
+pub fn find_mapping_position(graph:&GraphicalGenome, r: &Record, forward_contig: &str) -> HashMap<usize, (String, usize)> {
     let read_name = String::from_utf8_lossy(&r.qname()).to_string();
-    // Get forward sequence
-    // let forward_contig = if r.is_reverse() {
-    //     reverse_complement(&String::from_utf8_lossy(&r.seq().as_bytes()).to_string())
-    // } else {
-    //     String::from_utf8_lossy(&r.seq().as_bytes()).to_string()
-    // };
-    let forward_contig = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
     let path_items = find_path_on_graph(&graph, &read_name);
     let mut anchor_list = Vec::new();
     for item in path_items.iter(){
@@ -107,8 +140,10 @@ pub fn find_mapping_position(graph:&GraphicalGenome, r: &Record) -> HashMap<usiz
     }
 
     // Find positions of anchor sequences in the read
-    if forward_contig.len() > k {
-        for i in 1..(forward_contig.len() - k + 1) {
+    // Start at 0 so a k-mer at the very start of the read is not missed, and use
+    // >= k so a read exactly one anchor long is still scanned.
+    if forward_contig.len() >= k && k > 0 {
+        for i in 0..(forward_contig.len() - k + 1) {
             if let Some(kmer) = forward_contig.get(i..i+k) {
                 if position_dict.contains_key(kmer) {
                     position_dict.entry(kmer.to_string())
@@ -227,17 +262,9 @@ pub fn find_mapping_position(graph:&GraphicalGenome, r: &Record) -> HashMap<usiz
 
 }
 
-pub fn get_methylation_read(r: &Record, mod_char: char) -> HashMap<usize, f32> {
+pub fn get_methylation_read(r: &Record, mod_char: char, forward_sequence: &str) -> HashMap<usize, f32> {
     let mut methyl_pos_dict: HashMap<usize, f32> = HashMap::new();
-    
-    // Get forward sequence
-    // let forward_sequence = if r.is_reverse() {
-    //     reverse_complement(&String::from_utf8_lossy(&r.seq().as_bytes()).to_string())
-    // } else {
-    //     String::from_utf8_lossy(&r.seq().as_bytes()).to_string()
-    // };
-    let forward_sequence = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
-    
+
     // Check for modification data
     if let Ok(mods) = r.basemods_iter() {
         // Iterate over the modification types
@@ -274,7 +301,7 @@ pub fn get_methylation_read(r: &Record, mod_char: char) -> HashMap<usize, f32> {
                     }
                     
                 }else{
-                    println!("{},{},{}", pos_usize, qual, motif);
+                    info!("{},{},{}", pos_usize, qual, motif);
                     continue
                 }
 
@@ -286,29 +313,28 @@ pub fn get_methylation_read(r: &Record, mod_char: char) -> HashMap<usize, f32> {
     methyl_pos_dict
 }
 
-pub fn validation(graph: &GraphicalGenome, read_position_mapping:&HashMap<usize, (String, usize)>, r:&Record){
-    let read_sequence = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
+pub fn validation(graph: &GraphicalGenome, read_position_mapping:&HashMap<usize, (String, usize)>, read_sequence: &str){
+    // DNA is ASCII, so index bytes directly instead of the O(n) chars().nth() scan.
+    let read_bytes = read_sequence.as_bytes();
     for (position, (item, offset)) in read_position_mapping {
         if item.starts_with("A") {
             let anchor_data = graph.anchor.get(item).expect(&format!("Anchor {} not found", item));
             let seq = anchor_data.get("seq").and_then(|s| s.as_str()).expect(&format!("No seq for anchor {}", item));
-            
-            let query_char = read_sequence.chars().nth(*position).expect(&format!("Position {} out of bounds in query", position));
-            let anchor_char = seq.chars().nth(*offset).expect(&format!("Offset {} out of bounds in anchor {}", offset, item));
+
+            let query_char = read_bytes.get(*position).expect(&format!("Position {} out of bounds in query", position));
+            let anchor_char = seq.as_bytes().get(*offset).expect(&format!("Offset {} out of bounds in anchor {}", offset, item));
             if query_char != anchor_char{
-                println!("Mismatch at position {} for item {} offset {}", position, item, offset);
+                info!("Mismatch at position {} for item {} offset {}", position, item, offset);
             }
-            // assert_eq!(query_char, anchor_char, "Mismatch at position {} for item {} offset {}", position, item, offset);
         } else if item.starts_with("E") {
             let edge_data = graph.edges.get(item).expect(&format!("Edge {} not found", item));
             let seq = edge_data.get("seq").and_then(|s| s.as_str()).expect(&format!("No seq for edge {}", item));
-            
-            let query_char = read_sequence.chars().nth(*position).expect(&format!("Position {} out of bounds in query", position));
-            let edge_char = seq.chars().nth(*offset).expect(&format!("Offset {} out of bounds in edge {}", offset, item));
+
+            let query_char = read_bytes.get(*position).expect(&format!("Position {} out of bounds in query", position));
+            let edge_char = seq.as_bytes().get(*offset).expect(&format!("Offset {} out of bounds in edge {}", offset, item));
             if query_char != edge_char{
-                println!("Mismatch at position {} for item {} offset {}", position, item, offset);
+                info!("Mismatch at position {} for item {} offset {}", position, item, offset);
             }
-            // assert_eq!(query_char, edge_char, "Mismatch at position {} for item {} offset {}", position, item, offset);
         }
     }
 }
@@ -356,7 +382,9 @@ pub fn get_reference_coordinates(cigar: &str, ref_start: usize) -> HashMap<usize
                 alt_pos += length;
             },
             'I' => {  // Insertion
-                let pos = ref_start + ref_pos - 1;  // Mapping to one base pair before
+                // Map to one base pair before; guard against underflow when the
+                // alt sequence begins with an insertion at reference start 0.
+                let pos = (ref_start + ref_pos).saturating_sub(1);
                 for i in 0..length {
                     position_mapping.insert(alt_pos + i, pos);
                 }
@@ -375,80 +403,185 @@ pub fn get_reference_coordinates(cigar: &str, ref_start: usize) -> HashMap<usize
     position_mapping
 }
 
-pub fn add_methylation_to_graph(
-    graph: &mut GraphicalGenome, 
-    methyl_pos_dict: &HashMap<usize, f32>, 
-    mapping_position: &HashMap<usize, (String, usize)>, 
-    read_name: &str
-) {
+fn collect_methylation_updates(
+    graph: &GraphicalGenome,
+    methyl_pos_dict: &HashMap<usize, f32>,
+    mapping_position: &HashMap<usize, (String, usize)>,
+    read_name: &str,
+) -> Vec<GraphMethylUpdate> {
+    let mut updates = Vec::new();
     for (pos, likelihood) in methyl_pos_dict {
         if let Some((item, offset)) = mapping_position.get(pos) {
             if item.starts_with("A") {
-                if let Some(anchor_data) = graph.anchor.get_mut(item) {
-                    // Assert for debugging
-                    let seq = anchor_data.get("seq")
+                if let Some(anchor_data) = graph.anchor.get(item) {
+                    let seq = anchor_data
+                        .get("seq")
                         .and_then(|s| s.as_str())
                         .expect(&format!("No seq for anchor {}", item));
-                    let c = seq.chars().nth(*offset)
-                        .expect(&format!("Offset {} out of bounds in anchor {}", offset, item));
-                    assert_eq!(c, 'C', "Expected C at position {} in anchor {}, found {}", offset, item, c);
-                    
-                    // Update methylation data
-                    if !anchor_data.get("methyl").is_some() {
-                        anchor_data["methyl"] = json!({});
+                    // Skip (don't abort) if the mapped base isn't a C. A single
+                    // off-by-one or edge mismatch must not kill the whole run.
+                    if seq.as_bytes().get(*offset) != Some(&b'C') {
+                        continue;
                     }
-                    
-                    if let Some(methyl) = anchor_data.get_mut("methyl").and_then(|m| m.as_object_mut()) {
-                        if !methyl.contains_key(read_name) {
-                            methyl.insert(read_name.to_string(), json!([]));
-                        }
-                        
-                        if let Some(read_methyl) = methyl.get_mut(read_name).and_then(|rm| rm.as_array_mut()) {
-                            if !read_methyl.contains(&json!([offset, likelihood])){
-                                read_methyl.push(json!([offset, likelihood]));
-                            }
-                            
-                        }
-                    }
+                    updates.push(GraphMethylUpdate {
+                        item: item.clone(),
+                        is_anchor: true,
+                        read_name: read_name.to_string(),
+                        offset: *offset,
+                        likelihood: *likelihood,
+                    });
                 }
             } else if item.starts_with("E") {
-                if let Some(edge_data) = graph.edges.get_mut(item) {
-                    // Assert for debugging
-                    let seq = edge_data.get("seq")
+                if let Some(edge_data) = graph.edges.get(item) {
+                    let seq = edge_data
+                        .get("seq")
                         .and_then(|s| s.as_str())
                         .expect(&format!("No seq for edge {}", item));
-                    let c = seq.chars().nth(*offset)
-                        .expect(&format!("Offset {} out of bounds in edge {}", offset, item));
-                    assert_eq!(c, 'C', "Expected C at position {} in edge {}, found {}", offset, item, c);
-                    
-                    // Update methylation data
-                    if !edge_data.get("methyl").is_some() {
-                        edge_data["methyl"] = json!({});
+                    // Skip (don't abort) if the mapped base isn't a C.
+                    if seq.as_bytes().get(*offset) != Some(&b'C') {
+                        continue;
                     }
-                    
-                    if let Some(methyl) = edge_data.get_mut("methyl").and_then(|m| m.as_object_mut()) {
-                        if !methyl.contains_key(read_name) {
-                            methyl.insert(read_name.to_string(), json!([]));
-                        }
-                        
-                        if let Some(read_methyl) = methyl.get_mut(read_name).and_then(|rm| rm.as_array_mut()) {
-                            if !read_methyl.contains(&json!([offset, likelihood])){
-                                read_methyl.push(json!([offset, likelihood]));
-                            }
-                        }
-                    }
+                    updates.push(GraphMethylUpdate {
+                        item: item.clone(),
+                        is_anchor: false,
+                        read_name: read_name.to_string(),
+                        offset: *offset,
+                        likelihood: *likelihood,
+                    });
                 }
             } else {
-                println!("{}, {}", item, pos);
+                info!("{}, {}", item, pos);
             }
         }
     }
+    updates
+}
+
+fn apply_methylation_updates(graph: &mut GraphicalGenome, updates: &[GraphMethylUpdate]) {
+    // Deduplicate once by (kind, item, read, offset) so we can drop the per-array
+    // linear `contains` scan that made application O(n^2) at high coverage.
+    let mut seen: HashSet<(bool, &str, &str, usize)> = HashSet::new();
+    for update in updates {
+        let key = (
+            update.is_anchor,
+            update.item.as_str(),
+            update.read_name.as_str(),
+            update.offset,
+        );
+        if !seen.insert(key) {
+            continue;
+        }
+        let container = if update.is_anchor {
+            graph.anchor.get_mut(&update.item)
+        } else {
+            graph.edges.get_mut(&update.item)
+        };
+        let Some(data) = container else { continue };
+        if !data.get("methyl").is_some() {
+            data["methyl"] = json!({});
+        }
+        if let Some(methyl) = data.get_mut("methyl").and_then(|m| m.as_object_mut()) {
+            methyl
+                .entry(update.read_name.clone())
+                .or_insert_with(|| json!([]));
+            if let Some(read_methyl) = methyl
+                .get_mut(&update.read_name)
+                .and_then(|rm| rm.as_array_mut())
+            {
+                read_methyl.push(json!([update.offset, update.likelihood]));
+            }
+        }
+    }
+}
+
+pub fn add_methylation_to_graph(
+    graph: &mut GraphicalGenome,
+    methyl_pos_dict: &HashMap<usize, f32>,
+    mapping_position: &HashMap<usize, (String, usize)>,
+    read_name: &str,
+) {
+    let updates = collect_methylation_updates(graph, methyl_pos_dict, mapping_position, read_name);
+    apply_methylation_updates(graph, &updates);
+}
+
+fn process_bam_record(graph: &GraphicalGenome, r: &Record) -> (Option<ProcessedRead>, RecordTiming) {
+    let mut timing = RecordTiming::default();
+
+    // Skip unmapped, supplementary, and secondary alignments. Secondary records
+    // share the primary read's qname (double-counting methylation) and may carry
+    // an empty SEQ field.
+    if r.is_unmapped() || r.is_supplementary() || r.is_secondary() {
+        return (None, timing);
+    }
+
+    let read_name = String::from_utf8_lossy(&r.qname()).to_string();
+    let is_reverse = r.is_reverse();
+    // Decode the read sequence once and share it across the three steps below
+    // (previously each allocated its own copy).
+    let read_seq = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
+
+    let t0 = Instant::now();
+    let read_position_mapping = find_mapping_position(graph, r, &read_seq);
+    timing.mapping_ns = t0.elapsed().as_nanos();
+
+    let t0 = Instant::now();
+    validation(graph, &read_position_mapping, &read_seq);
+    timing.validation_ns = t0.elapsed().as_nanos();
+
+    let t0 = Instant::now();
+    let methyl_pos_dict = get_methylation_read(r, 'm', &read_seq);
+    timing.methylation_ns = t0.elapsed().as_nanos();
+
+    let t0 = Instant::now();
+    let aligned_pairs: HashMap<usize, usize> = r
+        .aligned_pairs_full()
+        .into_iter()
+        .filter_map(|pair| match pair {
+            [Some(q), Some(ref_pos)] => Some((q as usize, ref_pos as usize)),
+            _ => None,
+        })
+        .collect();
+    timing.aligned_pairs_ns = t0.elapsed().as_nanos();
+
+    let mut methyl_single_read: HashMap<usize, Vec<f32>> = HashMap::new();
+    for (read_pos, likelihood) in methyl_pos_dict.iter() {
+        if let Some(&ref_pos) = aligned_pairs.get(read_pos) {
+            methyl_single_read
+                .entry(ref_pos)
+                .or_insert_with(Vec::new)
+                .push(*likelihood);
+        }
+    }
+
+    let mut graph_updates = Vec::new();
+    if !read_position_mapping.is_empty() && !methyl_pos_dict.is_empty() {
+        let t0 = Instant::now();
+        graph_updates = collect_methylation_updates(
+            graph,
+            &methyl_pos_dict,
+            &read_position_mapping,
+            &read_name,
+        );
+        timing.graph_collect_ns = t0.elapsed().as_nanos();
+    }
+
+    (
+        Some(ProcessedRead {
+            read_name,
+            is_reverse,
+            methyl_single_read,
+            graph_updates,
+        }),
+        timing,
+    )
 }
 
 fn find_methylation_signal_on_major_haplotype(graph: &GraphicalGenome) -> HashMap<(usize, usize, String), HashMap<String, f64>> {
     let mut methyl: HashMap<(usize, usize, String), HashMap<String, f64>> = HashMap::new();
     let major_haplotype = construct_major_haplotype_entitylist(graph);
     let major_haplotype_sequence = construct_major_haplotype(graph);
+    // ASCII bytes for O(1) base lookups instead of chars().nth() over a ~16 kb string.
+    let haplotype_bytes = major_haplotype_sequence.as_bytes();
     let mut startpos = 0;
     
     let mut anchor_keys: Vec<_> = graph.anchor.keys().cloned().collect();
@@ -517,12 +650,10 @@ fn find_methylation_signal_on_major_haplotype(graph: &GraphicalGenome) -> HashMa
                 
                 let currentpos = startpos + pos;
                 let referencepos = reference_position_mapping.get(&pos).cloned();
-                if currentpos >= major_haplotype_sequence.len() || 
-                   major_haplotype_sequence.chars().nth(currentpos).unwrap() != 'C' {
+                if haplotype_bytes.get(currentpos) != Some(&b'C') {
                     continue;
                 }
-                if currentpos + 1 >= major_haplotype_sequence.len() || 
-                   major_haplotype_sequence.chars().nth(currentpos + 1).unwrap() != 'G' {
+                if haplotype_bytes.get(currentpos + 1) != Some(&b'G') {
                     continue;
                 }
 
@@ -605,22 +736,24 @@ fn write_methylation_to_csv<P: AsRef<Path>>(
     let file = File::create(path)?;
     let mut writer = Writer::from_writer(file);
 
-    // find all the readsets and positions
-    let mut refpos_list = Vec::new();
+    // find all the readsets and positions. Deduplicate reference positions: insertions
+    // map several assembly positions to the same refpos, so a plain push would create
+    // duplicate (all-zero) matrix rows and collapse distinct CpGs onto one row.
+    let mut refpos_set = HashSet::new();
     let mut read_set = HashSet::new();
-    for ((pos, refpos, motif), d) in methyl.iter() {
-        refpos_list.push(refpos);
-        for (read_name, &likelihood) in d.iter() {
+    for ((_pos, refpos, _motif), d) in methyl.iter() {
+        refpos_set.insert(*refpos);
+        for (read_name, &_likelihood) in d.iter() {
             read_set.insert(read_name.clone());
         }
     }
+    let mut refpos_list: Vec<usize> = refpos_set.into_iter().collect();
     refpos_list.sort();
-    // println!("{}", refpos_list.len());
 
     let ref_pos_dict: HashMap<usize, usize> = refpos_list
         .iter()
         .enumerate()
-        .map(|(i, rpos)| (**rpos, i))
+        .map(|(i, rpos)| (*rpos, i))
         .collect();
 
     let mut read_vec: Vec<String> = read_set.into_iter().collect();
@@ -633,8 +766,8 @@ fn write_methylation_to_csv<P: AsRef<Path>>(
 
     // construct matrix
     let mut matrix = Array2::<f64>::zeros((refpos_list.len(), read_vec.len()));
-    for ((pos, refpos, motif), d) in methyl.iter() {
-        let row_index = ref_pos_dict.get(&refpos).unwrap();
+    for ((_pos, refpos, _motif), d) in methyl.iter() {
+        let row_index = ref_pos_dict.get(refpos).unwrap();
         for (read_name, &likelihood) in d.iter() {
             let col_index = read_set_dict.get(read_name).unwrap();
             // matrix[[*row_index, *col_index]] = likelihood;
@@ -671,7 +804,7 @@ fn write_methylation_to_csv<P: AsRef<Path>>(
 
 fn write_methylation_alignment_to_csv<P: AsRef<Path>>(
     methyl: HashMap<String, HashMap<usize, Vec<f32>>>,
-    min_prob:f32,
+    _min_prob:f32,
     strand_dict: HashMap<String, bool>,
     path: P,
     fraction_threshold:f64
@@ -686,8 +819,8 @@ fn write_methylation_alignment_to_csv<P: AsRef<Path>>(
     let mut coverage_dict:HashMap<usize, usize> = HashMap::new();
     for (read_name, d) in methyl.iter() {
         read_set.insert(read_name.clone());
-        let strand = strand_dict.get(read_name).unwrap_or(&false);
-        for (refpos, likelihood) in d.iter() {
+        let _strand = strand_dict.get(read_name).unwrap_or(&false);
+        for (refpos, _likelihood) in d.iter() {
             refposlist.insert(refpos.clone());
             let count = coverage_dict.get(&refpos).unwrap_or(&0) + 1;
             coverage_dict.insert(*refpos, count);
@@ -701,7 +834,6 @@ fn write_methylation_alignment_to_csv<P: AsRef<Path>>(
         }
     }
     refpos_list.sort();
-    // println!("{}", refpos_list.len());
 
     let ref_pos_dict: HashMap<usize, usize> = refpos_list
         .iter()
@@ -716,33 +848,25 @@ fn write_methylation_alignment_to_csv<P: AsRef<Path>>(
         .enumerate()
         .map(|(i, read)| (read.clone(), i))
         .collect();
-    println!("read number {}, position number, {}", read_vec.len(),refpos_list.len());
-    // construct matrix
-    let mut matrix = Array2::<f64>::zeros((refpos_list.len(), read_vec.len()));
-    println!("{:?}", matrix.shape());
+    info!("read number {}, position number, {}", read_vec.len(), refpos_list.len());
+
+    // NaN sentinel = position not covered by this read; actual [0,1] likelihood stored otherwise
+    let mut matrix = Array2::<f64>::from_elem((refpos_list.len(), read_vec.len()), f64::NAN);
     for (read_name, d) in methyl.iter() {
         let col_index = read_set_dict.get(read_name).unwrap();
-        // let strand = strand_dict.get(read_name).unwrap_or(&false);
         for (refpos, likelihood) in d.iter() {
             if !ref_pos_dict.contains_key(&refpos){
                 continue
             }
             let row_index = ref_pos_dict.get(&refpos).unwrap();
-            // matrix[[*row_index, *col_index]] = likelihood;
-            if likelihood.len() > 1{
-                println!("{}, {}, {:?}", refpos, read_name, likelihood);
+            if likelihood.len() > 1 {
+                info!("{}, {}, {:?}", refpos, read_name, likelihood);
                 continue
             }
-            let likelihood_value = likelihood[0];
-    
-            if likelihood_value > min_prob {
-                matrix[[*row_index, *col_index]] = 1.0;
-            }else if likelihood_value < 1.0-min_prob {
-                matrix[[*row_index, *col_index]] = -1.0;
-            }
+            matrix[[*row_index, *col_index]] = likelihood[0] as f64;
         }
-        
     }
+
     // Prepare header row (with empty cell for the corner)
     let mut header = vec!["methylation".to_string()];
     header.extend(read_vec.iter().cloned());
@@ -754,9 +878,14 @@ fn write_methylation_alignment_to_csv<P: AsRef<Path>>(
     for (row_idx, refpos_name) in refpos_list.iter().enumerate() {
         let mut row = vec![refpos_name.to_string().clone()];
         
-        // Add the values from the matrix
+        // Add the values from the matrix: empty string for uncovered, 2-decimal float otherwise
         for col_idx in 0..matrix.ncols() {
-            row.push(matrix[[row_idx, col_idx]].to_string());
+            let v = matrix[[row_idx, col_idx]];
+            if v.is_nan() {
+                row.push("".to_string());
+            } else {
+                row.push(format!("{:.2}", v));
+            }
         }
         
         writer.write_record(&row)?;
@@ -768,72 +897,74 @@ fn write_methylation_alignment_to_csv<P: AsRef<Path>>(
 }
 
 pub fn start (graph_file: &PathBuf, bam_file: &PathBuf, output_file: &PathBuf, min_prob: f64, major_haploype: bool) {
-    println!("Add Methylation Signals!");
+    info!("Add Methylation Signals!");
     // annotate graph
-    println!("Annotated graph output: {}", graph_file.display());
-    let mut graph = GraphicalGenome::load_graph(graph_file).unwrap();
-    println!("Processing BAM file");
+    info!("Annotated graph output: {}", graph_file.display());
+    let graph = GraphicalGenome::load_graph(graph_file).unwrap();
+    info!("Processing BAM file");
     let mut bam = Reader::from_path(bam_file).unwrap();
+
+    let collect_start = Instant::now();
+    let records: Vec<Record> = bam
+        .records()
+        .map(|record| record.expect("Failed to read BAM record"))
+        .collect();
+    let bam_collect_ms = collect_start.elapsed().as_millis();
+
+    let graph_arc = Arc::new(graph);
+    let parallel_start = Instant::now();
+    let bar = ProgressBar::new(records.len() as u64);
+    let (processed_reads, aggregate_timing, skip_counts) = records
+        .par_iter()
+        .map(|r| {
+            bar.inc(1);
+            let (processed, timing) = process_bam_record(&graph_arc, r);
+            let skipped_unmapped = r.is_unmapped() as u64;
+            let skipped_supplementary = r.is_supplementary() as u64;
+            (processed, timing, skipped_unmapped, skipped_supplementary)
+        })
+        .fold(
+            || (Vec::new(), RecordTiming::default(), (0u64, 0u64)),
+            |mut acc, (processed, timing, unmapped, supp)| {
+                acc.1.merge(&timing);
+                acc.2.0 += unmapped;
+                acc.2.1 += supp;
+                if let Some(read) = processed {
+                    acc.0.push(read);
+                }
+                acc
+            },
+        )
+        .reduce(
+            || (Vec::new(), RecordTiming::default(), (0u64, 0u64)),
+            |mut a, b| {
+                a.0.extend(b.0);
+                a.1.merge(&b.1);
+                a.2.0 += b.2.0;
+                a.2.1 += b.2.1;
+                a
+            },
+        );
+    let parallel_process_ms = parallel_start.elapsed().as_millis();
+    bar.finish();
+    let mut graph = Arc::try_unwrap(graph_arc).unwrap_or_else(|arc| (*arc).clone());
     let mut read_name_set = HashSet::new();
-    let mut methyl_single_read: HashMap<String,HashMap<usize, Vec<f32>> >= HashMap::new(); // extract directly from reference map
-    let mut strand_dict:HashMap<String, bool> = HashMap::new();
-    for record in bam.records(){
-        let r = record.expect("Failed to read BAM record");
-        // let mut read_sequence = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
-        // if r.is_reverse(){
-        //     read_sequence = reverse_complement(&read_sequence);
-        // }
-        if r.is_unmapped(){
-            continue
-        }
-        if r.is_supplementary(){
-            continue
-        }
-        let read_name = String::from_utf8_lossy(&r.qname()).to_string();
-        // if read_name_set.contains(&read_name) {
-        //     continue
-        // }
-        strand_dict.insert(read_name.clone(), r.is_reverse());
-        read_name_set.insert(read_name.clone());
-        let read_position_mapping = find_mapping_position(&graph, &r);
-        // Validate read_position_mapping
-        validation(&graph, &read_position_mapping, &r);
-        let methyl_pos_dict = get_methylation_read(&r, 'm');
-        
-        // map to reference coordinates
-        let aligned_pairs:HashMap<usize, usize> = r.aligned_pairs_full()
-                                .into_iter()
-                                .filter_map(|pair| {
-                                // Only include pairs where both positions are defined
-                                match pair {
-                                    [Some(q), Some(r)] => Some((q as usize, r as usize)),
-                                    _ => None
-                                }
-                            })
-                            .collect();
+    let mut methyl_single_read: HashMap<String, HashMap<usize, Vec<f32>>> = HashMap::new();
+    let mut strand_dict: HashMap<String, bool> = HashMap::new();
+    let mut all_graph_updates = Vec::new();
 
-        for (read_pos, likelihood) in methyl_pos_dict.iter(){
-            if aligned_pairs.contains_key(read_pos){
-                let ref_pos = aligned_pairs.get(read_pos).copied().unwrap_or(0);
-                methyl_single_read
-                                    .entry(read_name.clone())
-                                    .or_insert_with(HashMap::new)
-                                    .entry(ref_pos)
-                                    .or_insert_with(Vec::new)
-                                    .push(*likelihood);
-            }
-
+    let merge_start = Instant::now();
+    for read in processed_reads {
+        read_name_set.insert(read.read_name.clone());
+        strand_dict.insert(read.read_name.clone(), read.is_reverse);
+        if !read.methyl_single_read.is_empty() {
+            methyl_single_read.insert(read.read_name.clone(), read.methyl_single_read);
         }
-
-        if read_position_mapping.len() == 0 {
-            continue
-        }
-        if methyl_pos_dict.len() == 0 {
-            continue
-        }
-        // println!("{}", read_position_mapping.len());
-        add_methylation_to_graph(&mut graph, &methyl_pos_dict, &read_position_mapping, &read_name);  
+        all_graph_updates.extend(read.graph_updates);
     }
+    apply_methylation_updates(&mut graph, &all_graph_updates);
+    let merge_ms = merge_start.elapsed().as_millis();
+
     let graph_output = output_file.with_extension("methyl.gfa");
     let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph);
     
@@ -851,7 +982,5 @@ pub fn start (graph_file: &PathBuf, bam_file: &PathBuf, output_file: &PathBuf, m
         let _ = write_methylation_alignment_to_csv(methyl_single_read, min_prob as f32, strand_dict, matrix_output, 0.1);
 
     }
-    
-    
 
 }

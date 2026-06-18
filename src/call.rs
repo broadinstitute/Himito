@@ -13,10 +13,11 @@ use csv::Writer;
 use ndarray::{Array1, Array2, Axis, s};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use statrs::distribution::{Normal, ContinuousCDF};
+use statrs::distribution::{Normal, ContinuousCDF, Binomial, DiscreteCDF};
 use regex::Regex;
 use adjustp::{adjust, Procedure};
 use bio::io::fasta::{Reader, Record};
+use rust_htslib::bam::{Read as HtsRead, Reader as BamReader};
 
 #[derive(Debug, Clone)]
 pub struct Variant {
@@ -313,7 +314,7 @@ fn collapse_identical_records(variants: Vec<Variant>, ref_length: usize) -> Vec<
         .collect()
 }
 
-fn format_vcf_record(variant: &Variant, coverage: HashMap<usize, usize>) -> String {
+fn format_vcf_record(variant: &Variant, coverage: HashMap<usize, usize>, indel_false_threshold: f64) -> String {
     // Add AC (allele count) to INFO field
     let read_depth = coverage.get(&variant.pos).unwrap_or(&0);
     let allele_frequency = if *read_depth == 0 {
@@ -326,25 +327,33 @@ fn format_vcf_record(variant: &Variant, coverage: HashMap<usize, usize>) -> Stri
     let format: String = format!("GT:AD:HF");
     let genotype: String = format!("1");
     let sample: String = format!("{}:{}:{}", genotype, variant.allele_count, allele_frequency);
-    
-    
+
+    let indel_len = (variant.ref_allele.len() as i32 - variant.alt_allele.len() as i32).abs();
+    let is_small_indel = variant.variant_type != "SNP" && indel_len < 5;
+    let filter = if is_small_indel && allele_frequency < indel_false_threshold as f32 {
+        "Potential_Artifact"
+    } else {
+        "PASS"
+    };
+
     match variant.variant_type.as_str() {
         "SNP" => format!(
-            "chrM\t{}\t.\t{}\t{}\t.\t.\t{}\t{}\t{}",
+            "chrM\t{}\t.\t{}\t{}\t.\t{}\t{}\t{}\t{}",
             variant.pos + 1,
             variant.ref_allele,
             variant.alt_allele,
+            filter,
             info,
             format,
             sample
         ),
         "INS" => format!(
-            "chrM\t{}\t.\t{}\t{}\t.\t.\t{}\t{}\t{}",
-            variant.pos, variant.ref_allele, variant.alt_allele, info, format, sample
+            "chrM\t{}\t.\t{}\t{}\t.\t{}\t{}\t{}\t{}",
+            variant.pos, variant.ref_allele, variant.alt_allele, filter, info, format, sample
         ),
         "DEL" => format!(
-            "chrM\t{}\t.\t{}\t{}\t.\t.\t{}\t{}\t{}",
-            variant.pos, variant.ref_allele, variant.alt_allele, info, format, sample
+            "chrM\t{}\t.\t{}\t{}\t.\t{}\t{}\t{}\t{}",
+            variant.pos, variant.ref_allele, variant.alt_allele, filter, info, format, sample
         ),
         _ => panic!("Unknown variant type"),
     }
@@ -389,7 +398,8 @@ fn write_vcf(
     output_file: &PathBuf,
     sample_id: &str,
     referencename:&str,
-    referencelength:usize
+    referencelength:usize,
+    indel_false_threshold: f64
 ) -> std::io::Result<()> {
     let mut file = File::create(Path::new(output_file))?;
 
@@ -412,6 +422,11 @@ fn write_vcf(
     writeln!(
         file,
         "##FORMAT=<ID=HF,Number=1,Type=Float,Description=\"Heteroplasmic Frequency\">"
+    )?;
+    writeln!(file, "##FILTER=<ID=PASS,Description=\"All filters passed\">")?;
+    writeln!(
+        file,
+        "##FILTER=<ID=Potential_Artifact,Description=\"Small indel (length < 5 bp) with heteroplasmic frequency < indel_false_threshold\">"
     )?;
     writeln!(
         file,
@@ -436,7 +451,7 @@ fn write_vcf(
     // Write variant records
     for variant in sorted_variants {
 
-        writeln!(file, "{}", format_vcf_record(&variant, coverage.clone()))?;
+        writeln!(file, "{}", format_vcf_record(&variant, coverage.clone(), indel_false_threshold))?;
     }
 
     Ok(())
@@ -583,7 +598,6 @@ fn jaccard_distance(vector1: &[bool], vector2: &[bool]) -> f64 {
 /// Generate a null distribution through permutation testing
 fn get_null_distribution(
     filtered_var: &Vec<Variant>,
-    coverage: &HashMap<usize, usize>,
     matrix: &Array2<f64>, 
     permutation_round: usize,
     threshold: f64
@@ -601,7 +615,7 @@ fn get_null_distribution(
             
             // Skip vectors with frequency > threshold
             let frequency = vector.sum() / vector.len() as f64;
-            if frequency > 0.8 {
+            if frequency > threshold {
                 continue;
             }
         
@@ -646,8 +660,6 @@ fn get_null_distribution(
 /// Calculate statistics for observed data
 fn calculate_observation_statistics(
     filtered_var: &Vec<Variant>,
-    coverage: &HashMap<usize, usize>,
-    threshold: f64,
     index: usize,
     matrix: &Array2<f64>, 
 ) -> f64 {
@@ -702,18 +714,126 @@ fn calculate_p_value(statistics: &[f64], observation: f64) -> f64 {
     return 1.0 - normal.cdf(z_score);
 }
 
+/// Build a map from read name (BAM qname) to strand (true = reverse, false = forward),
+/// using primary, mapped alignments only. Also returns the library-wide forward-strand
+/// fraction, which is the expected forward proportion for an unbiased allele.
+fn build_strand_map(bam_file: &PathBuf) -> (HashMap<String, bool>, f64) {
+    let mut bam = BamReader::from_path(bam_file)
+        .unwrap_or_else(|e| panic!("Failed to open BAM {:?}: {}", bam_file, e));
+    let mut strand_map = HashMap::new();
+    let (mut fwd, mut rev) = (0usize, 0usize);
+
+    for result in bam.records() {
+        let record = match result {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if record.is_secondary() || record.is_supplementary() || record.is_unmapped() {
+            continue;
+        }
+        let name = String::from_utf8_lossy(record.qname()).to_string();
+        let is_reverse = record.is_reverse();
+        if is_reverse { rev += 1; } else { fwd += 1; }
+        strand_map.insert(name, is_reverse);
+    }
+
+    let total = fwd + rev;
+    let fwd_frac = if total == 0 { 0.5 } else { fwd as f64 / total as f64 };
+    (strand_map, fwd_frac)
+}
+
+/// Two-sided binomial-tail p-value that a variant's alt-supporting reads' forward/reverse
+/// split deviates from the library's expected forward fraction. A small p-value means the
+/// allele is strand-skewed, which is characteristic of systematic (e.g. homopolymer) errors
+/// rather than true heteroplasmies, which should be roughly strand-balanced.
+fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64) -> f64 {
+    let n = (fwd + rev) as u64;
+    if n == 0 {
+        return 1.0;
+    }
+    // clamp away from 0/1 so the distribution is well defined
+    let p = expected_fwd_frac.clamp(1e-6, 1.0 - 1e-6);
+    let binom = Binomial::new(p, n).unwrap();
+    let k = fwd as u64;
+    let lower = binom.cdf(k);                                  // P(X <= k)
+    let upper = if k == 0 { 1.0 } else { binom.sf(k - 1) };    // P(X >= k)
+    (2.0 * lower.min(upper)).min(1.0)
+}
+
+/// Remove variants whose alt-supporting reads are significantly strand-skewed relative to
+/// the library's forward/reverse composition. Variants with fewer than `min_reads`
+/// strand-resolved supporting reads are kept (too little evidence to judge). Returns the
+/// kept variants together with the matrix subset to the corresponding rows.
+fn filter_strand_bias(
+    variants: &[Variant],
+    matrix: &Array2<f64>,
+    read_record: &HashMap<String, Vec<serde_json::Value>>,
+    strand_map: &HashMap<String, bool>,
+    expected_fwd_frac: f64,
+    p_threshold: f64,
+    min_reads: usize,
+) -> (Vec<Variant>, Array2<f64>) {
+    let mut keep_idx = Vec::new();
+    let mut kept = Vec::new();
+
+    for (i, variant) in variants.iter().enumerate() {
+        let name = generate_variant_name(variant);
+        let (mut fwd, mut rev) = (0usize, 0usize);
+        let mut seen = HashSet::new();
+
+        if let Some(reads) = read_record.get(&name) {
+            for read in reads {
+                if let Some(read_name) = read.as_str() {
+                    // count each supporting read once
+                    if !seen.insert(read_name.to_string()) {
+                        continue;
+                    }
+                    match strand_map.get(read_name) {
+                        Some(true) => rev += 1,
+                        Some(false) => fwd += 1,
+                        None => {} // read absent from BAM (e.g. non-primary alignment)
+                    }
+                }
+            }
+        }
+
+        let total = fwd + rev;
+        if total < min_reads {
+            // not enough strand-resolved reads to make a call: keep
+            keep_idx.push(i);
+            kept.push(variant.clone());
+            continue;
+        }
+
+        let p_value = strand_bias_pvalue(fwd, rev, expected_fwd_frac);
+        if p_value < p_threshold {
+            println!(
+                "Strand-biased (removed), {:?}, fwd={}, rev={}, p={:.3e}",
+                name, fwd, rev, p_value
+            );
+        } else {
+            keep_idx.push(i);
+            kept.push(variant.clone());
+        }
+    }
+
+    let filtered_matrix = matrix.select(Axis(0), &keep_idx);
+    (kept, filtered_matrix)
+}
+
 fn permutation_test(
     matrix: &Array2<f64>,
     p_value_threshold: f64,
+    heteroplasmic_error_threshold:f64,
     permutation_round: usize,
     filtered_var: &Vec<Variant>,
     coverage: &HashMap<usize, usize>,
-    frequency_threshold:f64,
+    permutation_frequency_threshold:f64,
     data_type: &str
 ) -> (Vec<Variant>, Array2<f64>, Vec<String>) {
 
     let bar = ProgressBar::new(filtered_var.len() as u64);
-    let statistics = get_null_distribution(filtered_var, coverage, &matrix, permutation_round, frequency_threshold);
+    let statistics = get_null_distribution(filtered_var, &matrix, permutation_round, permutation_frequency_threshold);
     let (indices, collected_values): (Vec<_>, Vec<_>) = (0..filtered_var.len()).into_par_iter().map(|i| {
         bar.inc(1);
         let current_variant = filtered_var[i].clone();
@@ -722,7 +842,7 @@ fn permutation_test(
         // let frequency = row.sum() / row.len() as f64;
         let frequency = current_variant.allele_count as f64 / *coverage.get(&current_variant.pos).unwrap() as f64;
 
-        if frequency > frequency_threshold {
+        if frequency > heteroplasmic_error_threshold {
             return (Ok(i), None);
         }
         // exclude large indel
@@ -731,7 +851,6 @@ fn permutation_test(
         }
 
         let variant = filtered_var[i].clone();
-        let pos = variant.pos;
         let ref_allele = variant.ref_allele;
         let alt_allele = variant.alt_allele;
 
@@ -744,7 +863,7 @@ fn permutation_test(
         // Note: For ONT, SNPs go through permutation test which should help filter false positives
         // If precision is still low, consider adjusting p_value_threshold or frequency_threshold
 
-        let observation = calculate_observation_statistics(&filtered_var, coverage, frequency_threshold, i, &matrix);
+        let observation = calculate_observation_statistics(&filtered_var,  i, &matrix);
         let p_value = calculate_p_value(&statistics, observation);
         (Err(index.clone()), Some((p_value, index.clone())))
 
@@ -812,18 +931,20 @@ pub fn resolve_thresholds(
     data_type: &str,
     p_value_threshold: Option<f64>,
     frequency_threshold: Option<f64>,
-) -> (f64, f64) {
-    let (default_p, default_f) = if data_type == "ont-r9" {
-        (0.0001, 0.5)
+    permutation_frequency_threshold: Option<f64>,
+) -> (f64, f64, f64) {
+    let (default_p, default_f, default_perm) = if data_type == "ont-r9" {
+        (0.0001, 0.5, 0.7)
     } else if data_type == "ont-r10" {
-        (0.01, 0.5)
+        (0.01, 0.2, 0.7)
     } else {
-        (0.01, 0.5)
+        (0.01, 0.2, 0.8)
     };
 
     (
         p_value_threshold.unwrap_or(default_p),
         frequency_threshold.unwrap_or(default_f),
+        permutation_frequency_threshold.unwrap_or(default_perm),
     )
 }
 
@@ -837,7 +958,11 @@ pub fn start(
     hf_threshold: f32,
     data_type: &str,
     p_value_threshold: f64,
-    frequency_threshold: f64,
+    heteroplasmic_frequency_threshold: f64,
+    bam_file: Option<&PathBuf>,
+    strand_bias_threshold: f64,
+    indel_false_threshold: f64,
+    permutation_frequency_threshold: f64,
 ) {
     if data_type != "pacbio" && data_type != "ont-r9" && data_type != "ont-r10" {
         eprintln!("Error: data type must be pacbio or ont-r9 or ont-r10");
@@ -869,9 +994,27 @@ pub fn start(
     // } else {
     //     (0.001, 0.2)    // PacBio: original thresholds
     // };
-    let (permu_filtered_var, filtered_matrix, filtered_name) = permutation_test(&matrix, p_value_threshold, 100, &var_record, &coverage, frequency_threshold, data_type);
+    let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&matrix, p_value_threshold, heteroplasmic_frequency_threshold, 100, &var_record, &coverage, permutation_frequency_threshold, data_type);
 
-    
+    // strand-bias filter: drop variants whose alt reads are strand-skewed relative to the
+    // library composition (only when a BAM is provided so per-read strand is available)
+    let (permu_filtered_var, filtered_matrix) = match bam_file {
+        Some(bam) => {
+            let (strand_map, fwd_frac) = build_strand_map(bam);
+            println!("Library forward-strand fraction: {:.3}", fwd_frac);
+            filter_strand_bias(
+                &permu_filtered_var,
+                &filtered_matrix,
+                &read_record,
+                &strand_map,
+                fwd_frac,
+                strand_bias_threshold,
+                2,
+            )
+        }
+        None => (permu_filtered_var, filtered_matrix),
+    };
+
     // write filtered vcf
     let _ = write_vcf(
         &permu_filtered_var,
@@ -879,7 +1022,8 @@ pub fn start(
         output_file,
         sample_id,
         &ref_header,
-        ref_seq.len()
+        ref_seq.len(),
+        indel_false_threshold
     );
     // write matrix
     let matrix_output = output_file.with_extension("matrix.csv");

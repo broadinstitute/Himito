@@ -22,7 +22,6 @@ workflow HierarchicallyMergeVcfs {
         String extra_concat_args = "--threads $(nproc) --naive"
 
         String docker
-        File? monitoring_script
     }
 
     call CreateBatches as SplitVcf {
@@ -47,8 +46,7 @@ workflow HierarchicallyMergeVcfs {
                         vcf_gz_tbis = read_lines(SplitTbi.vcf_gz_batch_fofns[i]),
                         output_prefix = output_prefix + ".batch-" + i + ".region-" + j,
                         extra_args = "-r " + regions[j] + " " + extra_merge_args,
-                        docker = docker,
-                        monitoring_script = monitoring_script
+                        docker = docker
                 }
             }
         }
@@ -62,8 +60,7 @@ workflow HierarchicallyMergeVcfs {
                         vcf_gzs = read_lines(SplitVcf.vcf_gz_batch_fofns[i]),
                         output_prefix = output_prefix + ".batch-" + i + ".region-" + j,
                         extra_args = "-r " + regions[j] + " " + extra_merge_args,
-                        docker = docker,
-                        monitoring_script = monitoring_script
+                        docker = docker
                 }
             }
         }
@@ -82,8 +79,7 @@ workflow HierarchicallyMergeVcfs {
                 vcf_gz_tbis = region_by_batch_vcf_gz_tbis[j],
                 output_prefix = output_prefix + ".region-" + j,
                 extra_args = extra_merge_args,
-                docker = docker,
-                monitoring_script = monitoring_script
+                docker = docker
         }
     }
     
@@ -95,8 +91,7 @@ workflow HierarchicallyMergeVcfs {
             vcf_gz_tbis = MergeVcfsSingleRegion.merged_vcf_gz_tbi,
             output_prefix = output_prefix,
             extra_args = extra_concat_args,
-            docker = docker,
-            monitoring_script = monitoring_script
+            docker = docker
     }
 
     output {
@@ -165,7 +160,7 @@ task MergeVcfs {
                 vcf_basename=$(basename "$vcf")
                 # Recompress and index the VCF file, excluding 1bp indels with HF < 0.1
                 bcftools view "$vcf" \
-                    -e 'abs(strlen(REF)-strlen(ALT))<=5 && FORMAT/HF<0.1' \
+                    -i 'FILTER="PASS"' \
                     -Oz -o "$vcf_basename.vcf.gz"
                 bcftools index -t "$vcf_basename.vcf.gz"
             done

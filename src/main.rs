@@ -1,6 +1,7 @@
 use std::path::PathBuf;
-
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use anyhow::{Context, Result as AnyhowResult};
+use log::{info};
 
 mod agg;
 mod asm;
@@ -18,8 +19,18 @@ mod callnumts;
 #[clap(about = "Analysis of mitochondrial genome using long reads.", long_about = None)]
 
 struct Cli {
+    #[command(flatten)]
+    global: GlobalOpts,
+
     #[clap(subcommand)]
     command: Commands,
+}
+
+#[derive(Args, Debug)]
+pub struct GlobalOpts {
+    /// Global options
+    #[arg(long, global = true)]
+    pub threads: Option<usize>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -346,8 +357,22 @@ enum Commands {
     }
 }
 
+pub fn init_rayon_threads(threads: Option<usize>) -> AnyhowResult<()> {
+    let Some(n) = threads else {
+        return Ok(());
+    };
+    anyhow::ensure!(n >= 1, "--threads must be at least 1 (got {n})");
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(n)
+        .build_global()
+        .context("failed to initialize rayon thread pool (already initialized?)")?;
+    info!("Rayon thread pool: {n} worker(s)");
+    Ok(())
+}
+
 fn main() {
     let args = Cli::parse();
+    init_rayon_threads(args.global.threads);
     match args.command {
         Commands::QuickStart {
             input_bam,

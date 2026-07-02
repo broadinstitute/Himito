@@ -14,32 +14,120 @@ use crate::agg;
 use bio::alignment::pairwise::*;
 use bio::alignment::AlignmentOperation;
 use rayon::prelude::*;
+use rustc_hash::FxHashMap;
 
 
 pub fn reverse_complement(kmer: &str) -> String {
-    kmer.chars()
-        .rev()
-        .map(|c| match c {
-            'A' => 'T',
-            'T' => 'A',
-            'C' => 'G',
-            'G' => 'C',
-            'N' => 'N',
-            _ => panic!("Unexpected character: {}", c),
-        })
-        .collect()
+    // Byte-level: ACGTN is pure ASCII, so this avoids UTF-8 char decoding/boundary
+    // checks that `.chars()` pays on every element.
+    let bytes = kmer.as_bytes();
+    let mut out = vec![0u8; bytes.len()];
+    for (dst, &b) in out.iter_mut().rev().zip(bytes.iter()) {
+        *dst = match b {
+            b'A' => b'T',
+            b'T' => b'A',
+            b'C' => b'G',
+            b'G' => b'C',
+            b'N' => b'N',
+            _ => panic!("Unexpected character: {}", b as char),
+        };
+    }
+    // Safety: every byte written above is a valid single-byte ASCII code point.
+    String::from_utf8(out).unwrap()
 }
 
-pub fn map_to_genome(contig: &str, k: usize) -> HashMap<String, Vec<usize>> {
-    let mut position_dict: HashMap<String, Vec<usize>> = HashMap::new();
-    
-    for i in 0..contig.len() - k + 1 {
-        let kmer = contig[i..i+k].to_string();
-        position_dict.entry(kmer)
-            .or_insert_with(Vec::new)
-            .push(i);
+/// 2-bit encoding for a single base; `None` for anything ambiguous (N, lowercase soft-mask, etc).
+#[inline]
+fn base_to_bits(b: u8) -> Option<u64> {
+    match b {
+        b'A' | b'a' => Some(0),
+        b'C' | b'c' => Some(1),
+        b'G' | b'g' => Some(2),
+        b'T' | b't' => Some(3),
+        _ => None,
     }
-    
+}
+
+/// Encode a short (<=32bp) sequence into a 2-bit-packed u64. Returns `None` if it
+/// contains any non-ACGT base or exceeds 32bp (u64 capacity).
+fn encode_kmer(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() > 32 {
+        return None;
+    }
+    let mut code: u64 = 0;
+    for &b in bytes {
+        code = (code << 2) | base_to_bits(b)?;
+    }
+    Some(code)
+}
+
+/// Hashable identity for a kmer window. `Bits` is the fast, allocation-free path for
+/// pure-ACGT windows (the overwhelming majority in real sequence data). `Raw` is an
+/// exact byte-slice fallback for anything that can't be 2-bit packed (an ambiguous
+/// base like the single historical `N` at rCRS position 3107, or k > 32) so uniqueness
+/// is decided by the same exact-match semantics as the original `String` comparison.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum KmerKey {
+    Bits(u64),
+    Raw(Box<[u8]>),
+}
+
+fn encode_kmer_key(bytes: &[u8]) -> KmerKey {
+    match encode_kmer(bytes) {
+        Some(code) => KmerKey::Bits(code),
+        None => KmerKey::Raw(bytes.into()),
+    }
+}
+
+/// Rolling k-mer scan over `contig`, calling `visit(key, pos)` for every window,
+/// including ones spanning an ambiguous base. Runs in O(n) with zero per-position
+/// allocation for the common all-ACGT case, only falling back to an owned byte slice
+/// for the rare window that can't be 2-bit packed.
+fn scan_kmers<F: FnMut(KmerKey, usize)>(contig: &[u8], k: usize, mut visit: F) {
+    if k == 0 || contig.len() < k {
+        return;
+    }
+    if k > 32 {
+        // 2-bit packing needs <=32 bases per u64; fall back to exact byte comparison.
+        for pos in 0..=contig.len() - k {
+            visit(KmerKey::Raw(contig[pos..pos + k].into()), pos);
+        }
+        return;
+    }
+
+    let mask: u64 = if k == 32 { u64::MAX } else { (1u64 << (2 * k)) - 1 };
+    let mut code: u64 = 0;
+    let mut run_len: usize = 0;
+
+    for (i, &b) in contig.iter().enumerate() {
+        match base_to_bits(b) {
+            Some(bits) => {
+                code = ((code << 2) | bits) & mask;
+                run_len += 1;
+            }
+            None => {
+                run_len = 0;
+                code = 0;
+            }
+        }
+        if i + 1 >= k {
+            let pos = i + 1 - k;
+            if run_len >= k {
+                visit(KmerKey::Bits(code), pos);
+            } else {
+                visit(KmerKey::Raw(contig[pos..pos + k].into()), pos);
+            }
+        }
+    }
+}
+
+pub fn map_to_genome(contig: &str, k: usize) -> FxHashMap<KmerKey, Vec<usize>> {
+    let mut position_dict: FxHashMap<KmerKey, Vec<usize>> = FxHashMap::default();
+
+    scan_kmers(contig.as_bytes(), k, |key, pos| {
+        position_dict.entry(key).or_insert_with(Vec::new).push(pos);
+    });
+
     position_dict
 }
 
@@ -66,27 +154,23 @@ impl AnchorInfo {
 }
 
 pub fn create_anchors(
-    position_dict: &HashMap<String, Vec<usize>>,
-    k: usize
+    position_dict: &FxHashMap<KmerKey, Vec<usize>>,
+    contig: &str,
+    k: usize,
 ) -> HashMap<String, AnchorInfo> {
-    let mut anchor_updated_list = Vec::new();
-    
-    // Collect kmers that appear exactly once
-    for (kmer, positions) in position_dict {
-        if positions.len() == 1 {
-            anchor_updated_list.push(kmer);
-        }
-    }
-
     let mut anchor_info = HashMap::new();
-    for kmer in anchor_updated_list {
-        if let Some(pos) = position_dict.get(kmer).and_then(|v| v.first()) {
+
+    // Kmers that appear exactly once become anchors; the sequence is recovered by
+    // slicing the original contig at that position rather than storing it as a key.
+    for positions in position_dict.values() {
+        if positions.len() == 1 {
+            let pos = positions[0];
             let anchor_name = format!("A{:06}", pos);
             anchor_info.insert(
                 anchor_name,
                 AnchorInfo {
-                    seq: kmer.clone(),
-                    pos: *pos,
+                    seq: contig[pos..pos + k].to_string(),
+                    pos,
                 },
             );
         }
@@ -127,30 +211,25 @@ pub fn get_final_anchor(
 
 pub fn mapping_info(
     anchor_info: &HashMap<String, &AnchorInfo>,
-    contig: String,
+    contig: &str,
     k: usize,
 ) -> (HashMap<String, usize>, HashMap<String, Vec<usize>>) {
-    // Create anchor_seq to anchor_name mapping
-    let anchor_seq_map: HashMap<String, String> = anchor_info
-        .iter()
-        .map(|(anchor, info)| (info.seq.clone(), anchor.clone()))
-        .collect();
-
-    // Initialize position dictionary
-    let mut position_dict: HashMap<String, Vec<usize>> = HashMap::new();
-    for anchor_seq in anchor_seq_map.keys() {
+    // Seed the position dict with the encoded forward and reverse-complement kmer for
+    // every anchor (anchor kmers are few, so encoding them isn't hot).
+    let mut position_dict: FxHashMap<KmerKey, Vec<usize>> = FxHashMap::default();
+    for info in anchor_info.values() {
+        let anchor_seq = &info.seq;
         let anchor_rev = reverse_complement(anchor_seq);
-        position_dict.insert(anchor_seq.clone(), Vec::new());
-        position_dict.insert(anchor_rev, Vec::new());
+        position_dict.entry(encode_kmer_key(anchor_seq.as_bytes())).or_insert_with(Vec::new);
+        position_dict.entry(encode_kmer_key(anchor_rev.as_bytes())).or_insert_with(Vec::new);
     }
 
-    // Find positions of kmers in contig
-    for i in 0..contig.len() - k + 1 {
-        let kmer = contig[i..i+k].to_string();
-        if position_dict.contains_key(&kmer) {
-            position_dict.get_mut(&kmer).unwrap().push(i);
+    // Single O(n) rolling scan of the contig instead of allocating a String per kmer.
+    scan_kmers(contig.as_bytes(), k, |key, pos| {
+        if let Some(v) = position_dict.get_mut(&key) {
+            v.push(pos);
         }
-    }
+    });
 
     let mut a = HashMap::new();
     let mut svs = HashMap::new();
@@ -159,12 +238,13 @@ pub fn mapping_info(
     for (anchor, info) in anchor_info {
         let anchor_seq = &info.seq;
         let anchor_rev = reverse_complement(anchor_seq);
-        
+
+        let empty = Vec::new();
+        let fwd_positions = position_dict.get(&encode_kmer_key(anchor_seq.as_bytes())).unwrap_or(&empty);
+        let rev_positions = position_dict.get(&encode_kmer_key(anchor_rev.as_bytes())).unwrap_or(&empty);
+
         // Combine positions from forward and reverse sequences
-        let position_list = [
-            position_dict.get(anchor_seq).unwrap_or(&Vec::new()).clone(),
-            position_dict.get(&anchor_rev).unwrap_or(&Vec::new()).clone()
-        ].concat();
+        let position_list = [fwd_positions.clone(), rev_positions.clone()].concat();
         // ! should change into position_dict.get(anchor_seq).len() == 1 and position_dict.get(&anchor_rev) == 0
         if position_list.len() == 1 {
             a.insert(anchor.clone(), position_list[0]);
@@ -181,10 +261,10 @@ pub fn construct_edges(
     src_pos: usize,
     dst_pos: usize,
     k: usize,
-    contig: String,
+    contig: &str,
     contigname: String,
     sample: String,
-    anchorseq: &HashMap<String, String>,
+    anchorseq: &FxHashMap<String, String>,
 ) -> EdgeInfo {
     let src_seq: String;
     let mut pr = false;
@@ -258,144 +338,123 @@ pub fn construct_edges(
 
 
 
+/// Build the edges contributed by a single contig, with no shared/cross-contig state.
+/// Kept separate so `create_edge_file` can run this per-contig work in parallel.
+fn edges_for_contig(
+    contig_name: &str,
+    contig: &str,
+    final_anchor: &HashMap<String, &AnchorInfo>,
+    anchorseq: &FxHashMap<String, String>,
+    k: usize,
+    threshold: usize,
+) -> Vec<EdgeInfo> {
+    let mut local_edges = Vec::new();
+    if contig.len() < k + 1 {
+        return local_edges;
+    }
+
+    let sample_name = if contig_name.contains('|') {
+        contig_name.split('|').last().unwrap_or("").to_string()
+    } else {
+        "".to_string()
+    };
+
+    let (a, _svs) = mapping_info(final_anchor, contig, k);
+    if a.len() < threshold {
+        return local_edges;
+    }
+
+    let mut splitposlist: Vec<_> = a.values().copied().collect();
+    splitposlist.sort();
+    let mut src_pos = 0;
+
+    // Process all positions except the last
+    for &dst_pos in &splitposlist {
+        if dst_pos - src_pos < k + 1 {
+            continue;
+        }
+        local_edges.push(construct_edges(
+            src_pos,
+            dst_pos,
+            k,
+            contig,
+            contig_name.to_string(),
+            sample_name.clone(),
+            anchorseq,
+        ));
+        src_pos = dst_pos;
+    }
+
+    // Process final edge to end of contig
+    let dst_pos = contig.len();
+    if dst_pos - src_pos > k + 1 {
+        local_edges.push(construct_edges(
+            src_pos,
+            dst_pos,
+            k,
+            contig,
+            contig_name.to_string(),
+            sample_name.clone(),
+            anchorseq,
+        ));
+    }
+
+    local_edges
+}
+
 pub fn create_edge_file(
     all_seq: &HashMap<String, String>,
     final_anchor: &HashMap<String, &AnchorInfo>,
     k: usize,
     threshold: usize
 ) -> (HashMap<String, EdgeInfo>, HashMap<String, Vec<String>>) {
-    let mut edge_info: HashMap<String, EdgeInfo> = HashMap::new();
-    let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
-    
-    let anchorseq: HashMap<_, _> = final_anchor
+    let anchorseq: FxHashMap<_, _> = final_anchor
         .iter()
         .map(|(anchor, info)| (info.seq.clone(), anchor.clone()))
         .collect();
 
-    let mut contig_index = 0;
-    let bar = ProgressBar::new(all_seq.len() as u64);
+    // Sort for deterministic iteration order (a plain HashMap iteration order isn't
+    // stable, and we want reproducible output regardless of thread scheduling).
+    let mut contigs: Vec<(&String, &String)> = all_seq.iter().collect();
+    contigs.sort_by(|a, b| a.0.cmp(b.0));
 
-    for (contig_name, contig) in all_seq.iter() {
-        if contig.len() < k + 1{
-            continue
-        }
-        contig_index += 1;
-        bar.inc(1);
-        // let contig_name = record.id().to_string();
-        // let contig = String::from_utf8_lossy(record.seq()).to_string();
-        // let sample_name = contig_name.split('|').last().unwrap_or("").to_string();
-        let sample_name = if contig_name.contains('|') {
-                contig_name.split('|').last().unwrap_or("").to_string()
-            } else {
-                "".to_string()
-            };
-        
-        let (a, _svs) = mapping_info(final_anchor, contig.to_string(), k);
+    let bar = ProgressBar::new(contigs.len() as u64);
 
-        if a.len() < threshold {
-            continue;
-        }
-
-        let mut splitposlist: Vec<_> = a.values().copied().collect();
-        splitposlist.sort();
-        let mut edgeindex = 0;
-        let mut src_pos = 0;
-
-        // Process all positions except the last
-        for &dst_pos in &splitposlist {
-            if dst_pos - src_pos < k+1 {
-                continue
-            }
-            let e = construct_edges(
-                src_pos,
-                dst_pos,
-                k,
-                contig.to_string(),
-                contig_name.to_string(),
-                sample_name.clone(),
-                &anchorseq,
-            );
-            
-            let src = &e.src;
-            let edgelist = outgoing.entry(src.clone()).or_default();
-            
-            // Try to find matching existing edge
-            let mut found_match = false;
-            for edge_name in edgelist.iter() {
-                let existing_edge = edge_info.get_mut(edge_name).unwrap();
-                if existing_edge.dst == e.dst && existing_edge.seq == e.seq {
-                    existing_edge.reads.extend(e.reads.clone());
-                    existing_edge.samples = existing_edge.samples.union(&e.samples).cloned().collect();
-                    found_match = true;
-                    break;
-                }
-            }
-            
-            // If no match found, create new edge
-            if !found_match {
-                let edgename = format!("E{:05}.{:04}", contig_index, edgeindex);
-                edge_info.insert(edgename.clone(), e.clone());
-                edgelist.push(edgename);
-                edgeindex += 1;
-            }
-            // debuging why edge sequence are empty
-            let edge_seq = if src_pos == 0 {
-            let seq = contig.get(0..dst_pos).unwrap_or_default().to_string();
-                if seq.is_empty() {
-                    println!("Warning: Empty edge sequence created for SOURCE. dst_pos: {}, contig_len: {}", dst_pos, contig.len());
-                }
-                seq
-            } else {
-                let seq = contig.get(src_pos + k..dst_pos).unwrap_or_default().to_string();
-                if seq.is_empty() {
-                    println!("Warning: Empty edge sequence created. src_pos: {}, dst_pos: {}, k: {}, contig_len: {}", 
-                            src_pos, dst_pos, k, contig.len());
-                }
-                seq
-            };
-            
-            src_pos = dst_pos;
-        }
-
-        // Process final edge to end of contig
-        let dst_pos = contig.len();
-        if dst_pos - src_pos > k+ 1{
-            let e = construct_edges(
-                src_pos,
-                dst_pos,
-                k,
-                contig.to_string(),
-                contig_name.to_string(),
-                sample_name.clone(),
-                &anchorseq,
-            );
-            
-            let src = &e.src;
-            let edgelist = outgoing.entry(src.clone()).or_default();
-        
-            // Try to find matching existing edge for final segment
-            let mut found_match = false;
-            for edge_name in edgelist.iter() {
-                let existing_edge = edge_info.get_mut(edge_name).unwrap();
-                if existing_edge.dst == e.dst && existing_edge.seq == e.seq {
-                    existing_edge.reads.extend(e.reads.clone());
-                    existing_edge.samples = existing_edge.samples.union(&e.samples).cloned().collect();
-                    found_match = true;
-                    break;
-                }
-            }
-            
-            // If no match found for final segment, create new edge
-            if !found_match {
-                let edgename = format!("E{:05}.{:04}", contig_index, edgeindex);
-                edge_info.insert(edgename.clone(), e.clone());
-                edgelist.push(edgename);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-    }
+    // Each contig's edges are computed independently in parallel; no shared state is
+    // touched until the sequential merge below.
+    let per_contig_edges: Vec<Vec<EdgeInfo>> = contigs
+        .par_iter()
+        .map(|(contig_name, contig)| {
+            let edges = edges_for_contig(contig_name, contig, final_anchor, &anchorseq, k, threshold);
+            bar.inc(1);
+            edges
+        })
+        .collect();
     bar.finish();
+
+    // Sequential merge: dedup edges globally by (src, dst, seq) in O(1) amortized per
+    // edge via a lookup map, instead of an O(m) linear scan of each src's edge list.
+    let mut edge_info: HashMap<String, EdgeInfo> = HashMap::new();
+    let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
+    let mut edge_key_to_name: FxHashMap<(String, String, String), String> = FxHashMap::default();
+    let mut edge_counter: usize = 0;
+
+    for edges in per_contig_edges {
+        for e in edges {
+            let key = (e.src.clone(), e.dst.clone(), e.seq.clone());
+            if let Some(existing_name) = edge_key_to_name.get(&key) {
+                let existing_edge = edge_info.get_mut(existing_name).unwrap();
+                existing_edge.reads.extend(e.reads);
+                existing_edge.samples.extend(e.samples);
+            } else {
+                let edgename = format!("E{:08}", edge_counter);
+                edge_counter += 1;
+                outgoing.entry(e.src.clone()).or_default().push(edgename.clone());
+                edge_key_to_name.insert(key, edgename.clone());
+                edge_info.insert(edgename, e);
+            }
+        }
+    }
 
     (edge_info, outgoing)
 }
@@ -518,16 +577,21 @@ pub fn find_ref_edge(
 }
 
 fn mask_ns(seq: &str) -> String {
-    seq.chars()
-        .map(|c| {
-            let upper_c = c.to_ascii_uppercase();
-            if !['A', 'G', 'C', 'T'].contains(&upper_c) {
-                c.to_ascii_lowercase()
+    // Byte-level: avoids `.chars()` UTF-8 decoding since ACGTN is pure ASCII.
+    let out: Vec<u8> = seq
+        .as_bytes()
+        .iter()
+        .map(|&b| {
+            let upper = b.to_ascii_uppercase();
+            if matches!(upper, b'A' | b'G' | b'C' | b'T') {
+                upper
             } else {
-                upper_c
+                b.to_ascii_lowercase()
             }
         })
-        .collect()
+        .collect();
+    // Safety: every output byte is a valid single-byte ASCII code point.
+    String::from_utf8(out).unwrap()
 }
 
 fn alignment_to_cigar(operations: &[AlignmentOperation]) -> String {
@@ -577,7 +641,7 @@ pub fn generate_cigar(
     k: usize,
     maxlength: usize,
     minimal_read_count: usize,
-) -> GraphicalGenome {
+) {
     let mut edgelist: Vec<_> = graph.edges.keys().cloned().collect();
     edgelist.sort();
     let bar = ProgressBar::new(edgelist.len() as u64);
@@ -659,7 +723,7 @@ pub fn generate_cigar(
                 return (edge.clone(), None);
             }
             let cigar = gap_open_aligner(&ref_seq, &alt_seq);
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // std::thread::sleep(std::time::Duration::from_millis(50));
 
             (edge.clone(), Some(cigar))
         })
@@ -677,7 +741,6 @@ pub fn generate_cigar(
         }
     }
     bar.finish();
-    graph.clone()
 }
 
 
@@ -689,7 +752,7 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
     let ref_header = reference_sequence[0].id().to_string();
     
     let position_dict = map_to_genome(&ref_seq, k);
-    let anchors = create_anchors(&position_dict, k);
+    let anchors = create_anchors(&position_dict, &ref_seq, k);
     println!("anchors, {:?}", anchors.len());
 
     let unadjacent_anchor = get_final_anchor(&anchors, k);
@@ -735,7 +798,7 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
         .map(|(k, v)| (k.clone(), v)) 
         .collect();
     let (n_edge_info, _outgoing) = create_edge_file(&read_dictionary, &dereferenced_anchor, k, 1);
-    let mut edge_info = n_edge_info.clone();
+    let mut edge_info = n_edge_info;
     // find final anchor set in the src and dst of edges
     let mut final_anchor_list = HashSet::new();
     
@@ -800,7 +863,7 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
     let mut graph = agg::GraphicalGenome::load_graph(&tmp_gfa_path).unwrap();
     
     // generate cigar
-    let mut graph_with_cigar = generate_cigar(&mut graph, &ref_header, k, maxlength, 2);
+    generate_cigar(&mut graph, &ref_header, k, maxlength, 2);
     let graph_output = output.with_extension("gfa");
-    let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph_with_cigar);
+    let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph);
 }

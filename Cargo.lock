@@ -21,6 +21,7 @@ dependencies = [
  "rayon",
  "regex",
  "rust-htslib",
+ "rustc-hash",
  "serde",
  "serde_json",
  "statrs 0.16.1",

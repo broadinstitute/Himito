@@ -835,22 +835,39 @@ fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64) -> f64 {
 
 /// Remove variants whose alt-supporting reads are significantly strand-skewed relative to
 /// the library's forward/reverse composition. Variants with fewer than `min_reads`
-/// strand-resolved supporting reads are kept (too little evidence to judge). Returns the
-/// kept variants together with the matrix subset to the corresponding rows.
+/// strand-resolved supporting reads are kept (too little evidence to judge). Near-homoplasmic
+/// variants (heteroplasmic frequency >= `homoplasmic_frequency_threshold`) are also kept
+/// without testing: a real single-strand-only sequencing artifact can only ever produce a
+/// low-to-moderate apparent frequency (it's absent from the unaffected strand's reads), so an
+/// allele present in nearly every read at the locus cannot be explained by strand-specific
+/// error and any measured strand skew there reflects fragmented read attribution across
+/// near-duplicate graph edges, not a real signal. Returns the kept variants together with the
+/// matrix subset to the corresponding rows.
 fn filter_strand_bias(
     variants: &[Variant],
     matrix: &Array2<f64>,
     read_record: &HashMap<String, Vec<serde_json::Value>>,
     strand_map: &HashMap<String, bool>,
+    coverage: &HashMap<usize, usize>,
     expected_fwd_frac: f64,
     p_threshold: f64,
     min_reads: usize,
+    homoplasmic_frequency_threshold: f64,
 ) -> (Vec<Variant>, Array2<f64>) {
     let mut keep_idx = Vec::new();
     let mut kept = Vec::new();
 
     for (i, variant) in variants.iter().enumerate() {
         let name = generate_variant_name(variant);
+
+        let depth = coverage.get(&variant.pos).copied().unwrap_or(0);
+        let hf = if depth == 0 { 0.0 } else { variant.allele_count as f64 / depth as f64 };
+        if hf >= homoplasmic_frequency_threshold {
+            keep_idx.push(i);
+            kept.push(variant.clone());
+            continue;
+        }
+
         let (mut fwd, mut rev) = (0usize, 0usize);
         let mut seen = HashSet::new();
 
@@ -1059,8 +1076,8 @@ pub fn start(
     // modified, exclude filtered data
     let (matrix, var_record, read_set) =
         construct_matrix(&read_record, &cover_record, &filtered_var, minimal_ac);
-    // let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
-    // let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
+    let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
+    let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
 
     // // use matrix information to filter vcf
     // Use stricter thresholds for ONT data due to higher error rates
@@ -1082,9 +1099,11 @@ pub fn start(
                 &filtered_matrix,
                 &read_record,
                 &strand_map,
+                &coverage,
                 fwd_frac,
                 strand_bias_threshold,
                 2,
+                permutation_frequency_threshold,
             )
         }
         None => (permu_filtered_var, filtered_matrix),

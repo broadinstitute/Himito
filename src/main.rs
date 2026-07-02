@@ -249,7 +249,7 @@ enum Commands {
         input_bam: Option<PathBuf>,
 
         /// p-value threshold for the strand-bias filter (only used with --input-bam)
-        #[clap(long, value_parser, default_value_t = 0.05)]
+        #[clap(long, value_parser, default_value_t = 0.01)]
         strand_bias_threshold: f64,
 
         /// indel false threshold for filtering variants

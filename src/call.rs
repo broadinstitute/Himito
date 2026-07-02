@@ -1,5 +1,6 @@
 use crate::agg;
 use agg::*;
+use rayon::iter::WhileSome;
 use crate::build;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
@@ -26,6 +27,7 @@ pub struct Variant {
     pub alt_allele: String,
     pub variant_type: String,
     pub allele_count: usize,
+    pub filter: Option<String>,
 }
 
 pub fn get_variants_from_cigar(
@@ -76,6 +78,7 @@ pub fn get_variants_from_cigar(
                         alt_allele: alt_allele.to_string(),
                         variant_type: "SNP".to_string(),
                         allele_count: allelecount,
+                        filter:None,
                     });
                 }
                 ref_pos += length;
@@ -109,6 +112,7 @@ pub fn get_variants_from_cigar(
                     alt_allele: alt_allele.to_string(),
                     variant_type: "INS".to_string(),
                     allele_count: allelecount,
+                    filter: None,
                 });
                 alt_pos += length;
             }
@@ -156,6 +160,7 @@ pub fn get_variants_from_cigar(
                     alt_allele: alt_allele.to_string(),
                     variant_type: "DEL".to_string(),
                     allele_count: allelecount,
+                    filter: None,
                 });
                 ref_pos += length;
             }
@@ -176,6 +181,7 @@ fn circuliarize_variants(variants: Vec<Variant>, ref_length: usize) -> Vec<Varia
                 alt_allele: variant.alt_allele,
                 variant_type: variant.variant_type,
                 allele_count: variant.allele_count,
+                filter: variant.filter,
             });
         }
     }
@@ -198,17 +204,36 @@ fn edge_reads(graph: &GraphicalGenome, edge: &str) -> HashSet<String> {
         .unwrap_or_default()
 }
 
-/// All reads traversing any parallel edge between the same anchor pair (ref + alt paths).
-fn bubble_cover_reads(graph: &GraphicalGenome, src: &str, dst: &str) -> HashSet<String> {
-    let empty = Vec::new();
+fn get_graph_intervals(graph:&GraphicalGenome, length: i64) -> HashMap<&String, (i64, i64)>{
+    let mut graph_intervals_dict = HashMap::new();
+    for edge in graph.edges.keys() {
+        let src = graph.edges[edge].get("src").unwrap().as_array().unwrap()[0].as_str().unwrap();
+        let dst = graph.edges[edge].get("dst").unwrap().as_array().unwrap()[0].as_str().unwrap();
+        let startpos = graph.anchor
+            .get(src)
+            .and_then(|v| v.get("pos"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i64;  
+        let endpos  = graph.anchor
+            .get(dst)
+            .and_then(|v| v.get("pos"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(length) as i64;  
+        if endpos > startpos {
+            graph_intervals_dict.insert(edge, (startpos, endpos));
+        }
+        
+    }
+    graph_intervals_dict
+}
+
+
+// /// All reads traversing any parallel edge between the same anchor pair (ref + alt paths).
+fn bubble_cover_reads(graph_intervals_dict: &HashMap<&String, (i64, i64)>, pos: usize, graph: &GraphicalGenome) -> HashSet<String> {
+    // let empty = Vec::new();
     let mut cover = HashSet::new();
-    for edge in graph.outgoing.get(src).unwrap_or(&empty) {
-        let edge_dst = graph
-            .outgoing
-            .get(edge.as_str())
-            .and_then(|d| d.first())
-            .map(|s| s.as_str());
-        if edge_dst == Some(dst) {
+    for (edge, (start, end)) in graph_intervals_dict.iter() {
+        if pos >= *start as usize && pos < *end as usize {
             cover.extend(edge_reads(graph, edge));
         }
     }
@@ -231,6 +256,7 @@ pub fn get_variant(
     let mut cover_record: HashMap<String, HashSet<String>> = HashMap::new();
     let mut var = Vec::new();
     let mut edgelist: Vec<_> = graph.edges.keys().collect();
+    let graph_intervals_dict = get_graph_intervals(graph, ref_length as i64);
     edgelist.sort();
     for edge in edgelist {
         let allele_count = graph
@@ -308,17 +334,19 @@ pub fn get_variant(
             .map_or(Vec::new(), |reads| {
                 reads.as_array().unwrap_or(&Vec::new()).to_vec()
             });
-        let cover_reads = bubble_cover_reads(graph, src, dst);
+        
         for v in &variants_circular {
             let key = generate_variant_name(&v.clone());
+            let cover_reads = bubble_cover_reads(&graph_intervals_dict, v.pos, graph);
             read_record
                 .entry(key.clone())
                 .or_insert_with(Vec::new)
                 .extend(readlist.clone());
-            let entry = cover_record.entry(key).or_default();
-            for read in &cover_reads {
-                entry.insert(read.clone());
-            }
+            // let entry = cover_record.entry(key).or_default();
+            cover_record.entry(key).or_insert_with(HashSet::new).extend(cover_reads.clone());
+            // for read in &cover_reads {
+            //     entry.insert(read.clone());
+            // }
         }
     }
     (var, coverage, read_record, cover_record)
@@ -355,6 +383,7 @@ fn collapse_identical_records(variants: Vec<Variant>, ref_length: usize) -> Vec<
                 alt_allele,
                 variant_type,
                 allele_count,
+                filter: None,
             },
         )
         .collect()
@@ -376,10 +405,21 @@ fn format_vcf_record(variant: &Variant, coverage: HashMap<usize, usize>, indel_f
 
     let indel_len = (variant.ref_allele.len() as i32 - variant.alt_allele.len() as i32).abs();
     let is_small_indel = variant.variant_type != "SNP" && indel_len < 5;
-    let filter = if is_small_indel && allele_frequency < indel_false_threshold as f32 {
-        "Potential_Artifact"
+    // Combine any upstream flag (e.g. Strand_bias) with the indel-artifact check here, rather
+    // than letting one filter suppress the other, so a call can carry multiple FILTER reasons.
+    let mut filters: Vec<String> = Vec::new();
+    if let Some(existing) = variant.filter.as_deref() {
+        if !existing.is_empty() {
+            filters.push(existing.to_string());
+        }
+    }
+    if is_small_indel && allele_frequency < indel_false_threshold as f32 {
+        filters.push("Potential_Artifact".to_string());
+    }
+    let filter = if filters.is_empty() {
+        "PASS".to_string()
     } else {
-        "PASS"
+        filters.join(";")
     };
 
     match variant.variant_type.as_str() {
@@ -473,6 +513,10 @@ fn write_vcf(
     writeln!(
         file,
         "##FILTER=<ID=Potential_Artifact,Description=\"Small indel (length < 5 bp) with heteroplasmic frequency < indel_false_threshold\">"
+    )?;
+    writeln!(
+        file,
+        "##FILTER=<ID=Strand_bias,Description=\"Alt-supporting reads are significantly skewed toward one strand relative to library composition\">"
     )?;
     writeln!(
         file,
@@ -833,8 +877,10 @@ fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64) -> f64 {
     (2.0 * lower.min(upper)).min(1.0)
 }
 
-/// Remove variants whose alt-supporting reads are significantly strand-skewed relative to
-/// the library's forward/reverse composition. Variants with fewer than `min_reads`
+/// Flag (but never drop) variants whose alt-supporting reads are significantly strand-skewed
+/// relative to the library's forward/reverse composition; flagged variants get
+/// `filter = Some("Strand_bias")` so the call survives in the VCF with FILTER set accordingly.
+/// Variants with fewer than `min_reads`
 /// strand-resolved supporting reads are kept (too little evidence to judge). Near-homoplasmic
 /// variants (heteroplasmic frequency >= `homoplasmic_frequency_threshold`) are also kept
 /// without testing: a real single-strand-only sequencing artifact can only ever produce a
@@ -858,13 +904,14 @@ fn filter_strand_bias(
     let mut kept = Vec::new();
 
     for (i, variant) in variants.iter().enumerate() {
-        let name = generate_variant_name(variant);
+        let mut variant = variant.clone();
+        let name = generate_variant_name(&variant);
 
         let depth = coverage.get(&variant.pos).copied().unwrap_or(0);
         let hf = if depth == 0 { 0.0 } else { variant.allele_count as f64 / depth as f64 };
         if hf >= homoplasmic_frequency_threshold {
             keep_idx.push(i);
-            kept.push(variant.clone());
+            kept.push(variant);
             continue;
         }
 
@@ -889,22 +936,24 @@ fn filter_strand_bias(
 
         let total = fwd + rev;
         if total < min_reads {
-            // not enough strand-resolved reads to make a call: keep
+            // not enough strand-resolved reads to make a call: keep, untested
             keep_idx.push(i);
-            kept.push(variant.clone());
+            kept.push(variant);
             continue;
         }
 
         let p_value = strand_bias_pvalue(fwd, rev, expected_fwd_frac);
         if p_value < p_threshold {
+            // flag but keep: downstream FILTER combines this with other filters (e.g.
+            // Potential_Artifact) instead of dropping the call
+            variant.filter = Some("Strand_bias".to_string());
             println!(
-                "Strand-biased (removed), {:?}, fwd={}, rev={}, p={:.3e}",
+                "Strand-biased (flagged, kept), {:?}, fwd={}, rev={}, p={:.3e}",
                 name, fwd, rev, p_value
             );
-        } else {
-            keep_idx.push(i);
-            kept.push(variant.clone());
         }
+        keep_idx.push(i);
+        kept.push(variant);
     }
 
     let filtered_matrix = matrix.select(Axis(0), &keep_idx);

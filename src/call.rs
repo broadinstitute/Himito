@@ -10,7 +10,7 @@ use std::path::Path;
 use std::{collections::HashSet, path::PathBuf};
 use std::error::Error;
 use csv::Writer;
-use ndarray::{Array1, Array2, Axis, s};
+use ndarray::{Array2, Axis, s};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
 use statrs::distribution::{Normal, ContinuousCDF, Binomial, DiscreteCDF};
@@ -182,14 +182,53 @@ fn circuliarize_variants(variants: Vec<Variant>, ref_length: usize) -> Vec<Varia
     circular_variants
 }
 
+fn edge_reads(graph: &GraphicalGenome, edge: &str) -> HashSet<String> {
+    graph
+        .edges
+        .get(edge)
+        .and_then(|e| e.get("reads"))
+        .map(|reads| {
+            reads
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .filter_map(|r| r.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// All reads traversing any parallel edge between the same anchor pair (ref + alt paths).
+fn bubble_cover_reads(graph: &GraphicalGenome, src: &str, dst: &str) -> HashSet<String> {
+    let empty = Vec::new();
+    let mut cover = HashSet::new();
+    for edge in graph.outgoing.get(src).unwrap_or(&empty) {
+        let edge_dst = graph
+            .outgoing
+            .get(edge.as_str())
+            .and_then(|d| d.first())
+            .map(|s| s.as_str());
+        if edge_dst == Some(dst) {
+            cover.extend(edge_reads(graph, edge));
+        }
+    }
+    cover
+}
+
 pub fn get_variant(
     graph: &mut GraphicalGenome,
     k: usize,
     ref_name: &str,
     ref_length: usize,
-) -> (Vec<Variant>, HashMap<usize, usize>, HashMap<String, Vec<serde_json::Value> > ) {
+) -> (
+    Vec<Variant>,
+    HashMap<usize, usize>,
+    HashMap<String, Vec<serde_json::Value>>,
+    HashMap<String, HashSet<String>>,
+) {
     let mut coverage = HashMap::new();
     let mut read_record = HashMap::new();
+    let mut cover_record: HashMap<String, HashSet<String>> = HashMap::new();
     let mut var = Vec::new();
     let mut edgelist: Vec<_> = graph.edges.keys().collect();
     edgelist.sort();
@@ -269,13 +308,20 @@ pub fn get_variant(
             .map_or(Vec::new(), |reads| {
                 reads.as_array().unwrap_or(&Vec::new()).to_vec()
             });
-        for v in &variants_circular{
+        let cover_reads = bubble_cover_reads(graph, src, dst);
+        for v in &variants_circular {
             let key = generate_variant_name(&v.clone());
-            read_record.entry(key).or_insert_with(Vec::new).extend(readlist.clone());
+            read_record
+                .entry(key.clone())
+                .or_insert_with(Vec::new)
+                .extend(readlist.clone());
+            let entry = cover_record.entry(key).or_default();
+            for read in &cover_reads {
+                entry.insert(read.clone());
+            }
         }
-            
     }
-    (var, coverage, read_record)
+    (var, coverage, read_record, cover_record)
 }
 
 fn collapse_identical_records(variants: Vec<Variant>, ref_length: usize) -> Vec<Variant> {
@@ -465,14 +511,15 @@ pub fn generate_variant_name(variant: &Variant) -> String {
     }
 }
 
-pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, variants:&[Variant], minimal_ac: usize) -> (Array2<f64>, Vec<Variant>, Vec<String>) {
+pub fn construct_matrix(
+    read_record: &HashMap<String, Vec<serde_json::Value>>,
+    cover_record: &HashMap<String, HashSet<String>>,
+    variants: &[Variant],
+    minimal_ac: usize,
+) -> (Array2<f64>, Vec<Variant>, Vec<String>) {
     let mut read_set: HashSet<String> = HashSet::new();
-    for (_, readlist) in read_record {
-        for read in readlist {
-            if let Some(read_str) = read.as_str() {
-                read_set.insert(read_str.to_string());
-            }
-        }
+    for reads in cover_record.values() {
+        read_set.extend(reads.iter().cloned());
     }
     let mut read_vec: Vec<String> = read_set.into_iter().collect();
     read_vec.sort();
@@ -497,43 +544,52 @@ pub fn construct_matrix (read_record:&HashMap<String, Vec<serde_json::Value>>, v
         .map(|(i, var)| (generate_variant_name(var), i))
         .collect();
 
-
-    // Create a 2D matrix filled with zeros
-    let mut matrix = Array2::<f64>::zeros((var_vec.len(), read_vec.len()));
+    // NaN = missing coverage; 0 = ref; 1 = alt
+    let mut matrix = Array2::<f64>::from_elem((var_vec.len(), read_vec.len()), f64::NAN);
 
     for var in &var_vec {
-        let readlist: HashSet<String> = read_record.get(&generate_variant_name(var))
+        let name = generate_variant_name(var);
+        let r_index = *var_record_dict.get(&name).unwrap();
+        let alt_reads: HashSet<String> = read_record
+            .get(&name)
             .map(|reads| {
-                reads.iter()
+                reads
+                    .iter()
                     .filter_map(|read| read.as_str().map(|s| s.to_string()))
                     .collect()
             })
-            .unwrap_or_else(|| HashSet::new());
-        
-        // Get row index for this variant
-        let r_index = *var_record_dict.get(&generate_variant_name(var)).unwrap();
-        
-        // For each read in the readlist
-        for read in readlist {
-            // Get column index for this read
+            .unwrap_or_default();
+        let cover_reads = cover_record.get(&name).cloned().unwrap_or_default();
+
+        for read in cover_reads {
             if let Some(c_index) = read_set_dict.get(&read) {
-                // Increment the matrix cell
-                matrix[[r_index, *c_index]] += 1.0;
+                matrix[[r_index, *c_index]] = if alt_reads.contains(&read) {
+                    1.0
+                } else {
+                    0.0
+                };
             }
         }
     }
 
-    // filter matrix where the sum of the column is less than 2
+    // Keep reads with more than minimal_ac alt calls across variants
     let mut col_index = Vec::new();
     for i in 0..matrix.ncols() {
-        if matrix.column(i).sum() > minimal_ac as f64 {
+        let alt_count = matrix
+            .column(i)
+            .iter()
+            .filter(|&&x| x == 1.0)
+            .count();
+        if alt_count > minimal_ac {
             col_index.push(i);
         }
     }
     let filtered_matrix = matrix.select(Axis(1), &col_index);
-    let filtered_read_vec: Vec<String> = read_vec.iter().filter(|read| col_index.contains(&read_set_dict.get(read.as_str()).unwrap())).map(|read| read.clone()).collect();
+    let filtered_read_vec: Vec<String> = col_index
+        .iter()
+        .map(|&i| read_vec[i].clone())
+        .collect();
     (filtered_matrix, var_vec, filtered_read_vec)
-
 }
 
 
@@ -560,9 +616,14 @@ fn write_matrix_to_csv<P: AsRef<Path>>(
         let var_name = generate_variant_name(variants);
         let mut row = vec![var_name.clone()];
         
-        // Add the values from the matrix
+        // Add the values from the matrix: empty string for missing (NaN)
         for col_idx in 0..matrix.ncols() {
-            row.push(matrix[[row_idx, col_idx]].to_string());
+            let v = matrix[[row_idx, col_idx]];
+            if v.is_nan() {
+                row.push(String::new());
+            } else {
+                row.push(v.to_string());
+            }
         }
         
         writer.write_record(&row)?;
@@ -573,26 +634,55 @@ fn write_matrix_to_csv<P: AsRef<Path>>(
     Ok(())
 }
 
-fn jaccard_distance(vector1: &[bool], vector2: &[bool]) -> f64 {
-    assert_eq!(vector1.len(), vector2.len(), "Vectors must have the same length");
-    
+fn alt_frequency(vector: ndarray::ArrayView1<f64>) -> f64 {
+    let covered: Vec<f64> = vector.iter().filter(|x| !x.is_nan()).copied().collect();
+    if covered.is_empty() {
+        return 0.0;
+    }
+    covered.iter().sum::<f64>() / covered.len() as f64
+}
+
+fn shuffle_genotypes(data: &[f64], rng: &mut impl rand::Rng) -> Vec<f64> {
+    let mut result = data.to_vec();
+    let covered_indices: Vec<usize> = result
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| !x.is_nan())
+        .map(|(i, _)| i)
+        .collect();
+    let mut values: Vec<f64> = covered_indices.iter().map(|&i| result[i]).collect();
+    values.shuffle(rng);
+    for (idx, val) in covered_indices.iter().zip(values.iter()) {
+        result[*idx] = *val;
+    }
+    result
+}
+
+fn genotype_jaccard_similarity(a: &[f64], b: &[f64]) -> f64 {
+    assert_eq!(a.len(), b.len(), "Vectors must have the same length");
+
     let mut intersection_count = 0;
     let mut union_count = 0;
-    
-    for (a, b) in vector1.iter().zip(vector2.iter()) {
-        if *a && *b {
+
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x.is_nan() || y.is_nan() {
+            continue;
+        }
+        let ax = *x > 0.5;
+        let by = *y > 0.5;
+        if ax && by {
             intersection_count += 1;
         }
-        if *a || *b {
+        if ax || by {
             union_count += 1;
         }
     }
-    
+
     if union_count == 0 {
-        return 0.0; // Both vectors are all zeros
+        return 0.0;
     }
-    
-    1.0 - (intersection_count as f64 / union_count as f64)
+
+    intersection_count as f64 / union_count as f64
 }
 
 /// Generate a null distribution through permutation testing
@@ -614,37 +704,27 @@ fn get_null_distribution(
             let vector = matrix.slice(s![i, ..]);
             
             // Skip vectors with frequency > threshold
-            let frequency = vector.sum() / vector.len() as f64;
+            let frequency = alt_frequency(vector);
             if frequency > threshold {
                 continue;
             }
-        
-            // Create a shuffled copy of the vector
+
+            // Shuffle genotypes only among covered reads; keep NaN positions fixed
             let vector_data: Vec<f64> = vector.iter().copied().collect();
-            let mut shuffled_data = vector_data.clone();
-            shuffled_data.shuffle(&mut rng);
-            let shuffled = Array1::from(shuffled_data);
+            let shuffled = shuffle_genotypes(&vector_data, &mut rng);
 
             let mut all_coefficients = Vec::new();
-            
+
             for (j, other_variant) in filtered_var.iter().enumerate() {
                 let other_index = generate_variant_name(other_variant);
                 if index == other_index {
                     continue;
                 }
 
-                // let other_frequency = other_variant.allele_count as f64 / *coverage.get(&other_variant.pos).unwrap() as f64;
-                // if other_frequency > threshold {
-                //     continue;
-                // }
-
                 let other_vector = matrix.slice(s![j, ..]);
-                
-                let binary_vector: Vec<bool> = shuffled.iter().map(|&x| x > 0.5).collect();
-                let binary_other: Vec<bool> = other_vector.iter().map(|&x| x > 0.5).collect();
+                let other_data: Vec<f64> = other_vector.iter().copied().collect();
 
-                // Calculate Jaccard distance
-                let coor = (1.0 - jaccard_distance(&binary_vector, &binary_other)).abs();
+                let coor = genotype_jaccard_similarity(&shuffled, &other_data);
                 all_coefficients.push(coor);
             }
            
@@ -664,26 +744,19 @@ fn calculate_observation_statistics(
     matrix: &Array2<f64>, 
 ) -> f64 {
 
-    let vector = &matrix.slice(s![index, ..]);
+    let vector = matrix.slice(s![index, ..]);
+    let vector_data: Vec<f64> = vector.iter().copied().collect();
     let mut all_coefficients = Vec::new();
-    
+
     for (i, variant) in filtered_var.iter().enumerate() {
         if i == index {
             continue;
         }
-        // let other_frequency = variant.allele_count as f64 / *coverage.get(&variant.pos).unwrap() as f64;
-        // if other_frequency > threshold {
-        //     continue;
-        // }
-        
-        let other_vector =&matrix.slice(s![i, ..]);
-        
-        // Convert arrays to binary vectors before calculating Jaccard distance
-        let binary_vector: Vec<bool> = vector.iter().map(|&x| x > 0.5).collect();
-        let binary_other: Vec<bool> = other_vector.iter().map(|&x| x > 0.5).collect();
 
-        // Calculate Jaccard distance
-        let coor = (1.0 - jaccard_distance(&binary_vector, &binary_other)).abs();
+        let other_vector = matrix.slice(s![i, ..]);
+        let other_data: Vec<f64> = other_vector.iter().copied().collect();
+
+        let coor = genotype_jaccard_similarity(&vector_data, &other_data);
         all_coefficients.push(coor);
     }
     
@@ -977,17 +1050,19 @@ pub fn start(
     // read in graphical genome
     let graph = agg::GraphicalGenome::load_graph(graph_file).unwrap();
     
-    let (variants, coverage, read_record) = get_variant(&mut graph.clone(), k, &ref_header, ref_seq.len());
+    let (variants, coverage, read_record, cover_record) =
+        get_variant(&mut graph.clone(), k, &ref_header, ref_seq.len());
     let collapsed_var = collapse_identical_records(variants, ref_seq.len());
     let filtered_var = filter_vcf_record(&collapsed_var, &coverage, minimal_ac, hf_threshold);
     // modified, exclude filtered data for FPs
-    
-    // modified, exclude filtered data
-    let (matrix, var_record, read_set) = construct_matrix(&read_record, &filtered_var, minimal_ac);
-    let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
-    let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
 
-    // use matrix information to filter vcf
+    // modified, exclude filtered data
+    let (matrix, var_record, read_set) =
+        construct_matrix(&read_record, &cover_record, &filtered_var, minimal_ac);
+    // let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
+    // let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
+
+    // // use matrix information to filter vcf
     // Use stricter thresholds for ONT data due to higher error rates
     // let (p_value_threshold, frequency_threshold) = if data_type == "ont" {
     //     (0.0001, 0.15)  // Stricter: lower p-value threshold, lower frequency threshold

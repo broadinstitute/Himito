@@ -1,6 +1,6 @@
 [package]
 name = "Himito"
-version = "1.1.1"
+version = "1.1.2"
 edition = "2021"
 
 [dependencies]
@@ -21,3 +21,5 @@ adjustp = "0.1.6"
 msbwt2 = "0.3.2"
 intervals = "2.1.0"
 log = "0.4.32"
+anyhow = "1.0.102"
+rustc-hash = "1.1"

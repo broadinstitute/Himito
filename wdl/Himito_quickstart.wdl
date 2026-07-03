@@ -8,6 +8,7 @@ workflow Himito_quickstart {
         String prefix
         String sample_id
         String data_type
+        String? billing_project
         Int kmer_size
         String chromo
     }
@@ -16,6 +17,7 @@ workflow Himito_quickstart {
         input:
             bam = whole_genome_bam,
             bai = whole_genome_bai,
+            billing_project = billing_project,
             locus = chromo,
             prefix = sample_id
     }
@@ -34,6 +36,7 @@ workflow Himito_quickstart {
     }
 
     output {
+        Float chrM_coverage = CalculateCoverage.coverage
         File graph = QuickStart.graph
         File methyl_bed = QuickStart.methyl_bed
         File asm = QuickStart.asm
@@ -87,6 +90,7 @@ task CalculateCoverage {
         File bam
         File bai
         String locus
+        String? billing_project
         String prefix = "subset"
 
         RuntimeAttr? runtime_attr_override
@@ -98,9 +102,9 @@ task CalculateCoverage {
 
     command <<<
         set -euxo pipefail
-
+        
         export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
-
+        export GCS_REQUESTER_PAYS_PROJECT="~{billing_project}"
         samtools view -bhX ~{bam} ~{bai} ~{locus} > ~{prefix}.bam
         samtools index ~{prefix}.bam
         samtools depth -r ~{locus} ~{prefix}.bam | awk '{sum+=$3} END {print sum/NR}' > coverage.txt
@@ -121,7 +125,7 @@ task CalculateCoverage {
         boot_disk_gb:       10,
         preemptible_tries:  2,
         max_retries:        1,
-        docker:             "us.gcr.io/broad-dsp-lrma/lr-utils:0.1.9"
+        docker:             "us.gcr.io/broad-dsp-lrma/hangsuunc/hifiasm:0.25.0"
     }
     RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])
     runtime {

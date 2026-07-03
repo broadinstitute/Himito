@@ -20,13 +20,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-15]
         rust: [stable, beta]
         include:
           - os: ubuntu-latest
             rust: stable
             cache-key: linux-stable
-          - os: macos-latest
+          - os: macos-15
             rust: stable
             cache-key: macos-stable
 
@@ -48,7 +48,7 @@ jobs:
             bcftools
 
       - name: Install system dependencies (macOS)
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-15'
         run: |
           brew install samtools bcftools || true
 

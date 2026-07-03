@@ -18,12 +18,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, macos-15, windows-latest]
         include:
           - os: ubuntu-latest
             artifact_name: Himito-linux-x86_64
             binary_name: Himito
-          - os: macos-latest
+          - os: macos-15
             artifact_name: Himito-macos-x86_64
             binary_name: Himito
           - os: windows-latest
@@ -46,7 +46,7 @@ jobs:
             liblzma-dev
 
       - name: Install system dependencies (macOS)
-        if: matrix.os == 'macos-latest'
+        if: matrix.os == 'macos-15'
         run: |
           brew install openssl || true
 

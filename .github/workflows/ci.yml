@@ -20,15 +20,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-15]
+        os: [ubuntu-latest]
         rust: [stable, beta]
         include:
           - os: ubuntu-latest
             rust: stable
             cache-key: linux-stable
-          - os: macos-15
-            rust: stable
-            cache-key: macos-stable
 
     steps:
       - name: Checkout code
@@ -46,11 +43,6 @@ jobs:
             liblzma-dev \
             samtools \
             bcftools
-
-      - name: Install system dependencies (macOS)
-        if: matrix.os == 'macos-15'
-        run: |
-          brew install samtools bcftools || true
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

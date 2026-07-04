@@ -240,6 +240,34 @@ fn bubble_cover_reads(graph_intervals_dict: &HashMap<&String, (i64, i64)>, pos: 
     cover
 }
 
+/// Populates `read_record`/`cover_record` for one edge's variants.
+///
+/// `graph_intervals_dict` holds raw (unwrapped) anchor coordinates, including
+/// the duplicated wrap-around span past `ref_length` used to circularize the
+/// graph. `variants` carries that same raw position, while `variants_circular`
+/// carries the wrapped position used to key/name the variant. The bubble
+/// lookup must use the raw position - using the wrapped one would look up
+/// the wrong bubble (or none) for any variant on the wrap-around edge.
+fn record_variant_reads(
+    variants: &[Variant],
+    variants_circular: &[Variant],
+    graph_intervals_dict: &HashMap<&String, (i64, i64)>,
+    graph: &GraphicalGenome,
+    readlist: &[serde_json::Value],
+    read_record: &mut HashMap<String, Vec<serde_json::Value>>,
+    cover_record: &mut HashMap<String, HashSet<String>>,
+) {
+    for (raw_v, v) in variants.iter().zip(variants_circular.iter()) {
+        let key = generate_variant_name(&v.clone());
+        let cover_reads = bubble_cover_reads(&graph_intervals_dict, raw_v.pos, graph);
+        read_record
+            .entry(key.clone())
+            .or_insert_with(Vec::new)
+            .extend(readlist.to_vec());
+        cover_record.entry(key).or_insert_with(HashSet::new).extend(cover_reads);
+    }
+}
+
 pub fn get_variant(
     graph: &mut GraphicalGenome,
     k: usize,
@@ -335,19 +363,15 @@ pub fn get_variant(
                 reads.as_array().unwrap_or(&Vec::new()).to_vec()
             });
         
-        for v in &variants_circular {
-            let key = generate_variant_name(&v.clone());
-            let cover_reads = bubble_cover_reads(&graph_intervals_dict, v.pos, graph);
-            read_record
-                .entry(key.clone())
-                .or_insert_with(Vec::new)
-                .extend(readlist.clone());
-            // let entry = cover_record.entry(key).or_default();
-            cover_record.entry(key).or_insert_with(HashSet::new).extend(cover_reads.clone());
-            // for read in &cover_reads {
-            //     entry.insert(read.clone());
-            // }
-        }
+        record_variant_reads(
+            &variants,
+            &variants_circular,
+            &graph_intervals_dict,
+            graph,
+            &readlist,
+            &mut read_record,
+            &mut cover_record,
+        );
     }
     (var, coverage, read_record, cover_record)
 }
@@ -1171,4 +1195,90 @@ pub fn start(
     // write matrix
     let matrix_output = output_file.with_extension("matrix.csv");
     let _ = write_matrix_to_csv(&filtered_matrix, &permu_filtered_var, &read_set, matrix_output);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Two bubbles: a normal one spanning raw positions [0, 5), and a
+    /// wrap-around bubble spanning raw positions [8, 12) - i.e. it crosses
+    /// the circular origin for a 10bp reference.
+    fn wraparound_test_graph() -> GraphicalGenome {
+        let mut anchor = HashMap::new();
+        anchor.insert("A1".to_string(), json!({"pos": 0}));
+        anchor.insert("A2".to_string(), json!({"pos": 5}));
+        anchor.insert("A3".to_string(), json!({"pos": 8}));
+        anchor.insert("A4".to_string(), json!({"pos": 12}));
+
+        let mut edges = HashMap::new();
+        edges.insert(
+            "E1".to_string(),
+            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1", "r2"]}),
+        );
+        edges.insert(
+            "E2".to_string(),
+            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r3"]}),
+        );
+        edges.insert(
+            "E3".to_string(),
+            json!({"src": ["A3"], "dst": ["A4"], "reads": ["r4"]}),
+        );
+        edges.insert(
+            "E4".to_string(),
+            json!({"src": ["A3"], "dst": ["A4"], "reads": ["r5"]}),
+        );
+
+        GraphicalGenome {
+            anchor,
+            edges,
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn record_variant_reads_uses_raw_position_for_wraparound_bubble() {
+        let graph = wraparound_test_graph();
+        let ref_length = 10usize;
+        let graph_intervals_dict = get_graph_intervals(&graph, ref_length as i64);
+
+        // Raw position 11 lies on the wrap-around bubble [8, 12) and
+        // circularizes down to wrapped position 1.
+        let raw_variant = Variant {
+            pos: 11,
+            ref_allele: "A".to_string(),
+            alt_allele: "G".to_string(),
+            variant_type: "SNP".to_string(),
+            allele_count: 1,
+            filter: None,
+        };
+        let variants = vec![raw_variant];
+        let variants_circular = circuliarize_variants(variants.clone(), ref_length);
+        assert_eq!(variants_circular[0].pos, 1, "sanity check: position should wrap");
+
+        let readlist = vec![json!("r4"), json!("r5")];
+        let mut read_record = HashMap::new();
+        let mut cover_record = HashMap::new();
+
+        record_variant_reads(
+            &variants,
+            &variants_circular,
+            &graph_intervals_dict,
+            &graph,
+            &readlist,
+            &mut read_record,
+            &mut cover_record,
+        );
+
+        let key = generate_variant_name(&variants_circular[0]);
+        let mut cover: Vec<String> = cover_record.get(&key).cloned().unwrap_or_default().into_iter().collect();
+        cover.sort();
+
+        // The wrap-around bubble's true reads are r4/r5. Using the wrapped
+        // position (1) instead of the raw one (11) would incorrectly match
+        // the unrelated bubble at [0, 5), pulling in r1/r2/r3 instead.
+        assert_eq!(cover, vec!["r4".to_string(), "r5".to_string()]);
+    }
 }

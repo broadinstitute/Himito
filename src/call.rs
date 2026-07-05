@@ -207,6 +207,18 @@ fn edge_reads(graph: &GraphicalGenome, edge: &str) -> HashSet<String> {
 fn get_graph_intervals(graph:&GraphicalGenome, length: i64) -> HashMap<&String, (i64, i64)>{
     let mut graph_intervals_dict = HashMap::new();
     for edge in graph.edges.keys() {
+        // Edges with no computed variant record were never CIGAR-processed
+        // (get_variant skips them via this same empty-cigar check) - a read
+        // reaching a bubble only through such an edge was never genotyped
+        // there, and must not be credited as "covering" it, or it later
+        // defaults to a false ref (0) call instead of the correct NaN.
+        let has_variant = graph.edges[edge]
+            .get("variants")
+            .and_then(|v| v.as_str())
+            .map_or(false, |s| !s.is_empty());
+        if !has_variant {
+            continue;
+        }
         let src = graph.edges[edge].get("src").unwrap().as_array().unwrap()[0].as_str().unwrap();
         let dst = graph.edges[edge].get("dst").unwrap().as_array().unwrap()[0].as_str().unwrap();
         let startpos = graph.anchor
@@ -1215,19 +1227,19 @@ mod tests {
         let mut edges = HashMap::new();
         edges.insert(
             "E1".to_string(),
-            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1", "r2"]}),
+            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1", "r2"], "variants": "5="}),
         );
         edges.insert(
             "E2".to_string(),
-            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r3"]}),
+            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r3"], "variants": "2=1X2="}),
         );
         edges.insert(
             "E3".to_string(),
-            json!({"src": ["A3"], "dst": ["A4"], "reads": ["r4"]}),
+            json!({"src": ["A3"], "dst": ["A4"], "reads": ["r4"], "variants": "4="}),
         );
         edges.insert(
             "E4".to_string(),
-            json!({"src": ["A3"], "dst": ["A4"], "reads": ["r5"]}),
+            json!({"src": ["A3"], "dst": ["A4"], "reads": ["r5"], "variants": "1=1X2="}),
         );
 
         GraphicalGenome {
@@ -1280,5 +1292,51 @@ mod tests {
         // position (1) instead of the raw one (11) would incorrectly match
         // the unrelated bubble at [0, 5), pulling in r1/r2/r3 instead.
         assert_eq!(cover, vec!["r4".to_string(), "r5".to_string()]);
+    }
+
+    /// A bubble at raw positions [0, 10) carries the real variant (edge
+    /// `E_real`, cigar `5=1X4=`), with reads r1/r2. A read that couldn't be
+    /// assembled through the fine-grained anchor chain instead crosses the
+    /// same span via a private "skip-over" edge with no computed CIGAR
+    /// (`E_private`, read r3) - mirroring what Himito's own graph does for
+    /// reads it can't cleanly anchor (see e.g. E00001050 in a real run).
+    fn skip_edge_test_graph() -> GraphicalGenome {
+        let mut anchor = HashMap::new();
+        anchor.insert("A1".to_string(), json!({"pos": 0}));
+        anchor.insert("A2".to_string(), json!({"pos": 10}));
+
+        let mut edges = HashMap::new();
+        edges.insert(
+            "E_real".to_string(),
+            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1", "r2"], "variants": "5=1X4="}),
+        );
+        edges.insert(
+            "E_private".to_string(),
+            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r3"]}),
+        );
+
+        GraphicalGenome {
+            anchor,
+            edges,
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn bubble_cover_reads_excludes_edges_with_no_computed_variant() {
+        let graph = skip_edge_test_graph();
+        let graph_intervals_dict = get_graph_intervals(&graph, 10);
+
+        let cover = bubble_cover_reads(&graph_intervals_dict, 5, &graph);
+        let mut cover: Vec<String> = cover.into_iter().collect();
+        cover.sort();
+
+        // r3 only reaches this span via E_private, which was never CIGAR-
+        // processed (get_variant would skip it via the empty-cigar check).
+        // It must not be credited as "covering" the variant - crediting it
+        // as covered-but-not-alt would wrongly call it ref (0) in the
+        // matrix instead of the correct NaN (unassembled/unknown).
+        assert_eq!(cover, vec!["r1".to_string(), "r2".to_string()]);
     }
 }

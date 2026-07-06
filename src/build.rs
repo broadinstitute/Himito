@@ -632,7 +632,146 @@ fn gap_open_aligner(reference: &str, sequence: &str) -> String {
     let cigar = alignment_to_cigar(&alignment.operations);
     // println!("{:?}", cigar);
 
-    cigar
+    // A single gap-open (-5) is pricier than a single mismatch (-1), so inside
+    // a homopolymer/tandem-repeat run the optimal-scoring alignment above will
+    // sometimes fold part of a real indel into an adjacent base as a spurious
+    // substitution instead of a clean insertion/deletion (e.g. chrM:310, a
+    // lone T flanked by poly-C, gets reported as a false near-homoplasmic
+    // T>C "SNP" alongside a same-run C insertion). That substitution is
+    // score-optimal but not the minimal/correct edit - normalize it away.
+    normalize_homopolymer_indels(&cigar, reference, sequence)
+}
+
+/// Rewrites a CIGAR to eliminate a length-1 `X` sitting directly against an
+/// `I` or `D` run whenever the X's "orphaned" base (the one with no partner
+/// on the gapped side) also occurs inside that run. In that case the run can
+/// be losslessly re-anchored so the X becomes a plain match and the indel is
+/// redistributed around it: same total ref/alt content, no substitution.
+/// Left untouched when the orphaned base doesn't occur in the adjacent run -
+/// that's very likely a genuine substitution, not a homopolymer-registration
+/// artifact.
+fn normalize_homopolymer_indels(cigar: &str, ref_seq: &str, alt_seq: &str) -> String {
+    let ops = parse_cigar(cigar);
+    let ref_bytes = ref_seq.as_bytes();
+    let alt_bytes = alt_seq.as_bytes();
+
+    let mut result: Vec<(usize, char)> = Vec::new();
+    let mut ref_pos = 0usize;
+    let mut alt_pos = 0usize;
+    let mut i = 0usize;
+
+    let push_op = |result: &mut Vec<(usize, char)>, len: usize, op: char| {
+        if len == 0 {
+            return;
+        }
+        if let Some(last) = result.last_mut() {
+            if last.1 == op {
+                last.0 += len;
+                return;
+            }
+        }
+        result.push((len, op));
+    };
+
+    while i < ops.len() {
+        let (len, op) = ops[i];
+
+        // I(n) immediately followed by a single mismatch: the mismatch's ref
+        // base may really belong inside the insertion run.
+        if op == 'I' && i + 1 < ops.len() && ops[i + 1] == (1, 'X') {
+            let ins = &alt_bytes[alt_pos..alt_pos + len];
+            let ref_x = ref_bytes[ref_pos];
+            if let Some(p) = ins.iter().rposition(|&b| b == ref_x) {
+                push_op(&mut result, p, 'I');
+                push_op(&mut result, 1, '=');
+                push_op(&mut result, len - p, 'I'); // trailing insertion piece + the X's alt base
+                ref_pos += 1;
+                alt_pos += len + 1;
+                i += 2;
+                continue;
+            }
+        }
+
+        // A single mismatch immediately followed by I(n): mirror of the above.
+        if op == 'X' && len == 1 && i + 1 < ops.len() && ops[i + 1].1 == 'I' {
+            let n = ops[i + 1].0;
+            let ins = &alt_bytes[alt_pos + 1..alt_pos + 1 + n];
+            let ref_x = ref_bytes[ref_pos];
+            if let Some(p) = ins.iter().position(|&b| b == ref_x) {
+                push_op(&mut result, 1 + p, 'I'); // the X's alt base + leading insertion piece
+                push_op(&mut result, 1, '=');
+                push_op(&mut result, n - p - 1, 'I');
+                ref_pos += 1;
+                alt_pos += 1 + n;
+                i += 2;
+                continue;
+            }
+        }
+
+        // D(n) immediately followed by a single mismatch: mirror of I+X with
+        // ref/alt roles swapped.
+        if op == 'D' && i + 1 < ops.len() && ops[i + 1] == (1, 'X') {
+            let del = &ref_bytes[ref_pos..ref_pos + len];
+            let alt_x = alt_bytes[alt_pos];
+            if let Some(q) = del.iter().rposition(|&b| b == alt_x) {
+                push_op(&mut result, q, 'D');
+                push_op(&mut result, 1, '=');
+                push_op(&mut result, len - q, 'D');
+                ref_pos += len + 1;
+                alt_pos += 1;
+                i += 2;
+                continue;
+            }
+        }
+
+        // A single mismatch immediately followed by D(n): mirror of X+I.
+        if op == 'X' && len == 1 && i + 1 < ops.len() && ops[i + 1].1 == 'D' {
+            let n = ops[i + 1].0;
+            let del = &ref_bytes[ref_pos + 1..ref_pos + 1 + n];
+            let alt_x = alt_bytes[alt_pos];
+            if let Some(q) = del.iter().position(|&b| b == alt_x) {
+                push_op(&mut result, 1 + q, 'D');
+                push_op(&mut result, 1, '=');
+                push_op(&mut result, n - q - 1, 'D');
+                ref_pos += 1 + n;
+                alt_pos += 1;
+                i += 2;
+                continue;
+            }
+        }
+
+        match op {
+            '=' | 'X' => {
+                ref_pos += len;
+                alt_pos += len;
+            }
+            'I' => alt_pos += len,
+            'D' => ref_pos += len,
+            _ => {}
+        }
+        push_op(&mut result, len, op);
+        i += 1;
+    }
+
+    result
+        .iter()
+        .map(|(count, op)| format!("{}{}", count, op))
+        .collect()
+}
+
+/// Parses a run-length CIGAR string ("23=4I1X20=") into `(length, op)` pairs.
+fn parse_cigar(cigar: &str) -> Vec<(usize, char)> {
+    let mut ops = Vec::new();
+    let mut num = String::new();
+    for c in cigar.chars() {
+        if c.is_ascii_digit() {
+            num.push(c);
+        } else {
+            ops.push((num.parse().expect("cigar length"), c));
+            num.clear();
+        }
+    }
+    ops
 }
 
 pub fn generate_cigar(
@@ -861,9 +1000,128 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
     );
     let tmp_gfa_path = PathBuf::from("tmp.gfa");
     let mut graph = agg::GraphicalGenome::load_graph(&tmp_gfa_path).unwrap();
-    
+
     // generate cigar
     generate_cigar(&mut graph, &ref_header, k, maxlength, 2);
     let graph_output = output.with_extension("gfa");
     let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reconstructs the alt sequence a CIGAR implies, given the same ref_seq
+    /// and alt_seq the CIGAR was computed from, so tests can prove a
+    /// rewritten CIGAR still encodes exactly the same edit as the original
+    /// rather than merely "having no X".
+    fn reconstruct_alt(cigar: &str, _ref_seq: &str, alt_seq: &str) -> String {
+        let alt_bytes = alt_seq.as_bytes();
+        let mut ref_pos = 0usize;
+        let mut alt_pos = 0usize;
+        let mut out = Vec::new();
+        let mut num = String::new();
+        for c in cigar.chars() {
+            if c.is_ascii_digit() {
+                num.push(c);
+                continue;
+            }
+            let len: usize = num.parse().unwrap();
+            num.clear();
+            match c {
+                '=' | 'X' => {
+                    out.extend_from_slice(&alt_bytes[alt_pos..alt_pos + len]);
+                    ref_pos += len;
+                    alt_pos += len;
+                }
+                'I' => {
+                    out.extend_from_slice(&alt_bytes[alt_pos..alt_pos + len]);
+                    alt_pos += len;
+                }
+                'D' => {
+                    ref_pos += len;
+                }
+                _ => {}
+            }
+        }
+        String::from_utf8(out).unwrap()
+    }
+
+    fn ref_consumed(cigar: &str) -> usize {
+        let mut total = 0usize;
+        let mut num = String::new();
+        for c in cigar.chars() {
+            if c.is_ascii_digit() {
+                num.push(c);
+                continue;
+            }
+            let len: usize = num.parse().unwrap();
+            num.clear();
+            if matches!(c, '=' | 'X' | 'D') {
+                total += len;
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn homopolymer_insertion_absorbs_adjacent_mismatch() {
+        // Real chrM 287-330 window from an NA12877 poly-C tract (7 C's, a
+        // lone T at what would be chrM:310, then 5 more C's). The sample's
+        // edge inserts 4 extra C's in that stretch; the raw aligner's optimal
+        // scoring path represents 3 of them as a clean "I" but folds the 4th
+        // together with the flanking T into a spurious "1X" (T>C) - a false
+        // homoplasmic SNP that doesn't exist in any real read.
+        let ref_seq = "AAAAATTTCCACCAAACCCCCCCTCCCCCGCTTCTGGCCACAGC";
+        let alt_seq = "AAAAATTTCCACCAAACCCCCCCCCCTCCCCCCGCTTCTGGCCACAGC";
+        let raw_cigar = "23=4I1X20=";
+        assert_eq!(reconstruct_alt(raw_cigar, ref_seq, alt_seq), alt_seq);
+
+        let normalized = normalize_homopolymer_indels(raw_cigar, ref_seq, alt_seq);
+
+        assert!(
+            !normalized.contains('X'),
+            "expected the homopolymer-adjacent mismatch to be absorbed, got {}",
+            normalized
+        );
+        assert_eq!(ref_consumed(&normalized), ref_seq.len());
+        assert_eq!(reconstruct_alt(&normalized, ref_seq, alt_seq), alt_seq);
+    }
+
+    #[test]
+    fn genuine_snp_next_to_unrelated_indel_is_left_alone() {
+        // A real substitution (ref 'G', alt 'A') sitting right next to an
+        // insertion whose inserted base never equals the mismatched ref base
+        // - there is no way to re-anchor this without changing content, so
+        // it must be left as a real X.
+        let ref_seq = "ACGTACGTG";
+        let alt_seq = "ACGTACGTTTA"; // insert "TT" then mismatch G->A
+        let raw_cigar = "8=2I1X";
+        assert_eq!(reconstruct_alt(raw_cigar, ref_seq, alt_seq), alt_seq);
+
+        let normalized = normalize_homopolymer_indels(raw_cigar, ref_seq, alt_seq);
+
+        assert_eq!(normalized, raw_cigar);
+    }
+
+    #[test]
+    fn homopolymer_deletion_absorbs_adjacent_mismatch() {
+        // Exact role-swap (ref<->alt, I<->D) of homopolymer_insertion_absorbs_adjacent_mismatch:
+        // a deletion is just an insertion viewed from the other sequence, so
+        // this is the same real chrM poly-C edit, mirrored.
+        let ref_seq = "AAAAATTTCCACCAAACCCCCCCCCCTCCCCCCGCTTCTGGCCACAGC";
+        let alt_seq = "AAAAATTTCCACCAAACCCCCCCTCCCCCGCTTCTGGCCACAGC";
+        let raw_cigar = "23=4D1X20=";
+        assert_eq!(reconstruct_alt(raw_cigar, ref_seq, alt_seq), alt_seq);
+
+        let normalized = normalize_homopolymer_indels(raw_cigar, ref_seq, alt_seq);
+
+        assert!(
+            !normalized.contains('X'),
+            "expected the homopolymer-adjacent mismatch to be absorbed, got {}",
+            normalized
+        );
+        assert_eq!(ref_consumed(&normalized), ref_seq.len());
+        assert_eq!(reconstruct_alt(&normalized, ref_seq, alt_seq), alt_seq);
+    }
 }

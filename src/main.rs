@@ -12,6 +12,7 @@ mod methyl;
 mod correct;
 mod minorhap;
 mod callnumts;
+mod lineage;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]

@@ -92,7 +92,6 @@ def assign_frequencies(tree: Tree, ref_fraction: float, rng: random.Random) -> N
     reference reads (so no mutation reaches 100% -> everything stays < max_hf).
     Every node keeps a floor of its incoming frequency for its own clone, so
     every mutation ends strictly inside (0.01, 0.95)."""
-    n = len(tree.nodes)
     # Root gets total mass 1.0; it keeps ref_fraction for the reference clone.
     tree.nodes[0].cum_freq = 1.0
 
@@ -117,7 +116,11 @@ def assign_frequencies(tree: Tree, ref_fraction: float, rng: random.Random) -> N
     distribute(0, 1.0)
     # Root's cum_freq is definitional (1.0); mutations must be in-band.
     for node in tree.nodes[1:]:
-        assert 0.01 < node.cum_freq < 0.95, (node.id, node.cum_freq)
+        if not (0.01 < node.cum_freq < 0.95):
+            raise ValueError(
+                f"node {node.id} has cum_freq={node.cum_freq:.6f} outside (0.01, 0.95); "
+                "try a smaller --n-mutations or a different --seed"
+            )
 
 
 def path_to_root(tree: Tree, node_id: int) -> list[tuple[int, str, str]]:
@@ -192,10 +195,20 @@ def main() -> None:
     ap.add_argument("--outdir", required=True)
     args = ap.parse_args()
 
-    rng = random.Random(args.seed)
     _, seq = load_reference(args.reference)
-    tree = build_tree(seq, args.n_mutations, rng)
-    assign_frequencies(tree, args.ref_fraction, rng)
+    max_attempts = 100
+    for attempt in range(max_attempts):
+        rng = random.Random(args.seed + attempt)
+        tree = build_tree(seq, args.n_mutations, rng)
+        try:
+            assign_frequencies(tree, args.ref_fraction, rng)
+            break
+        except ValueError as exc:
+            if attempt == max_attempts - 1:
+                raise SystemExit(
+                    f"Could not find valid frequency assignment after {max_attempts} attempts. "
+                    "Try a smaller --n-mutations or a different --seed."
+                ) from exc
     write_truth(tree, seq, args.outdir)
     print(f"wrote truth for {args.n_mutations} mutations to {args.outdir}/truth")
 

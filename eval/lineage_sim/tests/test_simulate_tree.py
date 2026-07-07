@@ -67,3 +67,66 @@ def test_clone_genome_applies_only_path_snvs():
     assert genome[:99] == seq[:99]
     assert genome[100:] == seq[100:]
     assert len(genome) == len(seq)
+
+
+def test_frequencies_decrease_from_parent_to_child():
+    """cum_freq must strictly decrease along every edge (root excluded)."""
+    _, seq = st.load_reference(REF)
+    rng = random.Random(13)
+    tree = st.build_tree(seq, n_mutations=10, rng=rng)
+    st.assign_frequencies(tree, ref_fraction=0.15, rng=rng)
+    for node in tree.nodes[1:]:  # skip root
+        parent = tree.nodes[node.parent]
+        assert node.cum_freq < parent.cum_freq, (
+            f"node {node.id} cum_freq={node.cum_freq:.6f} >= "
+            f"parent {parent.id} cum_freq={parent.cum_freq:.6f}"
+        )
+
+
+def test_write_truth_emits_expected_files_and_headers(tmp_path):
+    """write_truth produces all four output files with correct headers/content."""
+    import csv
+
+    _, seq = st.load_reference(REF)
+    n_mutations = 5
+    rng = random.Random(99)
+    tree = st.build_tree(seq, n_mutations=n_mutations, rng=rng)
+    st.assign_frequencies(tree, ref_fraction=0.15, rng=rng)
+    st.write_truth(tree, seq, str(tmp_path))
+
+    truth_dir = tmp_path / "truth"
+
+    # --- truth_mutation_tree.tsv ---
+    tree_tsv = truth_dir / "truth_mutation_tree.tsv"
+    assert tree_tsv.exists()
+    lines = tree_tsv.read_text().splitlines()
+    assert lines[0] == "node_id\tvariant\tparent_id\tparent_variant"
+    variants_col = [line.split("\t")[1] for line in lines[1:]]
+    assert "ROOT" in variants_col, "no ROOT row found in truth_mutation_tree.tsv"
+
+    # --- truth_variants.txt ---
+    variants_txt = truth_dir / "truth_variants.txt"
+    assert variants_txt.exists()
+    variant_lines = [l for l in variants_txt.read_text().splitlines() if l]
+    assert len(variant_lines) == n_mutations
+    import re
+    pattern = re.compile(r"^m\.\d+[ACGT]>[ACGT]$")
+    for v in variant_lines:
+        assert pattern.match(v), f"variant line {v!r} does not match m.<pos><ref>><alt>"
+
+    # --- clones.tsv ---
+    clones_tsv = truth_dir / "clones.tsv"
+    assert clones_tsv.exists()
+    clone_lines = clones_tsv.read_text().splitlines()
+    assert clone_lines[0] == "clone_id\tnode_variant\tvariant_path\tfrequency\tn_reads"
+    clone_ids = [line.split("\t")[0] for line in clone_lines[1:]]
+    assert "ref" in clone_ids, "no 'ref' clone row in clones.tsv"
+
+    # --- clone_genomes.fa ---
+    fa_file = truth_dir / "clone_genomes.fa"
+    assert fa_file.exists()
+    headers = [l for l in fa_file.read_text().splitlines() if l.startswith(">")]
+    assert ">clone_ref" in headers
+    assert len(headers) == n_mutations + 1, (
+        f"expected {n_mutations + 1} FASTA records, got {len(headers)}"
+    )

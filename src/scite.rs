@@ -170,6 +170,52 @@ pub fn tree_log_likelihood(matrix: &BinaryMatrix, tree: &MutationTree, rates: &E
         .sum()
 }
 
+fn subtree_all_carry(tree: &lineage::Tree, hap_matrix: &HaplotypeMatrix, node_id: usize, mutation: usize) -> bool {
+    let mut stack = vec![node_id];
+    while let Some(id) = stack.pop() {
+        let node = &tree.nodes[id];
+        if node.is_leaf {
+            if hap_matrix.haplotypes[node.id].profile[mutation] != Some(1) {
+                return false;
+            }
+        } else {
+            stack.extend(node.children.iter().copied());
+        }
+    }
+    true
+}
+
+/// Build an initial mutation tree from the Neighbor-Joining haplotype tree:
+/// each mutation is ranked by the size (in attached reads) of the largest NJ
+/// subtree entirely carrying it, then chained in descending order.
+pub fn from_nj_tree(hap_matrix: &HaplotypeMatrix, nj_tree: &lineage::Tree) -> MutationTree {
+    let n = hap_matrix.variants.len();
+    let mut best_size = vec![0usize; n];
+
+    for node in &nj_tree.nodes {
+        let size = nj_tree.subtree_read_count(node.id);
+        for m in 0..n {
+            if size > best_size[m] && subtree_all_carry(nj_tree, hap_matrix, node.id, m) {
+                best_size[m] = size;
+            }
+        }
+    }
+
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| best_size[b].cmp(&best_size[a]));
+
+    let root = n;
+    let mut parent = vec![root; n + 1];
+    parent[root] = root;
+    let mut prev = root;
+    for &m in &order {
+        parent[m] = prev;
+        prev = m;
+    }
+
+    MutationTree { n_mutations: n, parent }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +326,38 @@ mod tests {
                 assert_valid_tree(&tree);
             }
         }
+    }
+
+    #[test]
+    fn from_nj_tree_orders_mutations_by_largest_fully_carrying_subtree() {
+        use lineage::{Haplotype, HaplotypeMatrix, Node, Tree};
+
+        // 3 leaf haplotypes, all children of one root:
+        //   H0 (5 reads): neither A nor B
+        //   H1 (3 reads): A only
+        //   H2 (2 reads): A and B
+        // A's largest fully-carrying subtree is {H1} (3 reads) since H0 lacks A.
+        // B's largest fully-carrying subtree is {H2} (2 reads) since H0, H1 lack B.
+        let hap_matrix = HaplotypeMatrix {
+            variants: vec!["A".to_string(), "B".to_string()],
+            haplotypes: vec![
+                Haplotype { id: "H0".to_string(), profile: vec![Some(0), Some(0)], reads: vec![], count: 5 },
+                Haplotype { id: "H1".to_string(), profile: vec![Some(1), Some(0)], reads: vec![], count: 3 },
+                Haplotype { id: "H2".to_string(), profile: vec![Some(1), Some(1)], reads: vec![], count: 2 },
+            ],
+        };
+        let nj_tree = Tree {
+            nodes: vec![
+                Node { id: 0, label: "H0".to_string(), is_leaf: true, children: vec![], parent: Some(3), branch_length: 0.0, read_count: 5 },
+                Node { id: 1, label: "H1".to_string(), is_leaf: true, children: vec![], parent: Some(3), branch_length: 0.0, read_count: 3 },
+                Node { id: 2, label: "H2".to_string(), is_leaf: true, children: vec![], parent: Some(3), branch_length: 0.0, read_count: 2 },
+                Node { id: 3, label: "ROOT".to_string(), is_leaf: false, children: vec![0, 1, 2], parent: None, branch_length: 0.0, read_count: 0 },
+            ],
+            root: 3,
+        };
+
+        let tree = from_nj_tree(&hap_matrix, &nj_tree);
+        // A ranked ahead of B -> A's parent is root, B's parent is A.
+        assert_eq!(tree.parent, vec![2, 0, 2]);
     }
 }

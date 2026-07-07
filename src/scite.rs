@@ -75,6 +75,39 @@ impl MutationTree {
     }
 }
 
+/// Fixed sequencing/genotyping error rates used in the SCITE likelihood model.
+pub struct ErrorRates {
+    /// alpha: P(observed = 1 | true = 0) — false positive rate.
+    pub fp_rate: f64,
+    /// beta: P(observed = 0 | true = 1) — false negative rate.
+    pub fn_rate: f64,
+}
+
+/// Log-likelihood of `profile` (one read's observed calls, one per variant,
+/// `None` = missing/uncovered and contributes nothing) given that
+/// `ancestor_mask` bit `i` set means variant `i` is present under the
+/// candidate tree attachment being scored.
+pub fn attachment_log_likelihood(
+    profile: &[Option<u8>],
+    ancestor_mask: u64,
+    rates: &ErrorRates,
+) -> f64 {
+    let mut ll = 0.0;
+    for (i, call) in profile.iter().enumerate() {
+        let Some(observed) = call else { continue };
+        let expected_mutated = (ancestor_mask & (1u64 << i)) != 0;
+        let p = match (*observed, expected_mutated) {
+            (1, false) => rates.fp_rate,
+            (0, false) => 1.0 - rates.fp_rate,
+            (0, true) => rates.fn_rate,
+            (1, true) => 1.0 - rates.fn_rate,
+            _ => unreachable!("observed genotype must be 0 or 1"),
+        };
+        ll += p.ln();
+    }
+    ll
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +142,27 @@ mod tests {
         let moved = tree.with_parent(0, 3);
         assert_eq!(moved.parent, vec![3, 2, 3, 3]);
         assert_eq!(tree.parent, vec![1, 2, 3, 3]);
+    }
+
+    #[test]
+    fn attachment_log_likelihood_matches_hand_computed_value() {
+        let profile = vec![Some(1), Some(0), None];
+        let ancestor_mask = 0b011;
+        let rates = ErrorRates { fp_rate: 0.1, fn_rate: 0.2 };
+
+        let expected = (1.0 - rates.fn_rate).ln() + rates.fn_rate.ln();
+        let actual = attachment_log_likelihood(&profile, ancestor_mask, &rates);
+        assert!((actual - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn attachment_log_likelihood_scores_true_negative_and_false_positive() {
+        let profile = vec![Some(0), Some(1)];
+        let ancestor_mask = 0;
+        let rates = ErrorRates { fp_rate: 0.1, fn_rate: 0.2 };
+
+        let expected = (1.0 - rates.fp_rate).ln() + rates.fp_rate.ln();
+        let actual = attachment_log_likelihood(&profile, ancestor_mask, &rates);
+        assert!((actual - expected).abs() < 1e-12);
     }
 }

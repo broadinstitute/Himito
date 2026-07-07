@@ -73,6 +73,36 @@ impl MutationTree {
         parent[node] = new_parent;
         MutationTree { n_mutations: self.n_mutations, parent }
     }
+
+    /// A random valid tree: process mutations in random order, attaching
+    /// each one to a uniformly random *already-placed* node (root counts as
+    /// placed from the start). This is a "random recursive tree" — every
+    /// node it produces is acyclic by construction. It is not uniformly
+    /// distributed over all labeled trees the way reference SCITE's
+    /// Prüfer-sequence generator is, but that distinction doesn't matter for
+    /// MCMC correctness (see the plan header) — only for how fast chains
+    /// that DO start randomly mix, which the multi-chain restarts (Task 10)
+    /// already compensate for.
+    pub fn random(n_mutations: usize, rng: &mut impl Rng) -> Self {
+        let root = n_mutations;
+        let mut parent = vec![root; n_mutations + 1];
+        parent[root] = root;
+
+        let mut order: Vec<usize> = (0..n_mutations).collect();
+        for i in (1..order.len()).rev() {
+            let j = rng.random_range(0..=i);
+            order.swap(i, j);
+        }
+
+        let mut placed: Vec<usize> = vec![root];
+        for &node in &order {
+            let p = placed[rng.random_range(0..placed.len())];
+            parent[node] = p;
+            placed.push(node);
+        }
+
+        MutationTree { n_mutations, parent }
+    }
 }
 
 /// Fixed sequencing/genotyping error rates used in the SCITE likelihood model.
@@ -150,6 +180,21 @@ mod tests {
         MutationTree { n_mutations: 3, parent: vec![1, 2, 3, 3] }
     }
 
+    fn assert_valid_tree(tree: &MutationTree) {
+        let n = tree.n_mutations;
+        assert_eq!(tree.parent.len(), n + 1);
+        assert_eq!(tree.parent[tree.root()], tree.root());
+        for start in 0..=n {
+            let mut cur = start;
+            let mut steps = 0;
+            while cur != tree.root() {
+                cur = tree.parent[cur];
+                steps += 1;
+                assert!(steps <= n, "cycle detected starting from node {start}");
+            }
+        }
+    }
+
     #[test]
     fn ancestor_mask_includes_self_and_all_ancestors_up_to_root() {
         let tree = chain_tree();
@@ -224,5 +269,16 @@ mod tests {
         let expected = 2.0 * per_read_ll;
         let actual = tree_log_likelihood(&matrix, &tree, &rates);
         assert!((actual - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn random_tree_is_always_valid() {
+        let mut rng = StdRng::seed_from_u64(1);
+        for n in [1, 2, 5, 10] {
+            for _ in 0..20 {
+                let tree = MutationTree::random(n, &mut rng);
+                assert_valid_tree(&tree);
+            }
+        }
     }
 }

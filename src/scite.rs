@@ -337,6 +337,42 @@ pub fn propose_move(tree: &MutationTree, rng: &mut impl Rng) -> (MutationTree, f
     }
 }
 
+/// Run one MCMC chain of `n_iterations` moves, starting from `initial_tree`
+/// if given, otherwise a random tree, and return the highest-likelihood tree
+/// seen at any point in the chain (MCMC explores, it doesn't monotonically
+/// improve, so the running best must be tracked separately from the current
+/// state).
+pub fn run_mcmc(
+    matrix: &BinaryMatrix,
+    rates: &ErrorRates,
+    n_iterations: usize,
+    initial_tree: Option<&MutationTree>,
+    rng: &mut impl Rng,
+) -> (MutationTree, f64) {
+    let n = matrix.variants.len();
+    let mut current = initial_tree.cloned().unwrap_or_else(|| MutationTree::random(n, rng));
+    let mut current_ll = tree_log_likelihood(matrix, &current, rates);
+    let mut best = current.clone();
+    let mut best_ll = current_ll;
+
+    for _ in 0..n_iterations {
+        let (proposal, nbh_correction) = propose_move(&current, rng);
+        let proposal_ll = tree_log_likelihood(matrix, &proposal, rates);
+
+        let acceptance = nbh_correction * (proposal_ll - current_ll).exp();
+        if rng.random::<f64>() < acceptance {
+            current = proposal;
+            current_ll = proposal_ll;
+            if current_ll > best_ll {
+                best = current.clone();
+                best_ll = current_ll;
+            }
+        }
+    }
+
+    (best, best_ll)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,5 +599,34 @@ mod tests {
             assert_valid_tree(&proposal);
             assert!(correction.is_finite() && correction > 0.0);
         }
+    }
+
+    #[test]
+    fn run_mcmc_recovers_a_true_ancestor_relationship() {
+        let mut data_a = Vec::new();
+        let mut data_b = Vec::new();
+        for _ in 0..6 {
+            data_a.push(Some(1));
+            data_b.push(Some(1));
+        }
+        for _ in 0..3 {
+            data_a.push(Some(1));
+            data_b.push(Some(0));
+        }
+        data_a.push(Some(0)); // simulated false negative
+        data_b.push(Some(1));
+
+        let n_reads = data_a.len();
+        let matrix = BinaryMatrix {
+            variants: vec!["A".to_string(), "B".to_string()],
+            reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
+            data: vec![data_a, data_b],
+        };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let (tree, _ll) = run_mcmc(&matrix, &rates, 3000, None, &mut rng);
+
+        assert_eq!(tree.parent[1], 0);
     }
 }

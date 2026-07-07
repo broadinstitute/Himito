@@ -128,6 +128,18 @@ pub fn best_attachment(
     (best_node, best_ll)
 }
 
+/// Total log-likelihood of `matrix` under `tree`: sum, over every read, of
+/// that read's best-attachment log-likelihood.
+pub fn tree_log_likelihood(matrix: &BinaryMatrix, tree: &MutationTree, rates: &ErrorRates) -> f64 {
+    let n_reads = matrix.reads.len();
+    (0..n_reads)
+        .map(|r| {
+            let profile: Vec<Option<u8>> = matrix.data.iter().map(|row| row[r]).collect();
+            best_attachment(&profile, tree, rates).1
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +208,21 @@ mod tests {
         let (node, ll) = best_attachment(&profile, &tree, &rates);
         assert_eq!(node, 0);
         assert!((ll - expected_ll).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tree_log_likelihood_sums_best_attachment_over_all_reads() {
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 2, 2] };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.3 };
+        let matrix = BinaryMatrix {
+            variants: vec!["A".to_string(), "B".to_string()],
+            reads: vec!["r1".to_string(), "r2".to_string()],
+            data: vec![vec![Some(1), Some(0)], vec![Some(0), Some(1)]],
+        };
+
+        let per_read_ll = (1.0 - rates.fn_rate).ln() + (1.0 - rates.fp_rate).ln();
+        let expected = 2.0 * per_read_ll;
+        let actual = tree_log_likelihood(&matrix, &tree, &rates);
+        assert!((actual - expected).abs() < 1e-12);
     }
 }

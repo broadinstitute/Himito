@@ -591,7 +591,21 @@ pub fn write_haplotype_map(hap_matrix: &HaplotypeMatrix, path: &str) -> Result<(
 }
 
 
-pub fn start (matrix_file: &str, vcf_file: Option<&str>, min_hf: f64, max_hf: f64, min_presence: usize, min_absence: usize, min_reads: usize, output_prefix: &str) -> Result<()> {
+pub fn start(
+    matrix_file: &str,
+    vcf_file: Option<&str>,
+    min_hf: f64,
+    max_hf: f64,
+    min_presence: usize,
+    min_absence: usize,
+    min_reads: usize,
+    fp_rate: f64,
+    fn_rate: f64,
+    mcmc_iterations: usize,
+    mcmc_chains: usize,
+    mcmc_seed: u64,
+    output_prefix: &str,
+) -> Result<()> {
     println!("Starting lineage analysis...");
 
     // ── Step 1: load VCF HF values, then filter the binary matrix ─────────────
@@ -605,8 +619,7 @@ pub fn start (matrix_file: &str, vcf_file: Option<&str>, min_hf: f64, max_hf: f6
         min_presence,
         min_absence,
     )?;
-    println!("{:?}", binary.variants);
-    
+
     if binary.variants.is_empty() {
         anyhow::bail!(
             "No informative variants remain after filtering. \
@@ -626,20 +639,18 @@ pub fn start (matrix_file: &str, vcf_file: Option<&str>, min_hf: f64, max_hf: f6
     let hmap_path = format!("{}.raw_haplotype_map.tsv", output_prefix);
     write_haplotype_map(&hap_matrix, &hmap_path)?;
 
-    // ── Step 3: pairwise Hamming distance + Neighbor-Joining tree as the initial tree ─────────────
-    eprintln!("[4/5] Building Neighbor-Joining tree");
-    let dist = hamming_distance_matrix(&hap_matrix);
-    let tree = neighbor_joining(&dist, &hap_matrix)?;
-    eprintln!("      Tree has {} nodes ({} leaves)", tree.nodes.len(), tree.leaves().len());
-
-    // ── Step 4: MCMC  idenitfy the ─────────────
-
-
-
-
-
-
-
+    // ── Step 3: SCITE mutation-tree search (NJ-informed MCMC) ─────────────────
+    eprintln!("[3/3] Running SCITE mutation-tree search...");
+    crate::scite::run_scite_pipeline(
+        &binary,
+        &hap_matrix,
+        fp_rate,
+        fn_rate,
+        mcmc_iterations,
+        mcmc_chains,
+        mcmc_seed,
+        output_prefix,
+    )?;
 
     Ok(())
 

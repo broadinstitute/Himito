@@ -392,6 +392,26 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 3)]
         min_reads: usize,
 
+        /// SCITE false-positive rate (alpha): P(observed=1 | true=0)
+        #[clap(long, value_parser, default_value_t = 0.001)]
+        fp_rate: f64,
+
+        /// SCITE false-negative rate (beta): P(observed=0 | true=1)
+        #[clap(long, value_parser, default_value_t = 0.05)]
+        fn_rate: f64,
+
+        /// number of MCMC iterations per chain
+        #[clap(long, value_parser, default_value_t = 10000)]
+        mcmc_iterations: usize,
+
+        /// number of independent MCMC chains (best tree across all is kept)
+        #[clap(long, value_parser, default_value_t = 4)]
+        mcmc_chains: usize,
+
+        /// RNG seed for the MCMC search (reproducible runs)
+        #[clap(long, value_parser, default_value_t = 42)]
+        mcmc_seed: u64,
+
         /// output prefix; writes <prefix>.haplotype_map.tsv
         #[clap(short, long, value_parser, required = true)]
         output_prefix: String,
@@ -605,6 +625,11 @@ fn main() {
             min_presence,
             min_absence,
             min_reads,
+            fp_rate,
+            fn_rate,
+            mcmc_iterations,
+            mcmc_chains,
+            mcmc_seed,
             output_prefix,
         } => {
             let matrix_file = matrix_file.to_str().expect("matrix-file path is not valid UTF-8");
@@ -619,6 +644,11 @@ fn main() {
                 min_presence,
                 min_absence,
                 min_reads,
+                fp_rate,
+                fn_rate,
+                mcmc_iterations,
+                mcmc_chains,
+                mcmc_seed,
                 &output_prefix,
             ) {
                 eprintln!("Error running lineage analysis: {:#}", e);

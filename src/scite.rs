@@ -507,6 +507,63 @@ pub fn write_mutation_tree(tree: &MutationTree, matrix: &CleanedMatrix, path: &s
     Ok(())
 }
 
+/// Run the MCMC mutation-tree search (starting from an NJ-tree-derived guess
+/// when one can be built), attach every read to its best-fitting node, and
+/// write all four SCITE output files with the given `output_prefix`.
+pub fn run_scite_pipeline(
+    binary: &BinaryMatrix,
+    hap_matrix: &HaplotypeMatrix,
+    fp_rate: f64,
+    fn_rate: f64,
+    n_iterations: usize,
+    n_chains: usize,
+    seed: u64,
+    output_prefix: &str,
+) -> Result<()> {
+    if binary.variants.len() < 2 {
+        anyhow::bail!(
+            "SCITE requires at least 2 variants (got {}); \
+             relax --min-hf / --min-presence / --min-absence thresholds.",
+            binary.variants.len()
+        );
+    }
+    if binary.variants.len() > 63 {
+        anyhow::bail!(
+            "SCITE mutation-tree search supports at most 63 variants (got {}); \
+             tighten the lineage HF/prevalence thresholds.",
+            binary.variants.len()
+        );
+    }
+
+    let dist = lineage::hamming_distance_matrix(hap_matrix);
+    let initial_tree = lineage::neighbor_joining(&dist, hap_matrix)
+        .ok()
+        .map(|nj_tree| from_nj_tree(hap_matrix, &nj_tree));
+    eprintln!(
+        "[SCITE] Initial tree: {}",
+        if initial_tree.is_some() { "derived from Neighbor-Joining haplotype tree" } else { "random (NJ tree unavailable)" }
+    );
+
+    eprintln!(
+        "[SCITE] {} variants, {} reads. Running MCMC: {n_chains} chains x {n_iterations} iterations",
+        binary.variants.len(),
+        binary.reads.len()
+    );
+
+    let rates = ErrorRates { fp_rate, fn_rate };
+    let (tree, ll) = run_mcmc_multichain(binary, &rates, n_iterations, n_chains, initial_tree.as_ref(), seed);
+    eprintln!("[SCITE] Best tree log-likelihood: {ll:.3}");
+
+    let cleaned = attach_all_reads(binary, &tree, &rates);
+
+    write_cleaned_matrix(&cleaned, &format!("{output_prefix}.cleaned_matrix.csv"))?;
+    write_variant_cooccurrence(&cleaned, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
+    write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
+    write_mutation_tree(&tree, &cleaned, &format!("{output_prefix}.mutation_tree.tsv"))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -867,5 +924,37 @@ mod tests {
              1\tB\t0\tA\t1\n\
              2\tROOT\t2\tROOT\t0\n"
         );
+    }
+
+    #[test]
+    fn run_scite_pipeline_writes_all_four_output_files() {
+        let matrix = BinaryMatrix {
+            variants: vec!["m.A".to_string(), "m.B".to_string()],
+            reads: (0..10).map(|i| format!("r{i}")).collect(),
+            data: vec![
+                vec![Some(1); 9].into_iter().chain([Some(0)]).collect(),
+                vec![Some(1); 6].into_iter().chain(vec![Some(0); 3]).chain([Some(1)]).collect(),
+            ],
+        };
+        let hap_matrix = lineage::deduplicate(&matrix, 1);
+
+        let prefix = std::env::temp_dir()
+            .join("himito_test_scite_pipeline_out")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 500, 2, 123, &prefix).unwrap();
+
+        for suffix in [
+            ".cleaned_matrix.csv",
+            ".variant_cooccurrence.tsv",
+            ".molecule_summary.tsv",
+            ".mutation_tree.tsv",
+        ] {
+            let path = format!("{prefix}{suffix}");
+            assert!(std::path::Path::new(&path).exists(), "expected output file {path} to exist");
+            std::fs::remove_file(&path).ok();
+        }
     }
 }

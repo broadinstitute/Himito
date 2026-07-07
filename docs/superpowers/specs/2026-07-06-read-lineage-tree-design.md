@@ -39,14 +39,21 @@ represents. Re-expressing that tree as a haplotype tree:
 ## Unary collapse (confirmed behavior)
 
 To match tsinfer (no pass-through internal nodes), mutation nodes that are not
-real branch points are dissolved:
+real branch points are dissolved. A node's **effective children** are its
+surviving child-lineages plus its attached haplotype tips (each attached
+haplotype counts as one child).
 
-- A mutation node is **kept** as an internal node iff it has **≥2 children**,
-  where a "child" is either a surviving child-lineage or an attached haplotype
-  tip. (Read-bearing nodes therefore always survive.)
-- A mutation node with **exactly one child and no attached haplotype** is
-  **collapsed**: its mutation is prepended to that single child's branch mutation
-  list.
+- A mutation node is **kept** as an ancestral internal node (`anc<id>`) iff it
+  has **≥2 effective children** — a genuine branch point.
+- A mutation node with **exactly one effective child** is **collapsed**: its
+  mutation is folded onto that single child's branch.
+  - If the single child is a **child-lineage**, recurse into it, appending this
+    node's mutation to the branch (mutations accumulate ancestral→derived).
+  - If the single child is a **single haplotype tip**, the mutation rides on
+    that tip's own branch: `H0002_n56:1[&&NHX:mutation=m.309C>CCC:reads=56]`.
+- A mutation node with **zero effective children** (a dead-end mutation nobody's
+  best-fit carries and that has no descendants) is emitted as an ancestral leaf
+  `anc<id>:<len>[&&NHX:mutation=...]` so the mutation is not lost.
 - `ROOT` (germline) is **never collapsed** — it is always the tree anchor, even
   if it has a single child. When `ROOT` has one child, the tree is simply
   `(<child subtree>)ROOT;`.

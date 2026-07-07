@@ -57,15 +57,22 @@ real branch points are dissolved:
 ## Output format details
 
 - **Tip label:** `H<id>_n<read_count>` (e.g. `H0002_n56`). Alphanumeric +
-  underscore, no quoting needed.
+  underscore, no quoting needed — the read count is human-readable in the label.
 - **Internal label:** `anc<node_id>` for ancestral haplotypes, `ROOT` for
   germline.
+- **Read support (machine-readable):** every haplotype tip carries its read
+  count as an NHX field on its branch, `[&&NHX:reads=<count>]`, so viewers can
+  size/color tips by support without parsing the label. When the tip's branch
+  also carries mutations, both fields appear:
+  `[&&NHX:mutation=m.309C>CCC:reads=56]`. Internal (ancestral) nodes and `ROOT`
+  have no `reads` field (they are unobserved).
 - **Branch mutations:** NHX `[&&NHX:mutation=<comma-list>]`. Mutation names
   contain `.` and `>` but never `:` or `=` (the NHX field delimiters), so they
   are safe unquoted inside NHX.
 - **Branch length:** the number of mutations on that branch (`1` normally, more
   when collapsed). A haplotype tip that acquires no new mutation relative to its
-  parent node gets length `0` and no `mutation` field.
+  parent node gets length `0` and no `mutation` field (but still carries its
+  `reads` field).
 - **Root:** has no incoming branch and no mutation annotation.
 - Standard Newick termination with `;` and a trailing newline.
 
@@ -104,11 +111,11 @@ in `lineage::start` / the CLI.
 
 Unit test on a small hand-built `MutationTree` + `HaplotypeMatrix` asserting the
 exact Newick string, covering:
-1. A branch point with ≥2 haplotype tips.
+1. A branch point with ≥2 haplotype tips, each carrying `[&&NHX:...:reads=<n>]`.
 2. A collapsed pass-through mutation (branch carrying a comma-joined mutation
-   list).
+   list), with `mutation` and `reads` fields co-present on a tip.
 3. A haplotype attached to an internal (read-bearing) node → zero-length tip
-   edge with no mutation field.
+   edge with no `mutation` field but still a `reads` field.
 
 Plus the existing `run_scite_pipeline` file-existence test extended to assert
 `.read_lineage.nwk` is written.

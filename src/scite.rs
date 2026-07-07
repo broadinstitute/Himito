@@ -433,6 +433,80 @@ pub fn attach_all_reads(matrix: &BinaryMatrix, tree: &MutationTree, rates: &Erro
     }
 }
 
+pub fn write_cleaned_matrix(matrix: &CleanedMatrix, path: &str) -> Result<()> {
+    let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
+    write!(w, "variant")?;
+    for read in &matrix.reads {
+        write!(w, ",{read}")?;
+    }
+    writeln!(w)?;
+    for (v_idx, variant) in matrix.variants.iter().enumerate() {
+        write!(w, "{variant}")?;
+        for r_idx in 0..matrix.reads.len() {
+            write!(w, ",{}", matrix.data[v_idx][r_idx])?;
+        }
+        writeln!(w)?;
+    }
+    Ok(())
+}
+
+pub fn write_variant_cooccurrence(matrix: &CleanedMatrix, path: &str) -> Result<()> {
+    let n = matrix.variants.len();
+    let mut counts = vec![vec![0usize; n]; n];
+    for i in 0..n {
+        for j in 0..n {
+            counts[i][j] = (0..matrix.reads.len())
+                .filter(|&r| matrix.data[i][r] == 1 && matrix.data[j][r] == 1)
+                .count();
+        }
+    }
+
+    let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
+    write!(w, "variant")?;
+    for v in &matrix.variants {
+        write!(w, "\t{v}")?;
+    }
+    writeln!(w)?;
+    for i in 0..n {
+        write!(w, "{}", matrix.variants[i])?;
+        for j in 0..n {
+            write!(w, "\t{}", counts[i][j])?;
+        }
+        writeln!(w)?;
+    }
+    Ok(())
+}
+
+pub fn write_molecule_summary(matrix: &CleanedMatrix, path: &str) -> Result<()> {
+    let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
+    writeln!(w, "read_name\tn_variants\tvariants")?;
+    for (r_idx, read) in matrix.reads.iter().enumerate() {
+        let present: Vec<&str> = matrix
+            .variants
+            .iter()
+            .enumerate()
+            .filter(|(v_idx, _)| matrix.data[*v_idx][r_idx] == 1)
+            .map(|(_, name)| name.as_str())
+            .collect();
+        writeln!(w, "{read}\t{}\t{}", present.len(), present.join(","))?;
+    }
+    Ok(())
+}
+
+pub fn write_mutation_tree(tree: &MutationTree, matrix: &CleanedMatrix, path: &str) -> Result<()> {
+    let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
+    writeln!(w, "node_id\tvariant\tparent_id\tparent_variant\tn_reads_attached")?;
+    let node_name = |id: usize| -> String {
+        if id == tree.root() { "ROOT".to_string() } else { matrix.variants[id].clone() }
+    };
+    for node in 0..=tree.n_mutations {
+        let parent = tree.parent[node];
+        let n_reads = matrix.attachment.iter().filter(|&&a| a == node).count();
+        writeln!(w, "{node}\t{}\t{parent}\t{}\t{n_reads}", node_name(node), node_name(parent))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,5 +811,61 @@ mod tests {
         assert_eq!(cleaned.data[0], vec![1, 1, 1]); // A: unchanged, unchanged, false negative flipped
         assert_eq!(cleaned.data[1], vec![1, 0, 1]); // B: unchanged, imputed absent, unchanged
         assert_eq!(cleaned.attachment, vec![1, 0, 1]);
+    }
+
+    fn small_cleaned_matrix() -> CleanedMatrix {
+        CleanedMatrix {
+            variants: vec!["A".to_string(), "B".to_string()],
+            reads: vec!["r1".to_string(), "r2".to_string()],
+            data: vec![vec![1, 0], vec![1, 1]],
+            attachment: vec![1, 0],
+        }
+    }
+
+    #[test]
+    fn write_cleaned_matrix_writes_matrix_csv_shape() {
+        let matrix = small_cleaned_matrix();
+        let path = std::env::temp_dir().join("himito_test_write_cleaned_matrix.csv");
+        write_cleaned_matrix(&matrix, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(content, "variant,r1,r2\nA,1,0\nB,1,1\n");
+    }
+
+    #[test]
+    fn write_variant_cooccurrence_counts_reads_with_both_variants() {
+        let matrix = small_cleaned_matrix();
+        let path = std::env::temp_dir().join("himito_test_write_cooccurrence.tsv");
+        write_variant_cooccurrence(&matrix, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(content, "variant\tA\tB\nA\t1\t1\nB\t1\t2\n");
+    }
+
+    #[test]
+    fn write_molecule_summary_lists_variant_count_and_names_per_read() {
+        let matrix = small_cleaned_matrix();
+        let path = std::env::temp_dir().join("himito_test_write_molecule_summary.tsv");
+        write_molecule_summary(&matrix, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(content, "read_name\tn_variants\tvariants\nr1\t2\tA,B\nr2\t1\tB\n");
+    }
+
+    #[test]
+    fn write_mutation_tree_lists_every_node_with_parent_and_attached_read_count() {
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        let matrix = small_cleaned_matrix();
+        let path = std::env::temp_dir().join("himito_test_write_mutation_tree.tsv");
+        write_mutation_tree(&tree, &matrix, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            content,
+            "node_id\tvariant\tparent_id\tparent_variant\tn_reads_attached\n\
+             0\tA\t2\tROOT\t1\n\
+             1\tB\t0\tA\t1\n\
+             2\tROOT\t2\tROOT\t0\n"
+        );
     }
 }

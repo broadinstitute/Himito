@@ -108,6 +108,26 @@ pub fn attachment_log_likelihood(
     ll
 }
 
+/// The tree node (mutation node or root) whose implied genotype best
+/// explains `profile` under `rates`, together with that best log-likelihood.
+pub fn best_attachment(
+    profile: &[Option<u8>],
+    tree: &MutationTree,
+    rates: &ErrorRates,
+) -> (usize, f64) {
+    let mut best_node = tree.root();
+    let mut best_ll = f64::NEG_INFINITY;
+    for node in 0..=tree.n_mutations {
+        let mask = tree.ancestor_mask(node);
+        let ll = attachment_log_likelihood(profile, mask, rates);
+        if ll > best_ll {
+            best_ll = ll;
+            best_node = node;
+        }
+    }
+    (best_node, best_ll)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +184,17 @@ mod tests {
         let expected = (1.0 - rates.fp_rate).ln() + rates.fp_rate.ln();
         let actual = attachment_log_likelihood(&profile, ancestor_mask, &rates);
         assert!((actual - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn best_attachment_picks_the_node_matching_observed_mutations() {
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 2, 2] };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.3 };
+        let profile = vec![Some(1), Some(0)];
+
+        let expected_ll = (1.0 - rates.fn_rate).ln() + (1.0 - rates.fp_rate).ln();
+        let (node, ll) = best_attachment(&profile, &tree, &rates);
+        assert_eq!(node, 0);
+        assert!((ll - expected_ll).abs() < 1e-12);
     }
 }

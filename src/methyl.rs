@@ -765,7 +765,9 @@ fn write_methylation_to_csv<P: AsRef<Path>>(
         .collect();
 
     // construct matrix
-    let mut matrix = Array2::<f64>::zeros((refpos_list.len(), read_vec.len()));
+    // let mut matrix = Array2::<f64>::zeros((refpos_list.len(), read_vec.len()));
+    let mut matrix = Array2::<f64>::from_elem((refpos_list.len(), read_vec.len()), f64::NAN);
+    
     for ((_pos, refpos, _motif), d) in methyl.iter() {
         let row_index = ref_pos_dict.get(refpos).unwrap();
         for (read_name, &likelihood) in d.iter() {

@@ -355,6 +355,45 @@ enum Commands {
         /// minimal allele count for variants
         #[clap(short, long, value_parser, default_value_t = 2)]
         ac_threshold: i32,
+    },
+
+    /// Group reads into haplotypes from heteroplasmic variants and test for
+    /// four-gamete (recombination) violations between them.
+    #[clap(arg_required_else_help = true)]
+    Lineage {
+        /// path for the Himito matrix CSV (<prefix>.matrix.csv)
+        #[clap(short, long, value_parser, required = true)]
+        matrix_file: PathBuf,
+
+        /// path for the Himito VCF; used to read each variant's HF and
+        /// restrict the analysis to heteroplasmic (non-fixed) sites
+        #[clap(short, long, value_parser)]
+        vcf_file: Option<PathBuf>,
+
+        /// minimal heteroplasmic frequency (inclusive) for a variant to be considered
+        #[clap(long, value_parser, default_value_t = 0.01)]
+        min_hf: f64,
+
+        /// maximal heteroplasmic frequency (exclusive) for a variant to be considered;
+        /// default of 1.0 excludes fixed/homoplasmic variants (HF == 0.95)
+        #[clap(long, value_parser, default_value_t = 0.95)]
+        max_hf: f64,
+
+        /// minimal number of reads a variant must be present in to be informative
+        #[clap(long, value_parser, default_value_t = 2)]
+        min_presence: usize,
+
+        /// minimal number of reads a variant must be absent from to be informative
+        #[clap(long, value_parser, default_value_t = 1)]
+        min_absence: usize,
+
+        /// minimal number of reads required to report a haplotype
+        #[clap(long, value_parser, default_value_t = 3)]
+        min_reads: usize,
+
+        /// output prefix; writes <prefix>.haplotype_map.tsv
+        #[clap(short, long, value_parser, required = true)]
+        output_prefix: String,
     }
 }
 
@@ -556,6 +595,34 @@ fn main() {
             ac_threshold,
         } => {
             callnumts::start(&input_bam, &chromo, max_gap_threshold, &output_vcf, &reference_file, &sample_name, ac_threshold);
+        }
+        Commands::Lineage {
+            matrix_file,
+            vcf_file,
+            min_hf,
+            max_hf,
+            min_presence,
+            min_absence,
+            min_reads,
+            output_prefix,
+        } => {
+            let matrix_file = matrix_file.to_str().expect("matrix-file path is not valid UTF-8");
+            let vcf_file = vcf_file
+                .as_deref()
+                .map(|p| p.to_str().expect("vcf-file path is not valid UTF-8"));
+            if let Err(e) = lineage::start(
+                matrix_file,
+                vcf_file,
+                min_hf,
+                max_hf,
+                min_presence,
+                min_absence,
+                min_reads,
+                &output_prefix,
+            ) {
+                eprintln!("Error running lineage analysis: {:#}", e);
+                std::process::exit(1);
+            }
         }
     }
 

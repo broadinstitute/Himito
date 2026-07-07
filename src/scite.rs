@@ -216,6 +216,127 @@ pub fn from_nj_tree(hap_matrix: &HaplotypeMatrix, nj_tree: &lineage::Tree) -> Mu
     MutationTree { n_mutations: n, parent }
 }
 
+fn sample_two_distinct(n: usize, rng: &mut impl Rng) -> (usize, usize) {
+    let first = rng.random_range(0..n);
+    let mut second = rng.random_range(0..n);
+    while second == first {
+        second = rng.random_range(0..n);
+    }
+    (first, second)
+}
+
+/// Pick a uniformly random non-root node and reattach it to a uniformly
+/// random node outside its own subtree (excluding itself), so the result is
+/// always acyclic.
+///
+/// This proposal is symmetric: the number of valid reattachment targets for
+/// the chosen node depends only on the size of its own subtree, which this
+/// move does not change (moving a subtree doesn't change what's inside it,
+/// only where it's attached) — so plain Metropolis-Hastings acceptance
+/// (Task 9) needs no extra correction term for this move.
+pub fn propose_prune_reattach(tree: &MutationTree, rng: &mut impl Rng) -> MutationTree {
+    let n = tree.n_mutations;
+    let node = rng.random_range(0..n);
+    let forbidden = tree.descendant_mask(node) | (1u64 << node);
+    let valid_targets: Vec<usize> = (0..=n).filter(|&t| forbidden & (1u64 << t) == 0).collect();
+    let new_parent = valid_targets[rng.random_range(0..valid_targets.len())];
+    tree.with_parent(node, new_parent)
+}
+
+/// Relabel two mutation nodes: whichever tree positions `first` and `second`
+/// occupied, they now swap. Symmetric proposal (no Hastings correction),
+/// ported from reference SCITE's `get_new_parent_vec_swap_fast`.
+fn swap_labels(tree: &MutationTree, first: usize, second: usize) -> MutationTree {
+    let n = tree.n_mutations;
+    let mut parent = tree.parent.clone();
+
+    for i in 0..n {
+        if parent[i] == first && i != second {
+            parent[i] = second;
+        } else if parent[i] == second && i != first {
+            parent[i] = first;
+        }
+    }
+    parent.swap(first, second);
+    if parent[first] == first {
+        parent[first] = second;
+    }
+    if parent[second] == second {
+        parent[second] = first;
+    }
+
+    MutationTree { n_mutations: n, parent }
+}
+
+pub fn propose_swap_labels(tree: &MutationTree, rng: &mut impl Rng) -> MutationTree {
+    let (first, second) = sample_two_distinct(tree.n_mutations, rng);
+    swap_labels(tree, first, second)
+}
+
+/// Swap the tree positions of nodes `a` and `b`. When they're in different
+/// lineages this is a direct mutual reattachment. When one is an ancestor of
+/// the other, the ancestor is instead reinserted under a member of the
+/// descendant's (updated) subtree — `choice_index` selects which one, and
+/// must be `< ` the number of such candidates (see the two unit tests above
+/// for how to construct a case where that count is exactly 1). Returns the
+/// Metropolis-Hastings neighborhood-correction factor to multiply into the
+/// acceptance ratio (`1.0` for the different-lineages case).
+///
+/// Ported from reference SCITE's `propose_new_tree` movetype 3.
+fn swap_subtrees(tree: &MutationTree, a: usize, b: usize, choice_index: usize) -> (MutationTree, f64) {
+    let n = tree.n_mutations;
+    let (node, next_node) = if (tree.ancestor_mask(b) & (1u64 << a)) != 0 { (b, a) } else { (a, b) };
+
+    let mut parent = tree.parent.clone();
+
+    if (tree.ancestor_mask(node) & (1u64 << next_node)) == 0 {
+        parent[node] = tree.parent[next_node];
+        parent[next_node] = tree.parent[node];
+        return (MutationTree { n_mutations: n, parent }, 1.0);
+    }
+
+    parent[node] = tree.parent[next_node];
+    let descendants: Vec<usize> = (0..n)
+        .filter(|&i| (tree.ancestor_mask(i) & (1u64 << node)) != 0)
+        .collect();
+    parent[next_node] = descendants[choice_index];
+
+    let proposal = MutationTree { n_mutations: n, parent };
+    let next_descendants = (0..n)
+        .filter(|&i| (proposal.ancestor_mask(i) & (1u64 << next_node)) != 0)
+        .count();
+
+    let nbh_correction = descendants.len() as f64 / next_descendants as f64;
+    (proposal, nbh_correction)
+}
+
+pub fn propose_swap_subtrees(tree: &MutationTree, rng: &mut impl Rng) -> (MutationTree, f64) {
+    let n = tree.n_mutations;
+    let (a, b) = sample_two_distinct(n, rng);
+    let (node, next_node) = if (tree.ancestor_mask(b) & (1u64 << a)) != 0 { (b, a) } else { (a, b) };
+    if (tree.ancestor_mask(node) & (1u64 << next_node)) == 0 {
+        return swap_subtrees(tree, node, next_node, 0); // choice_index unused in this branch
+    }
+    let descendants_count = (0..n).filter(|&i| (tree.ancestor_mask(i) & (1u64 << node)) != 0).count();
+    let choice_index = rng.random_range(0..descendants_count);
+    swap_subtrees(tree, node, next_node, choice_index)
+}
+
+/// Weighted move dispatcher, matching reference SCITE's default move-type
+/// probabilities for the non-error-rate moves (`0.55` prune-and-reattach,
+/// `0.4` swap-labels, `0.05` swap-subtrees), renormalized to sum to 1 since
+/// this plan has no error-rate move at all.
+pub fn propose_move(tree: &MutationTree, rng: &mut impl Rng) -> (MutationTree, f64) {
+    let r: f64 = rng.random();
+    if r < 0.55 {
+        (propose_prune_reattach(tree, rng), 1.0)
+    } else if r < 0.95 {
+        (propose_swap_labels(tree, rng), 1.0)
+    } else {
+        propose_swap_subtrees(tree, rng)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +480,88 @@ mod tests {
         let tree = from_nj_tree(&hap_matrix, &nj_tree);
         // A ranked ahead of B -> A's parent is root, B's parent is A.
         assert_eq!(tree.parent, vec![2, 0, 2]);
+    }
+
+    #[test]
+    fn propose_prune_reattach_always_produces_a_valid_tree() {
+        let mut rng = StdRng::seed_from_u64(2);
+        let tree = MutationTree { n_mutations: 4, parent: vec![2, 2, 4, 4, 4] };
+        for _ in 0..200 {
+            let proposal = propose_prune_reattach(&tree, &mut rng);
+            assert_valid_tree(&proposal);
+            assert_eq!(proposal.n_mutations, tree.n_mutations);
+        }
+    }
+
+    #[test]
+    fn propose_prune_reattach_never_attaches_a_node_under_its_own_descendant() {
+        let mut rng = StdRng::seed_from_u64(3);
+        let tree = MutationTree { n_mutations: 4, parent: vec![2, 2, 4, 4, 4] };
+        for _ in 0..200 {
+            let proposal = propose_prune_reattach(&tree, &mut rng);
+            assert_ne!(proposal.parent[2], 0);
+            assert_ne!(proposal.parent[2], 1);
+        }
+    }
+
+    #[test]
+    fn swap_labels_exchanges_two_nodes_positions_in_the_chain() {
+        let tree = chain_tree(); // parent = [1, 2, 3, 3]: chain 0->1->2->root(3)
+        let swapped = swap_labels(&tree, 0, 2);
+        // Relabeling 0<->2 turns "0->1->2->root" into "2->1->0->root".
+        assert_eq!(swapped.parent, vec![3, 0, 1, 3]);
+    }
+
+    #[test]
+    fn propose_swap_labels_always_produces_a_valid_tree() {
+        let mut rng = StdRng::seed_from_u64(4);
+        let tree = MutationTree { n_mutations: 4, parent: vec![2, 2, 4, 4, 4] };
+        for _ in 0..200 {
+            let proposal = propose_swap_labels(&tree, &mut rng);
+            assert_valid_tree(&proposal);
+        }
+    }
+
+    #[test]
+    fn swap_subtrees_different_lineages_swaps_parents_directly() {
+        let tree = MutationTree { n_mutations: 4, parent: vec![2, 2, 4, 4, 4] };
+        let (proposal, correction) = swap_subtrees(&tree, 0, 3, 0);
+        assert_eq!(proposal.parent, vec![4, 2, 4, 2, 4]);
+        assert_eq!(correction, 1.0);
+    }
+
+    #[test]
+    fn swap_subtrees_same_lineage_reinserts_ancestor_with_hastings_correction() {
+        let tree = MutationTree { n_mutations: 4, parent: vec![2, 2, 4, 4, 4] };
+        // node=1, next_node=2: node1's only current "descendant" (self-inclusive)
+        // is itself, so this is fully deterministic regardless of choice_index.
+        let (proposal, correction) = swap_subtrees(&tree, 1, 2, 0);
+        assert_eq!(proposal.parent, vec![2, 4, 1, 4, 4]);
+        assert!((correction - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn swap_labels_star_topology_does_not_double_fire_self_loop_fixup() {
+        // Star tree: all leaves are direct children of root(4).
+        // Swapping any two leaves must not break the star structure or
+        // double-apply the self-loop fixup. This is the topology the
+        // chain_tree test misses.
+        let tree = MutationTree { n_mutations: 4, parent: vec![4, 4, 4, 4, 4] };
+        let swapped = swap_labels(&tree, 0, 3);
+        assert_valid_tree(&swapped);
+        // Labels 0 and 3 are leaves with no children — the parent array is
+        // unchanged for all other nodes; only positions 0 and 3 swap.
+        assert_eq!(swapped.parent, vec![4, 4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn propose_move_always_produces_a_valid_tree_with_a_positive_finite_correction() {
+        let mut rng = StdRng::seed_from_u64(5);
+        let tree = MutationTree { n_mutations: 4, parent: vec![2, 2, 4, 4, 4] };
+        for _ in 0..500 {
+            let (proposal, correction) = propose_move(&tree, &mut rng);
+            assert_valid_tree(&proposal);
+            assert!(correction.is_finite() && correction > 0.0);
+        }
     }
 }

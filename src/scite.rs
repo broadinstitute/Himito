@@ -397,6 +397,42 @@ pub fn run_mcmc_multichain(
     best.expect("n_chains must be >= 1")
 }
 
+/// The fully-imputed, denoised genotype matrix implied by attaching every
+/// read to its single best-fitting node in `tree`.
+#[derive(Debug)]
+pub struct CleanedMatrix {
+    pub variants: Vec<String>,
+    pub reads: Vec<String>,
+    /// `data[variant_idx][read_idx]`, always `0` or `1` (no missing values).
+    pub data: Vec<Vec<u8>>,
+    /// `attachment[read_idx]` = the tree node id that read attached to.
+    pub attachment: Vec<usize>,
+}
+
+pub fn attach_all_reads(matrix: &BinaryMatrix, tree: &MutationTree, rates: &ErrorRates) -> CleanedMatrix {
+    let n_variants = matrix.variants.len();
+    let n_reads = matrix.reads.len();
+    let mut data = vec![vec![0u8; n_reads]; n_variants];
+    let mut attachment = vec![0usize; n_reads];
+
+    for r in 0..n_reads {
+        let profile: Vec<Option<u8>> = matrix.data.iter().map(|row| row[r]).collect();
+        let (node, _ll) = best_attachment(&profile, tree, rates);
+        let mask = tree.ancestor_mask(node);
+        attachment[r] = node;
+        for v in 0..n_variants {
+            data[v][r] = u8::from((mask & (1u64 << v)) != 0);
+        }
+    }
+
+    CleanedMatrix {
+        variants: matrix.variants.clone(),
+        reads: matrix.reads.clone(),
+        data,
+        attachment,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,5 +715,27 @@ mod tests {
 
         let (tree, _ll) = run_mcmc_multichain(&matrix, &rates, 1000, 4, None, 7);
         assert_eq!(tree.parent[1], 0);
+    }
+
+    #[test]
+    fn attach_all_reads_imputes_missing_and_corrects_false_negatives() {
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] }; // A ancestor of B
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let matrix = BinaryMatrix {
+            variants: vec!["A".to_string(), "B".to_string()],
+            reads: vec!["r_full".to_string(), "r_missingB".to_string(), "r_errorA".to_string()],
+            data: vec![
+                vec![Some(1), Some(1), Some(0)],
+                vec![Some(1), None, Some(1)],
+            ],
+        };
+
+        let cleaned = attach_all_reads(&matrix, &tree, &rates);
+
+        assert_eq!(cleaned.variants, vec!["A", "B"]);
+        assert_eq!(cleaned.reads, vec!["r_full", "r_missingB", "r_errorA"]);
+        assert_eq!(cleaned.data[0], vec![1, 1, 1]); // A: unchanged, unchanged, false negative flipped
+        assert_eq!(cleaned.data[1], vec![1, 0, 1]); // B: unchanged, imputed absent, unchanged
+        assert_eq!(cleaned.attachment, vec![1, 0, 1]);
     }
 }

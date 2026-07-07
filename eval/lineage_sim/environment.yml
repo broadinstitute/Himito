@@ -1,0 +1,14 @@
+name: himito-eval
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - pbsim3
+  - pbccs
+  - minimap2
+  - samtools>=1.17
+  - numpy
+  - pytest
+  - dendropy
+  - git

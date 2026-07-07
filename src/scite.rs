@@ -507,6 +507,103 @@ pub fn write_mutation_tree(tree: &MutationTree, matrix: &CleanedMatrix, path: &s
     Ok(())
 }
 
+/// Recursively emit the Newick token for the subtree at `node`. `edge_muts` are
+/// the mutations accumulated (ancestral→derived) on the branch leading into the
+/// node that will actually be emitted here — pass-through mutation nodes fold
+/// their mutation into this list rather than becoming their own node.
+fn emit_lineage_node(
+    node: usize,
+    edge_muts: &[String],
+    tree: &MutationTree,
+    children: &[Vec<usize>],
+    haps_by_node: &[Vec<(String, usize)>],
+    variants: &[String],
+) -> String {
+    let is_root = node == tree.root();
+    let child_nodes = &children[node];
+    let haps = &haps_by_node[node];
+    let n_effective = child_nodes.len() + haps.len();
+
+    // Collapse: a non-root node with a single effective child is dissolved.
+    if !is_root && n_effective == 1 {
+        if child_nodes.len() == 1 {
+            // Single child-lineage: recurse, appending this node's edge mutations.
+            let c = child_nodes[0];
+            let mut muts = edge_muts.to_vec();
+            muts.push(variants[c].clone());
+            return emit_lineage_node(c, &muts, tree, children, haps_by_node, variants);
+        } else {
+            // Single haplotype tip: the mutation(s) ride on that tip's branch.
+            let (hid, count) = &haps[0];
+            return format!(
+                "{hid}_n{count}:{}[&&NHX:mutation={}:reads={count}]",
+                edge_muts.len(),
+                edge_muts.join(",")
+            );
+        }
+    }
+
+    // Otherwise this node is emitted (branch point, root, or dead-end).
+    let mut tokens: Vec<String> = Vec::new();
+    for &c in child_nodes {
+        let muts = vec![variants[c].clone()];
+        tokens.push(emit_lineage_node(c, &muts, tree, children, haps_by_node, variants));
+    }
+    for (hid, count) in haps {
+        // Haplotype attached directly to a surviving node: zero-length tip, reads only.
+        tokens.push(format!("{hid}_n{count}:0[&&NHX:reads={count}]"));
+    }
+
+    if is_root {
+        if tokens.is_empty() {
+            "ROOT".to_string()
+        } else {
+            format!("({})ROOT", tokens.join(","))
+        }
+    } else {
+        let blen = edge_muts.len();
+        let muts = edge_muts.join(",");
+        if tokens.is_empty() {
+            // Dead-end ancestral node (no descendants, no reads) — keep the mutation.
+            format!("anc{node}:{blen}[&&NHX:mutation={muts}]")
+        } else {
+            format!("({})anc{node}:{blen}[&&NHX:mutation={muts}]", tokens.join(","))
+        }
+    }
+}
+
+/// Write the read lineage tree (Newick + NHX branch mutations, tsinfer-style)
+/// to `path`. Tips are haplotypes (labeled `H<id>_n<reads>`, with a machine-
+/// readable `reads` NHX field); branches carry the mutations acquired, and
+/// pass-through mutation nodes are collapsed so mutations ride on a single
+/// branch (comma-joined, ancestral→derived).
+pub fn write_read_lineage_newick(
+    tree: &MutationTree,
+    hap_matrix: &HaplotypeMatrix,
+    rates: &ErrorRates,
+    path: &str,
+) -> Result<()> {
+    let children = tree.children_of();
+    let mut haps_by_node: Vec<Vec<(String, usize)>> = vec![Vec::new(); tree.n_mutations + 1];
+    for hap in &hap_matrix.haplotypes {
+        let (node, _ll) = best_attachment(&hap.profile, tree, rates);
+        haps_by_node[node].push((hap.id.clone(), hap.count));
+    }
+
+    let body = emit_lineage_node(
+        tree.root(),
+        &[],
+        tree,
+        &children,
+        &haps_by_node,
+        &hap_matrix.variants,
+    );
+
+    let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
+    writeln!(w, "{body};")?;
+    Ok(())
+}
+
 /// Run the MCMC mutation-tree search (starting from an NJ-tree-derived guess
 /// when one can be built), attach every read to its best-fitting node, and
 /// write all four SCITE output files with the given `output_prefix`.
@@ -560,6 +657,7 @@ pub fn run_scite_pipeline(
     write_variant_cooccurrence(&cleaned, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
     write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
     write_mutation_tree(&tree, &cleaned, &format!("{output_prefix}.mutation_tree.tsv"))?;
+    write_read_lineage_newick(&tree, hap_matrix, &rates, &format!("{output_prefix}.read_lineage.nwk"))?;
 
     Ok(())
 }
@@ -951,10 +1049,47 @@ mod tests {
             ".variant_cooccurrence.tsv",
             ".molecule_summary.tsv",
             ".mutation_tree.tsv",
+            ".read_lineage.nwk",
         ] {
             let path = format!("{prefix}{suffix}");
             assert!(std::path::Path::new(&path).exists(), "expected output file {path} to exist");
             std::fs::remove_file(&path).ok();
         }
+    }
+
+    #[test]
+    fn write_read_lineage_newick_collapses_and_annotates_reads_and_mutations() {
+        use lineage::{Haplotype, HaplotypeMatrix};
+
+        // root(4) -> A(0) -> B(1) -> {C(2), D(3)}
+        //   A: no haplotypes, single child B      -> collapses onto B's branch
+        //   B: branch point (C, D, and hap H3)    -> ancestral node anc1
+        //   C: single haplotype H0, no children   -> collapses onto H0's tip branch
+        //   D: two haplotypes H1, H2              -> ancestral node anc3
+        //   H3 attaches to internal node B        -> length-0 tip, reads only
+        let tree = MutationTree { n_mutations: 4, parent: vec![4, 0, 1, 1, 4] };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+
+        let hap_matrix = HaplotypeMatrix {
+            variants: vec!["mA".into(), "mB".into(), "mC".into(), "mD".into()],
+            haplotypes: vec![
+                Haplotype { id: "H0".into(), profile: vec![Some(1), Some(1), Some(1), Some(0)], reads: vec![], count: 9 },
+                Haplotype { id: "H1".into(), profile: vec![Some(1), Some(1), Some(0), Some(1)], reads: vec![], count: 7 },
+                Haplotype { id: "H2".into(), profile: vec![Some(1), Some(1), None, Some(1)], reads: vec![], count: 4 },
+                Haplotype { id: "H3".into(), profile: vec![Some(1), Some(1), Some(0), Some(0)], reads: vec![], count: 2 },
+            ],
+        };
+
+        let path = std::env::temp_dir().join("himito_test_read_lineage.nwk");
+        write_read_lineage_newick(&tree, &hap_matrix, &rates, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            content,
+            "((H0_n9:1[&&NHX:mutation=mC:reads=9],\
+             (H1_n7:0[&&NHX:reads=7],H2_n4:0[&&NHX:reads=4])anc3:1[&&NHX:mutation=mD],\
+             H3_n2:0[&&NHX:reads=2])anc1:2[&&NHX:mutation=mA,mB])ROOT;\n"
+        );
     }
 }

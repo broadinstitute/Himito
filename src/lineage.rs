@@ -640,7 +640,7 @@ pub fn start(
     write_haplotype_map(&hap_matrix, &hmap_path)?;
 
     // ── Step 3: SCITE mutation-tree search (NJ-informed MCMC) ─────────────────
-    eprintln!("[3/3] Running SCITE mutation-tree search...");
+    eprintln!("[3/6] Running SCITE mutation-tree search...");
     crate::scite::run_scite_pipeline(
         &binary,
         &hap_matrix,
@@ -649,8 +649,27 @@ pub fn start(
         mcmc_iterations,
         mcmc_chains,
         mcmc_seed,
+        min_reads,
         output_prefix,
     )?;
+
+    // ── Step 4: write final haplotype map (filtered by SCITE) ─────────────────
+    eprintln!("[4/6] Deduplicating cleaned reads into haplotypes...");
+    let cleaned_binary = load_and_filter_matrix(
+        &format!("{}.cleaned_matrix.csv", output_prefix),
+        &hf_map,
+        min_presence,
+        min_absence,
+    )?;
+    let cleaned_hap_matrix = deduplicate(&cleaned_binary, min_reads);
+    // write how many haplotypes and how many heteroplasmic variants on each haplotype
+    eprintln!("[4/6] Found {} haplotypes across {} variants.", cleaned_hap_matrix.haplotypes.len(), cleaned_hap_matrix.variants.len());
+    if cleaned_hap_matrix.haplotypes.is_empty() {
+        anyhow::bail!("No haplotypes remain after --min-reads filtering.");
+    }
+    // Global haplotype map (all variants)
+    let hmap_path = format!("{}.cleaned_haplotype_map.tsv", output_prefix);
+    write_haplotype_map(&cleaned_hap_matrix, &hmap_path)?;
 
     Ok(())
 

@@ -5,7 +5,7 @@ use rand::Rng;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
-use crate::lineage::{self, BinaryMatrix, HaplotypeMatrix};
+use crate::lineage::{self, BinaryMatrix, HaplotypeMatrix, load_and_filter_matrix};
 
 /// A SCITE-style mutation tree: `n_mutations` mutation nodes (ids
 /// `0..n_mutations`, in the same order as `BinaryMatrix::variants`) plus one
@@ -615,6 +615,7 @@ pub fn run_scite_pipeline(
     n_iterations: usize,
     n_chains: usize,
     seed: u64,
+    min_reads: usize,
     output_prefix: &str,
 ) -> Result<()> {
     if binary.variants.len() < 2 {
@@ -657,7 +658,21 @@ pub fn run_scite_pipeline(
     write_variant_cooccurrence(&cleaned, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
     write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
     write_mutation_tree(&tree, &cleaned, &format!("{output_prefix}.mutation_tree.tsv"))?;
-    write_read_lineage_newick(&tree, hap_matrix, &rates, &format!("{output_prefix}.read_lineage.nwk"))?;
+
+    // Deduplicate the SCITE-cleaned reads into haplotypes for the lineage tree.
+    // Keep the tree's variant set/order (no prevalence re-filter) so the mutation
+    // indices still line up with the tree nodes.
+    let cleaned_binary = BinaryMatrix {
+        variants: cleaned.variants.clone(),
+        reads: cleaned.reads.clone(),
+        data: cleaned
+            .data
+            .iter()
+            .map(|row| row.iter().map(|&b| Some(b)).collect())
+            .collect(),
+    };
+    let cleaned_hap_matrix = lineage::deduplicate(&cleaned_binary, min_reads);
+    write_read_lineage_newick(&tree, &cleaned_hap_matrix, &rates, &format!("{output_prefix}.read_lineage.nwk"))?;
 
     Ok(())
 }
@@ -1042,7 +1057,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 500, 2, 123, &prefix).unwrap();
+        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 500, 2, 123, 1, &prefix).unwrap();
 
         for suffix in [
             ".cleaned_matrix.csv",

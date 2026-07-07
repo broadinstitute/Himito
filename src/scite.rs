@@ -373,6 +373,30 @@ pub fn run_mcmc(
     (best, best_ll)
 }
 
+/// Run `n_chains` independent MCMC chains (each with its own derived seed)
+/// and return the single best tree found across all of them. `initial_tree`
+/// is used only for the first chain; the rest always start random.
+pub fn run_mcmc_multichain(
+    matrix: &BinaryMatrix,
+    rates: &ErrorRates,
+    n_iterations: usize,
+    n_chains: usize,
+    initial_tree: Option<&MutationTree>,
+    seed: u64,
+) -> (MutationTree, f64) {
+    let mut best: Option<(MutationTree, f64)> = None;
+    for chain in 0..n_chains {
+        let mut rng = StdRng::seed_from_u64(seed.wrapping_add(chain as u64));
+        let chain_initial = if chain == 0 { initial_tree } else { None };
+        let (tree, ll) = run_mcmc(matrix, rates, n_iterations, chain_initial, &mut rng);
+        best = match best {
+            Some((_, best_ll)) if best_ll >= ll => best,
+            _ => Some((tree, ll)),
+        };
+    }
+    best.expect("n_chains must be >= 1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -627,6 +651,33 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
         let (tree, _ll) = run_mcmc(&matrix, &rates, 3000, None, &mut rng);
 
+        assert_eq!(tree.parent[1], 0);
+    }
+
+    #[test]
+    fn run_mcmc_multichain_finds_the_true_tree_with_fewer_iterations_per_chain() {
+        let mut data_a = Vec::new();
+        let mut data_b = Vec::new();
+        for _ in 0..6 {
+            data_a.push(Some(1));
+            data_b.push(Some(1));
+        }
+        for _ in 0..3 {
+            data_a.push(Some(1));
+            data_b.push(Some(0));
+        }
+        data_a.push(Some(0));
+        data_b.push(Some(1));
+
+        let n_reads = data_a.len();
+        let matrix = BinaryMatrix {
+            variants: vec!["A".to_string(), "B".to_string()],
+            reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
+            data: vec![data_a, data_b],
+        };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+
+        let (tree, _ll) = run_mcmc_multichain(&matrix, &rates, 1000, 4, None, 7);
         assert_eq!(tree.parent[1], 0);
     }
 }

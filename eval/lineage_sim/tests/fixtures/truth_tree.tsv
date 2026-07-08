@@ -1,0 +1,6 @@
+node_id	variant	parent_id	parent_variant
+0	ROOT	0	ROOT
+1	m.100A>G	0	ROOT
+2	m.200C>T	1	m.100A>G
+3	m.300G>A	1	m.100A>G
+4	m.400T>C	2	m.200C>T

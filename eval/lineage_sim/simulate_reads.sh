@@ -42,7 +42,7 @@ tail -n +2 "$CLONES" | awk -F'\t' '{print $1 "\t" $4}' | while IFS=$'\t' read -r
   fa="$WORK/clone_${clone_id}.fa"
   [[ -f "$fa" ]] || { echo "missing $fa" >&2; exit 1; }
   # depth for this clone, halved across two rotations (integer, min 1)
-  depth=$(python3 -c "import math,sys; d=${TOTAL_DEPTH}*float('${freq}')/2; print(max(1,int(round(d))))")
+  depth=$(python3 -c "d=${TOTAL_DEPTH}*float('${freq}')/2; print(max(1,int(round(d))))")
 
   for rotidx in 0 1; do
     tmpl="$WORK/clone_${clone_id}_rot${rotidx}.fa"
@@ -66,7 +66,7 @@ PY
 
     pfx="$WORK/sim_${clone_id}_rot${rotidx}"
     # pbsim3 wants an integer seed; derive one deterministically.
-    seed=$(python3 -c "print((hash(('${clone_id}',${rotidx},${SEED})) % 2000000000) + 1)")
+    seed=$(python3 -c "import hashlib; h=int(hashlib.md5(f'${clone_id}-${rotidx}-${SEED}'.encode()).hexdigest(),16); print(h % 2000000000 + 1)")
 
     pbsim --strategy wgs --method errhmm --errhmm "$MODEL" \
           --depth "$depth" --genome "$tmpl" --prefix "$pfx" \

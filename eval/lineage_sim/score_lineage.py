@@ -97,9 +97,8 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars) -> dict:
     tp_pairs = _anc_pairs(truth_anc, shared)
     rp_pairs = _anc_pairs(recon_anc, shared)
     inter = tp_pairs & rp_pairs
-    union_pairs = tp_pairs | rp_pairs
-    ad_recall = len(inter) / len(union_pairs) if union_pairs else 0.0
-    ad_precision = len(inter) / len(union_pairs) if union_pairs else 0.0
+    ad_recall = len(inter) / len(tp_pairs) if tp_pairs else 0.0
+    ad_precision = len(inter) / len(rp_pairs) if rp_pairs else 0.0
 
     truth_edges = _pc_edges(truth_parent, shared)
     recon_edges = _pc_edges(recon_parent, shared)

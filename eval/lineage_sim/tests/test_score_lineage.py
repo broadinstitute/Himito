@@ -34,13 +34,17 @@ def test_score_ad_and_pc_against_known_trees():
     assert m["var_precision"] == 1.0
     assert m["var_recall"] == 1.0
 
-    # Truth ancestor pairs (a is ancestor of b):
-    #   A100<{C200,G300,T400}, C200<T400  -> 5 truth-anc pairs
-    # Recon ancestor pairs:
-    #   A100<{C200,T400,G300}, C200<{T400,G300} -> 5 recon-anc pairs
-    # Intersection: A100<C200, A100<T400, A100<G300, C200<T400 = 4
-    assert abs(m["ad_recall"] - 4/5) < 1e-9
-    assert abs(m["ad_precision"] - 4/5) < 1e-9
+    # Truth ancestor pairs (ancestor, descendant):
+    #   (A,C),(A,G),(A,T),(C,T) -> 4 truth-anc pairs
+    # Recon ancestor pairs (G misplaced under C instead of A):
+    #   (A,C),(A,T),(C,T),(A,G),(C,G) -> 5 recon-anc pairs
+    # Intersection: {(A,C),(A,G),(A,T),(C,T)} = 4
+    # ad_recall = 4/4 = 1.0  (denominator = |truth_pairs|)
+    # ad_precision = 4/5 = 0.8  (denominator = |recon_pairs|)
+    assert abs(m["ad_recall"] - 1.0) < 1e-9
+    assert abs(m["ad_precision"] - 0.8) < 1e-9
+    # Regression guard: asymmetric definitions must not collapse to Jaccard (recall != precision here).
+    assert m["ad_recall"] != m["ad_precision"]
 
     # Truth parent->child edges: A100->C200, A100->G300, C200->T400 (3).
     # Recon has A100->C200 and C200->T400 (G300 misplaced). Recovered = 2/3.

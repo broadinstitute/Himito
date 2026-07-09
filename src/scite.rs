@@ -7,6 +7,50 @@ use rand::SeedableRng;
 
 use crate::lineage::{self, BinaryMatrix, HaplotypeMatrix, load_and_filter_matrix};
 
+/// A growable bitset over mutation/variant ids, backed by `Vec<u64>` words.
+///
+/// Bit `i` set means mutation/variant `i` is present. Backing the mask with a
+/// word vector (rather than a single `u64`) lifts the old 63-variant ceiling on
+/// the SCITE search: any number of mutations is representable. An empty mask
+/// (no words) represents the all-zero germline state.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Mask {
+    words: Vec<u64>,
+}
+
+impl Mask {
+    /// An empty mask with no bits set.
+    pub fn new() -> Self {
+        Mask { words: Vec::new() }
+    }
+
+    /// Build a mask from an explicit list of set bit indices (test/helper use).
+    pub fn from_bits(bits: &[usize]) -> Self {
+        let mut m = Mask::new();
+        for &b in bits {
+            m.set(b);
+        }
+        m
+    }
+
+    /// Set bit `i`, growing the backing storage as needed.
+    #[inline]
+    pub fn set(&mut self, i: usize) {
+        let word = i / 64;
+        if word >= self.words.len() {
+            self.words.resize(word + 1, 0);
+        }
+        self.words[word] |= 1u64 << (i % 64);
+    }
+
+    /// Test whether bit `i` is set.
+    #[inline]
+    pub fn get(&self, i: usize) -> bool {
+        let word = i / 64;
+        word < self.words.len() && (self.words[word] & (1u64 << (i % 64))) != 0
+    }
+}
+
 /// A SCITE-style mutation tree: `n_mutations` mutation nodes (ids
 /// `0..n_mutations`, in the same order as `BinaryMatrix::variants`) plus one
 /// root node (id `n_mutations`, the unmutated germline state).
@@ -24,11 +68,11 @@ impl MutationTree {
 
     /// Bitmask of mutation ids on the path from `node` to the root,
     /// inclusive of `node` itself if it is a mutation node. Root's mask is 0.
-    pub fn ancestor_mask(&self, node: usize) -> u64 {
-        let mut mask = 0u64;
+    pub fn ancestor_mask(&self, node: usize) -> Mask {
+        let mut mask = Mask::new();
         let mut cur = node;
         while cur != self.root() {
-            mask |= 1u64 << cur;
+            mask.set(cur);
             cur = self.parent[cur];
         }
         mask
@@ -40,14 +84,14 @@ impl MutationTree {
     /// `ancestor_mask` with a filter that *does* include `node` itself — those
     /// two conventions are intentionally different. This method is only used in
     /// `propose_prune_reattach` to exclude a node's own subtree from reattachment targets.
-    fn descendant_mask(&self, node: usize) -> u64 {
+    fn descendant_mask(&self, node: usize) -> Mask {
         let children = self.children_of();
-        let mut mask = 0u64;
+        let mut mask = Mask::new();
         let mut stack = vec![node];
         while let Some(cur) = stack.pop() {
             for &c in &children[cur] {
                 if c < self.n_mutations {
-                    mask |= 1u64 << c;
+                    mask.set(c);
                 }
                 stack.push(c);
             }
@@ -119,13 +163,13 @@ pub struct ErrorRates {
 /// candidate tree attachment being scored.
 pub fn attachment_log_likelihood(
     profile: &[Option<u8>],
-    ancestor_mask: u64,
+    ancestor_mask: &Mask,
     rates: &ErrorRates,
 ) -> f64 {
     let mut ll = 0.0;
     for (i, call) in profile.iter().enumerate() {
         let Some(observed) = call else { continue };
-        let expected_mutated = (ancestor_mask & (1u64 << i)) != 0;
+        let expected_mutated = ancestor_mask.get(i);
         let p = match (*observed, expected_mutated) {
             (1, false) => rates.fp_rate,
             (0, false) => 1.0 - rates.fp_rate,
@@ -149,7 +193,7 @@ pub fn best_attachment(
     let mut best_ll = f64::NEG_INFINITY;
     for node in 0..=tree.n_mutations {
         let mask = tree.ancestor_mask(node);
-        let ll = attachment_log_likelihood(profile, mask, rates);
+        let ll = attachment_log_likelihood(profile, &mask, rates);
         if ll > best_ll {
             best_ll = ll;
             best_node = node;
@@ -237,8 +281,9 @@ fn sample_two_distinct(n: usize, rng: &mut impl Rng) -> (usize, usize) {
 pub fn propose_prune_reattach(tree: &MutationTree, rng: &mut impl Rng) -> MutationTree {
     let n = tree.n_mutations;
     let node = rng.random_range(0..n);
-    let forbidden = tree.descendant_mask(node) | (1u64 << node);
-    let valid_targets: Vec<usize> = (0..=n).filter(|&t| forbidden & (1u64 << t) == 0).collect();
+    let mut forbidden = tree.descendant_mask(node);
+    forbidden.set(node);
+    let valid_targets: Vec<usize> = (0..=n).filter(|&t| !forbidden.get(t)).collect();
     let new_parent = valid_targets[rng.random_range(0..valid_targets.len())];
     tree.with_parent(node, new_parent)
 }
@@ -285,11 +330,11 @@ pub fn propose_swap_labels(tree: &MutationTree, rng: &mut impl Rng) -> MutationT
 /// Ported from reference SCITE's `propose_new_tree` movetype 3.
 fn swap_subtrees(tree: &MutationTree, a: usize, b: usize, choice_index: usize) -> (MutationTree, f64) {
     let n = tree.n_mutations;
-    let (node, next_node) = if (tree.ancestor_mask(b) & (1u64 << a)) != 0 { (b, a) } else { (a, b) };
+    let (node, next_node) = if tree.ancestor_mask(b).get(a) { (b, a) } else { (a, b) };
 
     let mut parent = tree.parent.clone();
 
-    if (tree.ancestor_mask(node) & (1u64 << next_node)) == 0 {
+    if !tree.ancestor_mask(node).get(next_node) {
         parent[node] = tree.parent[next_node];
         parent[next_node] = tree.parent[node];
         return (MutationTree { n_mutations: n, parent }, 1.0);
@@ -297,13 +342,13 @@ fn swap_subtrees(tree: &MutationTree, a: usize, b: usize, choice_index: usize) -
 
     parent[node] = tree.parent[next_node];
     let descendants: Vec<usize> = (0..n)
-        .filter(|&i| (tree.ancestor_mask(i) & (1u64 << node)) != 0)
+        .filter(|&i| tree.ancestor_mask(i).get(node))
         .collect();
     parent[next_node] = descendants[choice_index];
 
     let proposal = MutationTree { n_mutations: n, parent };
     let next_descendants = (0..n)
-        .filter(|&i| (proposal.ancestor_mask(i) & (1u64 << next_node)) != 0)
+        .filter(|&i| proposal.ancestor_mask(i).get(next_node))
         .count();
 
     let nbh_correction = descendants.len() as f64 / next_descendants as f64;
@@ -313,11 +358,11 @@ fn swap_subtrees(tree: &MutationTree, a: usize, b: usize, choice_index: usize) -
 pub fn propose_swap_subtrees(tree: &MutationTree, rng: &mut impl Rng) -> (MutationTree, f64) {
     let n = tree.n_mutations;
     let (a, b) = sample_two_distinct(n, rng);
-    let (node, next_node) = if (tree.ancestor_mask(b) & (1u64 << a)) != 0 { (b, a) } else { (a, b) };
-    if (tree.ancestor_mask(node) & (1u64 << next_node)) == 0 {
+    let (node, next_node) = if tree.ancestor_mask(b).get(a) { (b, a) } else { (a, b) };
+    if !tree.ancestor_mask(node).get(next_node) {
         return swap_subtrees(tree, node, next_node, 0); // choice_index unused in this branch
     }
-    let descendants_count = (0..n).filter(|&i| (tree.ancestor_mask(i) & (1u64 << node)) != 0).count();
+    let descendants_count = (0..n).filter(|&i| tree.ancestor_mask(i).get(node)).count();
     let choice_index = rng.random_range(0..descendants_count);
     swap_subtrees(tree, node, next_node, choice_index)
 }
@@ -421,7 +466,7 @@ pub fn attach_all_reads(matrix: &BinaryMatrix, tree: &MutationTree, rates: &Erro
         let mask = tree.ancestor_mask(node);
         attachment[r] = node;
         for v in 0..n_variants {
-            data[v][r] = u8::from((mask & (1u64 << v)) != 0);
+            data[v][r] = u8::from(mask.get(v));
         }
     }
 
@@ -625,14 +670,6 @@ pub fn run_scite_pipeline(
             binary.variants.len()
         );
     }
-    if binary.variants.len() > 63 {
-        anyhow::bail!(
-            "SCITE mutation-tree search supports at most 63 variants (got {}); \
-             tighten the lineage HF/prevalence thresholds.",
-            binary.variants.len()
-        );
-    }
-
     let dist = lineage::hamming_distance_matrix(hap_matrix);
     let initial_tree = lineage::neighbor_joining(&dist, hap_matrix)
         .ok()
@@ -705,19 +742,19 @@ mod tests {
     #[test]
     fn ancestor_mask_includes_self_and_all_ancestors_up_to_root() {
         let tree = chain_tree();
-        assert_eq!(tree.ancestor_mask(0), 0b111);
-        assert_eq!(tree.ancestor_mask(1), 0b110);
-        assert_eq!(tree.ancestor_mask(2), 0b100);
-        assert_eq!(tree.ancestor_mask(3), 0);
+        assert_eq!(tree.ancestor_mask(0), Mask::from_bits(&[0, 1, 2]));
+        assert_eq!(tree.ancestor_mask(1), Mask::from_bits(&[1, 2]));
+        assert_eq!(tree.ancestor_mask(2), Mask::from_bits(&[2]));
+        assert_eq!(tree.ancestor_mask(3), Mask::new());
     }
 
     #[test]
     fn descendant_mask_excludes_self_and_includes_transitive_children() {
         let tree = chain_tree();
-        assert_eq!(tree.descendant_mask(2), 0b011);
-        assert_eq!(tree.descendant_mask(1), 0b001);
-        assert_eq!(tree.descendant_mask(0), 0);
-        assert_eq!(tree.descendant_mask(3), 0b111);
+        assert_eq!(tree.descendant_mask(2), Mask::from_bits(&[0, 1]));
+        assert_eq!(tree.descendant_mask(1), Mask::from_bits(&[0]));
+        assert_eq!(tree.descendant_mask(0), Mask::new());
+        assert_eq!(tree.descendant_mask(3), Mask::from_bits(&[0, 1, 2]));
     }
 
     #[test]
@@ -731,22 +768,22 @@ mod tests {
     #[test]
     fn attachment_log_likelihood_matches_hand_computed_value() {
         let profile = vec![Some(1), Some(0), None];
-        let ancestor_mask = 0b011;
+        let ancestor_mask = Mask::from_bits(&[0, 1]);
         let rates = ErrorRates { fp_rate: 0.1, fn_rate: 0.2 };
 
         let expected = (1.0 - rates.fn_rate).ln() + rates.fn_rate.ln();
-        let actual = attachment_log_likelihood(&profile, ancestor_mask, &rates);
+        let actual = attachment_log_likelihood(&profile, &ancestor_mask, &rates);
         assert!((actual - expected).abs() < 1e-12);
     }
 
     #[test]
     fn attachment_log_likelihood_scores_true_negative_and_false_positive() {
         let profile = vec![Some(0), Some(1)];
-        let ancestor_mask = 0;
+        let ancestor_mask = Mask::new();
         let rates = ErrorRates { fp_rate: 0.1, fn_rate: 0.2 };
 
         let expected = (1.0 - rates.fp_rate).ln() + rates.fp_rate.ln();
-        let actual = attachment_log_likelihood(&profile, ancestor_mask, &rates);
+        let actual = attachment_log_likelihood(&profile, &ancestor_mask, &rates);
         assert!((actual - expected).abs() < 1e-12);
     }
 
@@ -1037,6 +1074,42 @@ mod tests {
              1\tB\t0\tA\t1\n\
              2\tROOT\t2\tROOT\t0\n"
         );
+    }
+
+    #[test]
+    fn run_scite_pipeline_handles_more_than_63_variants() {
+        // 65 variants exceeds the old u64-bitmask limit. Reads form a nested
+        // chain: read j carries variants 0..j, so every variant has both
+        // present and absent reads and the deepest mutations live on bits ≥64.
+        let n_var = 65;
+        let n_reads = n_var + 1;
+        let variants: Vec<String> = (0..n_var).map(|i| format!("m.{i}")).collect();
+        let reads: Vec<String> = (0..n_reads).map(|j| format!("r{j}")).collect();
+        let data: Vec<Vec<Option<u8>>> = (0..n_var)
+            .map(|i| (0..n_reads).map(|j| Some(u8::from(j > i))).collect())
+            .collect();
+        let matrix = BinaryMatrix { variants, reads, data };
+        let hap_matrix = lineage::deduplicate(&matrix, 1);
+
+        let prefix = std::env::temp_dir()
+            .join("himito_test_scite_pipeline_65var")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 50, 1, 7, 1, &prefix).unwrap();
+
+        let nwk = format!("{prefix}.read_lineage.nwk");
+        assert!(std::path::Path::new(&nwk).exists(), "expected {nwk} to exist");
+        for suffix in [
+            ".cleaned_matrix.csv",
+            ".variant_cooccurrence.tsv",
+            ".molecule_summary.tsv",
+            ".mutation_tree.tsv",
+            ".read_lineage.nwk",
+        ] {
+            std::fs::remove_file(format!("{prefix}{suffix}")).ok();
+        }
     }
 
     #[test]

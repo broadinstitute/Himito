@@ -85,8 +85,6 @@ def test_frequencies_decrease_from_parent_to_child():
 
 def test_write_truth_emits_expected_files_and_headers(tmp_path):
     """write_truth produces all four output files with correct headers/content."""
-    import csv
-
     _, seq = st.load_reference(REF)
     n_mutations = 5
     rng = random.Random(99)

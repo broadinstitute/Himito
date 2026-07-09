@@ -2,7 +2,7 @@
 # One full simulate -> reconstruct -> score cycle for a single read profile.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REF=/Users/suhang/Analysis/Himito/rCRS.fasta
+REF="${REF:-/Users/suhang/Analysis/Himito/rCRS.fasta}"
 
 OUTDIR="" PROFILE="ont-r10" NMUT=12 DEPTH=300 SEED=1 FP=0.001 FN=0.05
 while [[ $# -gt 0 ]]; do

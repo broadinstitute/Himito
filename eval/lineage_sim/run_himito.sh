@@ -2,9 +2,9 @@
 # Align pooled simulated reads to rCRS and run Himito build -> call -> lineage.
 set -euo pipefail
 
-HIMITO=/Users/suhang/Analysis/Himito/target/release/Himito
-REF=/Users/suhang/Analysis/Himito/rCRS.fasta
-OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05
+HIMITO="${HIMITO:-/Users/suhang/Analysis/Himito/target/release/Himito}"
+REF="${REF:-/Users/suhang/Analysis/Himito/rCRS.fasta}"
+OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05 KMER=21
 # Call-tuning defaults: permissive for simulated data
 # -m 0: keep all reads in matrix (simulated reads carry few alts each; m>=1 empties the matrix)
 # -v 0.005: capture low-frequency clones (default 0.01 loses sub-1% clones)
@@ -20,6 +20,7 @@ while [[ $# -gt 0 ]]; do
     --minimal-ac) MINIMAL_AC="$2"; shift 2;;
     --vaf) VAF="$2"; shift 2;;
     --pval) PVAL="$2"; shift 2;;
+    --kmer) KMER="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
@@ -35,16 +36,18 @@ HDIR="$OUTDIR/himito"; mkdir -p "$HDIR"
 FQ="$OUTDIR/reads/reads.fastq.gz"
 BAM="$HDIR/aln.sorted.bam"
 
+[[ -s "$FQ" ]] || { echo "missing or empty reads file: $FQ (run simulate_reads.sh first)" >&2; exit 1; }
+
 minimap2 -ax "$MMPRESET" -t 4 "$REF" "$FQ" 2>/dev/null \
   | samtools sort -o "$BAM" -
 samtools index "$BAM"
 
 # Build anchor graph (input can be a BAM).
-"$HIMITO" build -i "$BAM" -r "$REF" -k 21 -o "$HDIR/sim.gfa" -l 3000
+"$HIMITO" build -i "$BAM" -r "$REF" -k "$KMER" -o "$HDIR/sim.gfa" -l 3000
 
 # Call variants: -o is the VCF; matrix.csv is derived as <o>.matrix.csv.
 "$HIMITO" call -g "$HDIR/sim.gfa" -r "$REF" -s "$SAMPLE" -d "$DTYPE" \
-  -o "$HDIR/sim.vcf" -k 21 --input-bam "$BAM" \
+  -o "$HDIR/sim.vcf" -k "$KMER" --input-bam "$BAM" \
   -m "$MINIMAL_AC" -v "$VAF" -p "$PVAL"
 
 # Lineage: SCITE mutation-tree reconstruction.

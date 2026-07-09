@@ -2,7 +2,7 @@
 # Sweep SCITE fp/fn on a fixed matrix; re-runs only `Himito lineage` per cell.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HIMITO=/Users/suhang/Analysis/Himito/target/release/Himito
+HIMITO="${HIMITO:-/Users/suhang/Analysis/Himito/target/release/Himito}"
 
 OUTDIR="" PROFILE="ont-r10"
 FP_GRID="0.0005 0.001 0.005 0.01"
@@ -45,6 +45,7 @@ done
 echo "=== sweep results ($SWEEP) ==="
 column -t "$SWEEP"
 echo "=== best cell by ad_f1 (tie-break var_f1) ==="
+[[ $(wc -l < "$SWEEP") -gt 1 ]] || { echo "no successful sweep cells (all lineage runs failed?)" >&2; exit 1; }
 # columns: 1=profile 2=fp 3=fn ... 9=var_f1 ... 12=ad_f1
 tail -n +2 "$SWEEP" | sort -t$'\t' -k12,12gr -k9,9gr | head -1 \
   | awk -F'\t' '{printf "profile=%s fp=%s fn=%s  ad_f1=%s var_f1=%s\n",$1,$2,$3,$12,$9}'

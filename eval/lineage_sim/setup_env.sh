@@ -13,7 +13,7 @@ fi
 # 2. pbsim3 bioconda package ships the binary but not always the error models.
 #    Clone the repo just for its data/ directory.
 MODELS_DIR="$HERE/pbsim3_models"
-if [[ ! -f "$MODELS_DIR/ERRHMM-SEQUEL.model" ]]; then
+if [[ ! -f "$MODELS_DIR/ERRHMM-SEQUEL.model" || ! -f "$MODELS_DIR/ERRHMM-ONT-HQ.model" ]]; then
   rm -rf "$HERE/.pbsim3_src"
   git clone --depth 1 https://github.com/yukiteruono/pbsim3.git "$HERE/.pbsim3_src"
   mkdir -p "$MODELS_DIR"

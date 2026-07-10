@@ -620,7 +620,6 @@ pub fn start(
         min_presence,
         min_absence,
     )?;
-
     if binary.variants.is_empty() {
         anyhow::bail!(
             "No informative variants remain after filtering. \

@@ -146,7 +146,7 @@ enum Commands {
         fraction_max_methylation: f64,
 
         /// maximal reads to keep from mtDNA 
-        #[clap(long, value_parser, default_value_t = 5000)]
+        #[clap(long, value_parser, default_value_t = 50000)]
         maximal_mt_depth: usize,
 
         /// RNG seed for mt read downsampling (reproducible subsampling)

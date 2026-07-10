@@ -3,6 +3,7 @@ use anyhow::{bail,Context, Result};
 use rust_htslib::bcf::{Read, Reader}; // Read trait must be in scope for .records()
 use std::io::{BufWriter, Write};
 use std::fs::File;
+use log::info;
 
 // ─── Tree data structure ──────────────────────────────────────────────────────
 
@@ -606,13 +607,13 @@ pub fn start(
     mcmc_seed: u64,
     output_prefix: &str,
 ) -> Result<()> {
-    println!("Starting lineage analysis...");
+    info!("Starting lineage analysis...");
 
     // ── Step 1: load VCF HF values, then filter the binary matrix ─────────────
-    println!("[1/6] Parsing VCF: {}", vcf_file.as_ref().unwrap_or(&""));
+    info!("[1/6] Parsing VCF: {}", vcf_file.as_ref().unwrap_or(&""));
     let hf_map = parse_vcf(vcf_file.as_ref().unwrap_or(&""), min_hf, max_hf)?;
 
-    eprintln!("[1/6] Loading and filtering matrix: {}", matrix_file);
+    info!("[1/6] Loading and filtering matrix: {}", matrix_file);
     let binary = load_and_filter_matrix(
         &matrix_file,
         &hf_map,
@@ -628,10 +629,10 @@ pub fn start(
     }
 
     // ── Step 2: deduplicate reads into haplotypes ───────────────────────────────
-    eprintln!("[2/6] Deduplicating reads into haplotypes...");
+    info!("[2/6] Deduplicating reads into haplotypes...");
     let hap_matrix = deduplicate(&binary, min_reads);
     // write how many haplotypes and how many heteroplasmic variants on each haplotype
-    eprintln!("[2/6] Found {} haplotypes across {} variants.", hap_matrix.haplotypes.len(), hap_matrix.variants.len());
+    info!("[2/6] Found {} haplotypes across {} variants.", hap_matrix.haplotypes.len(), hap_matrix.variants.len());
     if hap_matrix.haplotypes.is_empty() {
         anyhow::bail!("No haplotypes remain after --min-reads filtering.");
     }
@@ -640,7 +641,7 @@ pub fn start(
     write_haplotype_map(&hap_matrix, &hmap_path)?;
 
     // ── Step 3: SCITE mutation-tree search (NJ-informed MCMC) ─────────────────
-    eprintln!("[3/6] Running SCITE mutation-tree search...");
+    info!("[3/6] Running SCITE mutation-tree search...");
     crate::scite::run_scite_pipeline(
         &binary,
         &hap_matrix,
@@ -654,7 +655,7 @@ pub fn start(
     )?;
 
     // ── Step 4: write final haplotype map (filtered by SCITE) ─────────────────
-    eprintln!("[4/6] Deduplicating cleaned reads into haplotypes...");
+    info!("[4/6] Deduplicating cleaned reads into haplotypes...");
     let cleaned_binary = load_and_filter_matrix(
         &format!("{}.cleaned_matrix.csv", output_prefix),
         &hf_map,
@@ -663,7 +664,7 @@ pub fn start(
     )?;
     let cleaned_hap_matrix = deduplicate(&cleaned_binary, min_reads);
     // write how many haplotypes and how many heteroplasmic variants on each haplotype
-    eprintln!("[4/6] Found {} haplotypes across {} variants.", cleaned_hap_matrix.haplotypes.len(), cleaned_hap_matrix.variants.len());
+    info!("[4/6] Found {} haplotypes across {} variants.", cleaned_hap_matrix.haplotypes.len(), cleaned_hap_matrix.variants.len());
     if cleaned_hap_matrix.haplotypes.is_empty() {
         anyhow::bail!("No haplotypes remain after --min-reads filtering.");
     }

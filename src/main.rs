@@ -358,8 +358,7 @@ enum Commands {
         ac_threshold: i32,
     },
 
-    /// Group reads into haplotypes from heteroplasmic variants and test for
-    /// four-gamete (recombination) violations between them.
+    /// Infer mitochondrial lineage tree from Himito read_var matrix CSV and heteroplasmic variants
     #[clap(arg_required_else_help = true)]
     Lineage {
         /// path for the Himito matrix CSV (<prefix>.matrix.csv)

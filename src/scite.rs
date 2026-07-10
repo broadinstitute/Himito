@@ -4,6 +4,9 @@ use anyhow::{Context, Result};
 use rand::Rng;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
+use log::info;
+use statrs::function::gamma::ln_gamma;
+use adjustp::{adjust, Procedure};
 
 use crate::lineage::{self, BinaryMatrix, HaplotypeMatrix, load_and_filter_matrix};
 
@@ -495,31 +498,149 @@ pub fn write_cleaned_matrix(matrix: &CleanedMatrix, path: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn write_variant_cooccurrence(matrix: &CleanedMatrix, path: &str) -> Result<()> {
-    let n = matrix.variants.len();
-    let mut counts = vec![vec![0usize; n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            counts[i][j] = (0..matrix.reads.len())
-                .filter(|&r| matrix.data[i][r] == 1 && matrix.data[j][r] == 1)
-                .count();
-        }
+/// Pairwise Lewontin linkage-disequilibrium (D', r^2) and one-sided Fisher's
+/// exact enrichment for a variant pair's 2x2 read table
+/// `[[n11, n10], [n01, n00]]`, mirroring `h1_cooccurrence` in the
+/// `heteroplasmy_lineage_test.py` companion script.
+struct PairCooccurrence {
+    n_co: usize,
+    n11: usize,
+    n10: usize,
+    n01: usize,
+    n00: usize,
+    d_prime: f64,
+    r2: f64,
+    odds_ratio: f64,
+    fisher_p: f64,
+}
+
+fn lchoose(n: f64, k: f64) -> f64 {
+    if k < 0.0 || k > n {
+        return f64::NEG_INFINITY;
     }
+    ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)
+}
+
+/// One-sided Fisher's exact p for enrichment of the `n11` cell. Returns
+/// `(odds_ratio, p_greater)`.
+fn fisher_greater(n11: usize, n10: usize, n01: usize, n00: usize) -> (f64, f64) {
+    let (a, b, c, d) = (n11 as f64, n10 as f64, n01 as f64, n00 as f64);
+    let r1 = a + b;
+    let r2 = c + d;
+    let c1 = a + c;
+    let n = a + b + c + d;
+    if r1 == 0.0 || r2 == 0.0 || c1 == 0.0 || (b + d) == 0.0 {
+        return (f64::NAN, 1.0);
+    }
+    let denom = lchoose(n, c1);
+    let hi = r1.min(c1) as i64;
+    let mut p = 0.0;
+    let mut x = n11 as i64;
+    while x <= hi {
+        p += (lchoose(r1, x as f64) + lchoose(r2, c1 - x as f64) - denom).exp();
+        x += 1;
+    }
+    let odds_ratio = if b * c > 0.0 { (a * d) / (b * c) } else { f64::INFINITY };
+    (odds_ratio, p.min(1.0))
+}
+
+/// D' and r^2 for the 2x2 table `[[n11, n10], [n01, n00]]`.
+fn dprime_r2(n11: usize, n10: usize, n01: usize, n00: usize) -> (f64, f64) {
+    let (a, b, c, d) = (n11 as f64, n10 as f64, n01 as f64, n00 as f64);
+    let n = a + b + c + d;
+    if n == 0.0 {
+        return (0.0, 0.0);
+    }
+    let p_a = (a + b) / n;
+    let p_b = (a + c) / n;
+    let d_stat = a / n - p_a * p_b;
+    let d_max = if d_stat >= 0.0 {
+        (p_a * (1.0 - p_b)).min((1.0 - p_a) * p_b)
+    } else {
+        (p_a * p_b).min((1.0 - p_a) * (1.0 - p_b))
+    };
+    let d_prime = if d_max > 1e-12 { d_stat / d_max } else { 0.0 };
+    let denom = p_a * (1.0 - p_a) * p_b * (1.0 - p_b);
+    let r2 = if denom > 1e-12 { (d_stat * d_stat) / denom } else { 0.0 };
+    (d_prime, r2)
+}
+
+fn pair_cooccurrence(n11: usize, n10: usize, n01: usize, n00: usize) -> PairCooccurrence {
+    let (d_prime, r2) = dprime_r2(n11, n10, n01, n00);
+    let (odds_ratio, fisher_p) = fisher_greater(n11, n10, n01, n00);
+    PairCooccurrence { n_co: n11 + n10 + n01 + n00, n11, n10, n01, n00, d_prime, r2, odds_ratio, fisher_p }
+}
+
+fn write_pair_cooccurrence_table(
+    variants: &[String],
+    pairs: &[(usize, usize, PairCooccurrence)],
+    path: &str,
+) -> Result<()> {
+    let qvalues = if pairs.is_empty() {
+        Vec::new()
+    } else {
+        let pvals: Vec<f64> = pairs.iter().map(|(_, _, s)| s.fisher_p).collect();
+        adjust(&pvals, Procedure::BenjaminiHochberg)
+    };
 
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
-    write!(w, "variant")?;
-    for v in &matrix.variants {
-        write!(w, "\t{v}")?;
-    }
-    writeln!(w)?;
-    for i in 0..n {
-        write!(w, "{}", matrix.variants[i])?;
-        for j in 0..n {
-            write!(w, "\t{}", counts[i][j])?;
-        }
-        writeln!(w)?;
+    writeln!(w, "variant_a\tvariant_b\tn_co\tn11\tn10\tn01\tn00\td_prime\tr2\todds_ratio\tfisher_p\tfisher_q")?;
+    for (idx, (i, j, s)) in pairs.iter().enumerate() {
+        writeln!(
+            w,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.6}\t{:.6}\t{}\t{:.6e}\t{:.6e}",
+            variants[*i], variants[*j], s.n_co, s.n11, s.n10, s.n01, s.n00,
+            s.d_prime, s.r2, s.odds_ratio, s.fisher_p, qvalues[idx]
+        )?;
     }
     Ok(())
+}
+
+/// Pairwise co-occurrence stats on the SCITE-cleaned (tree-imputed, no
+/// missing values) matrix: every read counts toward every pair's table.
+pub fn write_variant_cooccurrence(matrix: &CleanedMatrix, path: &str) -> Result<()> {
+    let n = matrix.variants.len();
+    let mut pairs = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (mut n11, mut n10, mut n01, mut n00) = (0usize, 0usize, 0usize, 0usize);
+            for r in 0..matrix.reads.len() {
+                match (matrix.data[i][r], matrix.data[j][r]) {
+                    (1, 1) => n11 += 1,
+                    (1, 0) => n10 += 1,
+                    (0, 1) => n01 += 1,
+                    _ => n00 += 1,
+                }
+            }
+            pairs.push((i, j, pair_cooccurrence(n11, n10, n01, n00)));
+        }
+    }
+    write_pair_cooccurrence_table(&matrix.variants, &pairs, path)
+}
+
+/// Same statistics on the raw (pre-SCITE) matrix. Reads with a missing call
+/// (`None`) at either site are excluded from that pair's table, so `n_co`
+/// counts only reads jointly covering both variants.
+pub fn write_raw_variant_cooccurrence(matrix: &BinaryMatrix, path: &str) -> Result<()> {
+    let n = matrix.variants.len();
+    let mut pairs = Vec::new();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let (mut n11, mut n10, mut n01, mut n00) = (0usize, 0usize, 0usize, 0usize);
+            for r in 0..matrix.reads.len() {
+                if let (Some(vi), Some(vj)) = (matrix.data[i][r], matrix.data[j][r]) {
+                    match (vi, vj) {
+                        (1, 1) => n11 += 1,
+                        (1, 0) => n10 += 1,
+                        (0, 1) => n01 += 1,
+                        _ => n00 += 1,
+                    }
+                }
+            }
+            pairs.push((i, j, pair_cooccurrence(n11, n10, n01, n00)));
+        }
+    }
+    write_pair_cooccurrence_table(&matrix.variants, &pairs, path)
 }
 
 pub fn write_molecule_summary(matrix: &CleanedMatrix, path: &str) -> Result<()> {
@@ -674,12 +795,12 @@ pub fn run_scite_pipeline(
     let initial_tree = lineage::neighbor_joining(&dist, hap_matrix)
         .ok()
         .map(|nj_tree| from_nj_tree(hap_matrix, &nj_tree));
-    eprintln!(
+    info!(
         "[SCITE] Initial tree: {}",
         if initial_tree.is_some() { "derived from Neighbor-Joining haplotype tree" } else { "random (NJ tree unavailable)" }
     );
 
-    eprintln!(
+    info!(
         "[SCITE] {} variants, {} reads. Running MCMC: {n_chains} chains x {n_iterations} iterations",
         binary.variants.len(),
         binary.reads.len()
@@ -687,12 +808,13 @@ pub fn run_scite_pipeline(
 
     let rates = ErrorRates { fp_rate, fn_rate };
     let (tree, ll) = run_mcmc_multichain(binary, &rates, n_iterations, n_chains, initial_tree.as_ref(), seed);
-    eprintln!("[SCITE] Best tree log-likelihood: {ll:.3}");
+    info!("[SCITE] Best tree log-likelihood: {ll:.3}");
 
     let cleaned = attach_all_reads(binary, &tree, &rates);
 
     write_cleaned_matrix(&cleaned, &format!("{output_prefix}.cleaned_matrix.csv"))?;
     write_variant_cooccurrence(&cleaned, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
+    write_raw_variant_cooccurrence(binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
     write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
     write_mutation_tree(&tree, &cleaned, &format!("{output_prefix}.mutation_tree.tsv"))?;
 
@@ -1040,13 +1162,66 @@ mod tests {
     }
 
     #[test]
-    fn write_variant_cooccurrence_counts_reads_with_both_variants() {
+    fn write_variant_cooccurrence_reports_pairwise_ld_and_fisher_stats() {
         let matrix = small_cleaned_matrix();
         let path = std::env::temp_dir().join("himito_test_write_cooccurrence.tsv");
         write_variant_cooccurrence(&matrix, path.to_str().unwrap()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
-        assert_eq!(content, "variant\tA\tB\nA\t1\t1\nB\t1\t2\n");
+        let mut lines = content.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "variant_a\tvariant_b\tn_co\tn11\tn10\tn01\tn00\td_prime\tr2\todds_ratio\tfisher_p\tfisher_q"
+        );
+        // r1=[A,B]=[1,0], r2=[A,B]=[0,1] -> n11=1 (r1), n01=1 (r2)
+        let row = lines.next().unwrap();
+        let fields: Vec<&str> = row.split('\t').collect();
+        assert_eq!(&fields[0..7], &["A", "B", "2", "1", "0", "1", "0"]);
+        assert_eq!(lines.next(), None);
+    }
+
+    #[test]
+    fn fisher_greater_matches_known_2x2_table() {
+        // classic tea-tasting-style table with a clear enrichment in n11
+        let (odds_ratio, p) = fisher_greater(8, 2, 1, 9);
+        assert!((odds_ratio - 36.0).abs() < 1e-9);
+        assert!(p < 0.01, "expected a small one-sided p-value, got {p}");
+    }
+
+    #[test]
+    fn dprime_r2_is_one_for_perfect_co_occurrence() {
+        let (d_prime, r2) = dprime_r2(10, 0, 0, 10);
+        assert!((d_prime - 1.0).abs() < 1e-9);
+        assert!((r2 - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dprime_r2_is_zero_for_independent_variants() {
+        // p_a = p_b = 0.5 and the joint frequency exactly matches p_a*p_b
+        let (d_prime, r2) = dprime_r2(5, 5, 5, 5);
+        assert!(d_prime.abs() < 1e-9);
+        assert!(r2.abs() < 1e-9);
+    }
+
+    #[test]
+    fn write_raw_variant_cooccurrence_restricts_to_jointly_covered_reads() {
+        // r1: A alt, B missing (excluded); r2: A ref, B alt; r3: A alt, B alt
+        let matrix = BinaryMatrix {
+            variants: vec!["A".to_string(), "B".to_string()],
+            reads: vec!["r1".to_string(), "r2".to_string(), "r3".to_string()],
+            data: vec![
+                vec![Some(1), Some(0), Some(1)],
+                vec![None, Some(1), Some(1)],
+            ],
+        };
+        let path = std::env::temp_dir().join("himito_test_write_raw_cooccurrence.tsv");
+        write_raw_variant_cooccurrence(&matrix, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        let row = content.lines().nth(1).unwrap();
+        let fields: Vec<&str> = row.split('\t').collect();
+        // r1 dropped (B uncovered): n_co=2, n11=1 (r3), n01=1 (r2)
+        assert_eq!(&fields[0..7], &["A", "B", "2", "1", "0", "1", "0"]);
     }
 
     #[test]
@@ -1104,6 +1279,7 @@ mod tests {
         for suffix in [
             ".cleaned_matrix.csv",
             ".variant_cooccurrence.tsv",
+            ".raw_variant_cooccurrence.tsv",
             ".molecule_summary.tsv",
             ".mutation_tree.tsv",
             ".read_lineage.nwk",
@@ -1113,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn run_scite_pipeline_writes_all_four_output_files() {
+    fn run_scite_pipeline_writes_all_output_files() {
         let matrix = BinaryMatrix {
             variants: vec!["m.A".to_string(), "m.B".to_string()],
             reads: (0..10).map(|i| format!("r{i}")).collect(),
@@ -1135,6 +1311,7 @@ mod tests {
         for suffix in [
             ".cleaned_matrix.csv",
             ".variant_cooccurrence.tsv",
+            ".raw_variant_cooccurrence.tsv",
             ".molecule_summary.tsv",
             ".mutation_tree.tsv",
             ".read_lineage.nwk",

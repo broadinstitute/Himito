@@ -103,3 +103,26 @@ The output VCF file contains BND (breakend) records in standard VCFv4.3 format. 
 This will identify NUMT breakpoints where reads have alignments spanning both mitochondrial and nuclear genomes, merge breakpoints within 10kb, and output only those with at least 2 supporting reads. If you want to examine all possible NUMTs BND, adjust -a to <=1.
 
 ToDo: may perform local assembly to find sequence resolved NUMTs insertions
+
+### July 14th 2026 Updates: Mitochondrial lineage inference (Under-construction)
+
+Himito includes a new function for inferring mitochondrial mutation history from heteroplasmic variants given the Infinite Sites assumption (ISA) that every variant can only mutate once and will exist on the lineage over the lifetime. 
+
+Given a Himito read–variant matrix (`<prefix>.matrix.csv` from `call`) and the corresponding VCF, the `lineage` command filters to informative heteroplasmic sites, deduplicates reads into haplotypes, and runs an MCMC search over mutation trees and identify a ML tree (algorithm adapted from SCITE, Kuipers J et al. Single-cell sequencing data reveals widespread recurrence and loss of mutational hits in the life histories of tumorus. Genome Research 2017; 27:1885-1894.). The initial tree is a Neighbor–Joining tree constructed from reads instead of a random tree. Sequencing errors are modeled with configurable false-positive (defaul 0.001) and false-negative rates (defaul 0.05). 
+
+Outputs include a mutation tree, read-level lineage Newick tree, cleaned read–variant matrix, variant co-occurrence tables, and haplotype maps.
+
+```
+./target/release/Himito lineage -m <prefix>.matrix.csv \
+                                 -v <output.vcf> \
+                                 -o <output_prefix> \
+                                 --min-hf 0.01 \
+                                 --max-hf 0.95
+```
+
+Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix.csv`, `<output_prefix>.raw_haplotype_map.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`.
+
+To Do: 
+1. mutation/error rate in homopolymer regions could be different (higher FP rate). 
+2. add four gamete test
+3. Add posteriors, convergence and confidence metrics

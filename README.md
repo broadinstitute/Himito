@@ -5,7 +5,7 @@
 
 # Himito
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21522816.svg)](https://doi.org/10.5281/zenodo.21522816)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.21522816-blue?style=flat&logo=zenodo)](https://doi.org/10.5281/zenodo.21522816)
 [![bioRxiv](https://img.shields.io/badge/bioRxiv-10.1101%2F2025.11.03.686348-blue)](https://doi.org/10.1101/2025.11.03.686348)
 
 Building Mitochondrial anchor-based graphical genome from long reads. Filter Numts reads, assemble major haplotypes, call homoplasmic and heteroplasmic variants, analyze methylation signals

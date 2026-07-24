@@ -3,23 +3,51 @@
 <img src="https://github.com/user-attachments/assets/3129d44f-f69a-4491-a0cf-29fab5ee88a9" alt="logo" style="width: 30%; height: auto;">
 </p>
 
-# Himito 
+# Himito
+
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21522816.svg)](https://doi.org/10.5281/zenodo.21522816)
+[![bioRxiv](https://img.shields.io/badge/bioRxiv-10.1101%2F2025.11.03.686348-blue)](https://doi.org/10.1101/2025.11.03.686348)
+
 Building Mitochondrial anchor-based graphical genome from long reads. Filter Numts reads, assemble major haplotypes, call homoplasmic and heteroplasmic variants, analyze methylation signals
 
 ## Documentation
 [User Guide](https://github.com/broadinstitute/Himito/blob/main/docs/User_guide.md)
 
-## Usage
-### install rust
-```
+## Installation
+
+### Standard install
+
+**Rust:**
+```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
 ```
-### install Himito
+
+**System dependencies** (needed to compile `rust-htslib`):
+```bash
+# Debian/Ubuntu
+sudo apt-get install -y build-essential cmake pkg-config libssl-dev libclang-dev zlib1g-dev
 ```
+
+**Build Himito from source:**
+```bash
 git clone https://github.com/broadinstitute/Himito.git
 cd Himito
 cargo build --release
 ```
+
+**Or download a prebuilt Linux binary** from [GitHub Releases](https://github.com/broadinstitute/Himito/releases):
+```bash
+wget https://github.com/broadinstitute/Himito/releases/download/v1.1.2/Himito
+chmod +x Himito
+./Himito --help
+```
+
+### Restricted network environments (incl. China)
+
+If GitHub, Docker Hub, or `crates.io` are slow or unreachable, use the **Zenodo source archive**, Cargo/rustup mirrors, or an offline `cargo build --offline` workflow. See **[Installation in restricted network environments](docs/install_restricted_network.md)**.
+
+## Usage
 ### Quick start (Filter-Build-Asm-Call-Methyl)
 ```
 ./target/release/Himito quick-start -i <lrWGS.bam> \

@@ -338,12 +338,9 @@ enum Commands {
         /// input path for bam file.
         #[clap(short, long, value_parser, required = true)]
         input_bam: PathBuf,
-        /// contig name in the bam file
+        /// mitochondrial contig name in the bam file
         #[clap(short, long, value_parser)]
         chromo: String,
-        /// max gap threshold for merging numts breakpoints, default is 10000bp
-        #[clap(short, long, value_parser, default_value_t = 10000)]
-        max_gap_threshold: i32,
         /// output path for numts vcf file
         #[clap(short, long, value_parser, required = true)]
         output_vcf: PathBuf,
@@ -353,9 +350,30 @@ enum Commands {
         /// sample name of the bam file
         #[clap(short, long, value_parser, required = true)]
         sample_name: String,
-        /// minimal allele count for variants
+        /// junction-signature clustering tolerance (bp)
+        #[clap(long, value_parser, default_value_t = 100)]
+        tolerance: i64,
+        /// minimum MAPQ for both aligned segments of a junction
+        #[clap(long, value_parser, default_value_t = 20)]
+        min_mapq: u8,
+        /// minimum aligned segment length (bp)
+        #[clap(long, value_parser, default_value_t = 100)]
+        min_seg_len: i64,
+        /// minimal supporting-read count (AC) for a PASS variant
         #[clap(short, long, value_parser, default_value_t = 2)]
-        ac_threshold: i32,
+        ac_threshold: usize,
+        /// base allowance for supplementary alignments per read (chimera filter)
+        #[clap(long, value_parser, default_value_t = 3)]
+        max_splits: i64,
+        /// extra split allowance per read-kb (chimera filter)
+        #[clap(long, value_parser, default_value_t = 0.1)]
+        max_splits_per_kb: f64,
+        /// optional BED of reference NUMTs; overlapping calls get a REFNUMT filter
+        #[clap(long, value_parser)]
+        ref_numt_bed: Option<PathBuf>,
+        /// emit breakend (BND) records for all calls instead of sequence-resolved INS
+        #[clap(long, action)]
+        emit_bnd: bool,
     },
 
     /// Infer mitochondrial lineage tree from Himito read_var matrix CSV and heteroplasmic variants
@@ -608,13 +626,39 @@ fn main() {
         Commands::CallNumts {
             input_bam,
             chromo,
-            max_gap_threshold,
             output_vcf,
             reference_file,
             sample_name,
+            tolerance,
+            min_mapq,
+            min_seg_len,
             ac_threshold,
+            max_splits,
+            max_splits_per_kb,
+            ref_numt_bed,
+            emit_bnd,
         } => {
-            callnumts::start(&input_bam, &chromo, max_gap_threshold, &output_vcf, &reference_file, &sample_name, ac_threshold);
+            let config = callnumts::CallNumtsConfig {
+                tolerance,
+                min_mapq,
+                min_seg_len,
+                ac_threshold,
+                max_splits,
+                max_splits_per_kb,
+                emit_bnd,
+                ref_numt_bed,
+            };
+            if let Err(e) = callnumts::start(
+                &input_bam,
+                &chromo,
+                &output_vcf,
+                &reference_file,
+                &sample_name,
+                &config,
+            ) {
+                eprintln!("Error calling NUMTs: {:#}", e);
+                std::process::exit(2);
+            }
         }
         Commands::Lineage {
             matrix_file,

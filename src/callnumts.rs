@@ -14,9 +14,7 @@
 //
 // Grounding (2026-07-16 field survey): thresholds follow the split-read SV / NUMT
 // caller consensus (Sniffles2/cuteSV MAPQ 20, ~100bp clustering; dinumt ref-NUMT
-// masking; Sniffles2 3+0.1/kb max-splits chimera rule). PALMER's TSD+poly(A)
-// hallmarks are TPRT-specific and deliberately NOT used (NUMTs do not integrate
-// by target-primed reverse transcription).
+// masking; Sniffles2 3+0.1/kb max-splits chimera rule). 
 
 use std::{collections::{HashMap, HashSet}, path::PathBuf, io::Write, fs::File};
 use rust_htslib::bam::{self, Read, record::{Aux, Cigar}};

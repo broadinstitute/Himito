@@ -31,7 +31,7 @@ inside a `linux/amd64` container). Attempting it on macOS ARM64 will fail when
 cd /Users/suhang/Analysis/Himito/eval/lineage_sim
 ./setup_env.sh                # creates conda env himito-eval, fetches pbsim3 models
 conda activate himito-eval
-export PBSIM_MODEL_DIR=/Users/suhang/Analysis/Himito/eval/lineage_sim/pbsim3_models
+export PBSIM_MODEL_DIR=/Path/To/Folder/Himito/eval/lineage_sim/pbsim3_models
 ```
 
 `setup_env.sh` clones pbsim3 just for its `data/*.model` files and verifies

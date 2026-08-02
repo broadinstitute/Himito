@@ -252,16 +252,20 @@ pub fn neighbor_joining(dist: &DistMatrix, hap_matrix: &HaplotypeMatrix) -> Resu
 
     let mut tree = Tree { nodes, root: root_id };
 
-    // ── Re-root at all-zero haplotype's parent (outgroup rooting) ────────────
-    let zero_profile = vec![Some(0u8); hap_matrix.variants.len()];
+    // ── Re-root at ancestral haplotype's parent (outgroup rooting) ───────────
+    // The ancestral (reference) haplotype carries no alt calls. Match on the
+    // absence of any `Some(1)` rather than an exact all-`Some(0)` profile, so an
+    // otherwise-reference haplotype with uncovered sites (`None`) still roots the
+    // tree. Haplotypes are sorted fewest-mutations-first, so the first match is
+    // the best-covered ancestral candidate.
     if let Some(og_hap) = hap_matrix
         .haplotypes
         .iter()
-        .find(|h| h.profile == zero_profile)
+        .find(|h| !h.profile.iter().any(|&c| c == Some(1)))
     {
         reroot_at_outgroup_parent(&mut tree, &og_hap.id);
         eprintln!(
-            "      Rooted at parent of all-zero haplotype ({}) — outgroup rooting",
+            "      Rooted at parent of ancestral haplotype ({}) — outgroup rooting",
             og_hap.id
         );
     }
@@ -394,25 +398,36 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
         // Extract position (0-based in htslib → 1-based in VCF/Himito IDs)
         let pos = rec.pos() + 1;
 
-        // rec.alleles() borrows rec immutably; collect into owned Strings so
-        // we can release the borrow before calling rec.format() (mut borrow).
-        let (ref_allele, alt_allele) = {
+        // rec.alleles() borrows rec immutably; collect into owned Strings so we
+        // can release the borrow before calling rec.format() (mut borrow). Keep
+        // every ALT so multiallelic sites contribute one variant id per ALT
+        // (skipping alleles[1..] gracefully handles ALT-less records).
+        let (ref_allele, alt_alleles): (String, Vec<String>) = {
             let alleles = rec.alleles();
-            (
-                std::str::from_utf8(alleles[0]).unwrap_or("").to_owned(),
-                std::str::from_utf8(alleles[1]).unwrap_or("").to_owned(),
-            )
+            let ref_allele = std::str::from_utf8(alleles[0]).unwrap_or("").to_owned();
+            let alts = alleles
+                .iter()
+                .skip(1)
+                .map(|a| std::str::from_utf8(a).unwrap_or("").to_owned())
+                .collect();
+            (ref_allele, alts)
         };
 
-        let vid = format!("m.{pos}{ref_allele}>{alt_allele}");
-
-        // Read the HF FORMAT field (float, first sample, first value)
-        if let Ok(hf_data) = rec.format(b"HF").float() {
-            if let Some(&hf_val) = hf_data.get(0).and_then(|s| s.first()) {
-                let hf = hf_val as f64;
-                if hf >= min_hf && hf < max_hf {
-                    map.insert(vid, hf);
-                }
+        // Read the HF FORMAT field (float, first sample). HF is Number=A, so the
+        // i-th value lines up with the i-th ALT; fall back to the first value for
+        // single-valued encodings.
+        let hf_data = rec.format(b"HF").float().ok();
+        for (alt_idx, alt_allele) in alt_alleles.iter().enumerate() {
+            let hf_val = hf_data
+                .as_ref()
+                .and_then(|d| d.get(0).and_then(|s| s.get(alt_idx).or_else(|| s.first())));
+            let Some(&hf_val) = hf_val else { continue };
+            let hf = hf_val as f64;
+            if hf >= min_hf && hf < max_hf {
+                let vid = format!("m.{pos}{ref_allele}>{alt_allele}");
+                // Keep the first occurrence of a variant id (deterministic across
+                // duplicate records) rather than silently overwriting.
+                map.entry(vid).or_insert(hf);
             }
         }
     }
@@ -421,9 +436,14 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
 
 /// Read `matrix_path` (Himito `.matrix.csv`) and apply filters:
 ///
-/// * **HF bounds** — keep rows where `min_hf ≤ HF < max_hf`.
 /// * **Prevalence** — keep rows where the variant is present in ≥ `min_presence`
 ///   reads AND absent from ≥ `min_absence` reads (guarantees a bifurcation).
+/// * **HF bounds** — keep rows with `min_hf ≤ HF < max_hf`. When a VCF was
+///   provided (`hf_map` non-empty) the HF comes from the VCF and this function
+///   only checks membership. When no VCF was provided (`hf_map` empty) the HF is
+///   recomputed from the matrix as `present / (present + absent)` — alt calls
+///   over *covered* reads — matching Himito's `HF = allele_count / read_depth`,
+///   so the with-/without-VCF variant sets agree.
 ///
 /// Counts are binarised: any count ≥ 1 becomes 1.
 pub fn load_and_filter_matrix(
@@ -431,10 +451,12 @@ pub fn load_and_filter_matrix(
     hf_map: &HfMap,   // contains only variants that already passed HF filtering
     min_presence: usize,
     min_absence: usize,
+    min_hf: f64,
+    max_hf: f64,
 ) -> Result<BinaryMatrix> {
     let file = std::fs::File::open(matrix_path)
         .with_context(|| format!("Cannot read matrix CSV: {matrix_path}"))?;
-    parse_binary_matrix(file, hf_map, min_presence, min_absence)
+    parse_binary_matrix(file, hf_map, min_presence, min_absence, min_hf, max_hf)
 }
 
 /// `Read`-generic core of [`load_and_filter_matrix`] so it can be exercised
@@ -445,6 +467,8 @@ fn parse_binary_matrix<R: std::io::Read>(
     hf_map: &HfMap,
     min_presence: usize,
     min_absence: usize,
+    min_hf: f64,
+    max_hf: f64,
 ) -> Result<BinaryMatrix> {
     let mut rdr = csv::Reader::from_reader(reader);
     let headers = rdr.headers()?.clone();
@@ -478,6 +502,19 @@ fn parse_binary_matrix<R: std::io::Read>(
         if present < min_presence || absent < min_absence {
             continue;
         }
+
+        // No-VCF fallback HF: alt calls over *covered* reads (present + absent),
+        // NOT row.len(). This mirrors Himito's VCF `HF = allele_count / read_depth`
+        // so the homoplasmy filter keeps the same variants with and without a VCF.
+        // Uncovered (`None`) cells must be excluded from the denominator.
+        let covered = present + absent;
+        let freq = if covered > 0 { present as f64 / covered as f64 } else { 0.0 };
+
+        if hf_map.is_empty() && (freq < min_hf || freq >= max_hf) {
+            continue;
+        }
+
+        // println!("vid: {}, freq: {}", vid, freq);
 
         variants.push(vid);
         data.push(row);
@@ -547,21 +584,22 @@ pub fn deduplicate(matrix: &BinaryMatrix, min_reads: usize) -> HaplotypeMatrix {
 /// violation of the Infinite Sites Assumption (ISA).
 pub fn four_gamete_test(matrix: &HaplotypeMatrix) -> Vec<(String, String)> {
     let n_var = matrix.variants.len();
-    let profiles: Vec<Vec<u8>> = matrix
-        .haplotypes
-        .iter()
-        .map(|h| h.profile.iter().map(|c| c.unwrap_or(0)).collect())
-        .collect();
+    let profiles: Vec<&Vec<Option<u8>>> =
+        matrix.haplotypes.iter().map(|h| &h.profile).collect();
     let mut violations = Vec::new();
 
     for i in 0..n_var {
         for j in (i + 1)..n_var {
             let mut seen = [false; 4]; // index = a*2 + b for states a,b ∈ {0,1}
             for profile in &profiles {
-                let idx = (profile[i] * 2 + profile[j]) as usize;
-                seen[idx] = true;
-                if seen.iter().all(|&s| s) {
-                    break;
+                // A haplotype only informs the pair if it covers BOTH sites;
+                // missing calls (`None`) are excluded rather than read as ref.
+                if let (Some(a), Some(b)) = (profile[i], profile[j]) {
+                    let idx = (a * 2 + b) as usize;
+                    seen[idx] = true;
+                    if seen.iter().all(|&s| s) {
+                        break;
+                    }
                 }
             }
             if seen.iter().all(|&s| s) {
@@ -586,7 +624,18 @@ pub fn write_haplotype_map(hap_matrix: &HaplotypeMatrix, path: &str) -> Result<(
         let readlist = hap.reads.join(",");
         assert_eq!(hap.count, hap.reads.len());
         writeln!(w, "{}\t{n_mut}\t{}\t{readlist}", hap.id, hap.count)?;
-        
+
+    }
+    // Always represent the ancestral haplotype (the tree root: no heteroplasmic
+    // variants). If the deduplicated haplotypes already contain an all-reference
+    // profile it is kept as-is; otherwise a synthetic zero-read root row is
+    // appended so the ancestral state is consistent with the lineage tree.
+    let has_ancestral = hap_matrix
+        .haplotypes
+        .iter()
+        .any(|h| !h.profile.iter().any(|&b| b == Some(1)));
+    if !has_ancestral {
+        writeln!(w, "Hroot\t0\t0\t")?;
     }
     Ok(())
 }
@@ -610,8 +659,18 @@ pub fn start(
     info!("Starting lineage analysis...");
 
     // ── Step 1: load VCF HF values, then filter the binary matrix ─────────────
-    info!("[1/6] Parsing VCF: {}", vcf_file.as_ref().unwrap_or(&""));
-    let hf_map = parse_vcf(vcf_file.as_ref().unwrap_or(&""), min_hf, max_hf)?;
+    // The VCF is optional: without it, no HF filter is applied and every variant
+    // in the matrix is retained (an empty HfMap disables HF filtering downstream).
+    let hf_map = match vcf_file {
+        Some(path) => {
+            info!("[1/6] Parsing VCF: {}", path);
+            parse_vcf(path, min_hf, max_hf)?
+        }
+        None => {
+            info!("[1/6] No VCF provided; skipping HF filter (all matrix variants retained).");
+            HfMap::new()
+        }
+    };
 
     info!("[1/6] Loading and filtering matrix: {}", matrix_file);
     let binary = load_and_filter_matrix(
@@ -619,6 +678,8 @@ pub fn start(
         &hf_map,
         min_presence,
         min_absence,
+        min_hf,
+        max_hf,
     )?;
     if binary.variants.is_empty() {
         anyhow::bail!(
@@ -634,6 +695,15 @@ pub fn start(
     info!("[2/6] Found {} haplotypes across {} variants.", hap_matrix.haplotypes.len(), hap_matrix.variants.len());
     if hap_matrix.haplotypes.is_empty() {
         anyhow::bail!("No haplotypes remain after --min-reads filtering.");
+    }
+    // Diagnostic: variant pairs violating the infinite-sites assumption (all four
+    // gametes observed) hint at recurrent/back mutation or recombination.
+    let violations = four_gamete_test(&hap_matrix);
+    if !violations.is_empty() {
+        info!(
+            "[2/6] Four-gamete test: {} variant pair(s) violate the infinite-sites assumption.",
+            violations.len()
+        );
     }
     // Global haplotype map (all variants)
     let hmap_path = format!("{}.raw_haplotype_map.tsv", output_prefix);
@@ -655,11 +725,18 @@ pub fn start(
 
     // ── Step 4: write final haplotype map (filtered by SCITE) ─────────────────
     info!("[4/6] Deduplicating cleaned reads into haplotypes...");
+    // The cleaned matrix already contains exactly the variants the tree was built
+    // on; re-applying prevalence/HF filters here would re-drop variants after
+    // imputation (which removed the `None` cells and can push a variant to
+    // absent==0 or freq==1.0), making the no-VCF output diverge from the VCF one.
+    // Pass fully-permissive thresholds so this reload only deduplicates.
     let cleaned_binary = load_and_filter_matrix(
         &format!("{}.cleaned_matrix.csv", output_prefix),
         &hf_map,
-        min_presence,
-        min_absence,
+        0,
+        0,
+        0.0,
+        f64::INFINITY,
     )?;
     let cleaned_hap_matrix = deduplicate(&cleaned_binary, min_reads);
     // write how many haplotypes and how many heteroplasmic variants on each haplotype
@@ -688,7 +765,11 @@ mod tests {
     fn load_and_filter_matrix_preserves_missing_values() {
         let csv = "variant,r1,r2,r3\nm.100A>G,1,0,\nm.200C>T,0,1,1\n";
         let hf = hf_map(&["m.100A>G", "m.200C>T"]);
-        let matrix = parse_binary_matrix(Cursor::new(csv), &hf, 1, 1).unwrap();
+        let min_presence = 1;
+        let min_absence = 1;
+        let min_hf = 0.0;
+        let max_hf = 1.0;
+        let matrix = parse_binary_matrix(Cursor::new(csv), &hf, min_presence, min_absence, min_hf, max_hf).unwrap();
 
         assert_eq!(matrix.variants, vec!["m.100A>G", "m.200C>T"]);
         assert_eq!(matrix.reads, vec!["r1", "r2", "r3"]);
@@ -706,7 +787,7 @@ mod tests {
         // present=1 (r1), absent=0 (no explicit ref call) -> fails min_absence=1
         let csv = "variant,r1,r2\nm.100A>G,1,\n";
         let hf = hf_map(&["m.100A>G"]);
-        let matrix = parse_binary_matrix(Cursor::new(csv), &hf, 1, 1).unwrap();
+        let matrix = parse_binary_matrix(Cursor::new(csv), &hf, 1, 1, 0.0, 1.0).unwrap();
         assert!(matrix.variants.is_empty());
     }
 
@@ -721,6 +802,51 @@ mod tests {
         };
         let hap_matrix = deduplicate(&matrix, 1);
         assert_eq!(hap_matrix.haplotypes.len(), 2);
+    }
+
+    #[test]
+    fn write_haplotype_map_appends_synthetic_root_when_no_ancestral_haplotype() {
+        let hap_matrix = HaplotypeMatrix {
+            variants: vec!["m.100A>G".to_string()],
+            haplotypes: vec![Haplotype {
+                id: "H0000".to_string(),
+                profile: vec![Some(1)],
+                reads: vec!["r1".to_string(), "r2".to_string()],
+                count: 2,
+            }],
+        };
+        let path = std::env::temp_dir().join("himito_test_hapmap_synthetic_root.tsv");
+        write_haplotype_map(&hap_matrix, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            content,
+            "haplotype_id\tn_mutations\tn_reads\tread_name\n\
+             H0000\t1\t2\tr1,r2\n\
+             Hroot\t0\t0\t\n"
+        );
+    }
+
+    #[test]
+    fn write_haplotype_map_keeps_existing_ancestral_haplotype_without_duplicating() {
+        let hap_matrix = HaplotypeMatrix {
+            variants: vec!["m.100A>G".to_string()],
+            haplotypes: vec![Haplotype {
+                id: "H0000".to_string(),
+                profile: vec![Some(0)],
+                reads: vec!["r1".to_string()],
+                count: 1,
+            }],
+        };
+        let path = std::env::temp_dir().join("himito_test_hapmap_existing_root.tsv");
+        write_haplotype_map(&hap_matrix, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            content,
+            "haplotype_id\tn_mutations\tn_reads\tread_name\n\
+             H0000\t0\t1\tr1\n"
+        );
     }
 
     #[test]
@@ -747,5 +873,189 @@ mod tests {
         // They differ at B only -> distance = 1/2.
         assert!((dist.data[0][1] - 0.5).abs() < 1e-12);
         assert!((dist.data[1][0] - 0.5).abs() < 1e-12);
+    }
+
+    fn hap2(id: &str, a: Option<u8>, b: Option<u8>) -> Haplotype {
+        Haplotype { id: id.into(), profile: vec![a, b], reads: vec![], count: 1 }
+    }
+
+    #[test]
+    fn four_gamete_test_flags_all_four_gametes() {
+        let matrix = HaplotypeMatrix {
+            variants: vec!["A".into(), "B".into()],
+            haplotypes: vec![
+                hap2("H0", Some(0), Some(0)),
+                hap2("H1", Some(0), Some(1)),
+                hap2("H2", Some(1), Some(0)),
+                hap2("H3", Some(1), Some(1)),
+            ],
+        };
+        assert_eq!(four_gamete_test(&matrix), vec![("A".to_string(), "B".to_string())]);
+    }
+
+    #[test]
+    fn four_gamete_test_missing_calls_do_not_fabricate_the_ref_gamete() {
+        // Only 01, 10, 11 are truly observed. The "00" gamete would only appear
+        // if a None were read as ref (the old behavior). With None excluded there
+        // is no violation.
+        let matrix = HaplotypeMatrix {
+            variants: vec!["A".into(), "B".into()],
+            haplotypes: vec![
+                hap2("H0", None, None),
+                hap2("H1", Some(0), Some(1)),
+                hap2("H2", Some(1), Some(0)),
+                hap2("H3", Some(1), Some(1)),
+            ],
+        };
+        assert!(four_gamete_test(&matrix).is_empty());
+    }
+
+    #[test]
+    fn reroot_at_outgroup_parent_collapses_old_root_and_preserves_path_lengths() {
+        // ROOT(4) -> {INT3(3) -> {H0000(0), H1(1)}, H2(2)}
+        let mut tree = Tree {
+            nodes: vec![
+                Node { id: 0, label: "H0000".into(), is_leaf: true, children: vec![], parent: Some(3), branch_length: 1.0, read_count: 1 },
+                Node { id: 1, label: "H1".into(), is_leaf: true, children: vec![], parent: Some(3), branch_length: 2.0, read_count: 1 },
+                Node { id: 2, label: "H2".into(), is_leaf: true, children: vec![], parent: Some(4), branch_length: 5.0, read_count: 1 },
+                Node { id: 3, label: "INT3".into(), is_leaf: false, children: vec![0, 1], parent: Some(4), branch_length: 3.0, read_count: 0 },
+                Node { id: 4, label: "ROOT".into(), is_leaf: false, children: vec![3, 2], parent: None, branch_length: 0.0, read_count: 0 },
+            ],
+            root: 4,
+        };
+        reroot_at_outgroup_parent(&mut tree, "H0000");
+
+        assert_eq!(tree.root, 3);
+        assert_eq!(tree.nodes[3].parent, None);
+        // Old root (4) collapses; H2 hangs directly under the new root with its
+        // branch length summed through the old root (5.0 + 3.0).
+        assert_eq!(tree.nodes[2].parent, Some(3));
+        assert!((tree.nodes[2].branch_length - 8.0).abs() < 1e-12);
+        // Outgroup and sibling keep their original lengths to INT3.
+        assert!((tree.nodes[0].branch_length - 1.0).abs() < 1e-12);
+        assert!((tree.nodes[1].branch_length - 2.0).abs() < 1e-12);
+        // New root's children are exactly {H0000, H1, H2}.
+        let mut kids = tree.nodes[3].children.clone();
+        kids.sort();
+        assert_eq!(kids, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn parse_vcf_splits_multiallelic_sites_and_keeps_first_duplicate() {
+        let vcf = "\
+##fileformat=VCFv4.2
+##contig=<ID=chrM,length=16569>
+##FORMAT=<ID=HF,Number=A,Type=Float,Description=\"Heteroplasmic fraction\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1
+chrM\t100\t.\tA\tG,T\t.\tPASS\t.\tHF\t0.3,0.6
+chrM\t200\t.\tC\tT\t.\tPASS\t.\tHF\t0.9
+chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.99
+";
+        let path = std::env::temp_dir().join("himito_test_parse_vcf_multiallelic.vcf");
+        std::fs::write(&path, vcf).unwrap();
+        let map = parse_vcf(path.to_str().unwrap(), 0.0, 1.0).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        // Both ALTs of the multiallelic site become distinct variant ids.
+        assert_eq!(map.get("m.100A>G").copied(), Some(0.3_f32 as f64));
+        assert_eq!(map.get("m.100A>T").copied(), Some(0.6_f32 as f64));
+        assert_eq!(map.get("m.200C>T").copied(), Some(0.9_f32 as f64));
+        // The later duplicate record (HF 0.99) does not overwrite the first.
+        assert_eq!(map.len(), 3);
+    }
+}
+
+/// Parity checks: the with-VCF and without-VCF variant filtering must select the
+/// same variants, so a lineage run produces identical output either way (assuming
+/// a VCF whose HF matches the matrix and which applies no extra filters).
+#[cfg(test)]
+mod vcf_parity_tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Build a `variant,r1..r10` CSV. `cells` are raw tokens ("" = uncovered).
+    fn build_csv(rows: &[(&str, [&str; 10])]) -> String {
+        let mut csv = String::from("variant,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10\n");
+        for (vid, cells) in rows {
+            csv.push_str(vid);
+            for c in cells {
+                csv.push(',');
+                csv.push_str(c);
+            }
+            csv.push('\n');
+        }
+        csv
+    }
+
+    #[test]
+    fn no_vcf_matrix_frequency_filter_matches_vcf_hf_filter() {
+        // present/absent/uncovered per variant, thresholds min_hf=0.2 max_hf=0.85:
+        //   m.100A>G  present=3 absent=3 uncovered=4 -> HF 3/6  = 0.50  KEEP
+        //   m.200C>T  present=1 absent=3 uncovered=6 -> HF 1/4  = 0.25  KEEP
+        //             (row.len() denom would give 1/10 = 0.10 -> wrongly DROPPED,
+        //              so this row exercises the covered-read denominator)
+        //   m.300G>A  present=9 absent=1 uncovered=0 -> HF 9/10 = 0.90  DROP (homoplasmic)
+        //   m.400T>C  present=1 absent=9 uncovered=0 -> HF 1/10 = 0.10  DROP (too low)
+        let csv = build_csv(&[
+            ("m.100A>G", ["1", "1", "1", "0", "0", "0", "", "", "", ""]),
+            ("m.200C>T", ["1", "0", "0", "0", "", "", "", "", "", ""]),
+            ("m.300G>A", ["1", "1", "1", "1", "1", "1", "1", "1", "1", "0"]),
+            ("m.400T>C", ["1", "0", "0", "0", "0", "0", "0", "0", "0", "0"]),
+        ]);
+
+        let (min_presence, min_absence, min_hf, max_hf) = (1usize, 1usize, 0.2f64, 0.85f64);
+
+        // "With VCF": hf_map holds exactly the variants whose HF is in range, as
+        // parse_vcf would produce (HF computed as alt/coverage).
+        let mut with_vcf_hf = HfMap::new();
+        with_vcf_hf.insert("m.100A>G".to_string(), 0.50);
+        with_vcf_hf.insert("m.200C>T".to_string(), 0.25);
+
+        let with_vcf = parse_binary_matrix(
+            Cursor::new(csv.clone()),
+            &with_vcf_hf,
+            min_presence,
+            min_absence,
+            min_hf,
+            max_hf,
+        )
+        .unwrap();
+
+        // "Without VCF": empty hf_map -> frequency recomputed from the matrix.
+        let without_vcf = parse_binary_matrix(
+            Cursor::new(csv),
+            &HfMap::new(),
+            min_presence,
+            min_absence,
+            min_hf,
+            max_hf,
+        )
+        .unwrap();
+
+        // Both keep exactly the two heteroplasmic variants, same order, same data.
+        assert_eq!(without_vcf.variants, vec!["m.100A>G", "m.200C>T"]);
+        assert_eq!(with_vcf.variants, without_vcf.variants);
+        assert_eq!(with_vcf.data, without_vcf.data);
+        assert_eq!(with_vcf.reads, without_vcf.reads);
+    }
+
+    #[test]
+    fn no_vcf_denominator_excludes_uncovered_reads() {
+        // Heteroplasmic among covered reads but "rare" if uncovered cells are
+        // counted: present=2 absent=2 uncovered=6 -> covered HF 2/4 = 0.50,
+        // row.len() HF 2/10 = 0.20. A threshold between the two isolates the bug.
+        let csv = build_csv(&[("m.500A>C", ["1", "1", "0", "0", "", "", "", "", "", ""])]);
+        let kept = parse_binary_matrix(
+            Cursor::new(csv),
+            &HfMap::new(),
+            1,
+            1,
+            0.30f64,
+            0.85f64,
+        )
+        .unwrap();
+        // Covered-read denominator (0.50) retains it; the old row.len() denominator
+        // (0.20 < 0.30) would have dropped it.
+        assert_eq!(kept.variants, vec!["m.500A>C"]);
     }
 }

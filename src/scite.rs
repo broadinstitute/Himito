@@ -715,26 +715,30 @@ fn emit_lineage_node(
         let muts = vec![variants[c].clone()];
         tokens.push(emit_lineage_node(c, &muts, tree, children, haps_by_node, variants));
     }
+
+    if is_root {
+        // The root carries no heteroplasmic variants, so it is always emitted as
+        // an explicit ancestral haplotype tip. When reads best-attach to the root
+        // that haplotype supplies the id and read count; otherwise a synthetic
+        // zero-read tip keeps the ancestral state visible in every lineage tree.
+        let root_reads: usize = haps.iter().map(|(_, count)| *count).sum();
+        let root_hid = if haps.len() == 1 { haps[0].0.clone() } else { "Hroot".to_string() };
+        tokens.push(format!("{root_hid}_n{root_reads}:0[&&NHX:reads={root_reads}]"));
+        return format!("({})ROOT", tokens.join(","));
+    }
+
     for (hid, count) in haps {
         // Haplotype attached directly to a surviving node: zero-length tip, reads only.
         tokens.push(format!("{hid}_n{count}:0[&&NHX:reads={count}]"));
     }
 
-    if is_root {
-        if tokens.is_empty() {
-            "ROOT".to_string()
-        } else {
-            format!("({})ROOT", tokens.join(","))
-        }
+    let blen = edge_muts.len();
+    let muts = edge_muts.join(",");
+    if tokens.is_empty() {
+        // Dead-end ancestral node (no descendants, no reads) — keep the mutation.
+        format!("anc{node}:{blen}[&&NHX:mutation={muts}]")
     } else {
-        let blen = edge_muts.len();
-        let muts = edge_muts.join(",");
-        if tokens.is_empty() {
-            // Dead-end ancestral node (no descendants, no reads) — keep the mutation.
-            format!("anc{node}:{blen}[&&NHX:mutation={muts}]")
-        } else {
-            format!("({})anc{node}:{blen}[&&NHX:mutation={muts}]", tokens.join(","))
-        }
+        format!("({})anc{node}:{blen}[&&NHX:mutation={muts}]", tokens.join(","))
     }
 }
 
@@ -1350,11 +1354,42 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
+        // No haplotype carries zero mutations, so the ancestral root state is
+        // materialised as a synthetic zero-read tip (Hroot) under ROOT.
         assert_eq!(
             content,
             "((H0_n9:1[&&NHX:mutation=mC:reads=9],\
              (H1_n7:0[&&NHX:reads=7],H2_n4:0[&&NHX:reads=4])anc3:1[&&NHX:mutation=mD],\
-             H3_n2:0[&&NHX:reads=2])anc1:2[&&NHX:mutation=mA,mB])ROOT;\n"
+             H3_n2:0[&&NHX:reads=2])anc1:2[&&NHX:mutation=mA,mB],\
+             Hroot_n0:0[&&NHX:reads=0])ROOT;\n"
+        );
+    }
+
+    #[test]
+    fn write_read_lineage_newick_uses_all_zero_haplotype_as_root_tip() {
+        use lineage::{Haplotype, HaplotypeMatrix};
+
+        // root(1) -> A(0). The all-zero haplotype (H0000, 5 reads) best-attaches
+        // to the root and supplies the ancestral tip's id/count directly — no
+        // synthetic Hroot, and its reads are not double-counted elsewhere.
+        let tree = MutationTree { n_mutations: 1, parent: vec![1, 1] };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+        let hap_matrix = HaplotypeMatrix {
+            variants: vec!["mA".into()],
+            haplotypes: vec![
+                Haplotype { id: "H0000".into(), profile: vec![Some(0)], reads: vec![], count: 5 },
+                Haplotype { id: "H0001".into(), profile: vec![Some(1)], reads: vec![], count: 3 },
+            ],
+        };
+
+        let path = std::env::temp_dir().join("himito_test_read_lineage_root_tip.nwk");
+        write_read_lineage_newick(&tree, &hap_matrix, &rates, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(
+            content,
+            "(H0001_n3:1[&&NHX:mutation=mA:reads=3],H0000_n5:0[&&NHX:reads=5])ROOT;\n"
         );
     }
 }

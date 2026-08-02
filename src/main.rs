@@ -418,11 +418,11 @@ enum Commands {
         fn_rate: f64,
 
         /// number of MCMC iterations per chain
-        #[clap(long, value_parser, default_value_t = 10000)]
+        #[clap(long, value_parser, default_value_t = 5000)]
         mcmc_iterations: usize,
 
         /// number of independent MCMC chains (best tree across all is kept)
-        #[clap(long, value_parser, default_value_t = 4)]
+        #[clap(long, value_parser, default_value_t = 3)]
         mcmc_chains: usize,
 
         /// RNG seed for the MCMC search (reproducible runs)

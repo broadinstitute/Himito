@@ -36,7 +36,7 @@ done
 
 case "$PROFILE" in
   hifi)    MMPRESET="map-hifi"; DTYPE="pacbio";;
-  ont-r10) MMPRESET="map-ont";  DTYPE="ont-r10";;
+  ont-r10) MMPRESET="lr:hq";  DTYPE="ont-r10";;
   *) echo "profile must be hifi or ont-r10" >&2; exit 1;;
 esac
 

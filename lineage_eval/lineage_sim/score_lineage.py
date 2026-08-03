@@ -167,11 +167,17 @@ def quartet_distance(truth_parent, recon_parent, shared: set[str]) -> tuple[int,
     return diff, (diff / total if total else 0.0)
 
 
-def detected_variants_with_hf_from_vcf(path: str) -> dict[str, float | None]:
+def detected_variants_with_hf_from_vcf(
+    path: str,
+    min_hf: float = 0.01,
+    max_hf: float = 0.95,
+) -> dict[str, float | None]:
     """PASS/. SNVs from a Himito VCF → {m.<pos><ref>><alt>: HF}.
 
     HF is read from the first sample's FORMAT/HF field (first allele if
-    multi-valued). Missing HF → None. Non-PASS filters are excluded.
+    multi-valued). Non-PASS filters are excluded. Keeps only variants with
+    ``min_hf <= HF < max_hf`` (same band as Himito ``lineage``); records
+    without a usable HF are dropped.
     """
     out: dict[str, float | None] = {}
     with open(path) as fh:
@@ -184,7 +190,6 @@ def detected_variants_with_hf_from_vcf(path: str) -> dict[str, float | None]:
             pos, ref, alt, filt = f[1], f[3], f[4], f[6]
             if filt not in ("PASS", "."):
                 continue
-            vid = f"m.{pos}{ref}>{alt}"
             hf: float | None = None
             if len(f) >= 10:
                 keys = f[8].split(":")
@@ -192,13 +197,19 @@ def detected_variants_with_hf_from_vcf(path: str) -> dict[str, float | None]:
                 sample = dict(zip(keys, vals))
                 if "HF" in sample and sample["HF"] not in (".", ""):
                     hf = float(sample["HF"].split(",")[0])
-            out[vid] = hf
+            if hf is None or not (min_hf <= hf < max_hf):
+                continue
+            out[f"m.{pos}{ref}>{alt}"] = hf
     return out
 
 
-def detected_variants_from_vcf(path: str) -> set[str]:
+def detected_variants_from_vcf(
+    path: str,
+    min_hf: float = 0.01,
+    max_hf: float = 0.95,
+) -> set[str]:
     """PASS/. SNVs from a Himito VCF, as m.<pos><ref>><alt> strings."""
-    return set(detected_variants_with_hf_from_vcf(path))
+    return set(detected_variants_with_hf_from_vcf(path, min_hf=min_hf, max_hf=max_hf))
 
 
 def _f1(p: float, r: float) -> float:
@@ -265,13 +276,23 @@ def main() -> None:
     ap.add_argument("--profile", default="NA")
     ap.add_argument("--fp", default="NA")
     ap.add_argument("--fn", default="NA")
+    ap.add_argument(
+        "--min-hf", type=float, default=0.01,
+        help="keep detected variants with HF >= this (default: 0.01)",
+    )
+    ap.add_argument(
+        "--max-hf", type=float, default=0.95,
+        help="keep detected variants with HF < this (default: 0.95)",
+    )
     ap.add_argument("--metrics-out", default="")
     args = ap.parse_args()
 
     truth_pm = parse_mutation_tree(args.truth_tree)
     recon_pm = parse_mutation_tree(args.recon_tree)
     truth_vars = {l.strip() for l in open(args.truth_variants) if l.strip()}
-    detected_hf = detected_variants_with_hf_from_vcf(args.vcf)
+    detected_hf = detected_variants_with_hf_from_vcf(
+        args.vcf, min_hf=args.min_hf, max_hf=args.max_hf,
+    )
     detected = set(detected_hf)
 
     m = score(truth_pm, recon_pm, truth_vars, detected)

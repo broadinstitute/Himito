@@ -51,6 +51,7 @@ for fp in $FP_GRID; do
         --recon-tree "${pfx}.mutation_tree.tsv" \
         --truth-variants "$OUTDIR/truth/truth_variants.txt" \
         --vcf "$VCF" --profile "$PROFILE" --fp "$fp" --fn "$fn" \
+        --min-hf 0.01 --max-hf 0.95 \
         --metrics-out "$SWEEP" >/dev/null
     else
       echo "lineage failed at fp=$fp fn=$fn (skipped)" >&2

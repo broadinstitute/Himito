@@ -40,6 +40,7 @@ python "$HERE/score_lineage.py" \
   --truth-variants "$OUTDIR/truth/truth_variants.txt" \
   --vcf "$OUTDIR/himito/sim.vcf" \
   --profile "$PROFILE" --fp "$FP" --fn "$FN" \
+  --min-hf 0.01 --max-hf 0.99 \
   --metrics-out "$OUTDIR/metrics.tsv"
 
 echo "=== metrics ($OUTDIR/metrics.tsv) ==="

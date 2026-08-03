@@ -9,6 +9,7 @@ import argparse
 import csv
 import itertools
 import os
+import sys
 from collections import deque
 
 
@@ -166,9 +167,13 @@ def quartet_distance(truth_parent, recon_parent, shared: set[str]) -> tuple[int,
     return diff, (diff / total if total else 0.0)
 
 
-def detected_variants_from_vcf(path: str) -> set[str]:
-    """PASS SNVs from a Himito VCF, as m.<pos><ref>><alt> strings."""
-    out = set()
+def detected_variants_with_hf_from_vcf(path: str) -> dict[str, float | None]:
+    """PASS/. SNVs from a Himito VCF → {m.<pos><ref>><alt>: HF}.
+
+    HF is read from the first sample's FORMAT/HF field (first allele if
+    multi-valued). Missing HF → None. Non-PASS filters are excluded.
+    """
+    out: dict[str, float | None] = {}
     with open(path) as fh:
         for line in fh:
             if line.startswith("#"):
@@ -179,8 +184,21 @@ def detected_variants_from_vcf(path: str) -> set[str]:
             pos, ref, alt, filt = f[1], f[3], f[4], f[6]
             if filt not in ("PASS", "."):
                 continue
-            out.add(f"m.{pos}{ref}>{alt}")
+            vid = f"m.{pos}{ref}>{alt}"
+            hf: float | None = None
+            if len(f) >= 10:
+                keys = f[8].split(":")
+                vals = f[9].split(":")
+                sample = dict(zip(keys, vals))
+                if "HF" in sample and sample["HF"] not in (".", ""):
+                    hf = float(sample["HF"].split(",")[0])
+            out[vid] = hf
     return out
+
+
+def detected_variants_from_vcf(path: str) -> set[str]:
+    """PASS/. SNVs from a Himito VCF, as m.<pos><ref>><alt> strings."""
+    return set(detected_variants_with_hf_from_vcf(path))
 
 
 def _f1(p: float, r: float) -> float:
@@ -253,7 +271,8 @@ def main() -> None:
     truth_pm = parse_mutation_tree(args.truth_tree)
     recon_pm = parse_mutation_tree(args.recon_tree)
     truth_vars = {l.strip() for l in open(args.truth_variants) if l.strip()}
-    detected = detected_variants_from_vcf(args.vcf)
+    detected_hf = detected_variants_with_hf_from_vcf(args.vcf)
+    detected = set(detected_hf)
 
     m = score(truth_pm, recon_pm, truth_vars, detected)
     row = {"profile": args.profile, "fp": args.fp, "fn": args.fn, **m}
@@ -270,6 +289,14 @@ def main() -> None:
             fh.write(line + "\n")
     print("\t".join(FIELDS))
     print(line)
+
+    # False positives: PASS/. VCF calls not in the truth variant list.
+    fps = sorted(detected - truth_vars)
+    print(f"false_positives\t{len(fps)}", file=sys.stderr)
+    print("variant\tHF", file=sys.stderr)
+    for vid in fps:
+        hf = detected_hf[vid]
+        print(f"{vid}\t{hf if hf is not None else 'NA'}", file=sys.stderr)
 
 
 if __name__ == "__main__":

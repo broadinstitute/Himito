@@ -883,7 +883,7 @@ pub fn generate_cigar(
 }
 
 
-pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &PathBuf, maxlength: usize) {
+pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &PathBuf, maxlength: usize, min_edge_reads: usize) {
     // Read reference records into a vector
     let ref_reader = Reader::from_file(reference_path).unwrap();
     let reference_sequence: Vec<Record> = ref_reader.records().map(|r| r.unwrap()).collect();
@@ -1001,8 +1001,11 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
     let tmp_gfa_path = PathBuf::from("tmp.gfa");
     let mut graph = agg::GraphicalGenome::load_graph(&tmp_gfa_path).unwrap();
 
-    // generate cigar
-    generate_cigar(&mut graph, &ref_header, k, maxlength, 2);
+    // generate cigar. `min_edge_reads` is the `minimal_read_count` gate: an edge
+    // is aligned (and can yield variants) only if it carries strictly more than
+    // this many reads. Lower it to recover low-frequency variants whose reads are
+    // fragmented across many low-count edges on noisy long reads.
+    generate_cigar(&mut graph, &ref_header, k, maxlength, min_edge_reads);
     let graph_output = output.with_extension("gfa");
     let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph);
 }

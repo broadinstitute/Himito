@@ -88,7 +88,7 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 0.01)]
         vaf_threshold: f32,
 
-        /// p-value threshold for permutation test (optional, preset by data-type,lower is more stringent)
+        /// p-value threshold for permutation test (optional, preset by data-type,(optional, set as 1 to disable permutation test))
         #[clap(long, value_parser)]
         p_value_threshold: Option<f64>,
 
@@ -178,6 +178,14 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 3000)]
         length_max: usize,
 
+        /// minimal reads on a graph edge before it is aligned into a CIGAR.
+        /// Variants are read only from CIGAR-bearing edges, so an edge with this
+        /// >1, i.e. >=2, reads). Lower to recover low-frequency variants whose
+        /// reads fragment across many low-count edges on noisy long reads, at the
+        /// cost of more false positives.
+        #[clap(long, value_parser, default_value_t = 1)]
+        min_edge_reads: usize,
+
     },
 
     /// Correct graph based on srWGS data
@@ -238,7 +246,7 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 0.01)]
         vaf_threshold: f32,
 
-        /// p-value threshold for permutation test (optional)
+        /// p-value threshold for permutation test (optional, set as 1 to disable permutation test)
         #[clap(short, long, value_parser)]
         p_value_threshold: Option<f64>,
 
@@ -489,7 +497,8 @@ fn main() {
             );
             
             let graph_output = output_prefix.with_extension("gfa");
-            let _ = build::start(&graph_output, kmer_size, &mt_output, &reference_path, length_max);
+            // Preserve the historical default edge-read gate (2) for this combined pipeline.
+            let _ = build::start(&graph_output, kmer_size, &mt_output, &reference_path, length_max, 2);
 
             let assemble_output = output_prefix.with_extension("fasta");
             asm::start(&graph_output, &assemble_output, &sample_id);
@@ -543,8 +552,9 @@ fn main() {
             input_read_path,
             reference_path,
             length_max,
+            min_edge_reads,
         } => {
-            build::start(&output, kmer_size, &input_read_path, &reference_path, length_max);
+            build::start(&output, kmer_size, &input_read_path, &reference_path, length_max, min_edge_reads);
         }
 
         Commands::Correct {

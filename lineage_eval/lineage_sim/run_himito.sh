@@ -12,6 +12,8 @@ OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05 KMER=21
 # -v 0.005: capture low-frequency clones (default 0.01 loses sub-1% clones)
 # -p 1.0: disable permutation test (clean simulated variants have balanced strands)
 MINIMAL_AC=0 VAF=0.001 PVAL=1
+# HF band forwarded to `Himito lineage` (same band as run_eval.sh / sweep_fpfn.sh / score_lineage.py).
+MIN_HF=0.01 MAX_HF=0.95
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -25,10 +27,12 @@ while [[ $# -gt 0 ]]; do
     --vaf) VAF="$2"; shift 2;;
     --pval) PVAL="$2"; shift 2;;
     --kmer) KMER="$2"; shift 2;;
+    --min-hf) MIN_HF="$2"; shift 2;;
+    --max-hf) MAX_HF="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
-[[ -n "$OUTDIR" && -n "$PROFILE" ]] || { echo "usage: --outdir DIR --profile {hifi,ont-r10} [--sample S] [--fp F] [--fn F] [--minimal-ac N] [--vaf V] [--pval P]" >&2; exit 1; }
+[[ -n "$OUTDIR" && -n "$PROFILE" ]] || { echo "usage: --outdir DIR --profile {hifi,ont-r10} [--sample S] [--fp F] [--fn F] [--minimal-ac N] [--vaf V] [--pval P] [--min-hf F] [--max-hf F]" >&2; exit 1; }
 
 case "$PROFILE" in
   hifi)    MMPRESET="map-hifi"; DTYPE="pacbio";;
@@ -62,7 +66,7 @@ samtools index "$BAM"
 
 # Lineage: SCITE mutation-tree reconstruction.
 "$HIMITO" lineage -m "$HDIR/sim.matrix.csv" -v "$HDIR/sim.vcf" \
-  --fp-rate "$FP" --fn-rate "$FN" --min-hf 0.01 --max-hf 0.99 \
+  --fp-rate "$FP" --fn-rate "$FN" --min-hf "$MIN_HF" --max-hf "$MAX_HF" \
   -o "$HDIR/sim_lineage"
 
 echo "himito done: $HDIR/sim_lineage.mutation_tree.tsv"

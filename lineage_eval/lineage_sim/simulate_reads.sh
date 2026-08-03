@@ -41,9 +41,17 @@ fi
   echo "hint: run ./setup_env.sh to fetch models into $DEFAULT_MODEL_DIR" >&2
   exit 1
 }
+command -v pbsim >/dev/null || {
+  echo "pbsim not in PATH (activate the himito-eval env: conda activate himito-eval)" >&2
+  exit 1
+}
 
 GENOMES="$OUTDIR/truth/clone_genomes.fa"
 CLONES="$OUTDIR/truth/clones.tsv"
+[[ -s "$GENOMES" && -s "$CLONES" ]] || {
+  echo "missing truth outputs: $GENOMES / $CLONES (run simulate_tree.py first)" >&2
+  exit 1
+}
 WORK="$OUTDIR/reads/work"
 rm -rf "$WORK"; mkdir -p "$WORK"
 OUT_FQ="$OUTDIR/reads/reads.fastq"
@@ -53,6 +61,7 @@ ROT=8284  # floor(16569/2)
 
 # Split multi-FASTA into per-clone files (clone id from header ">clone_<id>").
 awk -v dir="$WORK" '/^>/{id=substr($0,8); f=dir"/clone_"id".fa"; print > f; next}{print >> f}' "$GENOMES"
+
 
 N_CLONES=$(tail -n +2 "$CLONES" | wc -l | tr -d ' ')
 N_JOBS=$((N_CLONES * 2))
@@ -96,10 +105,19 @@ PY
     # pbsim3 wants an integer seed; derive one deterministically.
     seed=$(python3 -c "import hashlib; h=int(hashlib.md5(f'${clone_id}-${rotidx}-${SEED}'.encode()).hexdigest(),16); print(h % 2000000000 + 1)")
 
-    pbsim --strategy wgs --method errhmm --errhmm "$MODEL" \
+    # Keep pbsim log on failure — success output is noisy and previously hid
+    # "command not found" / bad-model / bad-genome errors behind a generic message.
+    pbsim_log="${pfx}.pbsim.log"
+    if ! pbsim --strategy wgs --method errhmm --errhmm "$MODEL" \
           --depth "$depth" --genome "$tmpl" --prefix "$pfx" \
-          --pass-num "$PASS" --seed "$seed" >/dev/null 2>&1 || {
-            echo "pbsim failed for clone $clone_id rot $rotidx" >&2; exit 1; }
+          --pass-num "$PASS" --seed "$seed" >"$pbsim_log" 2>&1; then
+      echo "pbsim failed for clone $clone_id rot $rotidx (genome=$tmpl depth=$depth model=$MODEL)" >&2
+      echo "---- pbsim log ($pbsim_log) ----" >&2
+      cat "$pbsim_log" >&2 || true
+      echo "---- end pbsim log ----" >&2
+      exit 1
+    fi
+    rm -f "$pbsim_log"
 
     if [[ "$PROFILE" == "hifi" ]]; then
       # Multi-pass -> HiFi via ccs. pbsim3 emits <pfx>_0001.bam (subreads).

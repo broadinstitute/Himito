@@ -14,6 +14,7 @@ mod minorhap;
 mod callnumts;
 mod lineage;
 mod scite;
+mod denoise;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]

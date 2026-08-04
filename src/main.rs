@@ -529,13 +529,30 @@ fn main() {
                 downsample_seed,
             );
             
+            // For ONT, denoise the mt BAM so reads consolidate; PacBio is untouched.
+            // Methylation (below) keeps reading the ORIGINAL mt_output.
+            let build_bam = if data_type.starts_with("ont") {
+                let denoised = output_prefix.with_extension("mt.denoised.bam");
+                if let Err(e) = denoise::start(
+                    &mt_output, &denoised, &reference_path, &data_type,
+                    vaf_threshold as f64, 2, None,
+                ) {
+                    eprintln!("Warning: denoise failed ({e:#}); falling back to raw mt BAM.");
+                    mt_output.clone()
+                } else {
+                    denoised
+                }
+            } else {
+                mt_output.clone()
+            };
+
             let graph_output = output_prefix.with_extension("gfa");
             // Preserve the historical default edge-read gate (2) for this combined pipeline.
-            let _ = build::start(&graph_output, kmer_size, &mt_output, &reference_path, length_max, 2);
+            let _ = build::start(&graph_output, kmer_size, &build_bam, &reference_path, length_max, 2);
 
             let assemble_output = output_prefix.with_extension("fasta");
             asm::start(&graph_output, &assemble_output, &sample_id);
-            
+
             let vcf_output = output_prefix.with_extension("vcf");
             call::start(
                 &graph_output,
@@ -548,7 +565,7 @@ fn main() {
                 &data_type,
                 p_value_threshold,
                 frequency_threshold,
-                Some(&mt_output),
+                Some(&build_bam),
                 strand_bias_threshold,
                 indel_false_threshold,
                 permutation_frequency_threshold_,

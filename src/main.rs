@@ -189,6 +189,38 @@ enum Commands {
 
     },
 
+    /// Denoise ONT reads in a BAM (SNV error correction) before graph construction.
+    #[clap(arg_required_else_help = true)]
+    Denoise {
+        /// input BAM (coordinate-sorted)
+        #[clap(short, long, value_parser, required = true)]
+        input: PathBuf,
+
+        /// output denoised BAM
+        #[clap(short, long, value_parser, required = true)]
+        output: PathBuf,
+
+        /// reference FASTA (rCRS)
+        #[clap(short, long, value_parser, required = true)]
+        reference: PathBuf,
+
+        /// data type; only ont-* is denoised, others pass through unchanged
+        #[clap(short, long, value_parser, default_value = "ont-r10")]
+        data_type: String,
+
+        /// minimal VAF for an allele to be kept (below this it is corrected away)
+        #[clap(long, value_parser, default_value_t = 0.01)]
+        vaf: f64,
+
+        /// minimal observations required on EACH strand for allele candidacy
+        #[clap(long, value_parser, default_value_t = 2)]
+        min_strand: u32,
+
+        /// optional path to write denoise statistics as JSON
+        #[clap(long, value_parser)]
+        stats: Option<PathBuf>,
+    },
+
     /// Correct graph based on srWGS data
     #[clap(arg_required_else_help = true)]
     Correct {
@@ -556,6 +588,21 @@ fn main() {
             min_edge_reads,
         } => {
             build::start(&output, kmer_size, &input_read_path, &reference_path, length_max, min_edge_reads);
+        }
+
+        Commands::Denoise {
+            input,
+            output,
+            reference,
+            data_type,
+            vaf,
+            min_strand,
+            stats,
+        } => {
+            if let Err(e) = denoise::start(&input, &output, &reference, &data_type, vaf, min_strand, stats.as_ref()) {
+                eprintln!("Error running denoise: {e:#}");
+                std::process::exit(1);
+            }
         }
 
         Commands::Correct {

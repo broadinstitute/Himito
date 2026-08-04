@@ -288,6 +288,43 @@ fn compute_corrections(
     Ok((corrections, stats))
 }
 
+fn apply_corrections(in_bam: &Path, out_bam: &Path, corrections: &Corrections) -> Result<(u64, u64)> {
+    let mut reader = Reader::from_path(in_bam)
+        .with_context(|| format!("cannot open BAM {in_bam:?}"))?;
+    let header = bam::Header::from_template(reader.header());
+    let mut writer = bam::Writer::from_path(out_bam, &header, bam::Format::Bam)
+        .with_context(|| format!("cannot create BAM {out_bam:?}"))?;
+
+    let mut reads_processed = 0u64;
+    let mut reads_modified = 0u64;
+
+    for result in reader.records() {
+        let mut rec = result.context("read BAM record")?;
+        // Only primary mapped reads are candidates for correction.
+        let correctable =
+            !(rec.is_secondary() || rec.is_supplementary() || rec.is_unmapped());
+        if correctable {
+            reads_processed += 1;
+            if let Some(edits) = corrections.get(rec.qname()) {
+                // Extract owned parts, edit SEQ, rebuild (aux preserved by set()).
+                let qname = rec.qname().to_vec();
+                let cigar = rec.cigar().take();
+                let mut seq = rec.seq().as_bytes();
+                let qual = rec.qual().to_vec();
+                for &(qpos, base) in edits {
+                    if qpos < seq.len() {
+                        seq[qpos] = base;
+                    }
+                }
+                rec.set(&qname, Some(&cigar), &seq, &qual);
+                reads_modified += 1;
+            }
+        }
+        writer.write(&rec).context("write BAM record")?;
+    }
+    Ok((reads_processed, reads_modified))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -423,6 +460,50 @@ mod tests {
         assert_eq!(stats.bases_modified, 1);
         assert_eq!(stats.substitution_matrix[2][0], 1); // G(2) -> A(0)
         assert!(stats.columns_processed >= 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_corrections_rewrites_seq_and_preserves_tags() {
+        use rust_htslib::bam::record::Aux;
+        let dir = std::env::temp_dir().join("himito_denoise_t3");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        // One read "AAGAAA" with an aux tag we must preserve.
+        {
+            let mut header = Header::new();
+            let mut sq = HeaderRecord::new(b"SQ");
+            sq.push_tag(b"SN", "chrM");
+            sq.push_tag(b"LN", &6usize.to_string());
+            header.push_record(&sq);
+            let mut w = Writer::from_path(&inb, &header, Format::Bam).unwrap();
+            let mut rec = Record::new();
+            let seq = b"AAGAAA";
+            let quals = vec![30u8; 6];
+            rec.set(b"rerr", Some(&CigarString(vec![Cigar::Match(6)])), seq, &quals);
+            rec.set_tid(0);
+            rec.set_pos(0);
+            // Record::new() initializes as unmapped (see rust-htslib set_unmapped() in
+            // Record::new()); set_tid/set_pos alone do not clear that flag, so we must
+            // explicitly mark this record mapped to make it a candidate primary read.
+            rec.unset_unmapped();
+            rec.push_aux(b"XY", Aux::I32(7)).unwrap();
+            w.write(&rec).unwrap();
+        }
+
+        let mut corr: Corrections = HashMap::new();
+        corr.insert(b"rerr".to_vec(), vec![(2usize, b'A')]);
+        let (proc, modified) = apply_corrections(&inb, &outb, &corr).unwrap();
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 1);
+
+        // Verify SEQ was corrected and the aux tag survived.
+        let mut r = Reader::from_path(&outb).unwrap();
+        let rec = r.records().next().unwrap().unwrap();
+        assert_eq!(rec.seq().as_bytes(), b"AAAAAA");
+        assert!(matches!(rec.aux(b"XY").unwrap(), Aux::I32(7)));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

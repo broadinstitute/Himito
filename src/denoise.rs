@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
+use bio::io::fasta;
+use log::info;
 use rust_htslib::bam::{self, Read, Reader};
 
 pub(crate) const NQ: usize = 94; // Phred qualities 0..=93
@@ -325,6 +327,58 @@ fn apply_corrections(in_bam: &Path, out_bam: &Path, corrections: &Corrections) -
     Ok((reads_processed, reads_modified))
 }
 
+pub fn start(
+    input: &PathBuf,
+    output: &PathBuf,
+    reference: &PathBuf,
+    data_type: &str,
+    vaf: f64,
+    min_strand: u32,
+    stats_out: Option<&PathBuf>,
+) -> Result<()> {
+    // PacBio (and anything non-ONT) is a byte-identical passthrough.
+    if !data_type.starts_with("ont") {
+        std::fs::copy(input, output)
+            .with_context(|| format!("passthrough copy {input:?} -> {output:?}"))?;
+        info!("[denoise] data-type '{data_type}' is not ONT; passthrough copy.");
+        return Ok(());
+    }
+
+    // Load reference contigs into memory (uppercased).
+    let mut refs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+    let rdr = fasta::Reader::from_file(reference)
+        .with_context(|| format!("cannot open reference {reference:?}"))?;
+    for rec in rdr.records() {
+        let rec = rec.context("read reference record")?;
+        refs.insert(rec.id().as_bytes().to_vec(), rec.seq().to_ascii_uppercase());
+    }
+
+    let (corrections, mut stats) = compute_corrections(input, &refs, min_strand, vaf)?;
+    let (reads_processed, reads_modified) = apply_corrections(input, output, &corrections)?;
+    stats.reads_processed = reads_processed;
+    stats.reads_modified = reads_modified;
+
+    let rate = if stats.bases_examined > 0 {
+        stats.bases_modified as f64 / stats.bases_examined as f64
+    } else {
+        0.0
+    };
+    info!(
+        "[denoise] reads {}/{} modified; bases {}/{} modified ({:.2}%); \
+         columns {} processed / {} corrected / {} skipped; alt sites preserved {}",
+        stats.reads_modified, stats.reads_processed,
+        stats.bases_modified, stats.bases_examined, rate * 100.0,
+        stats.columns_processed, stats.columns_corrected, stats.columns_skipped,
+        stats.alt_sites_preserved,
+    );
+
+    if let Some(path) = stats_out {
+        let json = serde_json::to_string_pretty(&stats).context("serialize stats")?;
+        std::fs::write(path, json).with_context(|| format!("write stats {path:?}"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,6 +558,57 @@ mod tests {
         let rec = r.records().next().unwrap().unwrap();
         assert_eq!(rec.seq().as_bytes(), b"AAAAAA");
         assert!(matches!(rec.aux(b"XY").unwrap(), Aux::I32(7)));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn start_pacbio_is_byte_identical_passthrough() {
+        let dir = std::env::temp_dir().join("himito_denoise_t4pb");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+        let reff = dir.join("ref.fa");
+        std::fs::write(&reff, ">chrM\nAAAAAA\n").unwrap();
+        write_test_bam(&inb, "chrM", 6, &[("r0", 0, b"AAGAAA", false)]);
+
+        start(&inb, &outb, &reff, "pacbio", 0.01, 2, None).unwrap();
+        assert_eq!(std::fs::read(&inb).unwrap(), std::fs::read(&outb).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn start_ont_denoises_and_writes_stats_json() {
+        let dir = std::env::temp_dir().join("himito_denoise_t4ont");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+        let reff = dir.join("ref.fa");
+        let statsf = dir.join("stats.json");
+        std::fs::write(&reff, ">chrM\nAAAAAA\n").unwrap();
+        let clean = b"AAAAAA";
+        let mut reads: Vec<(&str, i64, &[u8], bool)> = vec![];
+        for i in 0..9 { reads.push((["r0","r1","r2","r3","r4","r5","r6","r7","r8"][i], 0, clean, i % 2 == 0)); }
+        reads.push(("rerr", 0, b"AAGAAA", false));
+        write_test_bam(&inb, "chrM", 6, &reads);
+
+        start(&inb, &outb, &reff, "ont-r10", 0.01, 2, Some(&statsf)).unwrap();
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let mut modified_ok = false;
+        for rec in r.records() {
+            let rec = rec.unwrap();
+            if rec.qname() == b"rerr" {
+                assert_eq!(rec.seq().as_bytes(), b"AAAAAA");
+                modified_ok = true;
+            }
+        }
+        assert!(modified_ok);
+        let json = std::fs::read_to_string(&statsf).unwrap();
+        // serde_json::to_string_pretty (used by `start`, per spec) inserts a space
+        // after the colon, unlike compact serialization; the brief's literal
+        // "\"bases_modified\":1" assumes compact output and never matches pretty
+        // JSON, so this assertion matches the actual (and required) pretty format.
+        assert!(json.contains("\"bases_modified\": 1"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -43,6 +43,8 @@ impl ColumnCounts {
         self.strand[allele][if reverse { 1 } else { 0 }] += 1;
     }
 
+    // Used by the pileup pass (next task); harmless-until-then dead-code allow.
+    #[allow(dead_code)]
     fn non_ref(&self) -> u32 {
         (0..4)
             .filter(|&a| Some(a) != self.ref_idx)

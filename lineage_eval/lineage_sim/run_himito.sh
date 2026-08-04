@@ -56,12 +56,22 @@ minimap2 -ax "$MMPRESET" -t 4 "$REF" "$FQ" \
   | samtools sort -o "$BAM" -
 samtools index "$BAM"
 
+# Denoise ONT reads before graph construction (no-op for hifi/pacbio).
+BUILD_BAM="$BAM"
+if [[ "$DTYPE" == ont-* ]]; then
+  DENOISED="$HDIR/aln.denoised.bam"
+  "$HIMITO" denoise -i "$BAM" -o "$DENOISED" -r "$REF" -d "$DTYPE" \
+    --vaf "$MIN_HF" --min-strand 2 --stats "$HDIR/denoise_stats.json"
+  samtools index "$DENOISED"
+  BUILD_BAM="$DENOISED"
+fi
+
 # Build anchor graph (input can be a BAM).
-"$HIMITO" build -i "$BAM" -r "$REF" -k "$KMER" -o "$HDIR/sim.gfa" -l 3000
+"$HIMITO" build -i "$BUILD_BAM" -r "$REF" -k "$KMER" -o "$HDIR/sim.gfa" -l 3000
 
 # Call variants: -o is the VCF; matrix.csv is derived as <o>.matrix.csv.
 "$HIMITO" call -g "$HDIR/sim.gfa" -r "$REF" -s "$SAMPLE" -d "$DTYPE" \
-  -o "$HDIR/sim.vcf" -k "$KMER" --input-bam "$BAM" \
+  -o "$HDIR/sim.vcf" -k "$KMER" --input-bam "$BUILD_BAM" \
   -m "$MINIMAL_AC" -v "$VAF" -p "$PVAL"
 
 # Lineage: SCITE mutation-tree reconstruction.

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
+use rust_htslib::bam::{self, Read, Reader};
 
 pub(crate) const NQ: usize = 94; // Phred qualities 0..=93
 
@@ -188,9 +189,111 @@ fn map_allele(observed: usize, q: u8, m: &SiteModel) -> usize {
     best
 }
 
+pub type Corrections = HashMap<Vec<u8>, Vec<(usize, u8)>>;
+
+#[derive(Default, Debug, serde::Serialize)]
+pub struct DenoiseStats {
+    pub reads_processed: u64,
+    pub reads_modified: u64,
+    pub bases_examined: u64,
+    pub bases_modified: u64,
+    pub columns_processed: u64,
+    pub columns_corrected: u64,
+    pub columns_skipped: u64,
+    pub alt_sites_preserved: u64,
+    pub substitution_matrix: [[u64; 4]; 4], // [from][to]
+}
+
+fn compute_corrections(
+    bam_path: &Path,
+    refs: &HashMap<Vec<u8>, Vec<u8>>,
+    min_strand: u32,
+    vaf: f64,
+) -> Result<(Corrections, DenoiseStats)> {
+    let mut reader = Reader::from_path(bam_path)
+        .with_context(|| format!("cannot open BAM {bam_path:?}"))?;
+    // Own the tid->contig-name map so we can borrow the reader mutably for pileup.
+    let header = reader.header().to_owned();
+
+    let mut corrections: Corrections = HashMap::new();
+    let mut stats = DenoiseStats::default();
+
+    let mut plp = reader.pileup();
+    plp.set_max_depth(1_000_000);
+    for p in plp {
+        let col = p.context("pileup error")?;
+        let name = header.tid2name(col.tid());
+        let refseq = match refs.get(name) {
+            Some(s) => s,
+            None => continue,
+        };
+        let refpos = col.pos() as usize;
+        let ref_idx = refseq.get(refpos).and_then(|&b| base_to_idx(b));
+
+        let mut counts = ColumnCounts::new(ref_idx);
+        // Remember each usable observation to correct after the fit.
+        let mut obs: Vec<(Vec<u8>, usize, usize, u8)> = Vec::new(); // (qname, qpos, allele, qual)
+
+        for a in col.alignments() {
+            let rec = a.record();
+            if rec.is_secondary() || rec.is_supplementary() || rec.is_unmapped() {
+                continue;
+            }
+            if a.is_del() || a.is_refskip() {
+                continue;
+            }
+            let qpos = match a.qpos() {
+                Some(x) => x,
+                None => continue,
+            };
+            let base = rec.seq()[qpos];
+            let allele = match base_to_idx(base) {
+                Some(i) => i,
+                None => continue,
+            };
+            let qual = rec.qual()[qpos];
+            counts.add(allele, qual, rec.is_reverse());
+            obs.push((rec.qname().to_vec(), qpos, allele, qual));
+        }
+
+        stats.columns_processed += 1;
+        stats.bases_examined += obs.len() as u64;
+
+        if counts.non_ref() == 0 {
+            stats.columns_skipped += 1;
+            continue;
+        }
+
+        let model = fit_site(&counts, min_strand, vaf);
+        stats.alt_sites_preserved += model.kept_alt_count(ref_idx) as u64;
+
+        let mut changed = false;
+        for (qname, qpos, allele, qual) in obs {
+            let corr = map_allele(allele, qual, &model);
+            if corr != allele {
+                corrections
+                    .entry(qname)
+                    .or_default()
+                    .push((qpos, idx_to_base(corr)));
+                stats.bases_modified += 1;
+                stats.substitution_matrix[allele][corr] += 1;
+                changed = true;
+            }
+        }
+        if changed {
+            stats.columns_corrected += 1;
+        }
+    }
+
+    Ok((corrections, stats))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_htslib::bam::{self, Format, Header, Read, Reader, Record, Writer};
+    use rust_htslib::bam::header::HeaderRecord;
+    use rust_htslib::bam::record::{Cigar, CigarString};
 
     fn q(v: u8) -> u8 { v } // readability helper for quality values
 
@@ -273,5 +376,53 @@ mod tests {
         let c = column(0, &obs);
         let m = fit_site(&c, 2, 0.05); // higher vaf threshold
         assert!(!m.kept[2]);
+    }
+
+    // Build a tiny coordinate-sorted BAM. Reads are full-length matches at `pos`.
+    // Each read: (qname, pos, seq bytes, reverse). Quality fixed at Q30.
+    fn write_test_bam(path: &Path, contig: &str, contig_len: usize, reads: &[(&str, i64, &[u8], bool)]) {
+        let mut header = Header::new();
+        let mut sq = HeaderRecord::new(b"SQ");
+        sq.push_tag(b"SN", contig);
+        sq.push_tag(b"LN", &contig_len.to_string());
+        header.push_record(&sq);
+        let mut w = Writer::from_path(path, &header, Format::Bam).unwrap();
+        for (name, pos, seq, reverse) in reads {
+            let mut rec = Record::new();
+            let quals = vec![30u8; seq.len()];
+            let cigar = CigarString(vec![Cigar::Match(seq.len() as u32)]);
+            rec.set(name.as_bytes(), Some(&cigar), seq, &quals);
+            rec.set_tid(0);
+            rec.set_pos(*pos);
+            rec.set_mapq(60);
+            rec.set_flags(if *reverse { 16 } else { 0 });
+            w.write(&rec).unwrap();
+        }
+    }
+
+    #[test]
+    fn compute_corrections_flags_a_single_base_error() {
+        let dir = std::env::temp_dir().join("himito_denoise_t2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        // Reference AAAAAA at chrM. Ten reads all "AAAAAA" except one with a G at pos 2.
+        let refseq = b"AAAAAA".to_vec();
+        let mut reads: Vec<(&str, i64, &[u8], bool)> = vec![];
+        let clean = b"AAAAAA";
+        let errd = b"AAGAAA"; // error at index 2
+        for i in 0..9 { reads.push((["r0","r1","r2","r3","r4","r5","r6","r7","r8"][i], 0, clean, i % 2 == 0)); }
+        reads.push(("rerr", 0, errd, false));
+        write_test_bam(&bam, "chrM", 6, &reads);
+
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), refseq);
+        let (corr, stats) = compute_corrections(&bam, &refs, 2, 0.01).unwrap();
+
+        // The single G (not strand-balanced, VAF 10% but fwd-only) is corrected to A.
+        assert_eq!(corr.get(&b"rerr".to_vec()), Some(&vec![(2usize, b'A')]));
+        assert_eq!(stats.bases_modified, 1);
+        assert_eq!(stats.substitution_matrix[2][0], 1); // G(2) -> A(0)
+        assert!(stats.columns_processed >= 1);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

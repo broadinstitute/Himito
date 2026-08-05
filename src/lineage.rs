@@ -659,7 +659,7 @@ pub fn start(
     info!("Starting lineage analysis...");
 
     // sweep_optimization
-    //hifi fp=0.0005 fn=0.01
+    //hifi fp>=0.005, > fn <= 0.15
 
     // ── Step 1: load VCF HF values, then filter the binary matrix ─────────────
     // The VCF is optional: without it, no HF filter is applied and every variant

@@ -216,6 +216,16 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 2)]
         min_strand: u32,
 
+        /// p-value threshold for the per-allele strand-bias test (binomial, against the
+        /// column's own forward fraction); alleles below it lose candidacy. 0 disables.
+        #[clap(long, value_parser, default_value_t = 0.01)]
+        strand_bias_p: f64,
+
+        /// alleles at or above this within-column frequency skip the strand-bias test
+        /// (a single-strand artifact cannot reach a near-homoplasmic frequency)
+        #[clap(long, value_parser, default_value_t = 0.95)]
+        homoplasmic_vaf: f64,
+
         /// optional path to write denoise statistics as JSON
         #[clap(long, value_parser)]
         stats: Option<PathBuf>,
@@ -259,7 +269,7 @@ enum Commands {
         #[clap(short, long, value_parser, required = true)]
         sample_id: String,
 
-        /// data type, pacbio, ont-r9, ont-r10
+        /// data type, pacbio, ont-r9, ont-r10, ont-denoised
         #[clap(short, long, value_parser, default_value = "pacbio")]
         data_type: String,
 
@@ -531,20 +541,27 @@ fn main() {
             
             // For ONT, denoise the mt BAM so reads consolidate; PacBio is untouched.
             // Methylation (below) keeps reading the ORIGINAL mt_output.
-            let build_bam = if data_type.starts_with("ont") {
+            // data_type_ only flips to "ont-denoised" when denoise actually succeeds;
+            // on fallback the raw reads keep their original type so the caller still
+            // applies the ONT permutation-test SNP filtering those reads need.
+            let (build_bam, data_type_) = if data_type == "ont-denoised" {
                 let denoised = output_prefix.with_extension("mt.denoised.bam");
+                // Denoise defaults for the combined pipeline: min_strand 2, strand-bias
+                // p 0.01, near-homoplasmic exemption at 0.7 (matching the Denoise CLI
+                // and call.rs's own permutation/homoplasmic threshold).
                 if let Err(e) = denoise::start(
                     &mt_output, &denoised, &reference_path, &data_type,
-                    vaf_threshold as f64, 2, None,
+                    vaf_threshold as f64, 2, 0.01, 0.7, None,
                 ) {
                     eprintln!("Warning: denoise failed ({e:#}); falling back to raw mt BAM.");
-                    mt_output.clone()
+                    (mt_output.clone(), data_type.as_str())
                 } else {
-                    denoised
+                    (denoised, "ont-denoised")
                 }
             } else {
-                mt_output.clone()
+                (mt_output.clone(), data_type.as_str())
             };
+            info!("Data Type for variant calling: {data_type_}");
 
             let graph_output = output_prefix.with_extension("gfa");
             // Preserve the historical default edge-read gate (2) for this combined pipeline.
@@ -554,6 +571,7 @@ fn main() {
             asm::start(&graph_output, &assemble_output, &sample_id);
 
             let vcf_output = output_prefix.with_extension("vcf");
+            println!("{}", data_type_);
             call::start(
                 &graph_output,
                 &reference_path,
@@ -562,7 +580,7 @@ fn main() {
                 &vcf_output,
                 &sample_id,
                 vaf_threshold,
-                &data_type,
+                &data_type_,
                 p_value_threshold,
                 frequency_threshold,
                 Some(&build_bam),
@@ -614,9 +632,14 @@ fn main() {
             data_type,
             vaf,
             min_strand,
+            strand_bias_p,
+            homoplasmic_vaf,
             stats,
         } => {
-            if let Err(e) = denoise::start(&input, &output, &reference, &data_type, vaf, min_strand, stats.as_ref()) {
+            if let Err(e) = denoise::start(
+                &input, &output, &reference, &data_type, vaf, min_strand,
+                strand_bias_p, homoplasmic_vaf, stats.as_ref(),
+            ) {
                 eprintln!("Error running denoise: {e:#}");
                 std::process::exit(1);
             }

@@ -7,10 +7,22 @@ use rust_htslib::bam::{self, Read, Reader};
 
 pub(crate) const NQ: usize = 94; // Phred qualities 0..=93
 
+/// Ceiling on the per-base error probability. Phred 0 literally means P(error) = 1,
+/// which would make P(observed | truth = observed) = 1 - e = 0: the model would assert
+/// the observed base is impossible and `map_allele` would rewrite EVERY base to some
+/// other allele, corrupting reads instead of correcting them. With four alleles the
+/// most error a base can carry is uniform-over-4, so e is capped at 3/4. At the cap the
+/// likelihood is flat (1 - e == e/3 == 0.25), i.e. the base carries no evidence and
+/// correction falls back to the site's frequency prior.
+///
+/// This is reachable in practice: pbsim3's errhmm models (and any BAM with QUAL '*')
+/// emit an all-Q0 quality string.
+pub(crate) const E_MAX: f64 = 0.75;
+
 #[inline]
 pub(crate) fn phred_to_e(q: u8) -> f64 {
     let q = q.min((NQ - 1) as u8);
-    10f64.powf(-(q as f64) / 10.0)
+    10f64.powf(-(q as f64) / 10.0).min(E_MAX)
 }
 
 #[inline]
@@ -54,11 +66,19 @@ impl ColumnCounts {
             .map(|a| self.strand[a][0] + self.strand[a][1])
             .sum()
     }
+
+    /// (fwd, rev) observation totals across all four alleles in this column.
+    fn strand_totals(&self) -> (u32, u32) {
+        (0..4).fold((0, 0), |(f, r), a| (f + self.strand[a][0], r + self.strand[a][1]))
+    }
 }
 
 pub(crate) struct SiteModel {
     freq: [f64; 4],
     kept: [bool; 4],
+    /// Non-ref alleles that cleared the per-strand count gate but were rejected as
+    /// strand-biased; surfaced in DenoiseStats so the gate's impact is auditable.
+    strand_biased_alts: usize,
 }
 
 impl SiteModel {
@@ -69,13 +89,58 @@ impl SiteModel {
     }
 }
 
-fn fit_site(c: &ColumnCounts, min_strand: u32, vaf: f64) -> SiteModel {
+fn fit_site(
+    c: &ColumnCounts,
+    min_strand: u32,
+    vaf: f64,
+    strand_bias_p: f64,
+    homoplasmic_vaf: f64,
+) -> SiteModel {
+    // The null for the strand-bias test is this column's OWN forward fraction, not a
+    // library-wide constant: mito coverage is frequently asymmetric, and a locally
+    // skewed column would otherwise make every allele in it look biased. Empty columns
+    // fall back to a balanced null (the test is vacuous there anyway).
+    let (col_fwd, col_rev) = c.strand_totals();
+    let col_total = col_fwd + col_rev;
+    let expected_fwd_frac = if col_total == 0 {
+        0.5
+    } else {
+        col_fwd as f64 / col_total as f64
+    };
+
     // Eligibility: reference always eligible; a non-ref allele needs >= min_strand
-    // observations on EACH strand (baldur's strand-balance candidacy).
+    // observations on EACH strand (baldur's strand-balance candidacy) AND must not be
+    // significantly strand-skewed by the same binomial test call.rs applies to variants
+    // (call::strand_bias_pvalue), which catches skews the raw count gate lets through.
     let mut eligible = [false; 4];
+    let mut strand_biased_alts = 0usize;
     for a in 0..4 {
-        eligible[a] = Some(a) == c.ref_idx
-            || (c.strand[a][0] >= min_strand && c.strand[a][1] >= min_strand);
+        if Some(a) == c.ref_idx {
+            eligible[a] = true;
+            continue;
+        }
+        let (fwd, rev) = (c.strand[a][0], c.strand[a][1]);
+        if !(fwd >= min_strand && rev >= min_strand) {
+            continue;
+        }
+        // Mirrors call::filter_strand_bias's near-homoplasmic exemption: a single-strand
+        // artifact is absent from the other strand's reads, so it can never reach a high
+        // apparent frequency. Skew in an allele carried by most reads at the locus is not
+        // evidence of artifact, and testing it would correct away a real variant.
+        let prop = if col_total == 0 {
+            0.0
+        } else {
+            (fwd + rev) as f64 / col_total as f64
+        };
+        if strand_bias_p > 0.0
+            && prop < homoplasmic_vaf
+            && crate::call::strand_bias_pvalue(fwd as usize, rev as usize, expected_fwd_frac)
+                < strand_bias_p
+        {
+            strand_biased_alts += 1;
+            continue;
+        }
+        eligible[a] = true;
     }
 
     // Precompute per-quality error and total observations.
@@ -170,7 +235,7 @@ fn fit_site(c: &ColumnCounts, min_strand: u32, vaf: f64) -> SiteModel {
         freq[r] = 1.0;
     }
 
-    SiteModel { freq, kept }
+    SiteModel { freq, kept, strand_biased_alts }
 }
 
 fn map_allele(observed: usize, q: u8, m: &SiteModel) -> usize {
@@ -203,6 +268,7 @@ pub struct DenoiseStats {
     pub columns_corrected: u64,
     pub columns_skipped: u64,
     pub alt_sites_preserved: u64,
+    pub alt_alleles_strand_biased: u64,
     pub substitution_matrix: [[u64; 4]; 4], // [from][to]
 }
 
@@ -211,6 +277,8 @@ fn compute_corrections(
     refs: &HashMap<Vec<u8>, Vec<u8>>,
     min_strand: u32,
     vaf: f64,
+    strand_bias_p: f64,
+    homoplasmic_vaf: f64,
 ) -> Result<(Corrections, DenoiseStats)> {
     let mut reader = Reader::from_path(bam_path)
         .with_context(|| format!("cannot open BAM {bam_path:?}"))?;
@@ -266,8 +334,9 @@ fn compute_corrections(
             continue;
         }
 
-        let model = fit_site(&counts, min_strand, vaf);
+        let model = fit_site(&counts, min_strand, vaf, strand_bias_p, homoplasmic_vaf);
         stats.alt_sites_preserved += model.kept_alt_count(ref_idx) as u64;
+        stats.alt_alleles_strand_biased += model.strand_biased_alts as u64;
 
         let mut changed = false;
         for (qname, qpos, allele, qual) in obs {
@@ -334,6 +403,8 @@ pub fn start(
     data_type: &str,
     vaf: f64,
     min_strand: u32,
+    strand_bias_p: f64,
+    homoplasmic_vaf: f64,
     stats_out: Option<&PathBuf>,
 ) -> Result<()> {
     // PacBio (and anything non-ONT) is a byte-identical passthrough.
@@ -353,7 +424,8 @@ pub fn start(
         refs.insert(rec.id().as_bytes().to_vec(), rec.seq().to_ascii_uppercase());
     }
 
-    let (corrections, mut stats) = compute_corrections(input, &refs, min_strand, vaf)?;
+    let (corrections, mut stats) =
+        compute_corrections(input, &refs, min_strand, vaf, strand_bias_p, homoplasmic_vaf)?;
     let (reads_processed, reads_modified) = apply_corrections(input, output, &corrections)?;
     stats.reads_processed = reads_processed;
     stats.reads_modified = reads_modified;
@@ -365,11 +437,12 @@ pub fn start(
     };
     info!(
         "[denoise] reads {}/{} modified; bases {}/{} modified ({:.2}%); \
-         columns {} processed / {} corrected / {} skipped; alt sites preserved {}",
+         columns {} processed / {} corrected / {} skipped; alt sites preserved {}; \
+         alt alleles rejected as strand-biased {}",
         stats.reads_modified, stats.reads_processed,
         stats.bases_modified, stats.bases_examined, rate * 100.0,
         stats.columns_processed, stats.columns_corrected, stats.columns_skipped,
-        stats.alt_sites_preserved,
+        stats.alt_sites_preserved, stats.alt_alleles_strand_biased,
     );
 
     if let Some(path) = stats_out {
@@ -388,11 +461,50 @@ mod tests {
 
     fn q(v: u8) -> u8 { v } // readability helper for quality values
 
+    // Defaults mirrored from the CLI so tests exercise the shipped configuration.
+    const SB_P: f64 = 0.01;
+    const HOM_VAF: f64 = 0.7;
+
     #[test]
     fn phred_to_e_matches_definition() {
         assert!((phred_to_e(10) - 0.1).abs() < 1e-12);
         assert!((phred_to_e(20) - 0.01).abs() < 1e-12);
-        assert!((phred_to_e(0) - 1.0).abs() < 1e-12);
+        assert!((phred_to_e(2) - 0.6309573444801932).abs() < 1e-12); // below the clamp
+    }
+
+    #[test]
+    fn phred_to_e_clamps_degenerate_qualities() {
+        // Q0 nominally means P(error) = 1, which would make P(obs | truth = obs) zero
+        // and invert every base. With 4 alleles the most error a base can carry is
+        // uniform-over-4, i.e. 0.75, so everything at or below Q1 clamps there.
+        assert!((phred_to_e(0) - E_MAX).abs() < 1e-12);
+        assert!((phred_to_e(1) - E_MAX).abs() < 1e-12);
+        for q in 0..=93u8 {
+            assert!(phred_to_e(q) <= E_MAX, "q={q} exceeds the clamp");
+        }
+    }
+
+    #[test]
+    fn zero_quality_observations_are_never_inverted() {
+        // ref A(0) at 60%, alt G(2) at 40%, both strand-balanced, ALL bases at Q0 --
+        // the shape pbsim's errhmm models emit (quality string of all '!').
+        let mut obs = vec![];
+        for i in 0..60 { obs.push((0usize, q(0), i % 2 == 0)); }
+        for i in 0..40 { obs.push((2usize, q(0), i % 2 == 0)); }
+        let c = column(0, &obs);
+        let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
+
+        // Before the clamp, like(k == observed) was 0 while like(k != observed) was
+        // e/3 > 0, so an A read was rewritten to some OTHER base -- corrupting the
+        // read instead of correcting it. A ref observation must stay ref.
+        assert_eq!(map_allele(0, q(0), &m), 0);
+        // At the clamp the likelihood is flat (1 - e == e/3 == 0.25), so a Q0 base
+        // carries no evidence and correction falls back to the frequency prior:
+        // every observation collapses to the most frequent kept allele (here ref).
+        // That is degenerate-input behavior, but it never invents a third base.
+        for observed in 0..4 {
+            assert_eq!(map_allele(observed, q(0), &m), 0, "observed={observed}");
+        }
     }
 
     #[test]
@@ -420,7 +532,7 @@ mod tests {
         obs.push((2, q(8), false)); // a single G error (fwd only)
         obs.push((1, q(8), true));  // a single C error (rev only)
         let c = column(0, &obs);
-        let m = fit_site(&c, 2, 0.01);
+        let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
         assert!(m.kept[0]); // ref kept
         assert_eq!(m.kept_alt_count(Some(0)), 0); // no alt survives
         // the two errors correct to ref A
@@ -435,7 +547,7 @@ mod tests {
         for i in 0..60 { obs.push((0usize, q(30), i % 2 == 0)); }
         for i in 0..40 { obs.push((2usize, q(30), i % 2 == 0)); }
         let c = column(0, &obs);
-        let m = fit_site(&c, 2, 0.01);
+        let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
         assert!(m.kept[0] && m.kept[2]);
         assert_eq!(m.kept_alt_count(Some(0)), 1);
         // confident observations of each allele are preserved
@@ -452,7 +564,7 @@ mod tests {
         for i in 0..90 { obs.push((0usize, q(30), i % 2 == 0)); }
         for _ in 0..10 { obs.push((2usize, q(30), false)); } // fwd only
         let c = column(0, &obs);
-        let m = fit_site(&c, 2, 0.01);
+        let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
         assert!(!m.kept[2]);
         assert_eq!(map_allele(2, q(30), &m), 0); // corrected to ref
     }
@@ -465,8 +577,67 @@ mod tests {
         for _ in 0..2 { obs.push((2usize, q(30), false)); }
         for _ in 0..2 { obs.push((2usize, q(30), true)); }
         let c = column(0, &obs);
-        let m = fit_site(&c, 2, 0.05); // higher vaf threshold
+        let m = fit_site(&c, 2, 0.05, SB_P, HOM_VAF); // higher vaf threshold
         assert!(!m.kept[2]);
+    }
+
+    #[test]
+    fn strand_biased_candidate_passing_min_strand_is_rejected() {
+        // ref A(0) 40fwd/40rev; alt G(2) 18fwd/2rev. min_strand=2 is satisfied on BOTH
+        // strands, so the count gate alone lets this through -- but against the column's
+        // own composition (58/100 fwd) an 18/2 split has p = 4.3e-3 < 0.01.
+        let mut obs = vec![];
+        for i in 0..80 { obs.push((0usize, q(30), i % 2 == 0)); }
+        for _ in 0..18 { obs.push((2usize, q(30), false)); }
+        for _ in 0..2 { obs.push((2usize, q(30), true)); }
+        let c = column(0, &obs);
+
+        // With the test disabled (p = 0), the count gate keeps it: VAF 0.20 >> 0.01.
+        let m_off = fit_site(&c, 2, 0.01, 0.0, HOM_VAF);
+        assert!(m_off.kept[2], "min_strand alone should not reject this allele");
+        assert_eq!(m_off.strand_biased_alts, 0);
+
+        // With the test on, the allele loses candidacy and its reads correct to ref.
+        let m_on = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
+        assert!(!m_on.kept[2]);
+        assert_eq!(m_on.kept_alt_count(Some(0)), 0);
+        assert_eq!(m_on.strand_biased_alts, 1);
+        assert_eq!(map_allele(2, q(30), &m_on), 0);
+    }
+
+    #[test]
+    fn near_homoplasmic_allele_is_exempt_from_strand_bias_test() {
+        // ref A(0) 2fwd/18rev; alt G(2) 75fwd/5rev -> alt is 80% of the column. Against
+        // the column composition (77/100 fwd) that split gives p = 1.2e-4, but an allele
+        // in 80% of reads cannot be a single-strand artifact, so it is kept untested.
+        let mut obs = vec![];
+        for _ in 0..2 { obs.push((0usize, q(30), false)); }
+        for _ in 0..18 { obs.push((0usize, q(30), true)); }
+        for _ in 0..75 { obs.push((2usize, q(30), false)); }
+        for _ in 0..5 { obs.push((2usize, q(30), true)); }
+        let c = column(0, &obs);
+
+        let m = fit_site(&c, 2, 0.01, SB_P, 0.7);
+        assert!(m.kept[2], "near-homoplasmic alt must survive the strand-bias test");
+        assert_eq!(m.strand_biased_alts, 0);
+        assert_eq!(map_allele(2, q(30), &m), 2);
+
+        // Raising the exemption bar above the allele's frequency re-enables the test,
+        // which then rejects it -- confirming the exemption is what saved it above.
+        let m_strict = fit_site(&c, 2, 0.01, SB_P, 0.95);
+        assert!(!m_strict.kept[2]);
+        assert_eq!(m_strict.strand_biased_alts, 1);
+    }
+
+    #[test]
+    fn empty_column_falls_back_to_reference_only() {
+        // No observations at all: expected-fwd-fraction fallback must not panic and the
+        // model must degenerate to reference-only.
+        let c = column(0, &[]);
+        let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
+        assert!(m.kept[0]);
+        assert_eq!(m.kept_alt_count(Some(0)), 0);
+        assert!((m.freq[0] - 1.0).abs() < 1e-12);
     }
 
     // Build a tiny coordinate-sorted BAM. Reads are full-length matches at `pos`.
@@ -507,7 +678,7 @@ mod tests {
 
         let mut refs = HashMap::new();
         refs.insert(b"chrM".to_vec(), refseq);
-        let (corr, stats) = compute_corrections(&bam, &refs, 2, 0.01).unwrap();
+        let (corr, stats) = compute_corrections(&bam, &refs, 2, 0.01, SB_P, HOM_VAF).unwrap();
 
         // The single G (not strand-balanced, VAF 10% but fwd-only) is corrected to A.
         assert_eq!(corr.get(&b"rerr".to_vec()), Some(&vec![(2usize, b'A')]));
@@ -571,7 +742,7 @@ mod tests {
         std::fs::write(&reff, ">chrM\nAAAAAA\n").unwrap();
         write_test_bam(&inb, "chrM", 6, &[("r0", 0, b"AAGAAA", false)]);
 
-        start(&inb, &outb, &reff, "pacbio", 0.01, 2, None).unwrap();
+        start(&inb, &outb, &reff, "pacbio", 0.01, 2, SB_P, HOM_VAF, None).unwrap();
         assert_eq!(std::fs::read(&inb).unwrap(), std::fs::read(&outb).unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -591,7 +762,7 @@ mod tests {
         reads.push(("rerr", 0, b"AAGAAA", false));
         write_test_bam(&inb, "chrM", 6, &reads);
 
-        start(&inb, &outb, &reff, "ont-r10", 0.01, 2, Some(&statsf)).unwrap();
+        start(&inb, &outb, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, Some(&statsf)).unwrap();
 
         let mut r = Reader::from_path(&outb).unwrap();
         let mut modified_ok = false;

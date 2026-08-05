@@ -899,7 +899,7 @@ fn build_strand_map(bam_file: &PathBuf) -> (HashMap<String, bool>, f64) {
 /// split deviates from the library's expected forward fraction. A small p-value means the
 /// allele is strand-skewed, which is characteristic of systematic (e.g. homopolymer) errors
 /// rather than true heteroplasmies, which should be roughly strand-balanced.
-fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64) -> f64 {
+pub(crate) fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64) -> f64 {
     let n = (fwd + rev) as u64;
     if n == 0 {
         return 1.0;
@@ -1032,7 +1032,7 @@ fn permutation_test(
         // For PacBio: exclude SNPs from permutation test (PacBio has high accuracy for SNPs)
         // For ONT: include SNPs in permutation test but with stricter filtering
         // ONT has higher error rates, so we need the permutation test to filter false positives
-        if (ref_allele.len() == 1 && alt_allele.len() == 1) && (data_type == "pacbio") {
+        if (ref_allele.len() == 1 && alt_allele.len() == 1) && (data_type == "pacbio" || data_type == "ont-denoised") {
             return (Ok(i), None);
         }
         // Note: For ONT, SNPs go through permutation test which should help filter false positives
@@ -1113,7 +1113,7 @@ pub fn resolve_thresholds(
     } else if data_type == "ont-r10" {
         (0.01, 0.2, 0.7)
     } else {
-        (0.01, 0.2, 0.8)
+        (0.01, 0.2, 0.7)
     };
 
     (
@@ -1139,8 +1139,8 @@ pub fn start(
     indel_false_threshold: f64,
     permutation_frequency_threshold: f64,
 ) {
-    if data_type != "pacbio" && data_type != "ont-r9" && data_type != "ont-r10" {
-        eprintln!("Error: data type must be pacbio or ont-r9 or ont-r10");
+    if data_type != "pacbio" && data_type != "ont-r9" && data_type != "ont-r10" && data_type != "ont-denoised" {
+        eprintln!("Error: data type must be pacbio or ont-r9 or ont-r10 or ont-denoised");
         std::process::exit(1);
     }
     // reference fasta information

@@ -25,9 +25,13 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$OUTDIR" && -n "$PROFILE" ]] || { echo "usage: --outdir DIR --profile {hifi,ont-r10} [--total-depth N] [--seed N]" >&2; exit 1; }
 
+# ONT uses pbsim3's qshmm method so reads carry realistic per-base quality
+# scores (errhmm emits placeholder Q0 '!' quals, which break any quality-aware
+# caller/denoiser). HiFi stays on errhmm (its reads are consensus-polished by
+# ccs, and no QSHMM-SEQUEL model ships with pbsim3).
 case "$PROFILE" in
-  hifi)     MODEL_NAME="ERRHMM-SEQUEL.model"; PASS=10;;
-  ont-r10)  MODEL_NAME="ERRHMM-ONT-HQ.model"; PASS=1;;
+  hifi)     METHOD="errhmm"; MODEL_NAME="ERRHMM-SEQUEL.model"; PASS=10;;
+  ont-r10)  METHOD="qshmm";  MODEL_NAME="QSHMM-ONT-HQ.model"; PASS=1;;
   *) echo "profile must be hifi or ont-r10" >&2; exit 1;;
 esac
 MODEL="$PBSIM_MODEL_DIR/$MODEL_NAME"
@@ -53,9 +57,46 @@ CLONES="$OUTDIR/truth/clones.tsv"
   exit 1
 }
 WORK="$OUTDIR/reads/work"
+mkdir -p "$OUTDIR/reads"
+# Refuse to run two sims against the same --outdir: each does `rm -rf "$WORK"`
+# below, so overlapping runs delete/recreate files under each other mid-stream,
+# which surfaces much later as a bare "gzip: unexpected end of file".
+LOCK="$OUTDIR/reads/.sim.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then
+  echo "another simulate_reads.sh appears to be running for --outdir=$OUTDIR" >&2
+  echo "  (lock: $LOCK; if stale, remove with: rmdir '$LOCK')" >&2
+  exit 1
+fi
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
 rm -rf "$WORK"; mkdir -p "$WORK"
 OUT_FQ="$OUTDIR/reads/reads.fastq"
 : > "$OUT_FQ"
+
+# Append a gzipped FASTQ into OUT_FQ (rewriting read headers), but only once the
+# stream is fully written. pbsim3 returns exit 0 BEFORE its gzip output is flushed
+# (confirmed: an immediate `gzip -t` fails, a few ms later it passes), so reading
+# eagerly hits a truncated stream and would otherwise abort the whole sim with a
+# bare "gzip: unexpected end of file". We poll `gzip -t` until the member is
+# complete, and only treat a persistent failure (~10s) as a real corruption — e.g.
+# a second run sharing --outdir deleting files mid-write. $4 is an optional log.
+append_fq_gz() {  # path clone_id rotidx [producer_log]
+  local fq="$1" cid="$2" rid="$3" diag="${4:-}" tries=0 max=100  # 100 * 0.1s = ~10s
+  until gzip -t "$fq" 2>/dev/null; do
+    tries=$((tries + 1))
+    if (( tries >= max )); then
+      echo "gzip never became intact after ${max} tries: $fq ($(wc -c <"$fq" 2>/dev/null | tr -d ' ') bytes) for clone $cid rot $rid" >&2
+      echo "  the producer never finished flushing, or a second run sharing --outdir=$OUTDIR" >&2
+      echo "  deleted/overwrote it mid-read (its 'rm -rf work/' races this)." >&2
+      if [[ -n "$diag" && -f "$diag" ]]; then
+        echo "---- producer log ($diag) ----" >&2; cat "$diag" >&2 || true; echo "---- end log ----" >&2
+      fi
+      exit 1
+    fi
+    sleep 0.1
+  done
+  gzip -dc "$fq" | awk -v c="$cid" -v r="$rid" \
+    'NR%4==1{print "@clone_"c"_rot"r"_"substr($0,2); next}{print}' >> "$OUT_FQ"
+}
 
 ROT=8284  # floor(16569/2)
 
@@ -108,7 +149,7 @@ PY
     # Keep pbsim log on failure — success output is noisy and previously hid
     # "command not found" / bad-model / bad-genome errors behind a generic message.
     pbsim_log="${pfx}.pbsim.log"
-    if ! pbsim --strategy wgs --method errhmm --errhmm "$MODEL" \
+    if ! pbsim --strategy wgs --method "$METHOD" --"$METHOD" "$MODEL" \
           --depth "$depth" --genome "$tmpl" --prefix "$pfx" \
           --pass-num "$PASS" --seed "$seed" >"$pbsim_log" 2>&1; then
       echo "pbsim failed for clone $clone_id rot $rotidx (genome=$tmpl depth=$depth model=$MODEL)" >&2
@@ -117,8 +158,8 @@ PY
       echo "---- end pbsim log ----" >&2
       exit 1
     fi
-    rm -f "$pbsim_log"
-
+    # Keep $pbsim_log until the reads are safely appended, so an integrity
+    # failure below still has the producer's log for context.
     if [[ "$PROFILE" == "hifi" ]]; then
       # Multi-pass -> HiFi via ccs. pbsim3 emits <pfx>_0001.bam (subreads).
       bam="${pfx}_0001.bam"
@@ -126,15 +167,14 @@ PY
       samtools sort -n -o "${pfx}.subreads.bam" "$bam"
       ccs "${pfx}.subreads.bam" "${pfx}.hifi.fastq.gz" --min-passes 3 >/dev/null 2>&1 || {
         echo "ccs failed for clone $clone_id rot $rotidx" >&2; exit 1; }
-      gzip -dc "${pfx}.hifi.fastq.gz" | awk -v c="$clone_id" -v r="$rotidx" \
-        'NR%4==1{print "@clone_"c"_rot"r"_"substr($0,2); next}{print}' >> "$OUT_FQ"
+      append_fq_gz "${pfx}.hifi.fastq.gz" "$clone_id" "$rotidx" "$pbsim_log"
     else
       # Single-pass ONT: pbsim emits <pfx>_0001.fq.gz directly.
       fq="${pfx}_0001.fq.gz"
       [[ -f "$fq" ]] || { echo "no pbsim fq.gz: $fq" >&2; exit 1; }
-      gzip -dc "$fq" | awk -v c="$clone_id" -v r="$rotidx" \
-        'NR%4==1{print "@clone_"c"_rot"r"_"substr($0,2); next}{print}' >> "$OUT_FQ"
+      append_fq_gz "$fq" "$clone_id" "$rotidx" "$pbsim_log"
     fi
+    rm -f "$pbsim_log"
   done
 done < <(tail -n +2 "$CLONES" | awk -F'\t' '{print $1 "\t" $4}')
 

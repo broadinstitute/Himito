@@ -167,6 +167,9 @@ def quartet_distance(truth_parent, recon_parent, shared: set[str]) -> tuple[int,
     return diff, (diff / total if total else 0.0)
 
 
+_BASES = frozenset("ACGT")
+
+
 def detected_variants_with_hf_from_vcf(
     path: str,
     min_hf: float = 0.01,
@@ -178,6 +181,13 @@ def detected_variants_with_hf_from_vcf(
     multi-valued). Non-PASS filters are excluded. Keeps only variants with
     ``min_hf <= HF < max_hf`` (same band as Himito ``lineage``); records
     without a usable HF are dropped.
+
+    Only single-base substitutions count. ``simulate_tree.py`` builds the truth set
+    from substitutions alone, so an indel call can never be a true positive; letting
+    indels through only deflated ``var_precision``. That mattered a lot on ONT graphs,
+    where indel artifacts outnumber SNV calls by ~50x and are filtered solely by the
+    permutation test -- with that test disabled (``call -p 1``) they dominated the
+    denominator and made precision look like a caller regression.
     """
     out: dict[str, float | None] = {}
     with open(path) as fh:
@@ -189,6 +199,9 @@ def detected_variants_with_hf_from_vcf(
                 continue
             pos, ref, alt, filt = f[1], f[3], f[4], f[6]
             if filt not in ("PASS", "."):
+                continue
+            # SNVs only: rejects indels, multiallelic ALTs ("G,T") and non-ACGT bases.
+            if ref not in _BASES or alt not in _BASES:
                 continue
             hf: float | None = None
             if len(f) >= 10:

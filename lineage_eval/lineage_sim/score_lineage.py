@@ -167,27 +167,25 @@ def quartet_distance(truth_parent, recon_parent, shared: set[str]) -> tuple[int,
     return diff, (diff / total if total else 0.0)
 
 
-_BASES = frozenset("ACGT")
+def detected_variants_with_hf_from_vcf(path: str) -> dict[str, float | None]:
+    """PASS/. calls from a Himito VCF → {m.<pos><ref>><alt>: HF}.
 
+    The FILTER column is the only gate: every record marked PASS or "." counts as a
+    detected variant. HF is read from the first sample's FORMAT/HF field (first allele
+    if multi-valued) and is reporting-only -- it never excludes a record, and a
+    missing/unparseable HF yields None rather than dropping the call.
 
-def detected_variants_with_hf_from_vcf(
-    path: str,
-    min_hf: float = 0.01,
-    max_hf: float = 0.95,
-) -> dict[str, float | None]:
-    """PASS/. SNVs from a Himito VCF → {m.<pos><ref>><alt>: HF}.
-
-    HF is read from the first sample's FORMAT/HF field (first allele if
-    multi-valued). Non-PASS filters are excluded. Keeps only variants with
-    ``min_hf <= HF < max_hf`` (same band as Himito ``lineage``); records
-    without a usable HF are dropped.
-
-    Only single-base substitutions count. ``simulate_tree.py`` builds the truth set
-    from substitutions alone, so an indel call can never be a true positive; letting
-    indels through only deflated ``var_precision``. That mattered a lot on ONT graphs,
-    where indel artifacts outnumber SNV calls by ~50x and are filtered solely by the
-    permutation test -- with that test disabled (``call -p 1``) they dominated the
-    denominator and made precision look like a caller regression.
+    No HF band and no SNV-only gate are applied here on purpose. Both used to shrink
+    the ``var_precision`` denominator to the slice ``Himito lineage`` consumes, which
+    made precision read 1.0 on runs whose VCF was in fact full of false positives:
+    error-driven calls sat below the band's floor and near-homoplasmic artifacts above
+    its ceiling, so neither reached the metric. Indels are likewise counted now.
+    ``simulate_tree.py`` emits substitutions only, so every indel call is a false
+    positive by construction -- expect ONT ``var_precision`` to read low, since indel
+    artifacts outnumber SNV calls by ~50x there and are suppressed solely by the
+    permutation test, which this harness disables (``call -p 1``). That is a property
+    of the caller output, not of lineage reconstruction; read ``ad_*``/``pc_recall``
+    for tree accuracy.
     """
     out: dict[str, float | None] = {}
     with open(path) as fh:
@@ -200,9 +198,6 @@ def detected_variants_with_hf_from_vcf(
             pos, ref, alt, filt = f[1], f[3], f[4], f[6]
             if filt not in ("PASS", "."):
                 continue
-            # SNVs only: rejects indels, multiallelic ALTs ("G,T") and non-ACGT bases.
-            if ref not in _BASES or alt not in _BASES:
-                continue
             hf: float | None = None
             if len(f) >= 10:
                 keys = f[8].split(":")
@@ -210,19 +205,13 @@ def detected_variants_with_hf_from_vcf(
                 sample = dict(zip(keys, vals))
                 if "HF" in sample and sample["HF"] not in (".", ""):
                     hf = float(sample["HF"].split(",")[0])
-            if hf is None or not (min_hf <= hf < max_hf):
-                continue
             out[f"m.{pos}{ref}>{alt}"] = hf
     return out
 
 
-def detected_variants_from_vcf(
-    path: str,
-    min_hf: float = 0.01,
-    max_hf: float = 0.95,
-) -> set[str]:
-    """PASS/. SNVs from a Himito VCF, as m.<pos><ref>><alt> strings."""
-    return set(detected_variants_with_hf_from_vcf(path, min_hf=min_hf, max_hf=max_hf))
+def detected_variants_from_vcf(path: str) -> set[str]:
+    """PASS/. calls from a Himito VCF, as m.<pos><ref>><alt> strings."""
+    return set(detected_variants_with_hf_from_vcf(path))
 
 
 def _f1(p: float, r: float) -> float:
@@ -289,23 +278,13 @@ def main() -> None:
     ap.add_argument("--profile", default="NA")
     ap.add_argument("--fp", default="NA")
     ap.add_argument("--fn", default="NA")
-    ap.add_argument(
-        "--min-hf", type=float, default=0.01,
-        help="keep detected variants with HF >= this (default: 0.01)",
-    )
-    ap.add_argument(
-        "--max-hf", type=float, default=0.95,
-        help="keep detected variants with HF < this (default: 0.95)",
-    )
     ap.add_argument("--metrics-out", default="")
     args = ap.parse_args()
 
     truth_pm = parse_mutation_tree(args.truth_tree)
     recon_pm = parse_mutation_tree(args.recon_tree)
     truth_vars = {l.strip() for l in open(args.truth_variants) if l.strip()}
-    detected_hf = detected_variants_with_hf_from_vcf(
-        args.vcf, min_hf=args.min_hf, max_hf=args.max_hf,
-    )
+    detected_hf = detected_variants_with_hf_from_vcf(args.vcf)
     detected = set(detected_hf)
 
     m = score(truth_pm, recon_pm, truth_vars, detected)

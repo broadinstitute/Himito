@@ -8,7 +8,9 @@ HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 OUTDIR="" PROFILE="ont-r10"
 FP_GRID="0.0005 0.001 0.005 0.01"
 FN_GRID="0.02 0.05 0.1 0.2"
-# Same HF band as run_eval.sh / run_himito.sh / score_lineage.py.
+# HF band for `Himito lineage` only, same as run_eval.sh / run_himito.sh.
+# score_lineage.py does not band its detected-variant set, so this does not move
+# var_precision across sweep cells -- only which variants enter the SCITE matrix.
 MIN_HF=0.01 MAX_HF=0.95
 # Sweeps re-run full MCMC per cell; use a lighter budget than the CLI defaults
 # (10000×4). Override for a final high-quality pass if needed.
@@ -58,7 +60,6 @@ for fp in $FP_GRID; do
         --recon-tree "${pfx}.mutation_tree.tsv" \
         --truth-variants "$OUTDIR/truth/truth_variants.txt" \
         --vcf "$VCF" --profile "$PROFILE" --fp "$fp" --fn "$fn" \
-        --min-hf "$MIN_HF" --max-hf "$MAX_HF" \
         --metrics-out "$SWEEP" >/dev/null
     else
       echo "lineage failed at fp=$fp fn=$fn (skipped)" >&2

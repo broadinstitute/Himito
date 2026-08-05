@@ -10,8 +10,9 @@ export REF="${REF:-$REPO/rCRS.fasta}"
 export HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 
 OUTDIR="" PROFILE="ont-r10" NMUT=12 DEPTH=300 SEED=1 FP=0.001 FN=0.05
-# Same HF band as Himito lineage / score_lineage / sweep_fpfn defaults.
-MIN_HF=0.1 MAX_HF=0.95 
+# HF band for `Himito lineage` only (forwarded via run_himito.sh). score_lineage.py
+# no longer bands its detected-variant set -- var_precision counts every PASS/. call.
+MIN_HF=0.01 MAX_HF=0.99
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -39,7 +40,7 @@ fi
 
 mkdir -p "$OUTDIR"
 echo "$OUTDIR"
-python "$HERE/simulate_tree.py" --reference "$REF" --n-mutations "$NMUT" --seed "$SEED" --outdir "$OUTDIR"
+python "$HERE/simulate_tree.py" --reference "$REF" --n-mutations "$NMUT" --seed "$SEED" --outdir "$OUTDIR" --min-hf "$MIN_HF" --max-hf "$MAX_HF"
 "$HERE/simulate_reads.sh" --outdir "$OUTDIR" --profile "$PROFILE" --total-depth "$DEPTH" --seed "$SEED"
 "$HERE/run_himito.sh" --outdir "$OUTDIR" --profile "$PROFILE" --sample SIM \
   --fp "$FP" --fn "$FN" --min-hf "$MIN_HF" --max-hf "$MAX_HF"
@@ -49,7 +50,6 @@ python "$HERE/score_lineage.py" \
   --truth-variants "$OUTDIR/truth/truth_variants.txt" \
   --vcf "$OUTDIR/himito/sim.vcf" \
   --profile "$PROFILE" --fp "$FP" --fn "$FN" \
-  --min-hf "$MIN_HF" --max-hf "$MAX_HF" \
   --metrics-out "$OUTDIR/metrics.tsv"
 
 echo "=== metrics ($OUTDIR/metrics.tsv) ==="

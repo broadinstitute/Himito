@@ -19,11 +19,12 @@ OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05 KMER=21
 # CALL_DATATYPE here is always "pacbio" or "ont-denoised", so that's the
 # branch that applies for every profile this script supports.
 
-MINIMAL_AC=2 VAF=0.01 PVAL=1 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
+MINIMAL_AC=2 VAF=0.01 PVAL=0.1 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
 STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1 MIN_EDGE_READS=2
 
-# HF band forwarded to `Himito lineage` (same band as run_eval.sh / sweep_fpfn.sh / score_lineage.py).
-# Unrelated to quick-start, which has no lineage/SCITE step of its own.
+# HF band forwarded to `Himito lineage` (same band as run_eval.sh / sweep_fpfn.sh).
+# Unrelated to quick-start, which has no lineage/SCITE step of its own, and no longer
+# related to scoring: score_lineage.py counts every PASS/. call regardless of HF.
 
 MIN_HF=0.01 MAX_HF=0.95
 while [[ $# -gt 0 ]]; do
@@ -119,7 +120,7 @@ fi
 
 # Lineage: SCITE mutation-tree reconstruction.
 "$HIMITO" lineage -m "$HDIR/sim.matrix.csv" -v "$HDIR/sim.vcf" \
-  --fp-rate "$FP" --fn-rate "$FN" --min-hf "$MIN_HF" --max-hf "$MAX_HF" \
+  --fp-rate "$FP" --fn-rate "$FN" --min-hf 0.01 --max-hf 0.95 \
   -o "$HDIR/sim_lineage"
 
 echo "himito done: $HDIR/sim_lineage.mutation_tree.tsv"

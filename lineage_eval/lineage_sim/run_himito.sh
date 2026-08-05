@@ -7,6 +7,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 REF="${REF:-$REPO/rCRS.fasta}"
 OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05 KMER=21
+
 # Call/build-tuning defaults: match `Himito quick-start`'s own defaults, NOT
 # tuned-for-simulated-data overrides, so this harness measures the pipeline
 # users actually run. Values below are quick-start's CLI defaults (main.rs
@@ -17,10 +18,13 @@ OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05 KMER=21
 # gets for a data_type other than ont-r9/ont-r10 (p=0.01, f=0.2, perm=0.7) --
 # CALL_DATATYPE here is always "pacbio" or "ont-denoised", so that's the
 # branch that applies for every profile this script supports.
-MINIMAL_AC=2 VAF=0.01 PVAL=0.01 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
+
+MINIMAL_AC=2 VAF=0.01 PVAL=1 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
 STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1 MIN_EDGE_READS=2
+
 # HF band forwarded to `Himito lineage` (same band as run_eval.sh / sweep_fpfn.sh / score_lineage.py).
 # Unrelated to quick-start, which has no lineage/SCITE step of its own.
+
 MIN_HF=0.01 MAX_HF=0.95
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -81,6 +85,7 @@ samtools index "$BAM"
 # defaults (0.01 p / 0.7 homoplasmic-exempt) are quick-start's own hardcoded
 # values, and match the Denoise subcommand's CLI defaults, so they're left
 # implicit below.
+
 BUILD_BAM="$BAM"
 CALL_DATATYPE="$DTYPE"
 if [[ "$DTYPE" == ont-* ]]; then

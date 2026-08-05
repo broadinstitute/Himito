@@ -321,8 +321,13 @@ def main() -> None:
             if new:
                 fh.write("\t".join(FIELDS) + "\n")
             fh.write(line + "\n")
-    print("\t".join(FIELDS))
-    print(line)
+    else:
+        # Standalone use has no file to read the result back from, so print it.
+        # When --metrics-out IS given, callers (e.g. run_eval.sh) read that file
+        # back themselves to display it -- printing here too would just show the
+        # same single result twice in the terminal.
+        print("\t".join(FIELDS))
+        print(line)
 
     # False positives: PASS/. VCF calls not in the truth variant list.
     fps = sorted(detected - truth_vars)

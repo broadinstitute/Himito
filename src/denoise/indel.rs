@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 /// An indel allele at a normalized site, indexed conceptually by its net length
 /// change: `Ref` = 0, `Ins(s)` = +s.len(), `Del(n)` = -n.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Allele {
     Ref,
     Ins(Vec<u8>),
@@ -52,6 +52,14 @@ pub struct IndelOpts {
     pub floor_mult: f64,
     pub delta: f64,
     pub flank: usize,
+    /// An allele carried by at least this fraction of reads at a site is never
+    /// corrected away, regardless of candidacy. This guards against `vaf_floor`
+    /// exceeding 1.0 in deep repeat contexts (which would otherwise make it
+    /// impossible for ANY alt allele to clear candidacy, so a genuine
+    /// heteroplasmy would be silently rewritten to REF read by read). Applies
+    /// symmetrically: a substantial REF allele is equally protected from being
+    /// converted to an indel.
+    pub protect_vaf: f64,
 }
 
 impl Default for IndelOpts {
@@ -66,6 +74,7 @@ impl Default for IndelOpts {
             floor_mult: 3.0,
             delta: 0.3,
             flank: 5,
+            protect_vaf: 0.2,
         }
     }
 }
@@ -193,10 +202,6 @@ impl IndelSite {
         }
     }
 
-    fn support(&self, a: &Allele) -> u32 {
-        self.obs.get(a).map_or(0, |&(f, r)| f + r)
-    }
-
     fn alt_total(&self) -> u32 {
         self.obs.values().map(|&(f, r)| f + r).sum()
     }
@@ -212,12 +217,11 @@ pub struct IndelSiteModel {
     /// `reassignments_by_hp_length` so correction inside long runs is auditable.
     pub context_len: u32,
     pub strand_biased: usize,
-}
-
-impl IndelSiteModel {
-    fn freq(&self, a: &Allele) -> f64 {
-        self.kept.iter().find(|(k, _)| k == a).map_or(0.0, |(_, f)| *f)
-    }
+    /// The RAW observed VAF of every allele at the site (kept or not), including
+    /// `Allele::Ref`. Unlike `kept`, this is never renormalized, so it is the
+    /// correct source for the `protect_vaf` substantiality check in
+    /// `assign_allele` -- candidacy rejection must not affect protection.
+    pub obs_vaf: Vec<(Allele, f64)>,
 }
 
 /// Decide which alleles survive at a site and compute their frequencies.
@@ -244,8 +248,10 @@ pub fn fit_indel_site(
     };
 
     // One eps per site. Alleles at the same site can in principle sit in different
-    // repeat contexts; take the deepest, which is the conservative choice (it raises
-    // the error rate, making assignment less willing to move reads).
+    // repeat contexts; take the deepest. This is conservative for CANDIDACY (it
+    // raises `vaf_floor`, so fewer alleles clear the gate) but anti-conservative
+    // for ASSIGNMENT: the crossover threshold `eps/(1-eps)` grows with eps, so a
+    // higher eps makes MAP assignment MORE willing to move reads, not less.
     let context_len = site
         .obs
         .keys()
@@ -254,14 +260,28 @@ pub fn fit_indel_site(
         .unwrap_or(1);
     let eps = error_rate(context_len, o);
 
+    debug_assert!(
+        site.alt_total() <= site.depth,
+        "indel site accounting invariant violated: alt_total ({}) exceeds depth ({})",
+        site.alt_total(),
+        site.depth
+    );
+
     let mut strand_biased = 0usize;
     // Raw counts over kept alleles; REF gets whatever depth the events did not claim.
     let mut raw: Vec<(Allele, f64)> = Vec::new();
     let ref_support = depth.saturating_sub(site.alt_total());
     raw.push((Allele::Ref, ref_support as f64));
 
+    // RAW observed VAF for every allele, whether kept or not, for the protection
+    // check in `assign_allele` -- rejection by candidacy must not strip protection
+    // from an allele that a substantial fraction of reads actually carry.
+    let mut obs_vaf: Vec<(Allele, f64)> = Vec::new();
+    obs_vaf.push((Allele::Ref, (ref_support as f64 / depth as f64).min(1.0)));
+
     for (allele, &(fwd, rev)) in site.obs.iter() {
         let n = fwd + rev;
+        obs_vaf.push((allele.clone(), (n as f64 / depth as f64).min(1.0)));
         if n == 0 {
             continue;
         }
@@ -269,7 +289,7 @@ pub fn fit_indel_site(
             continue;
         }
         let l = repeat_context(refseq, norm_pos, allele);
-        let vaf = n as f64 / depth as f64;
+        let vaf = (n as f64 / depth as f64).min(1.0);
         if vaf < vaf_floor(l, o) {
             continue;
         }
@@ -289,13 +309,19 @@ pub fn fit_indel_site(
 
     // Renormalize over the kept set, so mass on rejected alleles does not leak.
     let sum: f64 = raw.iter().map(|(_, c)| *c).sum();
-    let kept: Vec<(Allele, f64)> = if sum > 0.0 {
+    let mut kept: Vec<(Allele, f64)> = if sum > 0.0 {
         raw.into_iter().map(|(a, c)| (a, c / sum)).collect()
     } else {
         vec![(Allele::Ref, 1.0)]
     };
 
-    IndelSiteModel { kept, eps, context_len, strand_biased }
+    // Deterministic order: `site.obs` is a HashMap with a randomly-seeded hasher,
+    // so without this the two Vecs (and any downstream tie-break in
+    // `assign_allele`) would vary between runs on identical input.
+    kept.sort_by(|(a, _), (b, _)| a.cmp(b));
+    obs_vaf.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    IndelSiteModel { kept, eps, context_len, strand_biased, obs_vaf }
 }
 
 /// Outcome of MAP assignment for one read at one site.
@@ -372,6 +398,20 @@ pub fn assign_allele(observed: &Allele, m: &IndelSiteModel, o: &IndelOpts) -> As
         if mm > n {
             return Assignment::Refused;
         }
+    }
+    // Protection: an allele carried by a substantial fraction of reads is never
+    // corrected away, even when it lost candidacy (e.g. `vaf_floor` exceeding 1.0
+    // in a deep repeat context, which would otherwise make every alt allele
+    // uncorrectable-into and let a genuine heteroplasmy be erased read by read).
+    // This is symmetric: it protects a substantial observed REF just as much as
+    // a substantial observed indel.
+    let observed_vaf = m
+        .obs_vaf
+        .iter()
+        .find(|(a, _)| a == observed)
+        .map_or(0.0, |(_, v)| *v);
+    if observed_vaf >= o.protect_vaf {
+        return Assignment::Keep;
     }
     Assignment::Move(target.clone())
 }
@@ -591,6 +631,29 @@ mod tests {
         assert!(kept_of(&m, &ins).is_none());
     }
 
+    #[test]
+    fn kept_and_obs_vaf_are_returned_in_deterministic_sorted_order() {
+        // Three alleles survive candidacy in unique sequence (L=1, floor 0.05): REF,
+        // an insertion, and a deletion. `site.obs` is a HashMap with a randomly
+        // seeded hasher, so without an explicit sort the emitted order (and any
+        // downstream `>` tie-break in `assign_allele`) would vary between runs on
+        // identical input, making the emitted BAM nondeterministic.
+        let ins = Allele::Ins(b"A".to_vec());
+        let del = Allele::Del(1);
+        let s = site(100, &[(ins.clone(), 10, 10), (del.clone(), 10, 10)]);
+        let o = IndelOpts::default();
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        assert_eq!(m.kept.len(), 3, "REF, Ins, and Del must all survive candidacy here");
+        let alleles: Vec<&Allele> = m.kept.iter().map(|(a, _)| a).collect();
+        let mut sorted = alleles.clone();
+        sorted.sort();
+        assert_eq!(alleles, sorted, "kept must be in deterministic sorted order");
+        let obs_alleles: Vec<&Allele> = m.obs_vaf.iter().map(|(a, _)| a).collect();
+        let mut obs_sorted = obs_alleles.clone();
+        obs_sorted.sort();
+        assert_eq!(obs_alleles, obs_sorted, "obs_vaf must be in deterministic sorted order");
+    }
+
     // ---- assignment (the three rows of the design's table) ----
 
     #[test]
@@ -650,9 +713,10 @@ mod tests {
         o.floor_mult = 0.0;
         let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
         assert!(kept_of(&m, &del).is_none());
-        // MAP over {REF, Ins} for an observed Del: whichever wins, it is either REF
-        // (allowed) or Ins (refused). Assert we never emit the cross-kind Ins.
-        assert_ne!(assign_allele(&del, &m, &o), Assignment::Move(ins.clone()));
+        // The MAP target here is Ins (it dominates the site), which is a cross-kind
+        // transition the rewrite walk does not support, so it must be Refused --
+        // not silently reinterpreted as Keep.
+        assert_eq!(assign_allele(&del, &m, &o), Assignment::Refused);
     }
 
     #[test]
@@ -666,7 +730,10 @@ mod tests {
         o.vaf = 0.01;
         o.floor_mult = 0.0;
         let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
-        assert_ne!(assign_allele(&d1, &m, &o), Assignment::Move(d3.clone()));
+        // d3 dominates the site and is the MAP target, but growing Del(1) into
+        // Del(3) is a transition the rewrite walk does not support -- Refused,
+        // not silently reinterpreted as Keep.
+        assert_eq!(assign_allele(&d1, &m, &o), Assignment::Refused);
     }
 
     #[test]
@@ -689,6 +756,50 @@ mod tests {
         assert_eq!(
             assign_allele(&Allele::Ins(b"T".to_vec()), &m, &o),
             Assignment::Move(Allele::Ref)
+        );
+    }
+
+    // ref: C AAAAAAAAAAAA G (12 A's) -> a 1bp event here sits in L=12, where
+    // vaf_floor(12) = floor_mult(3.0) * err_cap(0.4) = 1.2 > 1.0: no alt allele can
+    // ever clear candidacy at this depth, regardless of true frequency.
+    const DEEP_HP_REF: &[u8] = b"CAAAAAAAAAAAAG";
+
+    #[test]
+    fn substantial_allele_erased_from_candidacy_is_still_protected_at_assignment() {
+        // A genuine 50/50 Del(1) heteroplasmy in a 12-mer homopolymer. Candidacy
+        // genuinely rejects the allele (that is fix 1's premise, not a bug to work
+        // around) -- but `protect_vaf` must stop `assign_allele` from rewriting
+        // every read carrying it back to REF, which would destroy a real 50/50
+        // heteroplasmy read by read (mirrors mtDNA's m.303-315 / m.16184-16193
+        // poly-C heteroplasmy hotspots).
+        let del = Allele::Del(1);
+        let o = IndelOpts::default();
+        assert!(vaf_floor(12, &o) > 1.0, "test premise: floor must exceed 1.0 at L=12");
+        let s = site(100, &[(del.clone(), 25, 25)]);
+        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        assert!(kept_of(&m, &del).is_none(), "candidacy must genuinely reject the allele");
+        assert_eq!(
+            assign_allele(&del, &m, &o),
+            Assignment::Keep,
+            "a substantial allele must be protected from erasure, not destroyed"
+        );
+    }
+
+    #[test]
+    fn low_frequency_indel_below_protect_vaf_is_still_reverted() {
+        // Same deep-homopolymer context (candidacy rejects the allele for the same
+        // reason), but now the indel is a rare ~5% event, well below the default
+        // `protect_vaf` of 0.2. Protection must NOT kick in here, proving fix 1
+        // did not disable ordinary cleaning of spurious low-frequency indels.
+        let del = Allele::Del(1);
+        let o = IndelOpts::default();
+        let s = site(100, &[(del.clone(), 3, 2)]); // 5/100 = 0.05 < protect_vaf 0.2
+        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        assert!(kept_of(&m, &del).is_none(), "candidacy must reject the allele");
+        assert_eq!(
+            assign_allele(&del, &m, &o),
+            Assignment::Move(Allele::Ref),
+            "a low-frequency indel below protect_vaf must still be reverted"
         );
     }
 }

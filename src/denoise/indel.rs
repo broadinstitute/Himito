@@ -114,6 +114,61 @@ pub fn normalize_left(refseq: &[u8], anchor: u32, allele: &Allele) -> (u32, Alle
     }
 }
 
+/// Reference repeat context `L` at a normalized site: how many tandem copies of the
+/// event's own sequence surround it. For a 1bp event this is the homopolymer run
+/// length. Unique sequence gives 1. This is where ONT's indel error mass concentrates,
+/// so it scales both the error rate and the candidacy floor.
+pub fn repeat_context(refseq: &[u8], norm_pos: u32, allele: &Allele) -> u32 {
+    let unit: Vec<u8> = match allele {
+        Allele::Ref => return 1,
+        Allele::Ins(s) => s.clone(),
+        Allele::Del(n) => {
+            let a = norm_pos as usize + 1;
+            match refseq.get(a..a + *n as usize) {
+                Some(w) => w.to_vec(),
+                None => return 1,
+            }
+        }
+    };
+    if unit.is_empty() {
+        return 1;
+    }
+    let u = unit.len();
+    let start = norm_pos as usize + 1;
+
+    // Copies running rightward from the event position...
+    let mut copies = 0u32;
+    let mut p = start;
+    while refseq.get(p..p + u).map_or(false, |w| w == &unit[..]) {
+        copies += 1;
+        p += u;
+    }
+    // ...and leftward. (After left-normalization there is usually nothing to the
+    // left, but counting both directions keeps the measure independent of which
+    // end the aligner happened to anchor.)
+    let mut p = start;
+    while p >= u && refseq.get(p - u..p).map_or(false, |w| w == &unit[..]) {
+        copies += 1;
+        p -= u;
+    }
+    copies.max(1)
+}
+
+/// Per-junction indel error probability, growing with repeat context and capped.
+/// This is the likelihood term that base quality supplies for substitutions and that
+/// indels have no equivalent for: without it, MAP assignment degenerates to
+/// "everything becomes the most frequent allele" and heteroplasmy is annihilated.
+pub fn error_rate(l: u32, o: &IndelOpts) -> f64 {
+    let exp = (l as i32 - 1).max(0);
+    (o.err0 * o.err_scale.powi(exp)).min(o.err_cap)
+}
+
+/// Candidacy VAF floor for an allele in context `L`: an absolute minimum, raised to a
+/// multiple of the local error rate wherever that is higher.
+pub fn vaf_floor(l: u32, o: &IndelOpts) -> f64 {
+    o.vaf.max(o.floor_mult * error_rate(l, o))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +249,55 @@ mod tests {
         let (pos, allele) = normalize_left(HP_REF, 4, &Allele::Ref);
         assert_eq!(pos, 4);
         assert_eq!(allele, Allele::Ref);
+    }
+
+    #[test]
+    fn repeat_context_counts_homopolymer_run() {
+        // HP_REF = C AAAAAAA G -> a 1bp A event normalized to anchor 0 sits in a 7-run.
+        assert_eq!(repeat_context(HP_REF, 0, &Allele::Del(1)), 7);
+        assert_eq!(repeat_context(HP_REF, 0, &Allele::Ins(b"A".to_vec())), 7);
+    }
+
+    #[test]
+    fn repeat_context_counts_tandem_copies() {
+        // ref: C ATATATAT G -> a 2bp "AT" event at anchor 0 sits in 4 copies.
+        let r = b"CATATATATG";
+        assert_eq!(repeat_context(r, 0, &Allele::Ins(b"AT".to_vec())), 4);
+        assert_eq!(repeat_context(r, 0, &Allele::Del(2)), 4);
+    }
+
+    #[test]
+    fn repeat_context_is_one_in_unique_sequence() {
+        let r = b"ACGTACGT";
+        // Deleting the single G at index 2 (anchor 1): "G" occurs once here.
+        assert_eq!(repeat_context(r, 1, &Allele::Del(1)), 1);
+        assert_eq!(repeat_context(r, 1, &Allele::Ref), 1);
+    }
+
+    #[test]
+    fn error_rate_grows_with_context_and_is_capped() {
+        let o = IndelOpts::default(); // err0 0.01, scale 1.5, cap 0.4
+        assert!((error_rate(1, &o) - 0.01).abs() < 1e-12);
+        assert!((error_rate(2, &o) - 0.015).abs() < 1e-12);
+        assert!(error_rate(3, &o) > error_rate(2, &o));
+        // Monotonic non-decreasing, never above the cap.
+        for l in 1..40u32 {
+            assert!(error_rate(l + 1, &o) >= error_rate(l, &o), "not monotonic at {l}");
+            assert!(error_rate(l, &o) <= o.err_cap + 1e-12, "cap exceeded at {l}");
+        }
+        // Deep enough runs saturate exactly at the cap.
+        assert!((error_rate(30, &o) - o.err_cap).abs() < 1e-12);
+    }
+
+    #[test]
+    fn vaf_floor_is_the_larger_of_absolute_and_error_scaled() {
+        let o = IndelOpts::default(); // vaf 0.05, floor_mult 3.0
+        // L=1: 3 * 0.01 = 0.03 < 0.05, so the absolute floor wins.
+        assert!((vaf_floor(1, &o) - 0.05).abs() < 1e-12);
+        // Deep homopolymer: 3 * 0.4 = 1.2 dominates.
+        assert!(vaf_floor(30, &o) > 1.0);
+        for l in 1..30u32 {
+            assert!(vaf_floor(l + 1, &o) >= vaf_floor(l, &o), "not monotonic at {l}");
+        }
     }
 }

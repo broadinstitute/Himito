@@ -220,8 +220,22 @@ pub struct IndelSiteModel {
     /// The RAW observed VAF of every allele at the site (kept or not), including
     /// `Allele::Ref`. Unlike `kept`, this is never renormalized, so it is the
     /// correct source for the `protect_vaf` substantiality check in
-    /// `assign_allele` -- candidacy rejection must not affect protection.
+    /// `assign_allele` -- candidacy rejection must not affect protection. Values
+    /// are clamped to 1.0 (an allele's count can exceed `depth` on corrupted or
+    /// overlapping input); the clamp bounds the raw VAF that the protection
+    /// comparison above reads and makes the floor check in `fit_indel_site`
+    /// slightly stricter on such input. It does not gate the near-homoplasmic
+    /// exemption: an unclamped VAF above 1.0 would already exceed
+    /// `homoplasmic_vaf`, so the exemption fires either way.
     pub obs_vaf: Vec<(Allele, f64)>,
+    /// Alleles rejected specifically by a strand gate: the per-strand count check
+    /// (`min_strand`) or the strand-bias binomial test. These are suspected
+    /// single-strand artifacts -- exactly what those gates exist to catch -- so
+    /// `assign_allele` must not let `protect_vaf` shield them even at a
+    /// substantial VAF. An allele rejected only by the context floor (or one that
+    /// is kept) is not included here and remains eligible for protection. Sorted
+    /// for the same determinism reason as `kept` and `obs_vaf`.
+    pub strand_rejected: Vec<Allele>,
 }
 
 /// Decide which alleles survive at a site and compute their frequencies.
@@ -278,6 +292,7 @@ pub fn fit_indel_site(
     // from an allele that a substantial fraction of reads actually carry.
     let mut obs_vaf: Vec<(Allele, f64)> = Vec::new();
     obs_vaf.push((Allele::Ref, (ref_support as f64 / depth as f64).min(1.0)));
+    let mut strand_rejected: Vec<Allele> = Vec::new();
 
     for (allele, &(fwd, rev)) in site.obs.iter() {
         let n = fwd + rev;
@@ -286,6 +301,7 @@ pub fn fit_indel_site(
             continue;
         }
         if fwd < min_strand || rev < min_strand {
+            strand_rejected.push(allele.clone());
             continue;
         }
         let l = repeat_context(refseq, norm_pos, allele);
@@ -302,6 +318,7 @@ pub fn fit_indel_site(
                 < strand_bias_p
         {
             strand_biased += 1;
+            strand_rejected.push(allele.clone());
             continue;
         }
         raw.push((allele.clone(), n as f64));
@@ -320,8 +337,9 @@ pub fn fit_indel_site(
     // `assign_allele`) would vary between runs on identical input.
     kept.sort_by(|(a, _), (b, _)| a.cmp(b));
     obs_vaf.sort_by(|(a, _), (b, _)| a.cmp(b));
+    strand_rejected.sort();
 
-    IndelSiteModel { kept, eps, context_len, strand_biased, obs_vaf }
+    IndelSiteModel { kept, eps, context_len, strand_biased, obs_vaf, strand_rejected }
 }
 
 /// Outcome of MAP assignment for one read at one site.
@@ -404,13 +422,17 @@ pub fn assign_allele(observed: &Allele, m: &IndelSiteModel, o: &IndelOpts) -> As
     // in a deep repeat context, which would otherwise make every alt allele
     // uncorrectable-into and let a genuine heteroplasmy be erased read by read).
     // This is symmetric: it protects a substantial observed REF just as much as
-    // a substantial observed indel.
+    // a substantial observed indel. It does NOT apply to an allele rejected by a
+    // strand gate (`min_strand` or the strand-bias test): that rejection means the
+    // allele is a suspected single-strand artifact, which is exactly what those
+    // gates exist to catch, so protection must not shield it.
+    let strand_rejected = m.strand_rejected.iter().any(|a| a == observed);
     let observed_vaf = m
         .obs_vaf
         .iter()
         .find(|(a, _)| a == observed)
         .map_or(0.0, |(_, v)| *v);
-    if observed_vaf >= o.protect_vaf {
+    if !strand_rejected && observed_vaf >= o.protect_vaf {
         return Assignment::Keep;
     }
     Assignment::Move(target.clone())
@@ -644,14 +666,23 @@ mod tests {
         let o = IndelOpts::default();
         let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
         assert_eq!(m.kept.len(), 3, "REF, Ins, and Del must all survive candidacy here");
+        // Assert the EXACT expected sequence rather than comparing the list to a
+        // sorted copy of itself: `Ref` is always pushed first and is always the
+        // Ord-minimum, so the only HashMap-order variability is between the two
+        // remaining alleles, and one of those two permutations is already sorted --
+        // a self-comparison would only catch a missing `sort_by` about half the time.
         let alleles: Vec<&Allele> = m.kept.iter().map(|(a, _)| a).collect();
-        let mut sorted = alleles.clone();
-        sorted.sort();
-        assert_eq!(alleles, sorted, "kept must be in deterministic sorted order");
+        assert_eq!(
+            alleles,
+            vec![&Allele::Ref, &Allele::Ins(b"A".to_vec()), &Allele::Del(1)],
+            "kept must be in deterministic sorted order"
+        );
         let obs_alleles: Vec<&Allele> = m.obs_vaf.iter().map(|(a, _)| a).collect();
-        let mut obs_sorted = obs_alleles.clone();
-        obs_sorted.sort();
-        assert_eq!(obs_alleles, obs_sorted, "obs_vaf must be in deterministic sorted order");
+        assert_eq!(
+            obs_alleles,
+            vec![&Allele::Ref, &Allele::Ins(b"A".to_vec()), &Allele::Del(1)],
+            "obs_vaf must be in deterministic sorted order"
+        );
     }
 
     // ---- assignment (the three rows of the design's table) ----
@@ -800,6 +831,52 @@ mod tests {
             assign_allele(&del, &m, &o),
             Assignment::Move(Allele::Ref),
             "a low-frequency indel below protect_vaf must still be reverted"
+        );
+    }
+
+    #[test]
+    fn strand_rejected_allele_is_not_shielded_by_protect_vaf() {
+        // 30% VAF in unique sequence, but entirely on the forward strand (0 reverse
+        // reads): a classic single-strand artifact, which `min_strand` exists to
+        // catch. 30% clears `protect_vaf` (0.2), but protection must NOT apply --
+        // shielding a suspected strand artifact would defeat the denoiser's main
+        // purpose of removing exactly this kind of error.
+        let ins = Allele::Ins(b"T".to_vec());
+        let s = site(100, &[(ins.clone(), 30, 0)]);
+        let o = IndelOpts::default();
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        assert!(kept_of(&m, &ins).is_none(), "candidacy must reject the strand-skewed allele");
+        assert!(
+            m.strand_rejected.contains(&ins),
+            "allele failing min_strand must be recorded in strand_rejected"
+        );
+        assert_eq!(
+            assign_allele(&ins, &m, &o),
+            Assignment::Move(Allele::Ref),
+            "protect_vaf must not shield an allele rejected by the strand-count gate"
+        );
+    }
+
+    #[test]
+    fn floor_rejected_allele_in_deep_homopolymer_is_still_shielded_by_protect_vaf() {
+        // Same 30% VAF, but now strand-balanced (15f/15r) in a deep homopolymer
+        // where `vaf_floor` exceeds 1.0: candidacy rejects it purely on the context
+        // floor, not on a strand gate. This is not a suspected artifact, so
+        // `protect_vaf` must still shield it.
+        let del = Allele::Del(1);
+        let o = IndelOpts::default();
+        assert!(vaf_floor(12, &o) > 1.0, "test premise: floor must exceed 1.0 at L=12");
+        let s = site(100, &[(del.clone(), 15, 15)]);
+        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        assert!(kept_of(&m, &del).is_none(), "candidacy must reject the allele on the floor gate");
+        assert!(
+            !m.strand_rejected.contains(&del),
+            "an allele rejected only by the context floor must not be in strand_rejected"
+        );
+        assert_eq!(
+            assign_allele(&del, &m, &o),
+            Assignment::Keep,
+            "protect_vaf must still shield an allele rejected only by the floor"
         );
     }
 }

@@ -12,7 +12,7 @@ export HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 OUTDIR="" PROFILE="ont-r10" NMUT=12 DEPTH=300 SEED=1 FP=0.001 FN=0.05
 # HF band for `Himito lineage` only (forwarded via run_himito.sh). score_lineage.py
 # no longer bands its detected-variant set -- var_precision counts every PASS/. call.
-MIN_HF=0.01 MAX_HF=0.99
+MIN_HF=0.1 MAX_HF=0.99
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;

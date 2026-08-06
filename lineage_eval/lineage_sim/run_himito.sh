@@ -20,7 +20,12 @@ OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05 KMER=21
 # branch that applies for every profile this script supports.
 
 MINIMAL_AC=2 VAF=0.01 PVAL=0.1 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
-STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1 MIN_EDGE_READS=2
+STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1
+# MIN_EDGE_READS deliberately diverges from quick-start's hardcoded 2: the gate is
+# now inclusive (>= N reads), and 1 CIGARs every read-supported edge. At 2, ~98% of
+# edges on this ONT graph go un-CIGARed and the reads reaching a bubble through them
+# are recorded as missing rather than ref, which is what starved the lineage matrix.
+MIN_EDGE_READS=2
 
 # HF band forwarded to `Himito lineage` (same band as run_eval.sh / sweep_fpfn.sh).
 # Unrelated to quick-start, which has no lineage/SCITE step of its own, and no longer

@@ -221,20 +221,37 @@ fn get_graph_intervals(graph:&GraphicalGenome, length: i64) -> HashMap<&String, 
         }
         let src = graph.edges[edge].get("src").unwrap().as_array().unwrap()[0].as_str().unwrap();
         let dst = graph.edges[edge].get("dst").unwrap().as_array().unwrap()[0].as_str().unwrap();
-        let startpos = graph.anchor
-            .get(src)
-            .and_then(|v| v.get("pos"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0) as i64;  
-        let endpos  = graph.anchor
-            .get(dst)
-            .and_then(|v| v.get("pos"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(length) as i64;  
-        if endpos > startpos {
-            graph_intervals_dict.insert(edge, (startpos, endpos));
-        }
-        
+        // SOURCE/SINK have no anchor coordinate, and get_variant skips those edges
+        // outright. Defaulting the missing endpoint to 0/length instead would hand
+        // them a genome-scale interval, crediting their reads as "covering" every
+        // variant in the graph.
+        let anchor_pos = |name: &str| {
+            graph
+                .anchor
+                .get(name)
+                .and_then(|v| v.get("pos"))
+                .and_then(|v| v.as_i64())
+        };
+        let (Some(startpos), Some(endpos)) = (anchor_pos(src), anchor_pos(dst)) else {
+            continue;
+        };
+        // The graph is circular: the final anchor links straight back to the first,
+        // so the closing bubble has `endpos < startpos` (e.g. A016544 -> A000022 on
+        // rCRS). Unwrap its end past the origin rather than dropping the edge --
+        // dropping it left every variant in that bubble with no covering reads, so
+        // origin-spanning variants could be emitted to the VCF yet never genotyped
+        // in the matrix. Variant positions on this edge are raw/unwrapped for the
+        // same reason (circuliarize_variants folds them back afterwards), so the
+        // unwrapped interval is exactly what bubble_cover_reads is queried with.
+        let end_unwrapped = if endpos > startpos {
+            endpos
+        } else if endpos < startpos {
+            endpos + length
+        } else {
+            // Degenerate self-loop on one anchor: zero-width, nothing to cover.
+            continue;
+        };
+        graph_intervals_dict.insert(edge, (startpos, end_unwrapped));
     }
     graph_intervals_dict
 }
@@ -254,12 +271,12 @@ fn bubble_cover_reads(graph_intervals_dict: &HashMap<&String, (i64, i64)>, pos: 
 
 /// Populates `read_record`/`cover_record` for one edge's variants.
 ///
-/// `graph_intervals_dict` holds raw (unwrapped) anchor coordinates, including
-/// the duplicated wrap-around span past `ref_length` used to circularize the
-/// graph. `variants` carries that same raw position, while `variants_circular`
-/// carries the wrapped position used to key/name the variant. The bubble
-/// lookup must use the raw position - using the wrapped one would look up
-/// the wrong bubble (or none) for any variant on the wrap-around edge.
+/// `graph_intervals_dict` holds raw (unwrapped) anchor coordinates: the closing
+/// bubble that crosses the origin is stored as `[src.pos, dst.pos + ref_length)`
+/// so it stays ordered and half-open. `variants` carries that same raw position,
+/// while `variants_circular` carries the wrapped position used to key/name the
+/// variant. The bubble lookup must use the raw position - using the wrapped one
+/// would look up the wrong bubble (or none) for any variant past the origin.
 fn record_variant_reads(
     variants: &[Variant],
     variants_circular: &[Variant],
@@ -595,7 +612,6 @@ pub fn construct_matrix(
     read_record: &HashMap<String, Vec<serde_json::Value>>,
     cover_record: &HashMap<String, HashSet<String>>,
     variants: &[Variant],
-    minimal_ac: usize,
 ) -> (Array2<f64>, Vec<Variant>, Vec<String>) {
     let mut read_set: HashSet<String> = HashSet::new();
     for reads in cover_record.values() {
@@ -652,24 +668,17 @@ pub fn construct_matrix(
         }
     }
 
-    // Keep reads with more than minimal_ac alt calls across variants
-    let mut col_index = Vec::new();
-    for i in 0..matrix.ncols() {
-        let alt_count = matrix
-            .column(i)
-            .iter()
-            .filter(|&&x| x == 1.0)
-            .count();
-        if alt_count > minimal_ac {
-            col_index.push(i);
-        }
-    }
-    let filtered_matrix = matrix.select(Axis(1), &col_index);
-    let filtered_read_vec: Vec<String> = col_index
-        .iter()
-        .map(|&i| read_vec[i].clone())
-        .collect();
-    (filtered_matrix, var_vec, filtered_read_vec)
+    // Every covered read is kept. There used to be a column filter here dropping
+    // reads with `alt_count <= minimal_ac` ALT calls, but `minimal_ac` is a
+    // per-variant allele-count gate ("a variant needs >= N supporting reads"),
+    // not a per-read one, and reusing it that way removed ~91% of reads on a
+    // real ONT run. Worse, it selected on noise: `alt_count` is summed over ALL
+    // raw variants, which on ONT are mostly indel artifacts, so retention was
+    // flat (~9%) regardless of how many true mutations a read carried and the
+    // reference-like reads that anchor the lineage root were dropped wholesale.
+    // Downstream SCITE models missing data explicitly via its FN rate, so sparse
+    // reads cost it far less than a biased subsample does.
+    (matrix, var_vec, read_vec)
 }
 
 
@@ -1160,7 +1169,7 @@ pub fn start(
 
     // modified, exclude filtered data
     let (matrix, var_record, read_set) =
-        construct_matrix(&read_record, &cover_record, &filtered_var, minimal_ac);
+        construct_matrix(&read_record, &cover_record, &filtered_var);
     let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
     let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
 
@@ -1338,5 +1347,161 @@ mod tests {
         // as covered-but-not-alt would wrongly call it ref (0) in the
         // matrix instead of the correct NaN (unassembled/unknown).
         assert_eq!(cover, vec!["r1".to_string(), "r2".to_string()]);
+    }
+
+    /// A genuinely circular graph: the last anchor links straight back to the
+    /// first, so the closing bubble has `dst.pos < src.pos`. Real Himito graphs
+    /// look like this (e.g. A016544 -> A000022 on rCRS); they do NOT carry a
+    /// duplicated anchor span past `ref_length`.
+    fn circular_test_graph() -> GraphicalGenome {
+        let mut anchor = HashMap::new();
+        anchor.insert("A_first".to_string(), json!({"pos": 2}));
+        anchor.insert("A_mid".to_string(), json!({"pos": 5}));
+        anchor.insert("A_last".to_string(), json!({"pos": 8}));
+
+        let mut edges = HashMap::new();
+        edges.insert(
+            "E_mid".to_string(),
+            json!({"src": ["A_first"], "dst": ["A_mid"], "reads": ["r1"], "variants": "3="}),
+        );
+        // Closing bubble: spans 8 -> 10 (== ref_length) -> 2, i.e. across the origin.
+        edges.insert(
+            "E_wrap".to_string(),
+            json!({"src": ["A_last"], "dst": ["A_first"], "reads": ["rw1", "rw2"], "variants": "2=1X1="}),
+        );
+
+        GraphicalGenome {
+            anchor,
+            edges,
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn origin_spanning_bubble_is_retained_and_covers_its_reads() {
+        let graph = circular_test_graph();
+        let ref_length = 10usize;
+        let dict = get_graph_intervals(&graph, ref_length as i64);
+
+        assert!(
+            dict.contains_key(&"E_wrap".to_string()),
+            "the origin-spanning bubble must not be dropped; variants there become uncallable"
+        );
+
+        // get_variants_from_cigar walks forward from the src anchor, so a variant
+        // in this bubble carries a RAW position past ref_length (8 + 2 = 10),
+        // which circuliarize_variants folds back to wrapped position 0.
+        let raw_pos = 10usize;
+        let mut cover: Vec<String> =
+            bubble_cover_reads(&dict, raw_pos, &graph).into_iter().collect();
+        cover.sort();
+        assert_eq!(cover, vec!["rw1".to_string(), "rw2".to_string()]);
+
+        // The pre-origin half of the same bubble resolves too.
+        let mut cover_before: Vec<String> =
+            bubble_cover_reads(&dict, 8, &graph).into_iter().collect();
+        cover_before.sort();
+        assert_eq!(cover_before, vec!["rw1".to_string(), "rw2".to_string()]);
+
+        // ... and it must not bleed into the unrelated bubble at [2, 5).
+        let mut cover_mid: Vec<String> =
+            bubble_cover_reads(&dict, 3, &graph).into_iter().collect();
+        cover_mid.sort();
+        assert_eq!(cover_mid, vec!["r1".to_string()]);
+    }
+
+    #[test]
+    fn source_and_sink_edges_do_not_get_genome_scale_intervals() {
+        let mut anchor = HashMap::new();
+        anchor.insert("A1".to_string(), json!({"pos": 900}));
+        anchor.insert("A2".to_string(), json!({"pos": 910}));
+
+        let mut edges = HashMap::new();
+        edges.insert(
+            "E_real".to_string(),
+            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1"], "variants": "5=1X4="}),
+        );
+        // SOURCE/SINK have no anchor coordinate. Defaulting the missing endpoint
+        // to 0/ref_length would give these edges a whole-genome interval and
+        // credit their reads as covering every variant in the graph.
+        edges.insert(
+            "E_source".to_string(),
+            json!({"src": ["SOURCE"], "dst": ["A2"], "reads": ["rs"], "variants": "5="}),
+        );
+        edges.insert(
+            "E_sink".to_string(),
+            json!({"src": ["A1"], "dst": ["SINK"], "reads": ["rk"], "variants": "5="}),
+        );
+
+        let graph = GraphicalGenome {
+            anchor,
+            edges,
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+        };
+        let dict = get_graph_intervals(&graph, 16569);
+
+        assert!(!dict.contains_key(&"E_source".to_string()));
+        assert!(!dict.contains_key(&"E_sink".to_string()));
+
+        // A distant position must pick up nothing at all.
+        assert!(bubble_cover_reads(&dict, 42, &graph).is_empty());
+        // The real bubble still resolves to exactly its own reads.
+        let cover: Vec<String> = bubble_cover_reads(&dict, 905, &graph).into_iter().collect();
+        assert_eq!(cover, vec!["r1".to_string()]);
+    }
+
+    #[test]
+    fn construct_matrix_keeps_reads_with_few_alt_calls() {
+        // Reads are the cells SCITE reasons over; dropping the ones carrying few
+        // ALT calls deletes the reference-like reads that anchor the root of the
+        // lineage, and on noisy data selects on error load rather than lineage.
+        let variants: Vec<Variant> = ["A", "C"]
+            .iter()
+            .enumerate()
+            .map(|(i, alt)| Variant {
+                pos: 100 + i,
+                ref_allele: "T".to_string(),
+                alt_allele: alt.to_string(),
+                variant_type: "SNP".to_string(),
+                allele_count: 1,
+                filter: None,
+            })
+            .collect();
+        let n0 = generate_variant_name(&variants[0]);
+        let n1 = generate_variant_name(&variants[1]);
+
+        // r_alt2 carries both ALTs, r_alt1 carries one, r_ref carries none.
+        let mut read_record: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+        read_record.insert(n0.clone(), vec![json!("r_alt2"), json!("r_alt1")]);
+        read_record.insert(n1.clone(), vec![json!("r_alt2")]);
+
+        let all: HashSet<String> = ["r_alt2", "r_alt1", "r_ref"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut cover_record = HashMap::new();
+        cover_record.insert(n0.clone(), all.clone());
+        cover_record.insert(n1.clone(), all.clone());
+
+        let (matrix, _vars, reads) = construct_matrix(&read_record, &cover_record, &variants);
+
+        let mut sorted = reads.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            vec!["r_alt1".to_string(), "r_alt2".to_string(), "r_ref".to_string()],
+            "every covered read must survive, including the all-reference one"
+        );
+        assert_eq!(matrix.ncols(), 3);
+
+        let col = |name: &str| reads.iter().position(|r| r == name).unwrap();
+        assert_eq!(matrix[[0, col("r_ref")]], 0.0);
+        assert_eq!(matrix[[1, col("r_ref")]], 0.0);
+        assert_eq!(matrix[[0, col("r_alt1")]], 1.0);
+        assert_eq!(matrix[[1, col("r_alt1")]], 0.0);
+        assert_eq!(matrix[[0, col("r_alt2")]], 1.0);
+        assert_eq!(matrix[[1, col("r_alt2")]], 1.0);
     }
 }

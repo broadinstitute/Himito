@@ -798,7 +798,13 @@ pub fn generate_cigar(
                 })
                 .len();
 
-            if allele_count <= minimal_read_count {
+            // Inclusive gate: an edge needs at least `minimal_read_count` reads.
+            // This was `<=` (i.e. strictly more than N), which with the default of
+            // 1 meant >=2 reads and left 108k of 109k edges on a real ONT graph
+            // un-CIGARed. Reads reaching a bubble only through those edges are not
+            // credited as covering it, so their genotypes became NaN rather than a
+            // ref call -- ~92% of depth at a given site.
+            if allele_count < minimal_read_count {
                 return (edge.clone(), None);
             }
 
@@ -1002,8 +1008,8 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
     let mut graph = agg::GraphicalGenome::load_graph(&tmp_gfa_path).unwrap();
 
     // generate cigar. `min_edge_reads` is the `minimal_read_count` gate: an edge
-    // is aligned (and can yield variants) only if it carries strictly more than
-    // this many reads. Lower it to recover low-frequency variants whose reads are
+    // is aligned (and can yield variants) only if it carries at least this many
+    // reads. Lower it to recover low-frequency variants whose reads are
     // fragmented across many low-count edges on noisy long reads.
     generate_cigar(&mut graph, &ref_header, k, maxlength, min_edge_reads);
     let graph_output = output.with_extension("gfa");

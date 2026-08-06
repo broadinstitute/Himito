@@ -180,11 +180,12 @@ enum Commands {
         length_max: usize,
 
         /// minimal reads on a graph edge before it is aligned into a CIGAR.
-        /// Variants are read only from CIGAR-bearing edges, so an edge with this
-        /// >1, i.e. >=2, reads). Lower to recover low-frequency variants whose
-        /// reads fragment across many low-count edges on noisy long reads, at the
-        /// cost of more false positives.
-        #[clap(long, value_parser, default_value_t = 1)]
+        /// Variants are read only from CIGAR-bearing edges, and reads reaching a
+        /// bubble solely through an un-CIGARed edge are not counted as covering it
+        /// (their genotype stays missing rather than ref). The default of 1 aligns
+        /// every read-supported edge; raise it to trade recall of low-frequency
+        /// variants for fewer false positives on noisy long reads.
+        #[clap(long, value_parser, default_value_t = 2)]
         min_edge_reads: usize,
 
     },

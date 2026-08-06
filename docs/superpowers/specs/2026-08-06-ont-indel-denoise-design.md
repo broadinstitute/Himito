@@ -89,7 +89,7 @@ floor(L) = max(indel_vaf, indel_floor_mult · ε(L))                  # candidac
 **Candidacy** (an allele is *kept*, i.e. eligible to receive reads, iff):
 
 1. `fwd ≥ min_strand && rev ≥ min_strand` — unchanged from the SNV design.
-2. `vaf = support / depth(norm_pos) ≥ floor(L)`. If `norm_pos` has no recorded column depth (it normalized past the first pileup column of the contig), the depth falls back to the maximum depth among the event's original anchor columns; if that is also zero, the site is left undecided and every read at it is untouched.
+2. `vaf = support / depth(norm_pos) ≥ floor(L)`. Site depth is accumulated directly as events are folded into their normalized site — every read contributing an observation, including a `None` (which votes REF), increments it. The denominator is therefore exact by construction, with no lookup and no fallback path for sites that normalize past the first pileup column.
 3. `call::strand_bias_pvalue(fwd, rev, column_fwd_frac) ≥ strand_bias_p`, with the same near-homoplasmic exemption at `homoplasmic_vaf` — a single-strand artifact cannot reach a near-homoplasmic frequency, so testing one would correct away a real variant.
 
 **REF is always kept**, mirroring "the reference allele is always eligible" in the SNV model.

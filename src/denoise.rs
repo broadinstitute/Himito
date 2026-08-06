@@ -5,6 +5,8 @@ use bio::io::fasta;
 use log::info;
 use rust_htslib::bam::{self, Read, Reader};
 
+pub(crate) mod indel;
+
 pub(crate) const NQ: usize = 94; // Phred qualities 0..=93
 
 /// Ceiling on the per-base error probability. Phred 0 literally means P(error) = 1,

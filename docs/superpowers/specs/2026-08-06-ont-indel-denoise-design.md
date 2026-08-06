@@ -89,12 +89,14 @@ floor(L) = max(indel_vaf, indel_floor_mult · ε(L))                  # candidac
 **Candidacy** (an allele is *kept*, i.e. eligible to receive reads, iff):
 
 1. `fwd ≥ min_strand && rev ≥ min_strand` — unchanged from the SNV design.
-2. `vaf = support / depth(norm_pos) ≥ floor(L)`. Site depth is accumulated directly as events are folded into their normalized site — every read contributing an observation, including a `None` (which votes REF), increments it. The denominator is therefore exact by construction, with no lookup and no fallback path for sites that normalize past the first pileup column.
+2. `vaf = support / depth(norm_pos) ≥ floor(L)`, where `depth(norm_pos)` is the **pileup depth at the site's own column**, recorded during the pass into a `pos → (depth, fwd, rev)` map. It cannot be a tally of observations: a read carrying an event reports `Indel::None` at the normalized column *and* its event at the anchor column, so counting observations counts that read twice, inflating the denominator and roughly halving every real indel's apparent frequency. ALT support comes from the normalized events; REF support is `depth − alt_total`. Sites whose column depth is zero are left undecided and every read at them is untouched.
 3. `call::strand_bias_pvalue(fwd, rev, column_fwd_frac) ≥ strand_bias_p`, with the same near-homoplasmic exemption at `homoplasmic_vaf` — a single-strand artifact cannot reach a near-homoplasmic frequency, so testing one would correct away a real variant.
 
 **REF is always kept**, mirroring "the reference allele is always eligible" in the SNV model.
 
 Allele frequencies `f` are raw proportions renormalized over the kept set — exactly what `fit_site` falls back to. This is deliberately *not* the full EM: upgrading to EM over the dynamic allele set is a drop-in later (§11).
+
+**`Z` normalizes over the kept set plus the observed allele**, not over the kept set alone. The observed allele is very often *not* kept — that is precisely the allele being corrected away. Normalizing over kept-only makes `Z` zero whenever REF is the sole survivor, which is the most common situation in real data: one read carrying a lone spurious indel. That read must still be corrected, so it has to appear in its own normalization.
 
 So a 1 bp deletion inside a 7-mer A-run must clear a far higher bar than the same deletion in unique sequence, which is where ONT's error mass actually sits.
 
@@ -125,7 +127,9 @@ The crossover is analytic and conservative: a read leaves its own allele only wh
 
 The third row is why this design is two-directional rather than revert-only: a one-directional model reverts the 2 bp read all the way to reference, leaving it disagreeing with consensus in the opposite direction.
 
-**Guards.** A read is reassignable at a site only if it spans the site's full footprint with plain `M`/`=`/`X` ops plus `--indel-flank` bases of margin on each side (default 5). Reads soft-clipped at the site are skipped. Skipped reads are counted (`reads_skipped_span_guard`).
+**Where assignment runs.** The pileup answers "what does this read have *at this column*", which cannot decide whether a read carries the event belonging to a site that normalization moved left — at the normalized column a carrier reports `Indel::None` exactly like a non-carrier. Assignment therefore runs **per record**, in the write-back pass, using the read's own CIGAR-derived normalized events (`read_events`). Pass 1 (pileup) accumulates site counts and column depths and decides sites; pass 2 (record walk) assigns and rewrites. The denoiser stays at two BAM passes and stores no per-read observation list.
+
+**Guards.** A read is reassignable at a site only if it extends `--indel-flank` reference bases to the **left** of the site and `flank + max_len` to the **right** — the asymmetry is because only a gained deletion consumes extra reference. A symmetric requirement is unsatisfiable near a contig start. A read is also skipped at sites within `flank + max_len` of an indel it carries that is at or above `max_len`: such a read cannot be represented by the site's alleles, and treating it as a clean REF observation would expose it to being "repaired" into an allele it cannot carry. Skipped reads are counted (`reads_skipped_span_guard`).
 
 ## 4. Write-back
 

@@ -16,7 +16,8 @@
 - **ONT only.** `data_type` not starting with `ont` remains a byte-identical passthrough copy.
 - **Reference-consumption invariant.** Every rewrite transition preserves the read's total reference consumption (sum of `M`/`=`/`X`/`D`/`N` lengths). `POS`, reference end, and coordinate-sort order are invariant. Assert this in every rewrite test.
 - **Exclusive length bound.** `indel_max_len` default `5` means lengths 1–4 are correctable; ≥ 5 is untouchable.
-- **Defaults (all tunable, all unvalidated until Task 9):** `max_len 5`, `vaf 0.05`, `err0 0.01`, `err_scale 1.5`, `err_cap 0.4`, `floor_mult 3.0`, `delta 0.3`, `flank 5`.
+- **Defaults (all tunable, all unvalidated until Task 10):** `max_len 5`, `vaf 0.05`, `err0 0.01`, `err_scale 1.5`, `err_cap 0.4`, `floor_mult 3.0`, `delta 0.3`, `flank 5`, `protect_vaf 0.2`.
+- **Substantial alleles are never corrected away.** An allele carried by `>= protect_vaf` of the reads at a site is left alone regardless of candidacy. Added after Task 3's review: `vaf_floor(L)` exceeds 1.0 once L >= 10, so in deep repeat contexts nothing clears candidacy and `assign_allele` would revert every read carrying a real indel to reference. Human mtDNA's poly-C tracts (m.303-315, m.16184-16193) are exactly that shape and are heteroplasmy hotspots. Protection applies symmetrically to REF.
 - **Reused SNV parameters:** `min_strand`, `strand_bias_p`, `homoplasmic_vaf` are shared with the existing substitution model — do not duplicate them into `IndelOpts`.
 - **Never invent sequence.** Inserted bases are always the site's consensus inserted bases or reference bases, never a per-read guess.
 - **Depth is per-column, never a tally of observations.** A read carrying an event reports `Indel::None` at the normalized site's own column *and* its event at the anchor column; counting both double-counts that read and halves every real indel's apparent VAF. The denominator is the pileup depth at `norm_pos`.
@@ -2771,6 +2772,12 @@ In `src/main.rs`, add the flags to the `Denoise` subcommand, immediately before 
         /// reads must extend this many bases past a site on both sides to be reassigned
         #[clap(long, value_parser, default_value_t = 5)]
         indel_flank: usize,
+
+        /// an allele carried by at least this fraction of reads at a site is never
+        /// corrected away, whatever candidacy says (protects real heteroplasmy in
+        /// deep repeat contexts, where the candidacy floor can exceed 1.0)
+        #[clap(long, value_parser, default_value_t = 0.2)]
+        indel_protect_vaf: f64,
 ```
 
 Replace the `Denoise` handler (lines 629-647):
@@ -2794,6 +2801,7 @@ Replace the `Denoise` handler (lines 629-647):
             indel_floor_mult,
             indel_delta,
             indel_flank,
+            indel_protect_vaf,
             stats,
         } => {
             let iopts = denoise::indel::IndelOpts {
@@ -2806,6 +2814,7 @@ Replace the `Denoise` handler (lines 629-647):
                 floor_mult: indel_floor_mult,
                 delta: indel_delta,
                 flank: indel_flank,
+                protect_vaf: indel_protect_vaf,
             };
             if let Err(e) = denoise::start(
                 &input, &output, &reference, &data_type, vaf, min_strand,
@@ -2836,7 +2845,7 @@ Run: `cargo test denoise:: 2>&1 | tail -30`
 Expected: all tests PASS.
 
 Run: `cargo build --release && ./target/release/Himito denoise --help 2>&1 | grep -c indel`
-Expected: `9` (one line per new flag).
+Expected: at least `10` (one line per new flag).
 
 - [ ] **Step 5: Commit**
 

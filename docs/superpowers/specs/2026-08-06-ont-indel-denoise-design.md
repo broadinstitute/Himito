@@ -129,6 +129,8 @@ The third row is why this design is two-directional rather than revert-only: a o
 
 **Where assignment runs.** The pileup answers "what does this read have *at this column*", which cannot decide whether a read carries the event belonging to a site that normalization moved left — at the normalized column a carrier reports `Indel::None` exactly like a non-carrier. Assignment therefore runs **per record**, in the write-back pass, using the read's own CIGAR-derived normalized events (`read_events`). Pass 1 (pileup) accumulates site counts and column depths and decides sites; pass 2 (record walk) assigns and rewrites. The denoiser stays at two BAM passes and stores no per-read observation list.
 
+**Substantial alleles are protected unconditionally.** Before any reassignment, if the read's *observed* allele has a raw VAF of at least `indel_protect_vaf` (default 0.2) at the site, the read is left alone whatever candidacy decided. This is necessary because `floor(L)` exceeds 1.0 once L >= 10, so in deep repeat contexts no allele can clear candidacy at all — and without this guard the site would collapse to REF-only and every read carrying a real indel would be reverted. A genuine 50/50 length heteroplasmy in a 12-mer poly-C tract would be destroyed read by read, and human mtDNA's m.303-315 and m.16184-16193 poly-C tracts are exactly that shape. Protection applies symmetrically: a substantial REF allele is equally safe from being converted into an indel.
+
 **Guards.** A read is reassignable at a site only if it extends `--indel-flank` reference bases to the **left** of the site and `flank + max_len` to the **right** — the asymmetry is because only a gained deletion consumes extra reference. A symmetric requirement is unsatisfiable near a contig start. A read is also skipped at sites within `flank + max_len` of an indel it carries that is at or above `max_len`: such a read cannot be represented by the site's alleles, and treating it as a clean REF observation would expose it to being "repaired" into an allele it cannot carry. Skipped reads are counted (`reads_skipped_span_guard`).
 
 ## 4. Write-back
@@ -206,6 +208,7 @@ pub struct IndelOpts {
     pub floor_mult: f64,    // --indel-floor-mult       default 3.0
     pub delta: f64,         // --indel-delta            default 0.3
     pub flank: usize,       // --indel-flank            default 5
+    pub protect_vaf: f64,   // --indel-protect-vaf      default 0.2
 }
 impl Default for IndelOpts { /* enabled: false */ }
 ```

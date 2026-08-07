@@ -877,7 +877,7 @@ The only length-changing code in the denoiser. It rebuilds SEQ, QUAL, and CIGAR 
 
 **Interfaces:**
 - Consumes: `Allele` from `super::indel`.
-- Produces: `pub struct IndelEdit { pub ref_pos: u32, pub from: Allele, pub to: Allele }`; `pub struct ReadEdits { pub subs: Vec<(u32, u8)>, pub indels: Vec<IndelEdit> }` (`Default`); `pub struct RewriteResult { pub seq: Vec<u8>, pub qual: Vec<u8>, pub cigar: CigarString, pub len_changed: bool }`; `pub fn rewrite_read(pos: i64, cigar: &CigarString, seq: &[u8], qual: &[u8], edits: &ReadEdits, refseq: &[u8]) -> RewriteResult`; `pub fn ref_consumed(c: &CigarString) -> u32`.
+- Produces: `pub struct IndelEdit { pub ref_pos: u32, pub from: Allele, pub to: Allele }`; `pub struct ReadEdits { pub subs: Vec<(u32, u8)>, pub indels: Vec<IndelEdit> }` (`Default`); `pub struct RewriteResult { pub seq: Vec<u8>, pub qual: Vec<u8>, pub cigar: CigarString, pub structure_changed: bool }`; `pub fn rewrite_read(pos: i64, cigar: &CigarString, seq: &[u8], qual: &[u8], edits: &ReadEdits, refseq: &[u8]) -> RewriteResult`; `pub fn ref_consumed(c: &CigarString) -> u32`.
 
 - [ ] **Step 1: Create the module with a stub and the failing tests**
 
@@ -925,7 +925,7 @@ pub struct RewriteResult {
     pub seq: Vec<u8>,
     pub qual: Vec<u8>,
     pub cigar: CigarString,
-    pub len_changed: bool,
+    pub structure_changed: bool,
 }
 
 /// Total reference bases consumed by a CIGAR (M/=/X/D/N). The rewrite invariant.
@@ -1618,7 +1618,7 @@ fn apply_corrections(
                     let out =
                         rewrite_read(rec.pos(), &cigar, &seq, &qual, edits, refseq);
                     rec.set(&qname, Some(&out.cigar), &out.seq, &out.qual);
-                    if out.len_changed {
+                    if out.structure_changed {
                         strip_stale_tags(&mut rec);
                     }
                     reads_modified += 1;
@@ -2563,7 +2563,7 @@ fn apply_corrections(
                 let qual = rec.qual().to_vec();
                 let out = rewrite_read(rec.pos(), &cigar, &seq, &qual, &edits, refseq);
                 rec.set(&qname, Some(&out.cigar), &out.seq, &out.qual);
-                if out.len_changed {
+                if out.structure_changed {
                     strip_stale_tags(&mut rec);
                 }
                 reads_modified += 1;

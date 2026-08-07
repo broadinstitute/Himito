@@ -186,7 +186,7 @@ Bases added by the walk (reverting a deletion, or adding consensus `INS` bases t
 
 ### 4.5 Auxiliary tags
 
-For any read whose **length changed**:
+For any read whose **structure changed** — meaning at least one indel edit was applied. Output length is not a sound proxy: an insertion at one site and a deletion at another can offset each other, leaving SEQ the same length while the CIGAR and every downstream query offset have shifted. In that case:
 
 - Strip `MM`, `ML`, `MN`. Base-modification tags are indexed by the read's own base positions and their semantics are broken by a length change. This is safe because `methyl::start` runs on the **original** mt BAM (`src/main.rs:594`), consistent with the v1 methylation-safety decision.
 - Strip `NM`, `MD`, `cs` as stale.

@@ -291,6 +291,27 @@ pub fn rewrite_read(
     }
 }
 
+/// Remove tags invalidated by a length change.
+///
+/// `MM`/`ML`/`MN` are base-modification tags indexed by the read's own base
+/// positions; a length change silently desynchronizes them. This is safe here
+/// because methylation aggregation runs on the ORIGINAL mt BAM (see main.rs
+/// QuickStart), not the denoised one. `NM`/`MD`/`cs` describe the pre-edit
+/// alignment and are simply stale.
+pub fn strip_stale_tags(rec: &mut rust_htslib::bam::Record) {
+    for tag in [
+        b"MM".as_slice(),
+        b"ML".as_slice(),
+        b"MN".as_slice(),
+        b"NM".as_slice(),
+        b"MD".as_slice(),
+        b"cs".as_slice(),
+    ] {
+        // Absent tags are expected; removal failure just means "wasn't there".
+        let _ = rec.remove_aux(tag);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -590,5 +611,40 @@ mod tests {
         assert_eq!(r.qual, qual);
         assert!(!r.structure_changed);
         assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn stale_tags_are_stripped_and_others_survive() {
+        use rust_htslib::bam::record::{Aux, Record};
+
+        let mut rec = Record::new();
+        rec.set(
+            b"r1",
+            Some(&cig(vec![Cigar::Match(4)])),
+            b"ACGT",
+            &[30u8; 4],
+        );
+        rec.push_aux(b"MM", Aux::String("C+m,0;")).unwrap();
+        rec.push_aux(b"ML", Aux::U8(200)).unwrap();
+        rec.push_aux(b"NM", Aux::I32(2)).unwrap();
+        rec.push_aux(b"XY", Aux::I32(7)).unwrap();
+
+        strip_stale_tags(&mut rec);
+
+        assert!(rec.aux(b"MM").is_err(), "MM must be stripped");
+        assert!(rec.aux(b"ML").is_err(), "ML must be stripped");
+        assert!(rec.aux(b"NM").is_err(), "NM must be stripped");
+        assert!(matches!(rec.aux(b"XY").unwrap(), Aux::I32(7)), "unrelated tags must survive");
+    }
+
+    #[test]
+    fn stripping_absent_tags_is_a_no_op() {
+        use rust_htslib::bam::record::{Aux, Record};
+
+        let mut rec = Record::new();
+        rec.set(b"r1", Some(&cig(vec![Cigar::Match(4)])), b"ACGT", &[30u8; 4]);
+        rec.push_aux(b"XY", Aux::I32(7)).unwrap();
+        strip_stale_tags(&mut rec); // must not panic on missing tags
+        assert!(matches!(rec.aux(b"XY").unwrap(), Aux::I32(7)));
     }
 }

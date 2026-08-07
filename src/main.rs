@@ -227,6 +227,48 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.95)]
         homoplasmic_vaf: f64,
 
+        /// enable small-indel (<5bp) correction in addition to substitutions
+        #[clap(long, value_parser, default_value_t = false)]
+        indels: bool,
+
+        /// exclusive upper bound on correctable indel length (5 = lengths 1..=4)
+        #[clap(long, value_parser, default_value_t = 5)]
+        indel_max_len: u32,
+
+        /// absolute minimal VAF floor for an indel allele to be kept
+        #[clap(long, value_parser, default_value_t = 0.05)]
+        indel_vaf: f64,
+
+        /// per-junction indel error probability in unique sequence
+        #[clap(long, value_parser, default_value_t = 0.01)]
+        indel_err0: f64,
+
+        /// multiplicative growth of the indel error rate per extra repeat copy
+        #[clap(long, value_parser, default_value_t = 1.5)]
+        indel_err_scale: f64,
+
+        /// ceiling on the context-scaled indel error rate
+        #[clap(long, value_parser, default_value_t = 0.4)]
+        indel_err_cap: f64,
+
+        /// candidacy floor is at least this multiple of the local indel error rate
+        #[clap(long, value_parser, default_value_t = 3.0)]
+        indel_floor_mult: f64,
+
+        /// decay of error mass per unit of net-length distance between alleles
+        #[clap(long, value_parser, default_value_t = 0.3)]
+        indel_delta: f64,
+
+        /// reads must extend this many bases past a site on both sides to be reassigned
+        #[clap(long, value_parser, default_value_t = 5)]
+        indel_flank: usize,
+
+        /// an allele carried by at least this fraction of reads at a site is never
+        /// corrected away, whatever candidacy says (protects real heteroplasmy in
+        /// deep repeat contexts, where the candidacy floor can exceed 1.0)
+        #[clap(long, value_parser, default_value_t = 0.2)]
+        indel_protect_vaf: f64,
+
         /// optional path to write denoise statistics as JSON
         #[clap(long, value_parser)]
         stats: Option<PathBuf>,
@@ -552,7 +594,11 @@ fn main() {
                 // and call.rs's own permutation/homoplasmic threshold).
                 if let Err(e) = denoise::start(
                     &mt_output, &denoised, &reference_path, &data_type,
-                    vaf_threshold as f64, 2, 0.01, 0.7, None,
+                    vaf_threshold as f64, 2, 0.01, 0.7,
+                    // Indel correction stays off in QuickStart until the lineage_sim
+                    // validation gate in the design doc passes.
+                    &denoise::indel::IndelOpts::default(),
+                    None,
                 ) {
                     eprintln!("Warning: denoise failed ({e:#}); falling back to raw mt BAM.");
                     (mt_output.clone(), data_type.as_str())
@@ -635,11 +681,33 @@ fn main() {
             min_strand,
             strand_bias_p,
             homoplasmic_vaf,
+            indels,
+            indel_max_len,
+            indel_vaf,
+            indel_err0,
+            indel_err_scale,
+            indel_err_cap,
+            indel_floor_mult,
+            indel_delta,
+            indel_flank,
+            indel_protect_vaf,
             stats,
         } => {
+            let iopts = denoise::indel::IndelOpts {
+                enabled: indels,
+                max_len: indel_max_len,
+                vaf: indel_vaf,
+                err0: indel_err0,
+                err_scale: indel_err_scale,
+                err_cap: indel_err_cap,
+                floor_mult: indel_floor_mult,
+                delta: indel_delta,
+                flank: indel_flank,
+                protect_vaf: indel_protect_vaf,
+            };
             if let Err(e) = denoise::start(
                 &input, &output, &reference, &data_type, vaf, min_strand,
-                strand_bias_p, homoplasmic_vaf, stats.as_ref(),
+                strand_bias_p, homoplasmic_vaf, &iopts, stats.as_ref(),
             ) {
                 eprintln!("Error running denoise: {e:#}");
                 std::process::exit(1);

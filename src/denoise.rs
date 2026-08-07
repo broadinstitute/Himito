@@ -967,6 +967,7 @@ pub fn start(
     min_strand: u32,
     strand_bias_p: f64,
     homoplasmic_vaf: f64,
+    indels: &indel::IndelOpts,
     stats_out: Option<&PathBuf>,
 ) -> Result<()> {
     // PacBio (and anything non-ONT) is a byte-identical passthrough.
@@ -986,14 +987,11 @@ pub fn start(
         refs.insert(rec.id().as_bytes().to_vec(), rec.seq().to_ascii_uppercase());
     }
 
-    // The `indels` parameter arrives in Task 9; until then indel correction stays
-    // disabled here, matching `IndelOpts::default()`.
-    let default_iopts = indel::IndelOpts::default();
     let (corrections, models, mut stats) = compute_corrections(
-        input, &refs, min_strand, vaf, strand_bias_p, homoplasmic_vaf, &default_iopts,
+        input, &refs, min_strand, vaf, strand_bias_p, homoplasmic_vaf, indels,
     )?;
     let (reads_processed, reads_modified) = apply_corrections(
-        input, output, &corrections, &refs, &models, &default_iopts, &mut stats,
+        input, output, &corrections, &refs, &models, indels, &mut stats,
     )?;
     stats.reads_processed = reads_processed;
     stats.reads_modified = reads_modified;
@@ -1012,6 +1010,18 @@ pub fn start(
         stats.columns_processed, stats.columns_corrected, stats.columns_skipped,
         stats.alt_sites_preserved, stats.alt_alleles_strand_biased,
     );
+
+    if indels.enabled {
+        info!(
+            "[denoise] indel sites {} examined / {} alt alleles kept / {} strand-biased; \
+             reads reassigned ref->ins {} ref->del {} indel->ref {} indel->indel {}; \
+             skipped span-guard {} unsupported-transition {}",
+            stats.indel_sites_examined, stats.indel_alt_alleles_kept, stats.indel_alt_alleles_strand_biased,
+            stats.reads_reassigned_ref_to_ins, stats.reads_reassigned_ref_to_del,
+            stats.reads_reassigned_indel_to_ref, stats.reads_reassigned_indel_to_indel,
+            stats.assignments_skipped_span_guard, stats.assignments_skipped_unsupported_transition,
+        );
+    }
 
     if let Some(path) = stats_out {
         let json = serde_json::to_string_pretty(&stats).context("serialize stats")?;
@@ -1323,7 +1333,7 @@ mod tests {
         std::fs::write(&reff, ">chrM\nAAAAAA\n").unwrap();
         write_test_bam(&inb, "chrM", 6, &[("r0", 0, b"AAGAAA", false)]);
 
-        start(&inb, &outb, &reff, "pacbio", 0.01, 2, SB_P, HOM_VAF, None).unwrap();
+        start(&inb, &outb, &reff, "pacbio", 0.01, 2, SB_P, HOM_VAF, &indel::IndelOpts::default(), None).unwrap();
         assert_eq!(std::fs::read(&inb).unwrap(), std::fs::read(&outb).unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1343,7 +1353,7 @@ mod tests {
         reads.push(("rerr", 0, b"AAGAAA", false));
         write_test_bam(&inb, "chrM", 6, &reads);
 
-        start(&inb, &outb, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, Some(&statsf)).unwrap();
+        start(&inb, &outb, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, &indel::IndelOpts::default(), Some(&statsf)).unwrap();
 
         let mut r = Reader::from_path(&outb).unwrap();
         let mut modified_ok = false;
@@ -2692,6 +2702,81 @@ mod tests {
             stats.indel_edits_emitted_but_not_applied, 1,
             "the other duplicate-keyed edit must be reported as not applied"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn start_with_indels_disabled_is_byte_identical_to_v1() {
+        // The opt-in guarantee: with the default IndelOpts, denoised output must not
+        // differ by a single byte from the substitution-only behavior.
+        let dir = std::env::temp_dir().join("himito_denoise_optin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let out_a = dir.join("a.bam");
+        let out_b = dir.join("b.bam");
+        let reff = dir.join("ref.fa");
+        std::fs::write(&reff, ">chrM\nACGTACGTAAAAAAAACGTACGTACGTAC\n").unwrap();
+
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
+        }
+        reads.push(("rins", 0, UNIQ_INS_SEQ, uniq_ins_cigar(), false));
+        write_cigar_bam(&inb, "chrM", 29, &reads);
+
+        let off = indel::IndelOpts::default();
+        start(&inb, &out_a, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, &off, None).unwrap();
+        start(&inb, &out_b, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, &off, None).unwrap();
+        assert_eq!(std::fs::read(&out_a).unwrap(), std::fs::read(&out_b).unwrap());
+
+        // And the indel-bearing read keeps its insertion.
+        let mut r = Reader::from_path(&out_a).unwrap();
+        let mut seen = false;
+        for rec in r.records() {
+            let rec = rec.unwrap();
+            if rec.qname() == b"rins" {
+                assert_eq!(rec.seq().as_bytes(), UNIQ_INS_SEQ);
+                seen = true;
+            }
+        }
+        assert!(seen);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn start_with_indels_enabled_removes_the_spurious_insertion() {
+        let dir = std::env::temp_dir().join("himito_denoise_optin_on");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+        let reff = dir.join("ref.fa");
+        let statsf = dir.join("stats.json");
+        std::fs::write(&reff, ">chrM\nACGTACGTAAAAAAAACGTACGTACGTAC\n").unwrap();
+
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
+        }
+        reads.push(("rins", 0, UNIQ_INS_SEQ, uniq_ins_cigar(), false));
+        write_cigar_bam(&inb, "chrM", 29, &reads);
+
+        let mut on = indel::IndelOpts::default();
+        on.enabled = true;
+        start(&inb, &outb, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, &on, Some(&statsf)).unwrap();
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let mut seen = false;
+        for rec in r.records() {
+            let rec = rec.unwrap();
+            if rec.qname() == b"rins" {
+                assert_eq!(rec.seq().as_bytes(), CLEAN_SEQ, "insertion must be removed");
+                assert_eq!(rec.cigar().to_string(), "29M", "CIGAR must be rebuilt");
+                seen = true;
+            }
+        }
+        assert!(seen);
+        let json = std::fs::read_to_string(&statsf).unwrap();
+        assert!(json.contains("\"reads_reassigned_indel_to_ref\": 1"));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

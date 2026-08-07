@@ -291,13 +291,16 @@ pub fn rewrite_read(
     }
 }
 
-/// Remove tags invalidated by a length change.
+/// Remove tags invalidated by a structural change.
 ///
 /// `MM`/`ML`/`MN` are base-modification tags indexed by the read's own base
-/// positions; a length change silently desynchronizes them. This is safe here
-/// because methylation aggregation runs on the ORIGINAL mt BAM (see main.rs
-/// QuickStart), not the denoised one. `NM`/`MD`/`cs` describe the pre-edit
-/// alignment and are simply stale.
+/// positions; any applied indel edit (see `RewriteResult::structure_changed`)
+/// silently desynchronizes them. Output length is not a sound proxy for this:
+/// an insertion at one site and a deletion at another can offset each other,
+/// leaving SEQ length unchanged while the CIGAR and every downstream query
+/// offset still shift. Stripping is safe here because methylation aggregation
+/// runs on the ORIGINAL mt BAM (see main.rs QuickStart), not the denoised
+/// one. `NM`/`MD`/`cs` describe the pre-edit alignment and are simply stale.
 pub fn strip_stale_tags(rec: &mut rust_htslib::bam::Record) {
     for tag in [
         b"MM".as_slice(),
@@ -626,14 +629,20 @@ mod tests {
         );
         rec.push_aux(b"MM", Aux::String("C+m,0;")).unwrap();
         rec.push_aux(b"ML", Aux::U8(200)).unwrap();
+        rec.push_aux(b"MN", Aux::I32(4)).unwrap();
         rec.push_aux(b"NM", Aux::I32(2)).unwrap();
+        rec.push_aux(b"MD", Aux::String("4")).unwrap();
+        rec.push_aux(b"cs", Aux::String(":4")).unwrap();
         rec.push_aux(b"XY", Aux::I32(7)).unwrap();
 
         strip_stale_tags(&mut rec);
 
         assert!(rec.aux(b"MM").is_err(), "MM must be stripped");
         assert!(rec.aux(b"ML").is_err(), "ML must be stripped");
+        assert!(rec.aux(b"MN").is_err(), "MN must be stripped");
         assert!(rec.aux(b"NM").is_err(), "NM must be stripped");
+        assert!(rec.aux(b"MD").is_err(), "MD must be stripped");
+        assert!(rec.aux(b"cs").is_err(), "cs must be stripped");
         assert!(matches!(rec.aux(b"XY").unwrap(), Aux::I32(7)), "unrelated tags must survive");
     }
 

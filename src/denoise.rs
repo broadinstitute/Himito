@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bio::io::fasta;
-use log::info;
+use log::{info, warn};
 use rust_htslib::bam::{self, Read, Reader};
 
-use crate::denoise::rewrite::{rewrite_read, strip_stale_tags, ReadEdits};
+use crate::denoise::rewrite::{rewrite_read, strip_stale_tags};
 
 pub(crate) mod indel;
 pub(crate) mod rewrite;
@@ -380,7 +380,12 @@ fn apply_corrections(
 
     let mut reads_processed = 0u64;
     let mut reads_modified = 0u64;
-    let empty: Vec<u8> = Vec::new();
+    // Contigs referenced by a correctable, edit-bearing record but absent from
+    // `refs`, and how many such records were affected. Tracked so a missing
+    // reference contig is loud (one warning) rather than silently splicing
+    // filler bases once indel edits exist (see FIX 1).
+    let mut missing_ref_contigs: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    let mut missing_ref_reads = 0u64;
 
     for result in reader.records() {
         let mut rec = result.context("read BAM record")?;
@@ -391,25 +396,47 @@ fn apply_corrections(
             reads_processed += 1;
             if let Some(edits) = corrections.get(rec.qname()) {
                 if !edits.is_empty() {
-                    let refseq = refs
-                        .get(header_view.tid2name(rec.tid() as u32))
-                        .unwrap_or(&empty);
-                    // Extract owned parts, rewrite, rebuild (aux preserved by set()).
-                    let qname = rec.qname().to_vec();
-                    let cigar = rec.cigar().take();
-                    let seq = rec.seq().as_bytes();
-                    let qual = rec.qual().to_vec();
-                    let out =
-                        rewrite_read(rec.pos(), &cigar, &seq, &qual, edits, refseq);
-                    rec.set(&qname, Some(&out.cigar), &out.seq, &out.qual);
-                    if out.structure_changed {
-                        strip_stale_tags(&mut rec);
+                    let contig = header_view.tid2name(rec.tid() as u32);
+                    match refs.get(contig) {
+                        Some(refseq) => {
+                            // Extract owned parts, rewrite, rebuild (aux preserved by set()).
+                            let qname = rec.qname().to_vec();
+                            let cigar = rec.cigar().take();
+                            let seq = rec.seq().as_bytes();
+                            let qual = rec.qual().to_vec();
+                            let out =
+                                rewrite_read(rec.pos(), &cigar, &seq, &qual, edits, refseq);
+                            rec.set(&qname, Some(&out.cigar), &out.seq, &out.qual);
+                            if out.structure_changed {
+                                strip_stale_tags(&mut rec);
+                            }
+                            reads_modified += 1;
+                        }
+                        None => {
+                            // Contig not in the supplied reference: do not rewrite
+                            // this record. Writing it through unchanged is safe;
+                            // fabricating a reference slice is not (it would let
+                            // the deletion-reversion path splice `N` filler into
+                            // real reads).
+                            missing_ref_contigs.insert(contig.to_vec());
+                            missing_ref_reads += 1;
+                        }
                     }
-                    reads_modified += 1;
                 }
             }
         }
         writer.write(&rec).context("write BAM record")?;
+    }
+    if missing_ref_reads > 0 {
+        let contigs = missing_ref_contigs
+            .iter()
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            "[denoise] {missing_ref_reads} correctable read(s) on contig(s) [{contigs}] \
+             not found in the supplied reference; written through unchanged."
+        );
     }
     Ok((reads_processed, reads_modified))
 }
@@ -740,7 +767,7 @@ mod tests {
         let mut corr: Corrections = HashMap::new();
         corr.insert(
             b"rerr".to_vec(),
-            ReadEdits { subs: vec![(2u32, b'A')], indels: vec![] },
+            rewrite::ReadEdits { subs: vec![(2u32, b'A')], indels: vec![] },
         );
         let mut refs = HashMap::new();
         refs.insert(b"chrM".to_vec(), b"AAAAAA".to_vec());
@@ -830,6 +857,76 @@ mod tests {
         let edits = corr.get(&b"rerr".to_vec()).expect("rerr must be corrected");
         assert_eq!(edits.subs, vec![(2u32, b'A')]);
         assert!(edits.indels.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrections_use_reference_position_not_query_offset() {
+        // Reads aligned at POS 10 (not 0): the erroneous base sits at read/query
+        // offset 2, which maps to REFERENCE position 12 (10 + 2). At POS 0 those
+        // two numbers coincide (2 == 2), so a fixture like
+        // `corrections_are_keyed_by_reference_position` above cannot distinguish
+        // a reference-keyed implementation from a query-offset-keyed one -- both
+        // would record the key as 2. With a nonzero POS the two coordinate
+        // systems disagree (12 != 2), so asserting the recorded key is 12 (not
+        // 2) actually exercises the reference-coordinate semantics.
+        let dir = std::env::temp_dir().join("himito_denoise_refcoord_nonzero_pos");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        // Reference long enough to cover POS 10 + a 6bp read.
+        let refseq = vec![b'A'; 20];
+        let clean = b"AAAAAA";
+        let errd = b"AAGAAA"; // error at read offset 2 -> reference position 10+2=12
+        let mut reads: Vec<(&str, i64, &[u8], bool)> = vec![];
+        for i in 0..9 {
+            reads.push((["r0","r1","r2","r3","r4","r5","r6","r7","r8"][i], 10, clean, i % 2 == 0));
+        }
+        reads.push(("rerr", 10, errd, false));
+        write_test_bam(&bam, "chrM", 20, &reads);
+
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), refseq);
+        let (corr, _) = compute_corrections(&bam, &refs, 2, 0.01, SB_P, HOM_VAF).unwrap();
+
+        let edits = corr.get(&b"rerr".to_vec()).expect("rerr must be corrected");
+        // The recorded key must be the REFERENCE position (12), not the query
+        // offset (2) at which the erroneous base actually occurs in the read.
+        assert_eq!(edits.subs, vec![(12u32, b'A')]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn apply_corrections_missing_contig_writes_through_unchanged() {
+        // A record on a contig absent from `refs`, with a correction registered
+        // for its qname, must NOT be rewritten: fabricating a reference slice
+        // for a missing contig is unsafe once indel edits exist (the
+        // deletion-reversion path would splice `N` filler into real reads).
+        let dir = std::env::temp_dir().join("himito_denoise_missing_contig");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        write_test_bam(&inb, "chrM", 6, &[("rerr", 0, b"AAGAAA", false)]);
+
+        let mut corr: Corrections = HashMap::new();
+        corr.insert(
+            b"rerr".to_vec(),
+            rewrite::ReadEdits { subs: vec![(2u32, b'A')], indels: vec![] },
+        );
+        // Deliberately do NOT insert "chrM" -- simulates a BAM whose contig is
+        // missing from the supplied reference FASTA.
+        let refs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+
+        let (proc, modified) = apply_corrections(&inb, &outb, &corr, &refs).unwrap();
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 0, "a record on a contig missing from refs must not be rewritten");
+
+        let mut orig_reader = Reader::from_path(&inb).unwrap();
+        let orig_rec = orig_reader.records().next().unwrap().unwrap();
+        let mut out_reader = Reader::from_path(&outb).unwrap();
+        let out_rec = out_reader.records().next().unwrap().unwrap();
+        assert_eq!(out_rec.seq().as_bytes(), orig_rec.seq().as_bytes(), "SEQ must be byte-for-byte unchanged");
+        assert_eq!(out_rec.cigar().take(), orig_rec.cigar().take(), "CIGAR must be byte-for-byte unchanged");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

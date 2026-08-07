@@ -91,13 +91,22 @@ samtools index "$BAM"
 # defaults (0.01 p / 0.7 homoplasmic-exempt) are quick-start's own hardcoded
 # values, and match the Denoise subcommand's CLI defaults, so they're left
 # implicit below.
+#
+# Indel denoising is OFF by default, matching quick-start. Set DENOISE_INDELS=1 to
+# run the off-vs-on comparison the design's ship gate requires:
+#   GFA edge/anchor count and matrix column count must drop, with no regression in
+#   the lineage tree score or small-indel precision/recall.
+DENOISE_INDELS="${DENOISE_INDELS:-0}"
 
 BUILD_BAM="$BAM"
 CALL_DATATYPE="$DTYPE"
 if [[ "$DTYPE" == ont-* ]]; then
   DENOISED="$HDIR/aln.denoised.bam"
-  "$HIMITO" denoise -i "$BAM" -o "$DENOISED" -r "$REF" -d "$DTYPE" \
-    --vaf "$VAF" --min-strand 2 --stats "$HDIR/denoise_stats.json"
+  DENOISE_ARGS=(--vaf "$VAF" --min-strand 2 --stats "$HDIR/denoise_stats.json")
+  if [[ "$DENOISE_INDELS" == "1" ]]; then
+    DENOISE_ARGS+=(--indels)
+  fi
+  "$HIMITO" denoise -i "$BAM" -o "$DENOISED" -r "$REF" -d "$DTYPE" "${DENOISE_ARGS[@]}"
   samtools index "$DENOISED"
   BUILD_BAM="$DENOISED"
   CALL_DATATYPE="ont-denoised"

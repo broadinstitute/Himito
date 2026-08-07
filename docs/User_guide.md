@@ -179,6 +179,97 @@ Example:
 ./target/release/Himito methyl -g HG002_mt.annotated.gfa -p 0.7 -b HG002_mt.bam -o HG002_methylation.bed
 ```
 
+### denoise - ONT Read Denoising
+Corrects sequencing errors in an ONT BAM before graph construction. Substitution
+correction runs for any `ont-*` data type (pacbio and other data types pass through
+unchanged); small-indel correction is available in addition but is **opt-in**.
+
+```
+./target/release/Himito denoise [OPTIONS]
+```
+
+Required Parameters:
+- -i, --input <FILE>: Input BAM (coordinate-sorted)
+- -o, --output <FILE>: Output denoised BAM
+- -r, --reference <FILE>: Mitochondrial reference genome (FASTA)
+
+Commonly used optional parameters (run `Himito denoise --help` for the full list):
+- -d, --data-type <STRING>: only `ont-*` is denoised, others pass through unchanged [default: ont-r10]
+- --vaf <FLOAT>: minimal VAF for a substitution allele to be kept [default: 0.01]
+- --min-strand <INT>: minimal observations required on each strand for allele candidacy [default: 2]
+- --stats <FILE>: optional path to write denoise statistics as JSON
+
+Example:
+```
+./target/release/Himito denoise -i HG002_mt.bam -o HG002_mt.denoised.bam -r rCRS.fasta -d ont-r10 --stats HG002_denoise_stats.json
+```
+
+#### Small-indel denoising (ONT, opt-in)
+
+`Himito denoise --indels` extends substitution correction to indels shorter than
+`--indel-max-len` (default 5, exclusive — so lengths 1-4). Reads are reassigned at
+left-normalized indel sites in both directions: a read can lose a spurious indel,
+gain a consensus indel it dropped, or snap from one indel allele to another of the
+same kind.
+
+Correction aggressiveness is governed by a repeat-context-scaled error rate: an indel
+inside a long homopolymer must clear a much higher frequency bar than the same indel
+in unique sequence, because that is where ONT's indel errors concentrate. A read only
+leaves its own allele when that allele's frequency falls below `eps / (1 - eps)` of a
+competing one.
+
+**Not enabled by Quick Start.** `Himito quick-start` already runs substitution
+denoising automatically for ONT data, but indel correction stays off there — you must
+run `Himito denoise --indels` yourself (as a stepwise, standalone call) to get it.
+
+Indel-specific flags and their defaults (from `Himito denoise --help`):
+- `--indels`: enable small-indel (<5bp) correction in addition to substitutions [off by default]
+- `--indel-max-len <INT>`: exclusive upper bound on correctable indel length [default: 5]
+- `--indel-vaf <FLOAT>`: absolute minimal VAF floor for an indel allele to be kept [default: 0.05]
+- `--indel-err0 <FLOAT>`: per-junction indel error probability in unique sequence [default: 0.01]
+- `--indel-err-scale <FLOAT>`: multiplicative growth of the indel error rate per extra repeat copy [default: 1.5]
+- `--indel-err-cap <FLOAT>`: ceiling on the context-scaled indel error rate [default: 0.4]
+- `--indel-floor-mult <FLOAT>`: candidacy floor is at least this multiple of the local indel error rate [default: 3]
+- `--indel-delta <FLOAT>`: decay of error mass per unit of net-length distance between alleles [default: 0.3]
+- `--indel-flank <INT>`: reads must extend this many bases past a site on both sides to be reassigned [default: 5]
+- `--indel-protect-vaf <FLOAT>`: an allele carried by at least this fraction of reads at a site is never corrected away, whatever candidacy says [default: 0.2]
+
+**Why `--indel-protect-vaf` exists.** In deep repeat contexts (e.g. the mtDNA poly-C
+tracts at m.303-315 and m.16184-16193) the candidacy floor computed from
+`--indel-floor-mult` and the repeat-scaled error rate can exceed 1.0, so no allele
+could ever clear it. Without a guard, every read carrying a real indel in these
+regions would be reverted to reference, destroying genuine heteroplasmy in exactly the
+loci where it concentrates. `--indel-protect-vaf` fixes this: any allele carried by at
+least that fraction of reads at a site is kept regardless of candidacy, **except** when
+the allele was rejected by the strand-bias gate — those are treated as suspected
+single-strand artifacts, which is precisely what this denoiser exists to remove, so the
+protection does not apply to them.
+
+**Known limitation — methylation tags are lost on length-changing edits.** Reads whose
+length changed as a result of an indel correction lose their `MM`/`ML`/`MN`
+(methylation) tags and their `NM`/`MD`/`cs` tags; these are indexed by the read's own
+base positions and cannot survive a length change. This is safe in the standard
+pipeline because methylation aggregation (`Himito methyl`) reads the *original* mt BAM,
+not the denoised one — but an indel-denoised BAM must not itself be used as a
+methylation input.
+
+**Known limitation — do not re-run the denoiser on its own output.** Allele
+frequencies are computed once from the input BAM and decisions are applied once.
+Feeding already-denoised reads back into another `denoise --indels` pass would let
+each pass shift the frequencies the next pass sees, compounding correction rather than
+converging.
+
+**Diagnostics.** When `--stats` is given, the JSON includes counters worth checking
+after a run:
+- `indel_edits_emitted_but_not_applied`: should normally be zero; a non-zero value
+  means edits were emitted that the rewrite step could not apply.
+- `indel_events_out_of_span`, `indel_events_duplicate_site`: bookkeeping counters for
+  events that fell outside a read's aligned span or collided on the same site.
+- `assignments_skipped_*`: counters for reads skipped during reassignment (e.g.
+  insufficient flank).
+- `reassignments_by_hp_length`: shows how much correction fired inside long
+  homopolymers, broken down by homopolymer length.
+
 ## Workflows
 ### WDL Workflows
 

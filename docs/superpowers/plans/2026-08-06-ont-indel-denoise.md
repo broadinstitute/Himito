@@ -972,7 +972,7 @@ pub fn rewrite_read(
         seq: seq.to_vec(),
         qual: qual.to_vec(),
         cigar: cigar.clone(),
-        len_changed: false,
+        structure_changed: false,
     }
 }
 
@@ -1019,7 +1019,7 @@ mod tests {
         assert_eq!(r.seq, seq);
         assert_eq!(r.qual, qual);
         assert_eq!(r.cigar, c);
-        assert!(!r.len_changed);
+        assert!(!r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -1032,7 +1032,7 @@ mod tests {
         let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
         assert_eq!(r.seq, b"ACTTAAAA".to_vec());
         assert_eq!(r.qual, qual);
-        assert!(!r.len_changed);
+        assert!(!r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -1049,7 +1049,7 @@ mod tests {
         let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
         assert_eq!(r.seq, b"ACGTAAAA".to_vec());
         assert_eq!(r.cigar, cig(vec![Cigar::Match(8)]));
-        assert!(r.len_changed);
+        assert!(r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -1068,7 +1068,7 @@ mod tests {
         assert_eq!(r.cigar, cig(vec![Cigar::Match(9)]));
         // Spliced bases take min(left flank, right flank) = min(23, 24) = 23.
         assert_eq!(r.qual, vec![20, 21, 22, 23, 23, 23, 24, 25, 26]);
-        assert!(r.len_changed);
+        assert!(r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -1087,7 +1087,7 @@ mod tests {
         assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Ins(1), Cigar::Match(4)]));
         // Inserted base takes min(23, 24) = 23.
         assert_eq!(r.qual, vec![20, 21, 22, 23, 23, 24, 25, 26, 27]);
-        assert!(r.len_changed);
+        assert!(r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -1104,7 +1104,7 @@ mod tests {
         let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
         assert_eq!(r.seq, b"ACGTAA".to_vec());
         assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Del(2), Cigar::Match(2)]));
-        assert!(r.len_changed);
+        assert!(r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -1373,12 +1373,16 @@ pub fn rewrite_read(
         }
     }
 
-    let len_changed = out_seq.len() != seq.len();
+    // NOT `out_seq.len() != seq.len()`: an insertion and a deletion at different
+    // sites can offset each other, leaving the length unchanged while the CIGAR and
+    // every downstream query offset have shifted. Set from whether an indel edit was
+    // actually applied during the walk.
+    let structure_changed = any_indel_edit_applied;
     RewriteResult {
         seq: out_seq,
         qual: out_qual,
         cigar: CigarString(ops),
-        len_changed,
+        structure_changed,
     }
 }
 ```
@@ -1660,7 +1664,7 @@ In `apply_corrections_rewrites_seq_and_preserves_tags`, replace the corrections 
 - [ ] **Step 4: Run the full denoise suite to verify no behavior change**
 
 Run: `cargo test denoise:: 2>&1 | tail -25`
-Expected: all tests PASS, including the pre-existing `apply_corrections_rewrites_seq_and_preserves_tags` (the `XY` tag still survives, because a substitution-only rewrite reports `len_changed == false` and skips tag stripping) and `start_ont_denoises_and_writes_stats_json`.
+Expected: all tests PASS, including the pre-existing `apply_corrections_rewrites_seq_and_preserves_tags` (the `XY` tag still survives, because a substitution-only rewrite reports `structure_changed == false` and skips tag stripping) and `start_ont_denoises_and_writes_stats_json`.
 
 - [ ] **Step 5: Build and commit**
 

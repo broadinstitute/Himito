@@ -39,7 +39,21 @@ pub struct RewriteResult {
     pub seq: Vec<u8>,
     pub qual: Vec<u8>,
     pub cigar: CigarString,
-    pub len_changed: bool,
+    /// `true` iff at least one indel edit (gain/revert/replace `Ins`, or
+    /// gain/revert/shrink `Del`) was actually applied during the walk.
+    /// A substitution alone never sets this.
+    ///
+    /// Callers use this to decide whether to strip base-modification tags
+    /// (`MM`/`ML`/`MN`) and stale alignment tags (`NM`/`MD`/`cs`): any indel
+    /// edit shifts every query offset downstream of it and rewrites the
+    /// CIGAR, invalidating those tags even when they key off query position
+    /// rather than SEQ length.
+    ///
+    /// Comparing output SEQ length to input SEQ length is NOT a sound proxy:
+    /// a read with an offsetting 1bp insertion at one site and a 1bp deletion
+    /// at another has unchanged SEQ length but a changed CIGAR and shifted
+    /// offsets, so a length-based check would be a false negative.
+    pub structure_changed: bool,
 }
 
 /// Total reference bases consumed by a CIGAR (M/=/X/D/N). The rewrite invariant.
@@ -73,6 +87,15 @@ fn push_op(ops: &mut Vec<Cigar>, op: Cigar) {
     ops.push(op);
 }
 
+/// Rewrite one read's SEQ/QUAL/CIGAR against `edits`, which are keyed by
+/// REFERENCE coordinate.
+///
+/// Contract: `refseq` MUST be the full contig the read is aligned to,
+/// indexed by absolute reference coordinate (not a windowed slice around the
+/// read). `pos` MUST be the read's absolute POS (0-based) into that same
+/// contig. Reverted deletions splice bases out of `refseq` at absolute
+/// coordinates; a windowed slice would silently splice in the wrong bases
+/// with no error.
 pub fn rewrite_read(
     pos: i64,
     cigar: &CigarString,
@@ -81,6 +104,19 @@ pub fn rewrite_read(
     edits: &ReadEdits,
     refseq: &[u8],
 ) -> RewriteResult {
+    if edits.is_empty() {
+        // Common fast path: no edits, so nothing about the read changes.
+        // Preserve the original CIGAR verbatim (including any `=`/`X` ops)
+        // rather than running it through the walk, which folds `=`/`X` into
+        // `M`.
+        return RewriteResult {
+            seq: seq.to_vec(),
+            qual: qual.to_vec(),
+            cigar: cigar.clone(),
+            structure_changed: false,
+        };
+    }
+
     let subs: HashMap<u32, u8> = edits.subs.iter().copied().collect();
     let indels: HashMap<u32, &IndelEdit> =
         edits.indels.iter().map(|e| (e.ref_pos, e)).collect();
@@ -88,10 +124,16 @@ pub fn rewrite_read(
     let mut out_seq: Vec<u8> = Vec::with_capacity(seq.len() + 8);
     let mut out_qual: Vec<u8> = Vec::with_capacity(qual.len() + 8);
     let mut ops: Vec<Cigar> = Vec::new();
+    let mut structure_changed = false;
 
     let mut rp: u32 = pos.max(0) as u32; // reference position of the next ref-consuming base
     let mut qp: usize = 0; // query position of the next original base
-    let mut last_ref: u32 = rp; // ref position of the most recent aligned base
+    // Ref position of the most recent *aligned* base emitted so far — the
+    // pileup anchor convention. `None` until the first aligned base is
+    // emitted, so a read whose first ref-relevant op is an `I` or `D` (no
+    // aligned base precedes it) cannot alias an edit anchored at some other,
+    // later site.
+    let mut last_ref: Option<u32> = None;
 
     // Quality assigned to synthesized bases: never more confident than the flanks.
     let fill_qual = |out_qual: &Vec<u8>, next: Option<u8>| -> u8 {
@@ -113,7 +155,7 @@ pub fn rewrite_read(
                     out_seq.push(*subs.get(&cur).unwrap_or(&seq[qi]));
                     out_qual.push(qual[qi]);
                     push_op(&mut ops, Cigar::Match(1));
-                    last_ref = cur;
+                    last_ref = Some(cur);
                     k += 1;
 
                     // An indel anchored on this aligned base?
@@ -125,6 +167,7 @@ pub fn rewrite_read(
                                 out_seq.extend_from_slice(s);
                                 out_qual.extend(std::iter::repeat(f).take(s.len()));
                                 push_op(&mut ops, Cigar::Ins(s.len() as u32));
+                                structure_changed = true;
                             }
                             (Allele::Ref, Allele::Del(m)) => {
                                 // The following m reference bases become a deletion.
@@ -134,6 +177,7 @@ pub fn rewrite_read(
                                 let m = (*m).min(n - k);
                                 push_op(&mut ops, Cigar::Del(m));
                                 k += m; // skip both the ref bases and their query partners
+                                structure_changed = true;
                             }
                             _ => {}
                         }
@@ -144,12 +188,17 @@ pub fn rewrite_read(
             }
 
             Cigar::Ins(n) => {
-                let e = indels
-                    .get(&last_ref)
+                // While `last_ref` is `None` there is no aligned base before
+                // this insertion to anchor an edit to, so skip the lookup
+                // entirely and copy the op verbatim (see FIX 3 above).
+                let e = last_ref
+                    .and_then(|lr| indels.get(&lr))
                     .filter(|e| matches!(e.from, Allele::Ins(_)));
                 match e.map(|e| &e.to) {
                     // Reverted: drop the inserted bases entirely.
-                    Some(Allele::Ref) => {}
+                    Some(Allele::Ref) => {
+                        structure_changed = true;
+                    }
                     // Replaced: emit the site's consensus inserted bases instead.
                     Some(Allele::Ins(s)) => {
                         let next = qual.get(qp + n as usize).copied();
@@ -157,6 +206,7 @@ pub fn rewrite_read(
                         out_seq.extend_from_slice(s);
                         out_qual.extend(std::iter::repeat(f).take(s.len()));
                         push_op(&mut ops, Cigar::Ins(s.len() as u32));
+                        structure_changed = true;
                     }
                     // No edit, or an unsupported cross-kind target: copy verbatim.
                     _ => {
@@ -169,8 +219,10 @@ pub fn rewrite_read(
             }
 
             Cigar::Del(n) => {
-                let e = indels
-                    .get(&last_ref)
+                // See the `Ins` arm above: skip the lookup entirely while
+                // there is no preceding aligned base to anchor to.
+                let e = last_ref
+                    .and_then(|lr| indels.get(&lr))
                     .filter(|e| matches!(e.from, Allele::Del(_)));
                 let splice = |out_seq: &mut Vec<u8>, out_qual: &mut Vec<u8>, from: u32, count: u32| {
                     let f = match (out_qual.last().copied(), qual.get(qp).copied()) {
@@ -181,6 +233,13 @@ pub fn rewrite_read(
                     };
                     for j in 0..count {
                         let idx = (from + j) as usize;
+                        debug_assert!(
+                            idx < refseq.len(),
+                            "refseq index {idx} out of range (refseq.len() = {}); \
+                             refseq must be the full contig indexed by absolute \
+                             reference coordinate",
+                            refseq.len()
+                        );
                         out_seq.push(refseq.get(idx).copied().unwrap_or(b'N'));
                         out_qual.push(f);
                     }
@@ -190,6 +249,7 @@ pub fn rewrite_read(
                     Some(Allele::Ref) => {
                         splice(&mut out_seq, &mut out_qual, rp, n);
                         push_op(&mut ops, Cigar::Match(n));
+                        structure_changed = true;
                     }
                     // Shrunk: left-aligned, so the shorter deletion comes first and
                     // the freed reference bases follow as matches.
@@ -200,6 +260,7 @@ pub fn rewrite_read(
                             splice(&mut out_seq, &mut out_qual, rp + *m, back);
                             push_op(&mut ops, Cigar::Match(back));
                         }
+                        structure_changed = true;
                     }
                     // No edit, or an unsupported target: copy verbatim.
                     _ => push_op(&mut ops, Cigar::Del(n)),
@@ -222,12 +283,11 @@ pub fn rewrite_read(
         }
     }
 
-    let len_changed = out_seq.len() != seq.len();
     RewriteResult {
         seq: out_seq,
         qual: out_qual,
         cigar: CigarString(ops),
-        len_changed,
+        structure_changed,
     }
 }
 
@@ -274,7 +334,7 @@ mod tests {
         assert_eq!(r.seq, seq);
         assert_eq!(r.qual, qual);
         assert_eq!(r.cigar, c);
-        assert!(!r.len_changed);
+        assert!(!r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -287,7 +347,7 @@ mod tests {
         let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
         assert_eq!(r.seq, b"ACTTAAAA".to_vec());
         assert_eq!(r.qual, qual);
-        assert!(!r.len_changed);
+        assert!(!r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -304,7 +364,7 @@ mod tests {
         let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
         assert_eq!(r.seq, b"ACGTAAAA".to_vec());
         assert_eq!(r.cigar, cig(vec![Cigar::Match(8)]));
-        assert!(r.len_changed);
+        assert!(r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -323,7 +383,7 @@ mod tests {
         assert_eq!(r.cigar, cig(vec![Cigar::Match(9)]));
         // Spliced bases take min(left flank, right flank) = min(23, 24) = 23.
         assert_eq!(r.qual, vec![20, 21, 22, 23, 23, 23, 24, 25, 26]);
-        assert!(r.len_changed);
+        assert!(r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -342,7 +402,7 @@ mod tests {
         assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Ins(1), Cigar::Match(4)]));
         // Inserted base takes min(23, 24) = 23.
         assert_eq!(r.qual, vec![20, 21, 22, 23, 23, 24, 25, 26, 27]);
-        assert!(r.len_changed);
+        assert!(r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -359,7 +419,7 @@ mod tests {
         let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
         assert_eq!(r.seq, b"ACGTAA".to_vec());
         assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Del(2), Cigar::Match(2)]));
-        assert!(r.len_changed);
+        assert!(r.structure_changed);
         assert_invariants(&c, &r);
     }
 
@@ -458,6 +518,77 @@ mod tests {
         let r = rewrite_read(4, &c, &seq, &qual, &edits, REF);
         assert_eq!(r.seq, b"AAAAC".to_vec());
         assert_eq!(r.cigar, cig(vec![Cigar::Match(2), Cigar::Del(1), Cigar::Match(3)]));
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn offsetting_insertion_and_deletion_leave_length_unchanged_but_set_structure_changed() {
+        // 12M read gains a 1bp insertion after ref index 3 and a 1bp
+        // deletion after ref index 8. The two length changes cancel out, so
+        // output SEQ length equals input SEQ length -- but the CIGAR changed
+        // and every offset after ref index 3 shifted. `structure_changed`
+        // must still be true: this is exactly the false-negative FIX 1
+        // closes (output-length comparison would wrongly say "unchanged").
+        let c = cig(vec![Cigar::Match(12)]);
+        let seq = b"ACGTAAAAACGT".to_vec();
+        let qual = vec![30u8; 12];
+        let edits = ReadEdits {
+            subs: vec![],
+            indels: vec![
+                IndelEdit { ref_pos: 3, from: Allele::Ref, to: Allele::Ins(b"A".to_vec()) },
+                IndelEdit { ref_pos: 8, from: Allele::Ref, to: Allele::Del(1) },
+            ],
+        };
+        let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
+        assert_eq!(
+            r.seq.len(),
+            seq.len(),
+            "offsetting insertion+deletion should leave SEQ length unchanged"
+        );
+        assert_eq!(r.seq, b"ACGTAAAAAAGT".to_vec());
+        assert!(
+            r.structure_changed,
+            "an indel edit was applied even though output length is unchanged"
+        );
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn leading_insertion_is_unaffected_by_an_edit_anchored_before_any_aligned_base() {
+        // `last_ref` starts as `None`: a read whose first ref-relevant op is
+        // an insertion has no aligned base preceding it, so an edit
+        // anchored at the read's POS must not be mistaken for one anchored
+        // on this leading insertion (FIX 3).
+        let c = cig(vec![Cigar::Ins(2), Cigar::Match(10)]);
+        let seq = b"GGACGTAAAAAC".to_vec();
+        let qual = vec![30u8; 12];
+        let edits = ReadEdits {
+            subs: vec![],
+            indels: vec![IndelEdit {
+                ref_pos: 0,
+                from: Allele::Ins(b"GG".to_vec()),
+                to: Allele::Ref,
+            }],
+        };
+        let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
+        assert_eq!(r.seq, seq, "leading insertion must be copied verbatim");
+        assert_eq!(r.cigar, c);
+        assert!(!r.structure_changed);
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn no_edits_preserves_equal_and_diff_ops_verbatim() {
+        // FIX 4's fast path: with zero edits, the original CIGAR (including
+        // `=`/`X` ops) must come back byte-identical, not folded into `M`.
+        let c = cig(vec![Cigar::Equal(4), Cigar::Diff(1), Cigar::Equal(3)]);
+        let seq = b"ACGTAAAA".to_vec();
+        let qual = vec![30u8; 8];
+        let r = rewrite_read(0, &c, &seq, &qual, &ReadEdits::default(), REF);
+        assert_eq!(r.cigar, c, "CIGAR must be byte-identical when there are no edits");
+        assert_eq!(r.seq, seq);
+        assert_eq!(r.qual, qual);
+        assert!(!r.structure_changed);
         assert_invariants(&c, &r);
     }
 }

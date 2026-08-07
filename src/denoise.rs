@@ -518,6 +518,17 @@ fn compute_corrections(
                     .or_default()
                     .subs
                     .push((refpos as u32, idx_to_base(corr)));
+                // KNOWN LIMITATION (diagnostic only, never affects output SEQ):
+                // these two counters are booked eagerly here, at decision time,
+                // whereas the indel counters are booked from what `rewrite_read`
+                // actually applied. A gained deletion makes the rewrite walk skip
+                // the reference positions it consumes, so a substitution this read
+                // has inside that span is never written while already counted here
+                // -- an over-count reachable only with --indels enabled. Closing it
+                // means widening `ReadEdits.subs` to carry the original allele and
+                // deferring these stats to the write-back pass, which ripples
+                // through every caller and every test asserting them off
+                // `compute_corrections` alone. Deliberately not done.
                 stats.bases_modified += 1;
                 stats.substitution_matrix[allele][corr] += 1;
                 changed = true;

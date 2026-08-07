@@ -54,15 +54,18 @@ pub struct IndelOpts {
     pub floor_mult: f64,
     pub delta: f64,
     /// Minimum plain match-context flank required on each side of an edit.
-    /// Consumers must clamp this to at least 1 wherever it is used: the FIX-4
-    /// match-run bound for a gained deletion is `m + flank + 1` (anchor base +
-    /// `m` deleted bases + `flank` genuine right-hand flank matches), and at
-    /// `flank == 0` that bound degenerates to one short of the true
-    /// no-truncation requirement, which trips a `debug_assert` in debug builds
-    /// and silently truncates the deletion in release. `apply_corrections`
-    /// enforces the clamp via `iopts.flank.max(1)`; this field itself is left
-    /// unvalidated (a `pub` field with no constructor) so any future direct
-    /// caller must not assume 0 is safe here.
+    /// Consumers must clamp this to at least 1 wherever it is used. This is
+    /// NOT itself a no-truncation safety requirement: at `flank == 0` the
+    /// FIX-4 match-run bound for a gained deletion, `m + flank + 1` (anchor
+    /// base + `m` deleted bases + `flank` genuine right-hand flank matches),
+    /// is already exactly `m + 1` -- the true no-truncation bound -- so
+    /// nothing would trip or truncate even unclamped. The clamp instead
+    /// guarantees that SOME flanking match context (rather than none) is
+    /// always required around an edit, which this feature wants
+    /// unconditionally as a quality bar, independent of that arithmetic.
+    /// `apply_corrections` enforces the clamp via `iopts.flank.max(1)`; this
+    /// field itself is left unvalidated (a `pub` field with no constructor)
+    /// so any future direct caller must not assume 0 is safe here.
     pub flank: usize,
     /// An allele carried by at least this fraction of reads at a site is never
     /// corrected away, regardless of candidacy. This guards against `vaf_floor`
@@ -202,17 +205,29 @@ pub struct IndelSite {
     /// rather than a library-wide constant.
     pub col_fwd: u32,
     pub col_rev: u32,
-    /// Qnames of reads that have already cast an ALT vote at this site (see FIX 1
-    /// in the task-8 review round). Left-normalization can pull two of one read's
-    /// OWN events -- e.g. an insertion and a nearby deletion, exactly what
-    /// coexists in a short tandem repeat -- to the SAME site; without this cap
-    /// that read would contribute two ALT votes while depth counts it once,
-    /// letting `alt_total` exceed `depth`.
-    voted: std::collections::HashSet<Vec<u8>>,
+    /// Hashes of the qnames of reads that have already cast an ALT vote at this
+    /// site (see FIX 1 in the task-8 review round). Left-normalization can pull
+    /// two of one read's OWN events -- e.g. an insertion and a nearby deletion,
+    /// exactly what coexists in a short tandem repeat -- to the SAME site;
+    /// without this cap that read would contribute two ALT votes while depth
+    /// counts it once, letting `alt_total` exceed `depth`.
+    ///
+    /// Stores a 64-bit hash rather than an owned `Vec<u8>`: this set is kept
+    /// per (contig, normalized site) for the whole pileup pass, and retaining
+    /// every distinct qname verbatim for every site it spans would scale that
+    /// memory with (sites x reads x qname length) instead of a flat 8 bytes
+    /// per (site, read) entry (see FIX 5 in the task-9 review round). The
+    /// tradeoff: a hash collision between two DIFFERENT qnames at the same
+    /// site would drop the second read's genuinely distinct vote. This never
+    /// makes `alt_total` exceed `depth` (the invariant this cap exists to
+    /// protect still holds -- a dropped vote can only undercount); it can
+    /// only make the denoiser very rarely slightly more conservative at a
+    /// site, at collision-probability odds no realistic pileup will hit.
+    voted: std::collections::HashSet<u64>,
 }
 
 impl IndelSite {
-    pub fn add(&mut self, allele: Allele, reverse: bool) {
+    fn add(&mut self, allele: Allele, reverse: bool) {
         let e = self.obs.entry(allele).or_insert((0, 0));
         if reverse {
             e.1 += 1;
@@ -223,8 +238,16 @@ impl IndelSite {
 
     /// Like `add`, but caps a single read to at most one ALT vote at this site.
     /// Returns `false` (and drops the vote) if `qname` has already voted here.
-    pub fn add_from_read(&mut self, qname: Vec<u8>, allele: Allele, reverse: bool) -> bool {
-        if !self.voted.insert(qname) {
+    ///
+    /// `add` above is private specifically so this cap cannot be bypassed by
+    /// some future caller reaching straight for the uncapped primitive (see
+    /// FIX 5 in the task-9 review round): callers outside this module have
+    /// exactly one way to record a vote, and it always enforces the cap.
+    pub fn add_from_read(&mut self, qname: &[u8], allele: Allele, reverse: bool) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        qname.hash(&mut h);
+        if !self.voted.insert(h.finish()) {
             return false;
         }
         self.add(allele, reverse);
@@ -535,18 +558,29 @@ pub fn read_events(
     let mut out = Vec::new();
     let mut rp = pos.max(0) as u32; // next reference position
     let mut qp = 0usize; // next query position
+    // Reference position of the last ALIGNED (M/=/X) base seen so far. `D`/`N`
+    // consume reference without an aligned query base, so they must NOT move
+    // this: an `Ins` (or `Del`) immediately following a `D`/`N` still has to
+    // anchor to the last genuinely aligned base, not to wherever `rp` has
+    // advanced to (see FIX 2). `rewrite_read`'s `last_ref` follows the same
+    // rule (it is only updated in its Match arm), so this keeps `read_events`
+    // reporting exactly the anchor `rewrite_read` will actually key its
+    // lookup on.
+    let mut last_aligned: Option<u32> = None;
 
     for op in cigar.iter() {
         match *op {
             Cigar::Match(n) | Cigar::Equal(n) | Cigar::Diff(n) => {
                 rp += n;
                 qp += n as usize;
+                if n > 0 {
+                    last_aligned = Some(rp - 1);
+                }
             }
             Cigar::Ins(n) => {
-                // The anchor is the last aligned reference base before the event.
-                // An insertion before any aligned base has no anchor and is skipped.
-                if rp > 0 {
-                    let anchor = rp - 1;
+                // No aligned base has been seen yet (e.g. a leading insertion):
+                // there is no anchor to report, so skip the event entirely.
+                if let Some(anchor) = last_aligned {
                     if n < max_len {
                         let s = seq[qp..qp + n as usize].to_vec();
                         let (np, a) = normalize_left(refseq, anchor, &Allele::Ins(s));
@@ -558,8 +592,7 @@ pub fn read_events(
                 qp += n as usize;
             }
             Cigar::Del(n) => {
-                if rp > 0 {
-                    let anchor = rp - 1;
+                if let Some(anchor) = last_aligned {
                     if n < max_len {
                         let (np, a) = normalize_left(refseq, anchor, &Allele::Del(n));
                         out.push(ReadEvent { norm_pos: np, anchor, allele: Some(a) });
@@ -1187,5 +1220,39 @@ mod tests {
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].norm_pos, 18);
         assert_eq!(evs[0].allele, Some(Allele::Ins(b"G".to_vec())));
+    }
+
+    // ---- FIX 2 regression: an insertion right after a D/N anchors at the
+    // last ALIGNED base, not the last DELETED one ----
+
+    #[test]
+    fn insertion_after_a_deletion_anchors_at_the_last_aligned_base_not_the_deleted_one() {
+        // `20M 2D 1I 20M` at POS 100. The OLD anchor computation was `rp - 1`
+        // at the point the `Ins` arm runs; since the preceding `Del` arm had
+        // already advanced `rp` by its own length, that landed on 121 -- the
+        // last DELETED reference base. `rewrite_read`'s `last_ref` is only
+        // updated in its Match arm, so at that `Ins` op it is still 119, and
+        // a lookup keyed at 121 would miss entirely: the edit gets emitted
+        // and counted while `rewrite_read` silently no-ops it. The insertion
+        // must anchor at 119, the last base the preceding 20M actually
+        // matched.
+        let refseq = vec![b'A'; 150];
+        let seq = vec![b'A'; 41]; // 20 (M) + 1 (I) + 20 (M); the D consumes no query
+        let cig = cs(vec![
+            Cigar::Match(20),
+            Cigar::Del(2),
+            Cigar::Ins(1),
+            Cigar::Match(20),
+        ]);
+        let evs = read_events(100, &cig, &seq, &refseq, 5);
+        assert_eq!(evs.len(), 2, "both the deletion and the insertion must be reported");
+        assert_eq!(evs[0].allele, Some(Allele::Del(2)));
+        assert_eq!(evs[0].anchor, 119, "the deletion's own anchor is the last aligned base");
+        assert!(matches!(evs[1].allele, Some(Allele::Ins(_))));
+        assert_eq!(
+            evs[1].anchor, 119,
+            "the insertion must anchor at the last ALIGNED base (119), not the last \
+             DELETED one (121)"
+        );
     }
 }

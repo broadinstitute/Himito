@@ -6,7 +6,7 @@
 //! D(n) back to M(n). POS, reference end, and coordinate-sort order are therefore
 //! invariant, so the output never needs re-sorting or re-indexing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rust_htslib::bam::record::{Cigar, CigarString};
 
@@ -40,13 +40,13 @@ pub struct IndelEdit {
 /// so keying by `(ref_pos, EditKind)` instead of `ref_pos` alone makes those
 /// lookups mutually exclusive rather than ambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum EditKind {
+pub(crate) enum EditKind {
     Ref,
     Ins,
     Del,
 }
 
-fn edit_kind(a: &Allele) -> EditKind {
+pub(crate) fn edit_kind(a: &Allele) -> EditKind {
     match a {
         Allele::Ref => EditKind::Ref,
         Allele::Ins(_) => EditKind::Ins,
@@ -87,6 +87,20 @@ pub struct RewriteResult {
     /// at another has unchanged SEQ length but a changed CIGAR and shifted
     /// offsets, so a length-based check would be a false negative.
     pub structure_changed: bool,
+    /// Keys of the edits this walk ACTUALLY applied -- gain/revert/replace
+    /// `Ins`, or gain/revert/shrink `Del` -- keyed exactly like the internal
+    /// lookup map (`ref_pos`, kind of `from`). A verbatim copy or an
+    /// unsupported-target fallthrough never adds its key here.
+    ///
+    /// Callers must drive reassignment statistics from THIS set, not from
+    /// the edit list they handed in: pass 2 predicts what this walk will do
+    /// with each edit, and that prediction can be wrong (a normalized site
+    /// vs. CIGAR-anchor mismatch, an insertion anchored inside the read's own
+    /// deletion, a site swallowed by an earlier gained deletion, ...). When
+    /// it is wrong this walk silently no-ops -- the reference-consumption
+    /// invariant still holds -- but counting the edit as applied anyway
+    /// would report a correction that never happened.
+    pub applied: HashSet<(u32, EditKind)>,
 }
 
 /// Total reference bases consumed by a CIGAR (M/=/X/D/N). The rewrite invariant.
@@ -147,6 +161,7 @@ pub fn rewrite_read(
             qual: qual.to_vec(),
             cigar: cigar.clone(),
             structure_changed: false,
+            applied: HashSet::new(),
         };
     }
 
@@ -173,6 +188,10 @@ pub fn rewrite_read(
     let mut out_qual: Vec<u8> = Vec::with_capacity(qual.len() + 8);
     let mut ops: Vec<Cigar> = Vec::new();
     let mut structure_changed = false;
+    // Edits genuinely applied, keyed exactly like `indels` above (see FIX 1
+    // in the task-9 review round). Populated at each of the six points below
+    // where an edit is actually acted on; a verbatim copy never touches this.
+    let mut applied: HashSet<(u32, EditKind)> = HashSet::new();
 
     let mut rp: u32 = pos.max(0) as u32; // reference position of the next ref-consuming base
     let mut qp: usize = 0; // query position of the next original base
@@ -219,6 +238,7 @@ pub fn rewrite_read(
                                 out_seq.extend_from_slice(s);
                                 out_qual.extend(std::iter::repeat(f).take(s.len()));
                                 push_op(&mut ops, Cigar::Ins(s.len() as u32));
+                                applied.insert((cur, EditKind::Ref));
                                 structure_changed = true;
                             }
                             (Allele::Ref, Allele::Del(m)) => {
@@ -229,6 +249,7 @@ pub fn rewrite_read(
                                 let m = (*m).min(n - k);
                                 push_op(&mut ops, Cigar::Del(m));
                                 k += m; // skip both the ref bases and their query partners
+                                applied.insert((cur, EditKind::Ref));
                                 structure_changed = true;
                             }
                             _ => {}
@@ -246,10 +267,12 @@ pub fn rewrite_read(
                 // `Ins` kind is baked into the key (see FIX 1), so this can
                 // only ever find an edit whose `from` is this read's own
                 // carried insertion -- no separate `filter` needed.
-                let e = last_ref.and_then(|lr| indels.get(&(lr, EditKind::Ins)));
+                let key = last_ref.map(|lr| (lr, EditKind::Ins));
+                let e = key.and_then(|k| indels.get(&k));
                 match e.map(|e| &e.to) {
                     // Reverted: drop the inserted bases entirely.
                     Some(Allele::Ref) => {
+                        applied.insert(key.expect("key set whenever `e` matched"));
                         structure_changed = true;
                     }
                     // Replaced: emit the site's consensus inserted bases instead.
@@ -259,6 +282,7 @@ pub fn rewrite_read(
                         out_seq.extend_from_slice(s);
                         out_qual.extend(std::iter::repeat(f).take(s.len()));
                         push_op(&mut ops, Cigar::Ins(s.len() as u32));
+                        applied.insert(key.expect("key set whenever `e` matched"));
                         structure_changed = true;
                     }
                     // No edit, or an unsupported cross-kind target: copy verbatim.
@@ -276,7 +300,8 @@ pub fn rewrite_read(
                 // there is no preceding aligned base to anchor to. The `Del`
                 // kind is baked into the key (see FIX 1), so no separate
                 // `filter` is needed here either.
-                let e = last_ref.and_then(|lr| indels.get(&(lr, EditKind::Del)));
+                let key = last_ref.map(|lr| (lr, EditKind::Del));
+                let e = key.and_then(|k| indels.get(&k));
                 let splice = |out_seq: &mut Vec<u8>, out_qual: &mut Vec<u8>, from: u32, count: u32| {
                     let f = match (out_qual.last().copied(), qual.get(qp).copied()) {
                         (Some(l), Some(r)) => l.min(r),
@@ -302,6 +327,7 @@ pub fn rewrite_read(
                     Some(Allele::Ref) => {
                         splice(&mut out_seq, &mut out_qual, rp, n);
                         push_op(&mut ops, Cigar::Match(n));
+                        applied.insert(key.expect("key set whenever `e` matched"));
                         structure_changed = true;
                     }
                     // Shrunk: left-aligned, so the shorter deletion comes first and
@@ -313,6 +339,7 @@ pub fn rewrite_read(
                             splice(&mut out_seq, &mut out_qual, rp + *m, back);
                             push_op(&mut ops, Cigar::Match(back));
                         }
+                        applied.insert(key.expect("key set whenever `e` matched"));
                         structure_changed = true;
                     }
                     // No edit, or an unsupported target: copy verbatim.
@@ -341,6 +368,7 @@ pub fn rewrite_read(
         qual: out_qual,
         cigar: CigarString(ops),
         structure_changed,
+        applied,
     }
 }
 

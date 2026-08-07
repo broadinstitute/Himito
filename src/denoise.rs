@@ -332,6 +332,17 @@ pub struct DenoiseStats {
     /// in (see FIX 6): `rewrite_read`'s Match arm advances past the whole
     /// deletion in one step, so a second edit inside that span is never visited.
     pub assignments_skipped_swallowed_by_gained_deletion: u64,
+    /// DIAGNOSTIC, should normally be zero. Indel edits pass 2 emitted that
+    /// `rewrite_read` reports it never actually applied (see FIX 1 in the
+    /// task-9 review round): pass 2's guards PREDICT what the rewrite walk
+    /// will do with an edit, and every instance where that prediction turned
+    /// out wrong (a normalized-site vs. CIGAR-anchor mismatch, an insertion
+    /// anchored on a deleted base, a site swallowed by an earlier gained
+    /// deletion, ...) surfaces here instead of silently inflating
+    /// `reads_reassigned_*`/`indel_bases_*`. A nonzero value means some guard
+    /// upstream failed to predict the walk correctly; it does NOT mean the
+    /// BAM was corrupted -- the read in question is simply left untouched.
+    pub indel_edits_emitted_but_not_applied: u64,
 }
 
 fn compute_corrections(
@@ -479,7 +490,7 @@ fn compute_corrections(
                 let voted = sites
                     .entry((name.to_vec(), norm_pos))
                     .or_default()
-                    .add_from_read(qname, norm_allele, reverse);
+                    .add_from_read(&qname, norm_allele, reverse);
                 if !voted {
                     stats.indel_events_duplicate_site += 1;
                 }
@@ -601,6 +612,12 @@ fn apply_corrections(
                 match refs.get(&contig) {
                     Some(refseq) => {
                         let mut edits = corrections.get(rec.qname()).cloned().unwrap_or_default();
+                        // (ref_pos, kind_of(from)) -> the repeat-context length that
+                        // decided this edit. Kept alongside `edits` (not inside
+                        // `IndelEdit` itself) so `reassignments_by_hp_length` can be
+                        // booked AFTER `rewrite_read` reports which edits it actually
+                        // applied (see FIX 1 in the task-9 review round).
+                        let mut edit_context_len: HashMap<(u32, rewrite::EditKind), usize> = HashMap::new();
 
                         if iopts.enabled {
                             // `end_pos()` (exclusive alignment end on the reference) is only
@@ -641,9 +658,10 @@ fn apply_corrections(
                             }
 
                             // `flank` is validated/clamped to >= 1 here (see IndelOpts::flank's
-                            // doc comment): the FIX-4 match-run bound below assumes a nonzero
-                            // flank, and degenerates to one short of the no-truncation bound
-                            // at `flank == 0`.
+                            // doc comment). The clamp is not a no-truncation safety
+                            // requirement -- at flank == 0 the FIX-4 match-run bound below is
+                            // already exactly the no-truncation bound -- it only guarantees
+                            // some flanking match context is required around every edit.
                             let flank = iopts.flank.max(1) as i64;
                             // A gained deletion consumes up to max_len reference bases to the
                             // right, so the right-hand requirement is larger than the left.
@@ -675,17 +693,24 @@ fn apply_corrections(
                                         stats.assignments_skipped_ambiguous_carry += 1;
                                         continue;
                                     }
-                                    // FIX 6: an earlier gained deletion already emitted for
-                                    // this read consumed this site's reference position, so
-                                    // `rewrite_read`'s Match arm will never visit it.
-                                    if s <= consumed_until {
-                                        stats.assignments_skipped_swallowed_by_gained_deletion += 1;
-                                        continue;
-                                    }
                                     let (observed, anchor) = carried
                                         .get(pos)
                                         .cloned()
                                         .unwrap_or((indel::Allele::Ref, *pos));
+                                    // FIX 6: an earlier gained deletion already emitted for
+                                    // this read consumed this site's reference position, so
+                                    // `rewrite_read`'s Match arm will never visit it. This can
+                                    // only apply when the read is a plain Ref observer here
+                                    // (see FIX 3 in the task-9 review round): a read that
+                                    // CARRIES its own indel at this site is keyed at its own
+                                    // CIGAR anchor, and the run bound above guarantees that
+                                    // anchor lies beyond the consumed span, so it remains
+                                    // genuinely reachable -- checking `s <= consumed_until`
+                                    // unconditionally would over-skip legitimate reversions.
+                                    if observed == indel::Allele::Ref && s <= consumed_until {
+                                        stats.assignments_skipped_swallowed_by_gained_deletion += 1;
+                                        continue;
+                                    }
                                     let target = match indel::assign_allele(&observed, model, iopts) {
                                         indel::Assignment::Keep => continue,
                                         indel::Assignment::Refused => {
@@ -738,61 +763,6 @@ fn apply_corrections(
                                         stats.assignments_skipped_oversized_neighbor += 1;
                                         continue;
                                     }
-                                    match (&observed, &target) {
-                                        (indel::Allele::Ref, indel::Allele::Ins(s2)) => {
-                                            stats.reads_reassigned_ref_to_ins += 1;
-                                            stats.indel_bases_inserted += s2.len() as u64;
-                                        }
-                                        (indel::Allele::Ref, indel::Allele::Del(n)) => {
-                                            stats.reads_reassigned_ref_to_del += 1;
-                                            stats.indel_bases_removed += *n as u64;
-                                        }
-                                        (indel::Allele::Ins(from_s), indel::Allele::Ref) => {
-                                            // Reverting a spurious insertion removes
-                                            // the bases it added -- the single most
-                                            // common correction this feature makes.
-                                            stats.reads_reassigned_indel_to_ref += 1;
-                                            stats.indel_bases_removed += from_s.len() as u64;
-                                        }
-                                        (indel::Allele::Del(from_n), indel::Allele::Ref) => {
-                                            // Reverting a spurious deletion restores
-                                            // the reference bases it dropped.
-                                            stats.reads_reassigned_indel_to_ref += 1;
-                                            stats.indel_bases_inserted += *from_n as u64;
-                                        }
-                                        (indel::Allele::Ins(from_s), indel::Allele::Ins(to_s)) => {
-                                            stats.reads_reassigned_indel_to_indel += 1;
-                                            if to_s.len() > from_s.len() {
-                                                stats.indel_bases_inserted +=
-                                                    (to_s.len() - from_s.len()) as u64;
-                                            } else if from_s.len() > to_s.len() {
-                                                stats.indel_bases_removed +=
-                                                    (from_s.len() - to_s.len()) as u64;
-                                            }
-                                        }
-                                        (indel::Allele::Del(from_n), indel::Allele::Del(to_n)) => {
-                                            stats.reads_reassigned_indel_to_indel += 1;
-                                            // FIX 3: shrinking a deletion splices reference
-                                            // bases BACK INTO the read (an insertion of read
-                                            // bases relative to what the read had before),
-                                            // e.g. Del(3) -> Del(1) restores 2 bases.
-                                            if to_n < from_n {
-                                                stats.indel_bases_inserted += (from_n - to_n) as u64;
-                                            }
-                                            // to_n > from_n (growing a deletion) is
-                                            // unreachable: `assign_allele` refuses that
-                                            // transition (see `Assignment::Refused`),
-                                            // since `rewrite_read` cannot grow a deletion
-                                            // into the following CIGAR op.
-                                        }
-                                        _ => stats.reads_reassigned_indel_to_indel += 1,
-                                    }
-                                    let l = model.context_len as usize;
-                                    if stats.reassignments_by_hp_length.len() <= l {
-                                        stats.reassignments_by_hp_length.resize(l + 1, 0);
-                                    }
-                                    stats.reassignments_by_hp_length[l] += 1;
-
                                     // FIX 6: a GAINED deletion (observed Ref -> Del(m))
                                     // consumes reference positions (s, s+m] once applied by
                                     // `rewrite_read`'s Match arm, which advances past all of
@@ -817,6 +787,21 @@ fn apply_corrections(
                                         indel::Allele::Ref => *pos,
                                         _ => anchor,
                                     };
+                                    // Reassignment/base-count/hp-length statistics are NOT
+                                    // booked here (see FIX 1 in the task-9 review round):
+                                    // every guard above PREDICTS what `rewrite_read`'s walk
+                                    // will do with this edit once emitted, and three rounds
+                                    // of review have each found one instance of that
+                                    // prediction being wrong (CRITICAL 1, FIX 2, FIX 6).
+                                    // Stash the context length now, keyed exactly like
+                                    // `rewrite_read`'s internal lookup, and book every
+                                    // counter afterward from what it reports as ACTUALLY
+                                    // APPLIED -- making any future instance of that class a
+                                    // harmless missed correction with honest statistics.
+                                    edit_context_len.insert(
+                                        (ref_pos, rewrite::edit_kind(&observed)),
+                                        model.context_len as usize,
+                                    );
                                     edits.indels.push(rewrite::IndelEdit {
                                         ref_pos,
                                         from: observed,
@@ -839,6 +824,76 @@ fn apply_corrections(
                             // actually changed anything -- CRITICAL 1's bug is exactly a
                             // case where it silently didn't. Compare the real output.
                             let changed = out.seq != seq || out.cigar != cigar;
+
+                            // FIX 1 (task-9 review round): the reassignment, base-count,
+                            // and hp-length counters are booked HERE, and only here, from
+                            // `out.applied` -- what `rewrite_read` reports it actually did
+                            // -- never from the edits pass 2 merely emitted. An edit whose
+                            // key is absent from `out.applied` was a silent no-op (the walk
+                            // never reached its `ref_pos`); counting it would report a
+                            // correction that never happened.
+                            for edit in &edits.indels {
+                                let key = (edit.ref_pos, rewrite::edit_kind(&edit.from));
+                                if !out.applied.contains(&key) {
+                                    stats.indel_edits_emitted_but_not_applied += 1;
+                                    continue;
+                                }
+                                match (&edit.from, &edit.to) {
+                                    (indel::Allele::Ref, indel::Allele::Ins(s2)) => {
+                                        stats.reads_reassigned_ref_to_ins += 1;
+                                        stats.indel_bases_inserted += s2.len() as u64;
+                                    }
+                                    (indel::Allele::Ref, indel::Allele::Del(n)) => {
+                                        stats.reads_reassigned_ref_to_del += 1;
+                                        stats.indel_bases_removed += *n as u64;
+                                    }
+                                    (indel::Allele::Ins(from_s), indel::Allele::Ref) => {
+                                        // Reverting a spurious insertion removes
+                                        // the bases it added -- the single most
+                                        // common correction this feature makes.
+                                        stats.reads_reassigned_indel_to_ref += 1;
+                                        stats.indel_bases_removed += from_s.len() as u64;
+                                    }
+                                    (indel::Allele::Del(from_n), indel::Allele::Ref) => {
+                                        // Reverting a spurious deletion restores
+                                        // the reference bases it dropped.
+                                        stats.reads_reassigned_indel_to_ref += 1;
+                                        stats.indel_bases_inserted += *from_n as u64;
+                                    }
+                                    (indel::Allele::Ins(from_s), indel::Allele::Ins(to_s)) => {
+                                        stats.reads_reassigned_indel_to_indel += 1;
+                                        if to_s.len() > from_s.len() {
+                                            stats.indel_bases_inserted +=
+                                                (to_s.len() - from_s.len()) as u64;
+                                        } else if from_s.len() > to_s.len() {
+                                            stats.indel_bases_removed +=
+                                                (from_s.len() - to_s.len()) as u64;
+                                        }
+                                    }
+                                    (indel::Allele::Del(from_n), indel::Allele::Del(to_n)) => {
+                                        stats.reads_reassigned_indel_to_indel += 1;
+                                        // FIX 3: shrinking a deletion splices reference
+                                        // bases BACK INTO the read (an insertion of read
+                                        // bases relative to what the read had before),
+                                        // e.g. Del(3) -> Del(1) restores 2 bases.
+                                        if to_n < from_n {
+                                            stats.indel_bases_inserted += (from_n - to_n) as u64;
+                                        }
+                                        // to_n > from_n (growing a deletion) is
+                                        // unreachable: `assign_allele` refuses that
+                                        // transition (see `Assignment::Refused`),
+                                        // since `rewrite_read` cannot grow a deletion
+                                        // into the following CIGAR op.
+                                    }
+                                    _ => stats.reads_reassigned_indel_to_indel += 1,
+                                }
+                                let l = *edit_context_len.get(&key).unwrap_or(&0);
+                                if stats.reassignments_by_hp_length.len() <= l {
+                                    stats.reassignments_by_hp_length.resize(l + 1, 0);
+                                }
+                                stats.reassignments_by_hp_length[l] += 1;
+                            }
+
                             rec.set(&qname, Some(&out.cigar), &out.seq, &out.qual);
                             if out.structure_changed {
                                 strip_stale_tags(&mut rec);
@@ -1872,9 +1927,11 @@ mod tests {
         // FIX 1: without a per-read cap, `rdup` would cast TWO ALT votes at
         // site 7 (one for its Ins("A"), one for its Del(1)) while depth counts
         // it once, letting `alt_total` exceed `depth` -- the invariant probed
-        // by `debug_assert!(site.alt_total() <= site.depth)` in indel.rs. If
-        // this test runs to completion in a debug build, that assert did not
-        // fire; the assertions below additionally verify the SECOND vote
+        // by `debug_assert!(site.alt_total() <= site.depth)` in indel.rs. With
+        // this fixture's depth (10) that assert would NOT fire even with the
+        // cap removed (alt_total tops out at 2, well under depth), so merely
+        // completing in a debug build proves nothing either way; the obs_vaf
+        // assertions below are the real proof, verifying the SECOND vote
         // (Del(1)) never landed at all, not merely that some counter moved.
         let dir = std::env::temp_dir().join("himito_denoise_indel_dup_site_vote");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1958,9 +2015,10 @@ mod tests {
 
     #[test]
     fn gained_insertion_at_a_column_the_read_deletes_is_rejected() {
-        // FIX 2: `rdel3`'s own D(3) is anchored at 9 and normalizes to 9 (unique
-        // sequence, no shift), so `carried` has no entry at the decided site 12
-        // -- the read is treated as observing plain Ref there. Before FIX 2, the
+        // FIX 2: `rdel3`'s own D(3) is anchored at 9; this fixture's reference
+        // is a 30bp homopolymer, so left-normalization pulls it all the way to
+        // 0. Either way `carried` has no entry at the decided site 12 -- the
+        // read is treated as observing plain Ref there. Before FIX 2, the
         // contiguous-match-run check fired only for a gained DELETION target;
         // a gained INSERTION at ref pos 12 sailed through even though `rdel3`
         // has NO aligned query base at 12 at all (it falls inside `rdel3`'s own
@@ -2427,6 +2485,78 @@ mod tests {
         .unwrap(); // must not panic on an unchecked tid2name offset
         assert_eq!(proc, 1);
         assert_eq!(modified, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- FIX 1 (task-9 review round): drive statistics from what was
+    // APPLIED, not what was intended ----
+
+    #[test]
+    fn edit_emitted_for_an_unreachable_ref_pos_is_a_harmless_missed_correction() {
+        // The regression guard for the whole class of bugs FIX 1 closes: pass
+        // 2 must PREDICT what `rewrite_read`'s walk will do with an edit, and
+        // three separate review rounds each found one instance of that
+        // prediction being wrong (CRITICAL 1, FIX 2, FIX 6). Rather than trust
+        // that every future instance will be caught by name, this test
+        // bypasses pass 2's own guards entirely and hand-feeds
+        // `apply_corrections` an edit keyed at a reference position that the
+        // walk can NEVER visit: ref_pos 11, inside `rvictim`'s own deletion
+        // span [10, 13) (`10M 3D 10M`). The Match arm's walk only ever visits
+        // `cur` in 0..10 and 13..23, so this edit is unreachable by
+        // construction, no matter which guard would normally have caught it.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_unreachable_edit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        let seq = vec![b'A'; 20];
+        let cigar = vec![Cigar::Match(10), Cigar::Del(3), Cigar::Match(10)];
+        write_cigar_bam(&inb, "chrM", 30, &[("rvictim", 0, seq.as_slice(), cigar.clone(), false)]);
+
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), vec![b'A'; 30]);
+
+        let mut corr: Corrections = HashMap::new();
+        corr.insert(
+            b"rvictim".to_vec(),
+            rewrite::ReadEdits {
+                subs: vec![],
+                indels: vec![rewrite::IndelEdit {
+                    ref_pos: 11,
+                    from: indel::Allele::Ref,
+                    to: indel::Allele::Ins(b"A".to_vec()),
+                }],
+            },
+        );
+
+        let models = IndelModels::new();
+        let mut stats = DenoiseStats::default();
+        let (proc, modified) = apply_corrections(
+            &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
+        )
+        .unwrap();
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 0, "the walk never reaches ref_pos 11, so nothing may change");
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let rec = r.records().next().unwrap().unwrap();
+        assert_eq!(rec.seq().as_bytes(), seq.as_slice(), "SEQ must be untouched");
+        assert_eq!(rec.cigar().take(), CigarString(cigar), "CIGAR must be untouched");
+
+        assert_eq!(stats.reads_reassigned_ref_to_ins, 0);
+        assert_eq!(stats.reads_reassigned_ref_to_del, 0);
+        assert_eq!(stats.reads_reassigned_indel_to_ref, 0);
+        assert_eq!(stats.reads_reassigned_indel_to_indel, 0);
+        assert_eq!(stats.indel_bases_inserted, 0);
+        assert_eq!(stats.indel_bases_removed, 0);
+        assert!(
+            stats.reassignments_by_hp_length.iter().all(|&c| c == 0),
+            "no hp-length bucket may record a correction that never happened"
+        );
+        assert_eq!(
+            stats.indel_edits_emitted_but_not_applied, 1,
+            "the emitted-but-unreachable edit must be loudly visible in the diagnostic counter"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

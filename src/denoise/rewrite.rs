@@ -267,8 +267,17 @@ pub fn rewrite_read(
                 // `Ins` kind is baked into the key (see FIX 1), so this can
                 // only ever find an edit whose `from` is this read's own
                 // carried insertion -- no separate `filter` needed.
+                //
+                // `remove`, not `get` (see FIX 1 in the task-10 review
+                // round): `last_ref` is only updated by the Match arm, so
+                // two `Ins` ops separated by nothing but a `D`/`N` share this
+                // SAME key. One `IndelEdit` represents one read's allele at
+                // one site and must be applied at MOST ONCE; removing it on
+                // first use makes a second op with the same key correctly
+                // find nothing and copy verbatim, instead of splicing the
+                // same edit in twice.
                 let key = last_ref.map(|lr| (lr, EditKind::Ins));
-                let e = key.and_then(|k| indels.get(&k));
+                let e = key.and_then(|k| indels.remove(&k));
                 match e.map(|e| &e.to) {
                     // Reverted: drop the inserted bases entirely.
                     Some(Allele::Ref) => {
@@ -299,9 +308,10 @@ pub fn rewrite_read(
                 // See the `Ins` arm above: skip the lookup entirely while
                 // there is no preceding aligned base to anchor to. The `Del`
                 // kind is baked into the key (see FIX 1), so no separate
-                // `filter` is needed here either.
+                // `filter` is needed here either. `remove`, not `get`, for
+                // the same one-shot-application reason as the `Ins` arm.
                 let key = last_ref.map(|lr| (lr, EditKind::Del));
-                let e = key.and_then(|k| indels.get(&k));
+                let e = key.and_then(|k| indels.remove(&k));
                 let splice = |out_seq: &mut Vec<u8>, out_qual: &mut Vec<u8>, from: u32, count: u32| {
                     let f = match (out_qual.last().copied(), qual.get(qp).copied()) {
                         (Some(l), Some(r)) => l.min(r),
@@ -698,6 +708,105 @@ mod tests {
             rewrite_read(0, &c, &seq, &qual, &edits, REF)
         }));
         assert!(result.is_err(), "a duplicate (ref_pos, kind) pair must trip the debug_assert");
+    }
+
+    #[test]
+    fn one_edit_shared_by_two_ins_ops_separated_only_by_a_deletion_is_applied_once() {
+        // FIX 1 (CRITICAL, task-10 review round): CIGAR 10M 1I 2D 1I 10M --
+        // both insertions share the SAME lookup key (last_ref, EditKind::Ins)
+        // because `last_ref` is only updated by the Match arm, and nothing
+        // but a `D` separates the two `Ins` ops. Before this fix, a single
+        // emitted edit would be found (and applied) at BOTH lookups. A
+        // single emitted edit must be consumed by AT MOST ONE of them.
+        let c = cig(vec![
+            Cigar::Match(10),
+            Cigar::Ins(1),
+            Cigar::Del(2),
+            Cigar::Ins(1),
+            Cigar::Match(10),
+        ]);
+        let mut seq = vec![b'A'; 10];
+        seq.push(b'T'); // first inserted base
+        seq.push(b'C'); // second inserted base
+        seq.extend(vec![b'A'; 10]);
+        let qual = vec![30u8; 22];
+        let edits = ReadEdits {
+            subs: vec![],
+            indels: vec![IndelEdit { ref_pos: 9, from: Allele::Ins(b"T".to_vec()), to: Allele::Ref }],
+        };
+        let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
+
+        // The FIRST Ins op ("T") reaches the key first and is reverted
+        // (dropped entirely); the SECOND ("C") finds the key already
+        // consumed and is copied verbatim, untouched.
+        let mut expected_seq = vec![b'A'; 10];
+        expected_seq.push(b'C');
+        expected_seq.extend(vec![b'A'; 10]);
+        assert_eq!(
+            r.seq, expected_seq,
+            "exactly one Ins op must be dropped -- the other must survive untouched"
+        );
+        assert_eq!(
+            r.cigar,
+            cig(vec![Cigar::Match(10), Cigar::Del(2), Cigar::Ins(1), Cigar::Match(10)])
+        );
+        assert_eq!(
+            r.applied.len(),
+            1,
+            "the shared key must be recorded as applied exactly once, not twice"
+        );
+        assert!(r.applied.contains(&(9, EditKind::Ins)));
+        assert!(r.structure_changed);
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn one_edit_shared_by_two_del_ops_separated_only_by_an_insertion_is_applied_once() {
+        // Mirror of the Ins-side test above: CIGAR 10M 2D 1I 2D 10M. Both
+        // deletions share the SAME lookup key (last_ref, EditKind::Del) for
+        // the same reason -- an intervening `Ins` op does not update
+        // `last_ref` either. A single emitted Del->Ref revert must be
+        // consumed by AT MOST ONE of the two deletions.
+        let c = cig(vec![
+            Cigar::Match(10),
+            Cigar::Del(2),
+            Cigar::Ins(1),
+            Cigar::Del(2),
+            Cigar::Match(10),
+        ]);
+        let mut seq = vec![b'A'; 10];
+        seq.push(b'T'); // the lone inserted base, between the two deletions
+        seq.extend(vec![b'A'; 10]);
+        let qual = vec![30u8; 21];
+        let edits = ReadEdits {
+            subs: vec![],
+            indels: vec![IndelEdit { ref_pos: 9, from: Allele::Del(2), to: Allele::Ref }],
+        };
+        let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
+
+        // The FIRST deletion is reverted: REF[10..12] ("GT") splices back in
+        // as matches. The SECOND deletion finds the key already consumed
+        // and remains a real, untouched deletion.
+        let mut expected_seq = vec![b'A'; 10];
+        expected_seq.extend_from_slice(b"GT");
+        expected_seq.push(b'T');
+        expected_seq.extend(vec![b'A'; 10]);
+        assert_eq!(
+            r.seq, expected_seq,
+            "exactly one deletion must be reverted -- the other must survive as a real deletion"
+        );
+        assert_eq!(
+            r.cigar,
+            cig(vec![Cigar::Match(12), Cigar::Ins(1), Cigar::Del(2), Cigar::Match(10)])
+        );
+        assert_eq!(
+            r.applied.len(),
+            1,
+            "the shared key must be recorded as applied exactly once, not twice"
+        );
+        assert!(r.applied.contains(&(9, EditKind::Del)));
+        assert!(r.structure_changed);
+        assert_invariants(&c, &r);
     }
 
     #[test]

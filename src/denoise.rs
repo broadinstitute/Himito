@@ -832,9 +832,23 @@ fn apply_corrections(
                             // key is absent from `out.applied` was a silent no-op (the walk
                             // never reached its `ref_pos`); counting it would report a
                             // correction that never happened.
+                            //
+                            // FIX 2 (task-10 review round): consult `out.applied` with a
+                            // ONE-SHOT `remove`, not `contains`. `out.applied` is a set of
+                            // KEYS, not a per-edit outcome -- if `edits.indels` ever holds
+                            // two entries sharing the same (ref_pos, kind) (pass 2's two
+                            // independent per-site decisions can legitimately produce this
+                            // for a read whose own two same-kind CIGAR ops share one anchor,
+                            // exactly CRITICAL 1's shape, when BOTH sites independently
+                            // decide to reassign it), a plain `.contains()` would find the
+                            // key present for BOTH iterations and double-book the
+                            // reassignment even though `rewrite_read` only ever physically
+                            // applied one of them. Consuming the key here mirrors the
+                            // one-shot semantics FIX 1 gave the internal Ins/Del lookups.
+                            let mut applied = out.applied;
                             for edit in &edits.indels {
                                 let key = (edit.ref_pos, rewrite::edit_kind(&edit.from));
-                                if !out.applied.contains(&key) {
+                                if !applied.remove(&key) {
                                     stats.indel_edits_emitted_but_not_applied += 1;
                                     continue;
                                 }
@@ -2549,13 +2563,123 @@ mod tests {
         assert_eq!(stats.reads_reassigned_indel_to_indel, 0);
         assert_eq!(stats.indel_bases_inserted, 0);
         assert_eq!(stats.indel_bases_removed, 0);
-        assert!(
-            stats.reassignments_by_hp_length.iter().all(|&c| c == 0),
-            "no hp-length bucket may record a correction that never happened"
+        // `.iter().all(|&c| c == 0)` on an EMPTY vector is vacuously true --
+        // this test's edit is hand-fed straight into `apply_corrections`,
+        // bypassing pass 2's own assignment loop entirely, so the
+        // `reassignments_by_hp_length` resize-and-increment (which only runs
+        // once an edit is booked as APPLIED) never executes and the vector
+        // never grows past its `DenoiseStats::default()` length of 0. Assert
+        // that length directly so a future regression that starts booking
+        // this edit (and pushes SOME nonzero bucket) is actually caught,
+        // instead of trivially passing an `all()` over nothing (FIX 3).
+        assert_eq!(
+            stats.reassignments_by_hp_length.len(),
+            0,
+            "no hp-length bucket may exist -- none may have been touched"
         );
+        // FIX 3: also confirm this edit bypassed EVERY pass-2 guard, not just
+        // that the net reassignment counters are zero -- proving it was
+        // rejected by `rewrite_read` itself (unreachable `ref_pos`), rather
+        // than by one of pass 2's own skip counters, which this hand-fed
+        // edit never passes through at all (this test calls
+        // `apply_corrections` directly with an empty `IndelModels`).
+        assert_eq!(stats.assignments_skipped_span_guard, 0);
+        assert_eq!(stats.assignments_skipped_unsupported_transition, 0);
+        assert_eq!(stats.assignments_skipped_oversized_neighbor, 0);
+        assert_eq!(stats.assignments_skipped_ambiguous_carry, 0);
+        assert_eq!(stats.assignments_skipped_swallowed_by_gained_deletion, 0);
         assert_eq!(
             stats.indel_edits_emitted_but_not_applied, 1,
             "the emitted-but-unreachable edit must be loudly visible in the diagnostic counter"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- FIX 2 (task-10 review round): duplicate emitted edits must not be
+    // double-counted ----
+
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn two_emitted_edits_sharing_ref_pos_and_kind_are_not_double_counted() {
+        // Same CIGAR shape as CRITICAL 1's regression test in rewrite.rs --
+        // 10M 1I 2D 1I 10M, where both `Ins` ops share ONE lookup key because
+        // nothing but a `D` separates them and `last_ref` is only updated by
+        // the Match arm -- but here pass 2's OWN construction is bypassed
+        // (via a hand-fed `Corrections` + empty `IndelModels`, exactly like
+        // the test above) to feed `apply_corrections` TWO real `IndelEdit`s
+        // that legitimately share `(ref_pos, kind)`: this is exactly what
+        // pass 2 emits when a read's two same-anchor events normalize to two
+        // DIFFERENT sites that BOTH independently decide to revert.
+        //
+        // `rewrite_read`'s internal map construction collapses the two into
+        // one entry and (in debug builds) trips the `debug_assert!` guarding
+        // exactly this collision -- a genuine construction bug pass 2 should
+        // never emit in practice, but reachable in principle in a release
+        // build, where the assert compiles out. This test therefore only
+        // runs in `--release` (see the sibling debug-only
+        // `duplicate_ref_pos_and_kind_trips_the_debug_assert` test in
+        // rewrite.rs, which covers the debug-build side of this same
+        // collision).
+        let dir = std::env::temp_dir().join("himito_denoise_indel_duplicate_emitted_edit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        let mut seq = vec![b'A'; 10];
+        seq.push(b'T'); // first inserted base
+        seq.push(b'C'); // second inserted base
+        seq.extend(vec![b'A'; 10]);
+        let cigar = vec![
+            Cigar::Match(10),
+            Cigar::Ins(1),
+            Cigar::Del(2),
+            Cigar::Ins(1),
+            Cigar::Match(10),
+        ];
+        write_cigar_bam(&inb, "chrM", 30, &[("rdup", 0, seq.as_slice(), cigar.clone(), false)]);
+
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), vec![b'A'; 30]);
+
+        let mut corr: Corrections = HashMap::new();
+        corr.insert(
+            b"rdup".to_vec(),
+            rewrite::ReadEdits {
+                subs: vec![],
+                indels: vec![
+                    rewrite::IndelEdit {
+                        ref_pos: 9,
+                        from: indel::Allele::Ins(b"T".to_vec()),
+                        to: indel::Allele::Ref,
+                    },
+                    rewrite::IndelEdit {
+                        ref_pos: 9,
+                        from: indel::Allele::Ins(b"C".to_vec()),
+                        to: indel::Allele::Ref,
+                    },
+                ],
+            },
+        );
+
+        let models = IndelModels::new();
+        let mut stats = DenoiseStats::default();
+        let (proc, modified) = apply_corrections(
+            &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
+        )
+        .unwrap();
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 1, "one of the two Ins ops must actually be reverted");
+
+        // Exactly one of the two duplicate-keyed edits is booked as applied;
+        // the other must be correctly reported as not applied, NOT double
+        // booked as a second reassignment for the same physical correction.
+        assert_eq!(
+            stats.reads_reassigned_indel_to_ref, 1,
+            "only ONE of the two duplicate-keyed edits may be booked as applied"
+        );
+        assert_eq!(
+            stats.indel_edits_emitted_but_not_applied, 1,
+            "the other duplicate-keyed edit must be reported as not applied"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

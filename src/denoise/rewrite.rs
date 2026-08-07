@@ -15,10 +15,43 @@ use super::indel::Allele;
 /// One read's reassignment at one normalized indel site.
 #[derive(Debug, Clone)]
 pub struct IndelEdit {
-    /// Reference position of the last base BEFORE the event (the pileup anchor).
+    /// The coordinate `rewrite_read` looks this edit up by. Direction-dependent,
+    /// NOT a single anchor convention: the left-normalized SITE position when
+    /// `from` is `Ref` (a gained indel has no CIGAR anchor of its own to key on
+    /// -- it is keyed to wherever the walk should splice it into plain match
+    /// context); the read's OWN CIGAR anchor (the last aligned base before its
+    /// own indel, exactly as htslib's pileup reports it) when `from` is `Ins` or
+    /// `Del` (reverting or replacing an indel the read already carries).
+    ///
+    /// Two edits for the SAME read can legitimately share a `ref_pos` while
+    /// differing in `from`'s kind -- e.g. a read's own insertion anchored at
+    /// position P that gets reverted, plus an unrelated gained deletion whose
+    /// normalized site also happens to be P. `rewrite_read` disambiguates by
+    /// keying its internal lookup on `(ref_pos, kind_of(from))`, not `ref_pos`
+    /// alone (see FIX 1).
     pub ref_pos: u32,
     pub from: Allele,
     pub to: Allele,
+}
+
+/// Which of the three edit varieties an `IndelEdit` is, discriminated by `from`.
+/// Used only to disambiguate `IndelEdit`s that share a `ref_pos` (see FIX 1):
+/// `rewrite_read`'s three lookup sites each want their OWN kind independently,
+/// so keying by `(ref_pos, EditKind)` instead of `ref_pos` alone makes those
+/// lookups mutually exclusive rather than ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EditKind {
+    Ref,
+    Ins,
+    Del,
+}
+
+fn edit_kind(a: &Allele) -> EditKind {
+    match a {
+        Allele::Ref => EditKind::Ref,
+        Allele::Ins(_) => EditKind::Ins,
+        Allele::Del(_) => EditKind::Del,
+    }
 }
 
 /// All edits for one read, keyed by REFERENCE coordinate so substitutions and
@@ -118,8 +151,23 @@ pub fn rewrite_read(
     }
 
     let subs: HashMap<u32, u8> = edits.subs.iter().copied().collect();
-    let indels: HashMap<u32, &IndelEdit> =
-        edits.indels.iter().map(|e| (e.ref_pos, e)).collect();
+    // Keyed by (ref_pos, kind_of(from)), not ref_pos alone (see FIX 1): two edits
+    // for the same read can share a ref_pos while differing in `from`'s kind (a
+    // gained indel keyed at a normalized site can coincide with this read's own
+    // indel anchored at the same coordinate), and each of the three lookup sites
+    // below wants its OWN kind specifically.
+    let mut indels: HashMap<(u32, EditKind), &IndelEdit> = HashMap::new();
+    for e in &edits.indels {
+        let key = (e.ref_pos, edit_kind(&e.from));
+        debug_assert!(
+            !indels.contains_key(&key),
+            "duplicate IndelEdit at ref_pos {}: two edits with the same `from` kind \
+             ({:?}) collide -- each (ref_pos, kind) pair must be unique per read",
+            e.ref_pos,
+            key.1
+        );
+        indels.insert(key, e);
+    }
 
     let mut out_seq: Vec<u8> = Vec::with_capacity(seq.len() + 8);
     let mut out_qual: Vec<u8> = Vec::with_capacity(qual.len() + 8);
@@ -158,8 +206,12 @@ pub fn rewrite_read(
                     last_ref = Some(cur);
                     k += 1;
 
-                    // An indel anchored on this aligned base?
-                    if let Some(e) = indels.get(&cur) {
+                    // An indel anchored on this aligned base? Look up the `Ref`
+                    // kind specifically: a gained indel is always keyed at the
+                    // normalized site with `from: Ref` (see FIX 1), independent
+                    // of any `Ins`/`Del`-kind edit that might share this same
+                    // `ref_pos` via the read's own CIGAR anchor.
+                    if let Some(e) = indels.get(&(cur, EditKind::Ref)) {
                         match (&e.from, &e.to) {
                             (Allele::Ref, Allele::Ins(s)) => {
                                 let next = qual.get(qp + k as usize).copied();
@@ -190,10 +242,11 @@ pub fn rewrite_read(
             Cigar::Ins(n) => {
                 // While `last_ref` is `None` there is no aligned base before
                 // this insertion to anchor an edit to, so skip the lookup
-                // entirely and copy the op verbatim (see FIX 3 above).
-                let e = last_ref
-                    .and_then(|lr| indels.get(&lr))
-                    .filter(|e| matches!(e.from, Allele::Ins(_)));
+                // entirely and copy the op verbatim (see FIX 3 above). The
+                // `Ins` kind is baked into the key (see FIX 1), so this can
+                // only ever find an edit whose `from` is this read's own
+                // carried insertion -- no separate `filter` needed.
+                let e = last_ref.and_then(|lr| indels.get(&(lr, EditKind::Ins)));
                 match e.map(|e| &e.to) {
                     // Reverted: drop the inserted bases entirely.
                     Some(Allele::Ref) => {
@@ -220,10 +273,10 @@ pub fn rewrite_read(
 
             Cigar::Del(n) => {
                 // See the `Ins` arm above: skip the lookup entirely while
-                // there is no preceding aligned base to anchor to.
-                let e = last_ref
-                    .and_then(|lr| indels.get(&lr))
-                    .filter(|e| matches!(e.from, Allele::Del(_)));
+                // there is no preceding aligned base to anchor to. The `Del`
+                // kind is baked into the key (see FIX 1), so no separate
+                // `filter` is needed here either.
+                let e = last_ref.and_then(|lr| indels.get(&(lr, EditKind::Del)));
                 let splice = |out_seq: &mut Vec<u8>, out_qual: &mut Vec<u8>, from: u32, count: u32| {
                     let f = match (out_qual.last().copied(), qual.get(qp).copied()) {
                         (Some(l), Some(r)) => l.min(r),
@@ -543,6 +596,80 @@ mod tests {
         assert_eq!(r.seq, b"AAAAC".to_vec());
         assert_eq!(r.cigar, cig(vec![Cigar::Match(2), Cigar::Del(1), Cigar::Match(3)]));
         assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn two_edits_sharing_a_ref_pos_but_differing_in_kind_are_both_applied() {
+        // A single read can legitimately carry two IndelEdits with the SAME
+        // ref_pos: one keyed at the read's own CIGAR anchor (from: Ins,
+        // reverting an insertion the read itself carries), and one keyed at
+        // the normalized site (from: Ref, a gained insertion into plain match
+        // context) -- which happen to coincide at position 15 here. Before
+        // keying by (ref_pos, kind), a plain `HashMap<u32, &IndelEdit>` could
+        // only hold ONE of these two per read, so whichever was inserted
+        // second would silently overwrite the first.
+        //
+        // 16M read that also carries its own 1bp insertion right at the end
+        // (anchor 15, the read's last aligned base): REF[0..16] + inserted "A".
+        let c = cig(vec![Cigar::Match(16), Cigar::Ins(1)]);
+        let mut seq = REF.to_vec();
+        seq.extend_from_slice(b"A");
+        let qual = vec![30u8; 17];
+        let edits = ReadEdits {
+            subs: vec![],
+            indels: vec![
+                // Gained: at ref_pos 15 (from: Ref), splice in a 2bp consensus
+                // insertion "AT" right after the last matched base.
+                IndelEdit {
+                    ref_pos: 15,
+                    from: Allele::Ref,
+                    to: Allele::Ins(b"AT".to_vec()),
+                },
+                // Reverted: this read's OWN carried insertion (from: Ins),
+                // also anchored at ref_pos 15, is dropped entirely.
+                IndelEdit {
+                    ref_pos: 15,
+                    from: Allele::Ins(b"A".to_vec()),
+                    to: Allele::Ref,
+                },
+            ],
+        };
+        let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
+        // The gained "AT" is spliced in (proving the Ref-kind lookup fired),
+        // AND the read's own inserted "A" is dropped (proving the Ins-kind
+        // lookup ALSO fired independently) -- not one overwriting the other.
+        let mut expected_seq = REF.to_vec();
+        expected_seq.extend_from_slice(b"AT");
+        assert_eq!(r.seq, expected_seq);
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(16), Cigar::Ins(2)]));
+        assert!(r.structure_changed);
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    fn duplicate_ref_pos_and_kind_trips_the_debug_assert() {
+        // Two edits with the IDENTICAL (ref_pos, kind) pair -- both `from: Ref`
+        // at position 3 -- are a genuine construction bug (pass 2 should never
+        // emit two gained-indel edits at the same site for one read); the
+        // dedup guard must catch it rather than silently keeping whichever one
+        // happened to be inserted last. `debug_assert!` is compiled out in
+        // release, so this test is debug-only (see `#[cfg(debug_assertions)]`
+        // above) -- there is nothing for it to catch in a release build.
+        let c = cig(vec![Cigar::Match(8)]);
+        let seq = b"ACGTAAAA".to_vec();
+        let qual = vec![30u8; 8];
+        let edits = ReadEdits {
+            subs: vec![],
+            indels: vec![
+                IndelEdit { ref_pos: 3, from: Allele::Ref, to: Allele::Ins(b"A".to_vec()) },
+                IndelEdit { ref_pos: 3, from: Allele::Ref, to: Allele::Del(1) },
+            ],
+        };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rewrite_read(0, &c, &seq, &qual, &edits, REF)
+        }));
+        assert!(result.is_err(), "a duplicate (ref_pos, kind) pair must trip the debug_assert");
     }
 
     #[test]

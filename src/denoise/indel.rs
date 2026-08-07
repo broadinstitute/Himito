@@ -458,6 +458,40 @@ pub struct ReadEvent {
     pub allele: Option<Allele>,
 }
 
+/// Length of the contiguous `M`/`=`/`X` run starting AT `target`, walking a read's
+/// own CIGAR from its POS. Returns 0 when `target` is not covered by such a run at
+/// all -- inside a `D`/`N`, before the read's start, or past its end.
+///
+/// This is the read's actual "aligned query base" test, and is stricter than
+/// checking only the read's overall `[pos, end_pos())` span: that span includes any
+/// `D`/`N` the read carries, but a read has no query base -- and hence no depth or
+/// rewrite context -- inside those. Used both to gate an ALT vote in pass 1 (FIX 2:
+/// a read that deletes the normalized column must not cast a vote there even though
+/// its overall span covers it) and to size-check a gained deletion's flank in pass 2
+/// (FIX 3: the deletion and its right-hand flank must fit inside ONE such run, not
+/// merely inside the read's overall span).
+pub fn match_run_len(pos: i64, cigar: &CigarString, target: u32) -> u32 {
+    let mut rp = pos.max(0) as u32;
+    for op in cigar.iter() {
+        match *op {
+            Cigar::Match(n) | Cigar::Equal(n) | Cigar::Diff(n) => {
+                if target >= rp && target < rp + n {
+                    return rp + n - target;
+                }
+                rp += n;
+            }
+            Cigar::Del(n) | Cigar::RefSkip(n) => {
+                if target >= rp && target < rp + n {
+                    return 0;
+                }
+                rp += n;
+            }
+            Cigar::Ins(_) | Cigar::SoftClip(_) | Cigar::HardClip(_) | Cigar::Pad(_) => {}
+        }
+    }
+    0
+}
+
 /// Enumerate a read's own indel events straight from its CIGAR, left-normalized.
 ///
 /// The pileup reports what a read has AT A COLUMN, which cannot answer "does this
@@ -966,6 +1000,54 @@ mod tests {
 
     fn cs(ops: Vec<Cigar>) -> CigarString {
         CigarString(ops)
+    }
+
+    #[test]
+    fn match_run_len_reports_remaining_run_inside_a_match() {
+        // 10M starting at pos 0: from target 3, 7 match bases remain (3..10).
+        let c = cs(vec![Cigar::Match(10)]);
+        assert_eq!(match_run_len(0, &c, 3), 7);
+        // At the very first base of the run, the whole run remains.
+        assert_eq!(match_run_len(0, &c, 0), 10);
+        // At the last base, exactly 1 remains.
+        assert_eq!(match_run_len(0, &c, 9), 1);
+    }
+
+    #[test]
+    fn match_run_len_is_zero_inside_a_deletion_or_refskip() {
+        // 5M 3D 5M: targets 5..8 fall inside the deletion, and have no aligned
+        // query base at all.
+        let c = cs(vec![Cigar::Match(5), Cigar::Del(3), Cigar::Match(5)]);
+        for t in 5..8 {
+            assert_eq!(match_run_len(0, &c, t), 0, "target {t} is inside the deletion");
+        }
+        // The match run resumes after the deletion.
+        assert_eq!(match_run_len(0, &c, 8), 5);
+
+        let n = cs(vec![Cigar::Match(5), Cigar::RefSkip(3), Cigar::Match(5)]);
+        for t in 5..8 {
+            assert_eq!(match_run_len(0, &n, t), 0, "target {t} is inside the refskip");
+        }
+    }
+
+    #[test]
+    fn match_run_len_is_zero_before_start_or_past_end() {
+        let c = cs(vec![Cigar::Match(10)]);
+        assert_eq!(match_run_len(0, &c, 10), 0, "target at end_pos is past the read");
+        assert_eq!(match_run_len(5, &c, 3), 0, "target before the read's own POS");
+    }
+
+    #[test]
+    fn match_run_len_skips_insertions_without_advancing_reference() {
+        // An insertion consumes no reference, so the two Match ops it splits are
+        // still contiguous in REFERENCE space -- but `rewrite_read`'s Match arm only
+        // sees ONE op at a time, so this helper (used by FIX 2/3, both of which
+        // reason about a single contiguous CIGAR M/=/X op) correctly reports the
+        // SECOND op's own length once the target falls past the insertion, not the
+        // combined length of both flanking runs.
+        let c = cs(vec![Cigar::Match(5), Cigar::Ins(2), Cigar::Match(5)]);
+        assert_eq!(match_run_len(0, &c, 5), 5, "second run's own length at its start");
+        assert_eq!(match_run_len(0, &c, 4), 1, "first run's own remaining length");
     }
 
     #[test]

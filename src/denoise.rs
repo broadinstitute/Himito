@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use bio::io::fasta;
 use log::{info, warn};
 use rust_htslib::bam::{self, Read, Reader};
+use rust_htslib::bam::record::CigarString;
 
 use crate::denoise::rewrite::{rewrite_read, strip_stale_tags};
 
@@ -286,9 +287,13 @@ pub struct DenoiseStats {
     /// Non-reference ALLELES (not sites) rejected specifically as strand-biased.
     pub indel_alt_alleles_strand_biased: u64,
     pub indel_events_examined: u64,
-    /// Votes dropped in pass 1 because the read that cast them does not actually
-    /// span the column its event left-normalized into (see CRITICAL 2). Depth for
-    /// that read already excludes it, so this only tracks the ALT side.
+    /// Votes dropped in pass 1 because the read that cast them has no ALIGNED QUERY
+    /// BASE at the column its event left-normalized into -- not merely because that
+    /// column falls outside the read's overall `[pos, end_pos())` span (see
+    /// CRITICAL 2), but also when the read's span covers the column only through
+    /// its OWN `D`/`N` there, where depth was never incremented for this read
+    /// either (see FIX 2). Depth already excludes both cases, so this only tracks
+    /// the ALT side.
     pub indel_events_out_of_span: u64,
     pub reads_reassigned_ref_to_ins: u64,
     pub reads_reassigned_ref_to_del: u64,
@@ -361,10 +366,11 @@ fn compute_corrections(
         let mut col_depth = 0u32;
         let mut col_fwd = 0u32;
         let mut col_rev = 0u32;
-        // (allele, reverse, read's own aligned span [rstart, rend)). The span
-        // travels with the event so it can be checked AFTER normalization, once
-        // we know which column the event actually folds into (see CRITICAL 2).
-        let mut col_events: Vec<(indel::Allele, bool, i64, i64)> = Vec::new();
+        // (allele, reverse, read's own POS, read's own CIGAR). The read's full
+        // CIGAR travels with the event so the ALT-vote gate can be checked AFTER
+        // normalization, once we know which column the event actually folds into
+        // (see CRITICAL 2 / FIX 2), via `indel::match_run_len`.
+        let mut col_events: Vec<(indel::Allele, bool, i64, CigarString)> = Vec::new();
 
         for a in col.alignments() {
             let rec = a.record();
@@ -376,32 +382,28 @@ fn compute_corrections(
                 if let Some(q) = a.qpos() {
                     col_depth += 1;
                     if rec.is_reverse() { col_rev += 1 } else { col_fwd += 1 }
-                    match a.indel() {
+                    // Decide the event's allele first, WITHOUT touching the CIGAR;
+                    // `rec.cigar()` re-parses and allocates the whole CIGAR from raw
+                    // bytes on every call, so it must be hoisted to a single call
+                    // site reached at most once per alignment (only when this
+                    // alignment actually carries a correctable event), not called
+                    // separately from each of the two (mutually exclusive) arms.
+                    let ev_allele = match a.indel() {
                         bam::pileup::Indel::Ins(n) if n < iopts.max_len => {
                             let s: Vec<u8> =
                                 (0..n as usize).map(|i| rec.seq()[q + 1 + i]).collect();
-                            let view = rec.cigar();
-                            col_events.push((
-                                indel::Allele::Ins(s),
-                                rec.is_reverse(),
-                                rec.pos(),
-                                view.end_pos(),
-                            ));
-                            stats.indel_events_examined += 1;
+                            Some(indel::Allele::Ins(s))
                         }
                         bam::pileup::Indel::Del(n) if n < iopts.max_len => {
-                            let view = rec.cigar();
-                            col_events.push((
-                                indel::Allele::Del(n),
-                                rec.is_reverse(),
-                                rec.pos(),
-                                view.end_pos(),
-                            ));
-                            stats.indel_events_examined += 1;
+                            Some(indel::Allele::Del(n))
                         }
                         // Indel::None contributes depth only; an indel at or above
                         // max_len contributes depth and is never corrected.
-                        _ => {}
+                        _ => None,
+                    };
+                    if let Some(allele) = ev_allele {
+                        col_events.push((allele, rec.is_reverse(), rec.pos(), rec.cigar().take()));
+                        stats.indel_events_examined += 1;
                     }
                 }
             }
@@ -425,17 +427,21 @@ fn compute_corrections(
 
         if iopts.enabled {
             depths.insert((name.to_vec(), refpos as u32), (col_depth, col_fwd, col_rev));
-            for (allele, reverse, rstart, rend) in col_events {
+            for (allele, reverse, rpos, cigar) in col_events {
                 let (norm_pos, norm_allele) =
                     indel::normalize_left(refseq, refpos as u32, &allele);
                 // `normalize_left` walks the reference with no knowledge of read
                 // boundaries: a read whose alignment starts (or ends) inside a
                 // repeat can normalize an event to a column outside its own
-                // aligned span. Depth at that column already excludes this read
-                // (depth comes from the column map, and this read never appears
-                // there), so counting its ALT vote too would let alt_total exceed
-                // depth -- see CRITICAL 2. Drop the vote and count it instead.
-                if (norm_pos as i64) < rstart || (norm_pos as i64) >= rend {
+                // aligned span -- or even to a column its span covers only through
+                // this SAME read's own `D`/`N`, where depth was never incremented
+                // for this read either (depth only counts
+                // `!is_refskip() && qpos().is_some()`; see FIX 2). Either way,
+                // counting the ALT vote would let alt_total exceed depth at that
+                // column -- see CRITICAL 2. The correct test is whether the read
+                // has an actual ALIGNED QUERY BASE at norm_pos, i.e. a nonzero
+                // contiguous M/=/X run starting there.
+                if indel::match_run_len(rpos, &cigar, norm_pos) == 0 {
                     stats.indel_events_out_of_span += 1;
                     continue;
                 }
@@ -597,7 +603,11 @@ fn apply_corrections(
                                 let lo = list.partition_point(|(p, _)| (*p as i64) < rstart);
                                 for (pos, model) in &list[lo..] {
                                     let s = *pos as i64;
-                                    if s > rend {
+                                    // `rend` is EXCLUSIVE, so `s == rend` is a site the
+                                    // read does not span at all; admitting it here only
+                                    // inflates the span-guard counter below with sites
+                                    // that were never real candidates for this read.
+                                    if s >= rend {
                                         break;
                                     }
                                     let (observed, anchor) = carried
@@ -622,6 +632,28 @@ fn apply_corrections(
                                         stats.assignments_skipped_span_guard += 1;
                                         continue;
                                     }
+                                    // FIX 3: the check above bounds only the read's
+                                    // OVERALL span, which can pass even when the
+                                    // read's own alignment breaks up into several
+                                    // Match/=/X runs -- e.g. an unrelated `D`/`N`
+                                    // shortly after this site. A GAINED deletion
+                                    // (Ref -> Del(m)) is spliced into `rewrite_read`'s
+                                    // Match arm at the normalized site, so it and its
+                                    // right-hand flank must both fit inside that ONE
+                                    // contiguous run, or the walk truncates it to the
+                                    // wrong length (debug_assert in debug, silent
+                                    // truncation in release).
+                                    if observed == indel::Allele::Ref {
+                                        if let indel::Allele::Del(m) = &target {
+                                            let need = *m as i64 + flank;
+                                            if (indel::match_run_len(rstart, &cigar, s as u32) as i64)
+                                                < need
+                                            {
+                                                stats.assignments_skipped_span_guard += 1;
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     // An oversized indel nearby means this read's alignment in
                                     // this window cannot be represented by the site's alleles.
                                     if blocked.iter().any(|b| (b - s).abs() <= reach) {
@@ -637,8 +669,18 @@ fn apply_corrections(
                                             stats.reads_reassigned_ref_to_del += 1;
                                             stats.indel_bases_removed += *n as u64;
                                         }
-                                        (_, indel::Allele::Ref) => {
+                                        (indel::Allele::Ins(from_s), indel::Allele::Ref) => {
+                                            // Reverting a spurious insertion removes
+                                            // the bases it added -- the single most
+                                            // common correction this feature makes.
                                             stats.reads_reassigned_indel_to_ref += 1;
+                                            stats.indel_bases_removed += from_s.len() as u64;
+                                        }
+                                        (indel::Allele::Del(from_n), indel::Allele::Ref) => {
+                                            // Reverting a spurious deletion restores
+                                            // the reference bases it dropped.
+                                            stats.reads_reassigned_indel_to_ref += 1;
+                                            stats.indel_bases_inserted += *from_n as u64;
                                         }
                                         (indel::Allele::Ins(from_s), indel::Allele::Ins(to_s)) => {
                                             stats.reads_reassigned_indel_to_indel += 1;
@@ -690,7 +732,7 @@ fn apply_corrections(
                             // Extract owned parts, rewrite, rebuild (aux preserved by set()).
                             let qname = rec.qname().to_vec();
                             let cigar = rec.cigar().take();
-                            let seq = rec.seq().as_bytes().to_vec();
+                            let seq = rec.seq().as_bytes();
                             let qual = rec.qual().to_vec();
                             let out =
                                 rewrite_read(rec.pos(), &cigar, &seq, &qual, &edits, refseq);
@@ -1384,12 +1426,13 @@ mod tests {
         let (_corr, models, _stats) =
             compute_corrections(&bam, &indel_refs(), 2, 0.01, SB_P, HOM_VAF, &indels_on()).unwrap();
         let list = models.get(&b"chrM".to_vec()).expect("chrM must have sites");
-        // Assert the exact expected positions rather than comparing the list to
-        // its own sorted copy: with only two elements, an unsorted 2-element list
-        // equals its own `.sort()`ed copy about half the time by pure chance
-        // (whichever of the two orderings HashMap iteration happens to produce),
-        // so that comparison would pass about half the time even with the
-        // `sort_by_key` deleted.
+        // Assert the exact expected positions rather than checking ascending order
+        // pairwise (the old form: `list.windows(2).all(|w| w[0].0 <= w[1].0)`):
+        // with only two elements, an unsorted 2-element list still satisfies
+        // pairwise ascending order about half the time by pure chance (whichever
+        // of the two orderings HashMap iteration happens to produce), so that
+        // check would pass about half the time even with the `sort_by_key`
+        // deleted.
         let positions: Vec<u32> = list.iter().map(|(p, _)| *p).collect();
         assert_eq!(positions, vec![7, 19], "sites must be exactly [7, 19], in that order");
         std::fs::remove_dir_all(&dir).ok();
@@ -1435,6 +1478,8 @@ mod tests {
         }
         assert!(seen);
         assert_eq!(stats.reads_reassigned_indel_to_ref, 1);
+        // FIX 4: reverting a 1bp insertion removes 1 base from the read.
+        assert_eq!(stats.indel_bases_removed, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1631,6 +1676,9 @@ mod tests {
         }
         assert!(seen);
         assert_eq!(stats.reads_reassigned_indel_to_ref, 1);
+        // FIX 4: this revert removes the 1 spurious base from the read; before
+        // FIX 4 `indel_bases_removed` stayed 0 for exactly this transition.
+        assert_eq!(stats.indel_bases_removed, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1682,12 +1730,15 @@ mod tests {
             stats.indel_events_out_of_span, 4,
             "all four out-of-span votes must be dropped and counted"
         );
-        if let Some(list) = models.get(&b"chrM".to_vec()) {
-            assert!(
-                list.iter().all(|(p, _)| *p != 7),
-                "site 7 must not be fabricated from reads that never span it"
-            );
-        }
+        // This fixture's only would-be evidence for site 7 is the four dropped
+        // votes above, so with them correctly rejected "chrM" has no entry in
+        // `models` at all -- assert that absence explicitly instead of nesting
+        // the check inside an `if let Some(list)` that never runs (and so never
+        // exercises this assertion) on this fixture.
+        let no_site_7 = models
+            .get(&b"chrM".to_vec())
+            .map_or(true, |list| list.iter().all(|(p, _)| *p != 7));
+        assert!(no_site_7, "site 7 must not be fabricated from reads that never span it");
 
         apply_corrections(&bam, &outb, &corr, &refs, &models, &iopts, &mut stats).unwrap();
         let mut r = Reader::from_path(&outb).unwrap();
@@ -1701,6 +1752,173 @@ mod tests {
                 assert_eq!(rec.cigar().to_string(), "29M");
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- FIX 2 regression: a read's own D/N covering the normalized column ----
+
+    #[test]
+    fn read_deleting_the_normalized_column_does_not_cast_a_phantom_alt_vote() {
+        // Depth is only incremented where a read has qpos().is_some() -- never
+        // inside that SAME read's own D/N. `rdel` deletes reference column 7
+        // (Match(7) + Del(1)) and, separately, carries a spurious insertion
+        // inside the downstream A-run (anchor 15) that left-normalizes to
+        // that very column 7. `rdel`'s own [pos, end_pos()) span covers
+        // column 7 (via the deletion), so the OLD span check would have
+        // accepted this as an ALT vote there with no matching depth --
+        // alt_total could exceed depth in miniature, CRITICAL 2's failure
+        // mode reappearing. The new contiguous-match-run check must reject
+        // it, because `rdel` has no aligned M/=/X base at column 7 at all.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_deletes_own_norm_col");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
+        }
+        // ref[0..7) + (skip ref[7]) + ref[8..16) + inserted "A" + ref[16..29).
+        let mut del_seq: Vec<u8> = Vec::new();
+        del_seq.extend_from_slice(&REF29[0..7]);
+        del_seq.extend_from_slice(&REF29[8..16]);
+        del_seq.push(b'A');
+        del_seq.extend_from_slice(&REF29[16..29]);
+        let del_cigar = vec![
+            Cigar::Match(7), Cigar::Del(1), Cigar::Match(8), Cigar::Ins(1), Cigar::Match(13),
+        ];
+        reads.push(("rdel", 0, del_seq.as_slice(), del_cigar, false));
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let (_corr, models, stats) =
+            compute_corrections(&bam, &indel_refs(), 2, 0.01, SB_P, HOM_VAF, &indels_on()).unwrap();
+
+        assert!(
+            stats.indel_events_out_of_span >= 1,
+            "the phantom vote at column 7 must be rejected and counted"
+        );
+        let no_site_7 = models
+            .get(&b"chrM".to_vec())
+            .map_or(true, |list| list.iter().all(|(p, _)| *p != 7));
+        assert!(no_site_7, "site 7 must not be fabricated from a read with no depth there");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- FIX 3 regression: a gained deletion must fit inside ONE match run ----
+
+    #[test]
+    fn gained_deletion_is_skipped_when_its_own_match_run_is_too_short() {
+        // The span/flank guard bounds only the read's OVERALL alignment span.
+        // Read `rguard`'s alignment is 0..33 overall -- comfortably inside
+        // flank(5)+reach(10) of the decided site at 18 -- but its FIRST
+        // Match run ends at ref pos 20, only 2 bases past the site, because
+        // of an unrelated RefSkip further along. A gained Del(2) at 18 needs
+        // a contiguous match run of at least m(2)+flank(5)=7 bases from the
+        // site; this read only has 2, so it must be skipped, not truncated
+        // (the old guard alone would have let `rewrite_read`'s Match arm
+        // walk `k + m` past its op length).
+        let dir = std::env::temp_dir().join("himito_denoise_indel_shortrun");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        let seq = vec![b'A'; 30];
+        let cigar = vec![Cigar::Match(20), Cigar::RefSkip(3), Cigar::Match(10)];
+        write_cigar_bam(&inb, "chrM", 40, &[("rguard", 0, seq.as_slice(), cigar, false)]);
+
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), vec![b'A'; 40]);
+
+        // Hand-built decided site at position 18: Del(2) dominates 90/10 over
+        // Ref, with eps large enough that MAP assignment genuinely wants to
+        // move a Ref-observing read to Del(2) (same arithmetic shape as
+        // `near_homoplasmic_site_repairs_reads_that_dropped_the_indel` in
+        // indel.rs). Hand-building this model bypasses the pileup/candidacy
+        // machinery entirely, which is irrelevant to what this test checks.
+        let model = indel::IndelSiteModel {
+            kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(2), 0.9)],
+            eps: 0.15,
+            context_len: 1,
+            strand_biased: 0,
+            obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(2), 0.9)],
+            strand_rejected: vec![],
+        };
+        let mut models = IndelModels::new();
+        models.entry(b"chrM".to_vec()).or_default().push((18u32, model));
+
+        let corr: Corrections = HashMap::new();
+        let mut stats = DenoiseStats::default();
+        let (proc, modified) = apply_corrections(
+            &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
+        )
+        .unwrap();
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 0, "the guarded read must not be rewritten");
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let rec = r.records().next().unwrap().unwrap();
+        assert_eq!(rec.seq().as_bytes(), seq.as_slice(), "SEQ must be untouched");
+        assert_eq!(
+            rec.cigar().take(),
+            CigarString(vec![Cigar::Match(20), Cigar::RefSkip(3), Cigar::Match(10)]),
+            "CIGAR must be untouched"
+        );
+        assert!(
+            stats.assignments_skipped_span_guard >= 1,
+            "the too-short match run must be counted as a span-guard skip"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- FIX 4 regression: revert-direction base counts ----
+
+    #[test]
+    fn lone_spurious_deletion_is_reverted_and_counted_as_bases_inserted() {
+        // `Del(n)->Ref` restores n bases to the read but was not being counted
+        // in `indel_bases_inserted`. Mirrors
+        // `lone_spurious_insertion_is_removed_from_a_substitution_clean_column`
+        // but with a deletion: a single read carries a spurious 1bp deletion in
+        // unique sequence; candidacy rejects it (a lone single-strand
+        // observation fails min_strand), but the stray read must still be
+        // repaired back to REF, and that repair must show up as 1 restored
+        // (inserted) base.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_lone_del");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
+        }
+        // ref[0..7) + (skip ref[7]) + ref[8..29): a 1bp deletion anchored at 6,
+        // in the unique prefix, far enough from both read ends to clear the
+        // span/flank guard.
+        let mut del_seq: Vec<u8> = Vec::new();
+        del_seq.extend_from_slice(&REF29[0..7]);
+        del_seq.extend_from_slice(&REF29[8..29]);
+        let del_cigar = vec![Cigar::Match(7), Cigar::Del(1), Cigar::Match(21)];
+        reads.push(("rdel", 0, del_seq.as_slice(), del_cigar, false));
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let refs = indel_refs();
+        let iopts = indels_on();
+        let (corr, models, mut stats) =
+            compute_corrections(&bam, &refs, 2, 0.01, SB_P, HOM_VAF, &iopts).unwrap();
+        apply_corrections(&bam, &outb, &corr, &refs, &models, &iopts, &mut stats).unwrap();
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let mut seen = false;
+        for rec in r.records() {
+            let rec = rec.unwrap();
+            if rec.qname() == b"rdel" {
+                assert_eq!(rec.seq().as_bytes(), CLEAN_SEQ, "the spurious deletion must be reverted");
+                assert_eq!(rec.cigar().to_string(), "29M");
+                seen = true;
+            } else {
+                assert_eq!(rec.seq().as_bytes(), CLEAN_SEQ, "clean reads must be untouched");
+            }
+        }
+        assert!(seen);
+        assert_eq!(stats.reads_reassigned_indel_to_ref, 1);
+        assert_eq!(stats.indel_bases_inserted, 1, "restoring the deleted base must count as inserted");
         std::fs::remove_dir_all(&dir).ok();
     }
 

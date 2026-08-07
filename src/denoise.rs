@@ -6,6 +6,7 @@ use log::info;
 use rust_htslib::bam::{self, Read, Reader};
 
 pub(crate) mod indel;
+pub(crate) mod rewrite;
 
 pub(crate) const NQ: usize = 94; // Phred qualities 0..=93
 

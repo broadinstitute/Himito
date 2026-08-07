@@ -5,6 +5,8 @@ use bio::io::fasta;
 use log::info;
 use rust_htslib::bam::{self, Read, Reader};
 
+use crate::denoise::rewrite::{rewrite_read, strip_stale_tags, ReadEdits};
+
 pub(crate) mod indel;
 pub(crate) mod rewrite;
 
@@ -259,7 +261,7 @@ fn map_allele(observed: usize, q: u8, m: &SiteModel) -> usize {
     best
 }
 
-pub type Corrections = HashMap<Vec<u8>, Vec<(usize, u8)>>;
+pub type Corrections = HashMap<Vec<u8>, rewrite::ReadEdits>;
 
 #[derive(Default, Debug, serde::Serialize)]
 pub struct DenoiseStats {
@@ -342,13 +344,14 @@ fn compute_corrections(
         stats.alt_alleles_strand_biased += model.strand_biased_alts as u64;
 
         let mut changed = false;
-        for (qname, qpos, allele, qual) in obs {
+        for (qname, _qpos, allele, qual) in obs {
             let corr = map_allele(allele, qual, &model);
             if corr != allele {
                 corrections
                     .entry(qname)
                     .or_default()
-                    .push((qpos, idx_to_base(corr)));
+                    .subs
+                    .push((refpos as u32, idx_to_base(corr)));
                 stats.bases_modified += 1;
                 stats.substitution_matrix[allele][corr] += 1;
                 changed = true;
@@ -362,15 +365,22 @@ fn compute_corrections(
     Ok((corrections, stats))
 }
 
-fn apply_corrections(in_bam: &Path, out_bam: &Path, corrections: &Corrections) -> Result<(u64, u64)> {
+fn apply_corrections(
+    in_bam: &Path,
+    out_bam: &Path,
+    corrections: &Corrections,
+    refs: &HashMap<Vec<u8>, Vec<u8>>,
+) -> Result<(u64, u64)> {
     let mut reader = Reader::from_path(in_bam)
         .with_context(|| format!("cannot open BAM {in_bam:?}"))?;
+    let header_view = reader.header().to_owned();
     let header = bam::Header::from_template(reader.header());
     let mut writer = bam::Writer::from_path(out_bam, &header, bam::Format::Bam)
         .with_context(|| format!("cannot create BAM {out_bam:?}"))?;
 
     let mut reads_processed = 0u64;
     let mut reads_modified = 0u64;
+    let empty: Vec<u8> = Vec::new();
 
     for result in reader.records() {
         let mut rec = result.context("read BAM record")?;
@@ -380,18 +390,23 @@ fn apply_corrections(in_bam: &Path, out_bam: &Path, corrections: &Corrections) -
         if correctable {
             reads_processed += 1;
             if let Some(edits) = corrections.get(rec.qname()) {
-                // Extract owned parts, edit SEQ, rebuild (aux preserved by set()).
-                let qname = rec.qname().to_vec();
-                let cigar = rec.cigar().take();
-                let mut seq = rec.seq().as_bytes();
-                let qual = rec.qual().to_vec();
-                for &(qpos, base) in edits {
-                    if qpos < seq.len() {
-                        seq[qpos] = base;
+                if !edits.is_empty() {
+                    let refseq = refs
+                        .get(header_view.tid2name(rec.tid() as u32))
+                        .unwrap_or(&empty);
+                    // Extract owned parts, rewrite, rebuild (aux preserved by set()).
+                    let qname = rec.qname().to_vec();
+                    let cigar = rec.cigar().take();
+                    let seq = rec.seq().as_bytes();
+                    let qual = rec.qual().to_vec();
+                    let out =
+                        rewrite_read(rec.pos(), &cigar, &seq, &qual, edits, refseq);
+                    rec.set(&qname, Some(&out.cigar), &out.seq, &out.qual);
+                    if out.structure_changed {
+                        strip_stale_tags(&mut rec);
                     }
+                    reads_modified += 1;
                 }
-                rec.set(&qname, Some(&cigar), &seq, &qual);
-                reads_modified += 1;
             }
         }
         writer.write(&rec).context("write BAM record")?;
@@ -429,7 +444,7 @@ pub fn start(
 
     let (corrections, mut stats) =
         compute_corrections(input, &refs, min_strand, vaf, strand_bias_p, homoplasmic_vaf)?;
-    let (reads_processed, reads_modified) = apply_corrections(input, output, &corrections)?;
+    let (reads_processed, reads_modified) = apply_corrections(input, output, &corrections, &refs)?;
     stats.reads_processed = reads_processed;
     stats.reads_modified = reads_modified;
 
@@ -684,7 +699,8 @@ mod tests {
         let (corr, stats) = compute_corrections(&bam, &refs, 2, 0.01, SB_P, HOM_VAF).unwrap();
 
         // The single G (not strand-balanced, VAF 10% but fwd-only) is corrected to A.
-        assert_eq!(corr.get(&b"rerr".to_vec()), Some(&vec![(2usize, b'A')]));
+        let edits = corr.get(&b"rerr".to_vec()).expect("rerr must be corrected");
+        assert_eq!(edits.subs, vec![(2u32, b'A')]);
         assert_eq!(stats.bases_modified, 1);
         assert_eq!(stats.substitution_matrix[2][0], 1); // G(2) -> A(0)
         assert!(stats.columns_processed >= 1);
@@ -722,8 +738,13 @@ mod tests {
         }
 
         let mut corr: Corrections = HashMap::new();
-        corr.insert(b"rerr".to_vec(), vec![(2usize, b'A')]);
-        let (proc, modified) = apply_corrections(&inb, &outb, &corr).unwrap();
+        corr.insert(
+            b"rerr".to_vec(),
+            ReadEdits { subs: vec![(2u32, b'A')], indels: vec![] },
+        );
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), b"AAAAAA".to_vec());
+        let (proc, modified) = apply_corrections(&inb, &outb, &corr, &refs).unwrap();
         assert_eq!(proc, 1);
         assert_eq!(modified, 1);
 
@@ -783,6 +804,32 @@ mod tests {
         // "\"bases_modified\":1" assumes compact output and never matches pretty
         // JSON, so this assertion matches the actual (and required) pretty format.
         assert!(json.contains("\"bases_modified\": 1"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrections_are_keyed_by_reference_position() {
+        // The single G error sits at reference position 2 (reads start at POS 0).
+        // Recording it in reference coordinates is what lets Task 7 mix
+        // length-changing indel edits into the same per-read payload (Task 8).
+        let dir = std::env::temp_dir().join("himito_denoise_refcoord");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let mut reads: Vec<(&str, i64, &[u8], bool)> = vec![];
+        let clean = b"AAAAAA";
+        for i in 0..9 {
+            reads.push((["r0","r1","r2","r3","r4","r5","r6","r7","r8"][i], 0, clean, i % 2 == 0));
+        }
+        reads.push(("rerr", 0, b"AAGAAA", false));
+        write_test_bam(&bam, "chrM", 6, &reads);
+
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), b"AAAAAA".to_vec());
+        let (corr, _) = compute_corrections(&bam, &refs, 2, 0.01, SB_P, HOM_VAF).unwrap();
+
+        let edits = corr.get(&b"rerr".to_vec()).expect("rerr must be corrected");
+        assert_eq!(edits.subs, vec![(2u32, b'A')]);
+        assert!(edits.indels.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

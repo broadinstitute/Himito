@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use rust_htslib::bam::record::{Cigar, CigarString};
+
 /// An indel allele at a normalized site, indexed conceptually by its net length
 /// change: `Ref` = 0, `Ins(s)` = +s.len(), `Del(n)` = -n.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -436,6 +438,75 @@ pub fn assign_allele(observed: &Allele, m: &IndelSiteModel, o: &IndelOpts) -> As
         return Assignment::Keep;
     }
     Assignment::Move(target.clone())
+}
+
+/// One indel carried by a read, in normalized site coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadEvent {
+    pub norm_pos: u32,
+    /// `None` means the indel is at or above `max_len`: untouchable, and a marker
+    /// that this read must not be assigned at nearby sites either. Omitting it
+    /// entirely would make the read indistinguishable from a clean REF observation
+    /// and expose it to being "repaired" into an allele it cannot represent.
+    pub allele: Option<Allele>,
+}
+
+/// Enumerate a read's own indel events straight from its CIGAR, left-normalized.
+///
+/// The pileup reports what a read has AT A COLUMN, which cannot answer "does this
+/// read carry the event belonging to the site normalization moved left to?" — at the
+/// normalized column the carrier reports `Indel::None` just like a non-carrier. Going
+/// through the read's own CIGAR answers it exactly, per record.
+pub fn read_events(
+    pos: i64,
+    cigar: &CigarString,
+    seq: &[u8],
+    refseq: &[u8],
+    max_len: u32,
+) -> Vec<ReadEvent> {
+    let mut out = Vec::new();
+    let mut rp = pos.max(0) as u32; // next reference position
+    let mut qp = 0usize; // next query position
+
+    for op in cigar.iter() {
+        match *op {
+            Cigar::Match(n) | Cigar::Equal(n) | Cigar::Diff(n) => {
+                rp += n;
+                qp += n as usize;
+            }
+            Cigar::Ins(n) => {
+                // The anchor is the last aligned reference base before the event.
+                // An insertion before any aligned base has no anchor and is skipped.
+                if rp > 0 {
+                    let anchor = rp - 1;
+                    if n < max_len {
+                        let s = seq[qp..qp + n as usize].to_vec();
+                        let (np, a) = normalize_left(refseq, anchor, &Allele::Ins(s));
+                        out.push(ReadEvent { norm_pos: np, allele: Some(a) });
+                    } else {
+                        out.push(ReadEvent { norm_pos: anchor, allele: None });
+                    }
+                }
+                qp += n as usize;
+            }
+            Cigar::Del(n) => {
+                if rp > 0 {
+                    let anchor = rp - 1;
+                    if n < max_len {
+                        let (np, a) = normalize_left(refseq, anchor, &Allele::Del(n));
+                        out.push(ReadEvent { norm_pos: np, allele: Some(a) });
+                    } else {
+                        out.push(ReadEvent { norm_pos: anchor, allele: None });
+                    }
+                }
+                rp += n;
+            }
+            Cigar::SoftClip(n) => qp += n as usize,
+            Cigar::RefSkip(n) => rp += n,
+            Cigar::HardClip(_) | Cigar::Pad(_) => {}
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -878,5 +949,117 @@ mod tests {
             Assignment::Keep,
             "protect_vaf must still shield an allele rejected only by the floor"
         );
+    }
+
+    // Reference shared by the read_events tests. Index map:
+    //   0-7   ACGTACGT
+    //   8-15  AAAAAAAA   (an 8bp homopolymer run)
+    //   16-28 CGTACGTACGTAC
+    const REF29: &[u8] = b"ACGTACGTAAAAAAAACGTACGTACGTAC";
+
+    fn cs(ops: Vec<Cigar>) -> CigarString {
+        CigarString(ops)
+    }
+
+    #[test]
+    fn read_with_no_indels_yields_no_events() {
+        let evs = read_events(0, &cs(vec![Cigar::Match(29)]), REF29, REF29, 5);
+        assert!(evs.is_empty());
+    }
+
+    #[test]
+    fn insertion_event_is_normalized_out_of_the_homopolymer() {
+        // Read carries an extra A, anchored by the aligner at reference index 15
+        // (the last A of the run). Normalization must pull it back to index 7.
+        let seq = b"ACGTACGTAAAAAAAAACGTACGTACGTAC"; // 30bp: 16 + 1 inserted + 13
+        let cig = cs(vec![Cigar::Match(16), Cigar::Ins(1), Cigar::Match(13)]);
+        let evs = read_events(0, &cig, seq, REF29, 5);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].norm_pos, 7);
+        assert_eq!(evs[0].allele, Some(Allele::Ins(b"A".to_vec())));
+    }
+
+    #[test]
+    fn deletion_event_is_normalized_out_of_the_homopolymer() {
+        // Read is missing one A from the run; the aligner anchored the deletion at
+        // reference index 14, normalization pulls it to 7.
+        let seq = b"ACGTACGTAAAAAAACGTACGTACGTAC"; // 28bp: 29 ref bases minus one A
+        let cig = cs(vec![Cigar::Match(15), Cigar::Del(1), Cigar::Match(13)]);
+        let evs = read_events(0, &cig, seq, REF29, 5);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].norm_pos, 7);
+        assert_eq!(evs[0].allele, Some(Allele::Del(1)));
+    }
+
+    #[test]
+    fn unique_sequence_insertion_keeps_its_anchor() {
+        // Insert "G" after reference index 18 (a T). Nothing to shift through.
+        let seq = b"ACGTACGTAAAAAAAACGTGACGTACGTAC"; // 30bp
+        let cig = cs(vec![Cigar::Match(19), Cigar::Ins(1), Cigar::Match(10)]);
+        let evs = read_events(0, &cig, seq, REF29, 5);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].norm_pos, 18);
+        assert_eq!(evs[0].allele, Some(Allele::Ins(b"G".to_vec())));
+    }
+
+    #[test]
+    fn oversized_indel_is_reported_as_untouchable() {
+        // A 6bp insertion with max_len 5: recorded with allele None so the caller
+        // knows this read must not be assigned at nearby sites. Reporting nothing at
+        // all would make the read look like a clean REF observation and expose it to
+        // being "repaired" into some other allele.
+        let seq = b"ACGTACGTAAAAAAAACGTGGGGGGACGTACGTAC"; // 35bp
+        let cig = cs(vec![Cigar::Match(19), Cigar::Ins(6), Cigar::Match(10)]);
+        let evs = read_events(0, &cig, seq, REF29, 5);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].allele, None);
+        assert_eq!(evs[0].norm_pos, 18);
+    }
+
+    #[test]
+    fn multiple_events_in_one_read_are_all_reported() {
+        // An extra A in the run (normalizes to 7) plus a 1bp deletion at index 19.
+        let seq = b"ACGTACGTAAAAAAAAACGTCGTACGTAC"; // 29bp
+        let cig = cs(vec![
+            Cigar::Match(16),
+            Cigar::Ins(1),
+            Cigar::Match(4),
+            Cigar::Del(1),
+            Cigar::Match(8),
+        ]);
+        let evs = read_events(0, &cig, seq, REF29, 5);
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].norm_pos, 7);
+        assert_eq!(evs[0].allele, Some(Allele::Ins(b"A".to_vec())));
+        assert_eq!(evs[1].norm_pos, 19);
+        assert_eq!(evs[1].allele, Some(Allele::Del(1)));
+    }
+
+    #[test]
+    fn soft_clips_do_not_shift_reference_coordinates() {
+        // Leading soft clip consumes query but no reference; the event must still
+        // land at reference index 18.
+        let seq = b"TTTACGTACGTAAAAAAAACGTGACGTACGTAC"; // 3 clipped + 30
+        let cig = cs(vec![
+            Cigar::SoftClip(3),
+            Cigar::Match(19),
+            Cigar::Ins(1),
+            Cigar::Match(10),
+        ]);
+        let evs = read_events(0, &cig, seq, REF29, 5);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].norm_pos, 18);
+        assert_eq!(evs[0].allele, Some(Allele::Ins(b"G".to_vec())));
+    }
+
+    #[test]
+    fn read_aligned_at_nonzero_pos_reports_absolute_coordinates() {
+        // Read starts at reference index 16; insert "G" after index 18.
+        let seq = b"CGTGACGTACGTAC"; // ref[16..19] + "G" + ref[19..29]
+        let cig = cs(vec![Cigar::Match(3), Cigar::Ins(1), Cigar::Match(10)]);
+        let evs = read_events(16, &cig, seq, REF29, 5);
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].norm_pos, 18);
+        assert_eq!(evs[0].allele, Some(Allele::Ins(b"G".to_vec())));
     }
 }

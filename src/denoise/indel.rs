@@ -53,6 +53,16 @@ pub struct IndelOpts {
     pub err_cap: f64,
     pub floor_mult: f64,
     pub delta: f64,
+    /// Minimum plain match-context flank required on each side of an edit.
+    /// Consumers must clamp this to at least 1 wherever it is used: the FIX-4
+    /// match-run bound for a gained deletion is `m + flank + 1` (anchor base +
+    /// `m` deleted bases + `flank` genuine right-hand flank matches), and at
+    /// `flank == 0` that bound degenerates to one short of the true
+    /// no-truncation requirement, which trips a `debug_assert` in debug builds
+    /// and silently truncates the deletion in release. `apply_corrections`
+    /// enforces the clamp via `iopts.flank.max(1)`; this field itself is left
+    /// unvalidated (a `pub` field with no constructor) so any future direct
+    /// caller must not assume 0 is safe here.
     pub flank: usize,
     /// An allele carried by at least this fraction of reads at a site is never
     /// corrected away, regardless of candidacy. This guards against `vaf_floor`
@@ -192,6 +202,13 @@ pub struct IndelSite {
     /// rather than a library-wide constant.
     pub col_fwd: u32,
     pub col_rev: u32,
+    /// Qnames of reads that have already cast an ALT vote at this site (see FIX 1
+    /// in the task-8 review round). Left-normalization can pull two of one read's
+    /// OWN events -- e.g. an insertion and a nearby deletion, exactly what
+    /// coexists in a short tandem repeat -- to the SAME site; without this cap
+    /// that read would contribute two ALT votes while depth counts it once,
+    /// letting `alt_total` exceed `depth`.
+    voted: std::collections::HashSet<Vec<u8>>,
 }
 
 impl IndelSite {
@@ -202,6 +219,16 @@ impl IndelSite {
         } else {
             e.0 += 1;
         }
+    }
+
+    /// Like `add`, but caps a single read to at most one ALT vote at this site.
+    /// Returns `false` (and drops the vote) if `qname` has already voted here.
+    pub fn add_from_read(&mut self, qname: Vec<u8>, allele: Allele, reverse: bool) -> bool {
+        if !self.voted.insert(qname) {
+            return false;
+        }
+        self.add(allele, reverse);
+        true
     }
 
     fn alt_total(&self) -> u32 {

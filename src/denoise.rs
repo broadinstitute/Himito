@@ -295,6 +295,13 @@ pub struct DenoiseStats {
     /// either (see FIX 2). Depth already excludes both cases, so this only tracks
     /// the ALT side.
     pub indel_events_out_of_span: u64,
+    /// Votes dropped in pass 1 because the SAME read already cast an ALT vote at
+    /// this normalized site via a different one of its own events (see FIX 1 in
+    /// the task-8 review round) -- e.g. an insertion and a nearby deletion that
+    /// both left-normalize to one site, exactly what coexists in a short tandem
+    /// repeat. Without this cap the read would contribute two ALT votes while
+    /// depth counts it once, letting `alt_total` exceed `depth`.
+    pub indel_events_duplicate_site: u64,
     pub reads_reassigned_ref_to_ins: u64,
     pub reads_reassigned_ref_to_del: u64,
     pub reads_reassigned_indel_to_ref: u64,
@@ -315,6 +322,16 @@ pub struct DenoiseStats {
     /// window cannot be represented by the site's alleles. Filed separately from
     /// the span guard: a distinct cause, not a coordinate-flank failure.
     pub assignments_skipped_oversized_neighbor: u64,
+    /// (read, site) PAIRS skipped because this read's own CIGAR carries TWO
+    /// events that normalize to this SAME site (see FIX 5): which one to treat
+    /// as "carried" is ambiguous, and a read whose alignment is ambiguous at a
+    /// site is exactly the case where doing nothing is right.
+    pub assignments_skipped_ambiguous_carry: u64,
+    /// (read, site) PAIRS skipped because an earlier, already-emitted GAINED
+    /// deletion for this SAME read consumed the reference span this site falls
+    /// in (see FIX 6): `rewrite_read`'s Match arm advances past the whole
+    /// deletion in one step, so a second edit inside that span is never visited.
+    pub assignments_skipped_swallowed_by_gained_deletion: u64,
 }
 
 fn compute_corrections(
@@ -366,11 +383,13 @@ fn compute_corrections(
         let mut col_depth = 0u32;
         let mut col_fwd = 0u32;
         let mut col_rev = 0u32;
-        // (allele, reverse, read's own POS, read's own CIGAR). The read's full
-        // CIGAR travels with the event so the ALT-vote gate can be checked AFTER
-        // normalization, once we know which column the event actually folds into
-        // (see CRITICAL 2 / FIX 2), via `indel::match_run_len`.
-        let mut col_events: Vec<(indel::Allele, bool, i64, CigarString)> = Vec::new();
+        // (qname, allele, reverse, read's own POS, read's own CIGAR). The read's
+        // full CIGAR travels with the event so the ALT-vote gate can be checked
+        // AFTER normalization, once we know which column the event actually
+        // folds into (see CRITICAL 2 / FIX 2), via `indel::match_run_len`. qname
+        // travels too so a read carrying two of its OWN events that normalize to
+        // the same site casts at most one vote there (see FIX 1).
+        let mut col_events: Vec<(Vec<u8>, indel::Allele, bool, i64, CigarString)> = Vec::new();
 
         for a in col.alignments() {
             let rec = a.record();
@@ -402,7 +421,13 @@ fn compute_corrections(
                         _ => None,
                     };
                     if let Some(allele) = ev_allele {
-                        col_events.push((allele, rec.is_reverse(), rec.pos(), rec.cigar().take()));
+                        col_events.push((
+                            rec.qname().to_vec(),
+                            allele,
+                            rec.is_reverse(),
+                            rec.pos(),
+                            rec.cigar().take(),
+                        ));
                         stats.indel_events_examined += 1;
                     }
                 }
@@ -427,7 +452,7 @@ fn compute_corrections(
 
         if iopts.enabled {
             depths.insert((name.to_vec(), refpos as u32), (col_depth, col_fwd, col_rev));
-            for (allele, reverse, rpos, cigar) in col_events {
+            for (qname, allele, reverse, rpos, cigar) in col_events {
                 let (norm_pos, norm_allele) =
                     indel::normalize_left(refseq, refpos as u32, &allele);
                 // `normalize_left` walks the reference with no knowledge of read
@@ -445,10 +470,19 @@ fn compute_corrections(
                     stats.indel_events_out_of_span += 1;
                     continue;
                 }
-                sites
+                // A read carrying two of ITS OWN events (e.g. an insertion and a
+                // nearby deletion, exactly what coexists in a short tandem
+                // repeat) that both normalize to this same site must contribute
+                // at most one ALT vote here -- depth counts that read once (see
+                // FIX 1). `add_from_read` enforces the cap and reports whether
+                // this vote was the read's first at this site.
+                let voted = sites
                     .entry((name.to_vec(), norm_pos))
                     .or_default()
-                    .add(norm_allele, reverse);
+                    .add_from_read(qname, norm_allele, reverse);
+                if !voted {
+                    stats.indel_events_duplicate_site += 1;
+                }
             }
         }
 
@@ -587,17 +621,40 @@ fn apply_corrections(
                             // too large to represent.
                             let mut carried: HashMap<u32, (indel::Allele, u32)> = HashMap::new();
                             let mut blocked: Vec<i64> = Vec::new();
+                            // Sites where this read's OWN CIGAR carries two DIFFERENT events
+                            // that both normalize here (see FIX 5): `carried.insert` above
+                            // would silently keep only the last one, leaving the read treated
+                            // as carrying an allele it doesn't unambiguously carry. A read
+                            // whose alignment is ambiguous at a site is exactly the case
+                            // where doing nothing is right, so such sites are tracked here
+                            // and skipped below rather than arbitrarily picking one event.
+                            let mut ambiguous: std::collections::HashSet<u32> = std::collections::HashSet::new();
                             for e in &evs {
                                 match &e.allele {
-                                    Some(a) => { carried.insert(e.norm_pos, (a.clone(), e.anchor)); }
+                                    Some(a) => {
+                                        if carried.insert(e.norm_pos, (a.clone(), e.anchor)).is_some() {
+                                            ambiguous.insert(e.norm_pos);
+                                        }
+                                    }
                                     None => blocked.push(e.norm_pos as i64),
                                 }
                             }
 
-                            let flank = iopts.flank as i64;
+                            // `flank` is validated/clamped to >= 1 here (see IndelOpts::flank's
+                            // doc comment): the FIX-4 match-run bound below assumes a nonzero
+                            // flank, and degenerates to one short of the no-truncation bound
+                            // at `flank == 0`.
+                            let flank = iopts.flank.max(1) as i64;
                             // A gained deletion consumes up to max_len reference bases to the
                             // right, so the right-hand requirement is larger than the left.
                             let reach = flank + iopts.max_len as i64;
+                            // Furthest reference position already consumed by a GAINED
+                            // deletion emitted earlier in this loop for this same read (see
+                            // FIX 6). Sites are visited in ascending order (`list` is sorted
+                            // and `list[lo..]` preserves that), so tracking only the running
+                            // maximum is sufficient to detect a later site falling inside an
+                            // earlier gained deletion's span.
+                            let mut consumed_until: i64 = -1;
 
                             if let Some(list) = models.get(&contig) {
                                 let lo = list.partition_point(|(p, _)| (*p as i64) < rstart);
@@ -609,6 +666,21 @@ fn apply_corrections(
                                     // that were never real candidates for this read.
                                     if s >= rend {
                                         break;
+                                    }
+                                    // FIX 5: this read's own CIGAR carries two DIFFERENT
+                                    // events that both normalize to this site, so which one
+                                    // it "carries" here is ambiguous -- leave it untouched
+                                    // rather than arbitrarily picking one.
+                                    if ambiguous.contains(pos) {
+                                        stats.assignments_skipped_ambiguous_carry += 1;
+                                        continue;
+                                    }
+                                    // FIX 6: an earlier gained deletion already emitted for
+                                    // this read consumed this site's reference position, so
+                                    // `rewrite_read`'s Match arm will never visit it.
+                                    if s <= consumed_until {
+                                        stats.assignments_skipped_swallowed_by_gained_deletion += 1;
+                                        continue;
                                     }
                                     let (observed, anchor) = carried
                                         .get(pos)
@@ -632,26 +704,32 @@ fn apply_corrections(
                                         stats.assignments_skipped_span_guard += 1;
                                         continue;
                                     }
-                                    // FIX 3: the check above bounds only the read's
-                                    // OVERALL span, which can pass even when the
-                                    // read's own alignment breaks up into several
-                                    // Match/=/X runs -- e.g. an unrelated `D`/`N`
-                                    // shortly after this site. A GAINED deletion
-                                    // (Ref -> Del(m)) is spliced into `rewrite_read`'s
-                                    // Match arm at the normalized site, so it and its
-                                    // right-hand flank must both fit inside that ONE
-                                    // contiguous run, or the walk truncates it to the
-                                    // wrong length (debug_assert in debug, silent
-                                    // truncation in release).
+                                    // FIX 2 / FIX 4: the check above bounds only the read's
+                                    // OVERALL span, which can pass even when the read's own
+                                    // alignment breaks up into several Match/=/X runs -- e.g.
+                                    // an unrelated `D`/`N` shortly after this site -- or even
+                                    // when the target column is only reachable through this
+                                    // SAME read's own `D`/`N` (a "Ref" observation is also
+                                    // reported there; see FIX 2 in pass 1 for the same
+                                    // reasoning). A GAINED indel (observed == Ref) is spliced
+                                    // into `rewrite_read`'s Match arm at the normalized site,
+                                    // so the read needs an ACTUAL ALIGNED QUERY BASE there: a
+                                    // gained insertion needs at least the anchor base itself
+                                    // (`run >= 1`); a gained deletion needs the anchor base
+                                    // FIRST (`rewrite_read` emits it before the deletion),
+                                    // then `m` deleted bases, then `flank` genuine right-hand
+                                    // flank matches -- all inside that ONE contiguous run, or
+                                    // the walk truncates it to the wrong length (debug_assert
+                                    // in debug, silent truncation in release).
                                     if observed == indel::Allele::Ref {
-                                        if let indel::Allele::Del(m) = &target {
-                                            let need = *m as i64 + flank;
-                                            if (indel::match_run_len(rstart, &cigar, s as u32) as i64)
-                                                < need
-                                            {
-                                                stats.assignments_skipped_span_guard += 1;
-                                                continue;
-                                            }
+                                        let run = indel::match_run_len(rstart, &cigar, s as u32) as i64;
+                                        let need = match &target {
+                                            indel::Allele::Del(m) => *m as i64 + flank + 1,
+                                            _ => 1,
+                                        };
+                                        if run < need {
+                                            stats.assignments_skipped_span_guard += 1;
+                                            continue;
                                         }
                                     }
                                     // An oversized indel nearby means this read's alignment in
@@ -694,11 +772,18 @@ fn apply_corrections(
                                         }
                                         (indel::Allele::Del(from_n), indel::Allele::Del(to_n)) => {
                                             stats.reads_reassigned_indel_to_indel += 1;
+                                            // FIX 3: shrinking a deletion splices reference
+                                            // bases BACK INTO the read (an insertion of read
+                                            // bases relative to what the read had before),
+                                            // e.g. Del(3) -> Del(1) restores 2 bases.
                                             if to_n < from_n {
-                                                stats.indel_bases_removed += (from_n - to_n) as u64;
-                                            } else if to_n > from_n {
-                                                stats.indel_bases_inserted += (to_n - from_n) as u64;
+                                                stats.indel_bases_inserted += (from_n - to_n) as u64;
                                             }
+                                            // to_n > from_n (growing a deletion) is
+                                            // unreachable: `assign_allele` refuses that
+                                            // transition (see `Assignment::Refused`),
+                                            // since `rewrite_read` cannot grow a deletion
+                                            // into the following CIGAR op.
                                         }
                                         _ => stats.reads_reassigned_indel_to_indel += 1,
                                     }
@@ -707,6 +792,20 @@ fn apply_corrections(
                                         stats.reassignments_by_hp_length.resize(l + 1, 0);
                                     }
                                     stats.reassignments_by_hp_length[l] += 1;
+
+                                    // FIX 6: a GAINED deletion (observed Ref -> Del(m))
+                                    // consumes reference positions (s, s+m] once applied by
+                                    // `rewrite_read`'s Match arm, which advances past all of
+                                    // them in a single step. Any other decided site that
+                                    // falls in that span would therefore never be visited if
+                                    // an edit were emitted for it -- record the furthest
+                                    // position this read's gained deletions have consumed so
+                                    // later sites (visited in ascending order) can detect and
+                                    // skip landing inside it, instead of silently emitting an
+                                    // edit that `rewrite_read` would never apply.
+                                    if let (indel::Allele::Ref, indel::Allele::Del(m)) = (&observed, &target) {
+                                        consumed_until = consumed_until.max(s + *m as i64);
+                                    }
 
                                     // Direction determines which coordinate `rewrite_read`
                                     // will actually look this edit up by (see CRITICAL 1):
@@ -1752,6 +1851,373 @@ mod tests {
                 assert_eq!(rec.cigar().to_string(), "29M");
             }
         }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- task-8 review round: closing fixes ----
+
+    // A read whose own insertion (anchor 8) and deletion (anchor 12) BOTH
+    // left-normalize to site 7 -- short tandem repeats (the mito CA/poly-C
+    // tracts this feature targets) are exactly where an insertion and a
+    // deletion coexist in one read's own CIGAR. `dup_cigar`'s net length
+    // change is zero (a +1bp insertion offset by a -1bp deletion in the same
+    // A-run), so its SEQ is byte-identical to CLEAN_SEQ even though its CIGAR
+    // is not a plain 29M.
+    fn dup_cigar() -> Vec<Cigar> {
+        vec![Cigar::Match(9), Cigar::Ins(1), Cigar::Match(4), Cigar::Del(1), Cigar::Match(15)]
+    }
+
+    #[test]
+    fn read_casting_two_events_that_normalize_to_the_same_site_votes_once() {
+        // FIX 1: without a per-read cap, `rdup` would cast TWO ALT votes at
+        // site 7 (one for its Ins("A"), one for its Del(1)) while depth counts
+        // it once, letting `alt_total` exceed `depth` -- the invariant probed
+        // by `debug_assert!(site.alt_total() <= site.depth)` in indel.rs. If
+        // this test runs to completion in a debug build, that assert did not
+        // fire; the assertions below additionally verify the SECOND vote
+        // (Del(1)) never landed at all, not merely that some counter moved.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_dup_site_vote");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
+        }
+        reads.push(("rdup", 0, CLEAN_SEQ, dup_cigar(), false));
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let (_corr, models, stats) =
+            compute_corrections(&bam, &indel_refs(), 2, 0.01, SB_P, HOM_VAF, &indels_on()).unwrap();
+
+        assert_eq!(
+            stats.indel_events_duplicate_site, 1,
+            "the second vote from the same read at the same site must be dropped and counted"
+        );
+        let list = models.get(&b"chrM".to_vec()).expect("chrM must have a site at 7");
+        let (_, model) = list.iter().find(|(p, _)| *p == 7).expect("site at 7 must exist");
+        let ins = indel::Allele::Ins(b"A".to_vec());
+        let del = indel::Allele::Del(1);
+        let ins_vaf = model.obs_vaf.iter().find(|(a, _)| *a == ins).map(|(_, v)| *v);
+        assert!(
+            (ins_vaf.expect("the FIRST vote (Ins) must be recorded") - 0.1).abs() < 1e-9,
+            "the recorded vote must reflect exactly one voting read (1/10 depth), got {ins_vaf:?}"
+        );
+        assert!(
+            model.obs_vaf.iter().all(|(a, _)| *a != del),
+            "the SECOND vote (Del) from the same read must never appear at this site at all"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn read_with_ambiguous_carried_events_at_one_site_is_left_untouched() {
+        // FIX 5: in pass 2 (the per-read record walk), `rdup`'s own CIGAR
+        // produces TWO different events (Ins("A") and Del(1)) that both
+        // normalize to site 7. Before FIX 5, `carried.insert` silently kept
+        // only the second one, so the read would be treated as carrying an
+        // allele it did not unambiguously carry. The read must instead be
+        // left completely untouched at this site.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_ambiguous_carry");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
+        }
+        reads.push(("rdup", 0, CLEAN_SEQ, dup_cigar(), false));
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let refs = indel_refs();
+        let iopts = indels_on();
+        let (corr, models, mut stats) =
+            compute_corrections(&bam, &refs, 2, 0.01, SB_P, HOM_VAF, &iopts).unwrap();
+        apply_corrections(&bam, &outb, &corr, &refs, &models, &iopts, &mut stats).unwrap();
+
+        assert!(
+            stats.assignments_skipped_ambiguous_carry >= 1,
+            "the ambiguous-carry skip must be counted"
+        );
+        let mut r = Reader::from_path(&outb).unwrap();
+        let mut seen = false;
+        for rec in r.records() {
+            let rec = rec.unwrap();
+            if rec.qname() == b"rdup" {
+                assert_eq!(rec.seq().as_bytes(), CLEAN_SEQ, "SEQ must be untouched");
+                assert_eq!(
+                    rec.cigar().take(),
+                    CigarString(dup_cigar()),
+                    "CIGAR must be untouched -- no arbitrary pick between the two events"
+                );
+                seen = true;
+            }
+        }
+        assert!(seen);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gained_insertion_at_a_column_the_read_deletes_is_rejected() {
+        // FIX 2: `rdel3`'s own D(3) is anchored at 9 and normalizes to 9 (unique
+        // sequence, no shift), so `carried` has no entry at the decided site 12
+        // -- the read is treated as observing plain Ref there. Before FIX 2, the
+        // contiguous-match-run check fired only for a gained DELETION target;
+        // a gained INSERTION at ref pos 12 sailed through even though `rdel3`
+        // has NO aligned query base at 12 at all (it falls inside `rdel3`'s own
+        // deletion). `rewrite_read`'s Match arm never visits cur == 12 for this
+        // read, so the edit would be a silent no-op while the reassignment and
+        // base-inserted counters still climbed.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_gained_ins_in_own_del");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        // 10M 3D 10M: ref[0..10) matched, ref[10..13) deleted, ref[13..23) matched.
+        let seq = vec![b'A'; 20]; // 10 (M) + 10 (M) query bases; D consumes none
+        let cigar = vec![Cigar::Match(10), Cigar::Del(3), Cigar::Match(10)];
+        write_cigar_bam(&inb, "chrM", 30, &[("rdel3", 0, seq.as_slice(), cigar.clone(), false)]);
+
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), vec![b'A'; 30]);
+
+        // Hand-built decided site at position 12 (inside `rdel3`'s own
+        // deletion): Ins("A") dominates 90/10 over Ref, with eps large enough
+        // that MAP assignment genuinely wants to move a Ref-observing read to
+        // the insertion (same arithmetic shape used by the other hand-built
+        // guard-regression fixtures in this module).
+        let model = indel::IndelSiteModel {
+            kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
+            eps: 0.15,
+            context_len: 1,
+            strand_biased: 0,
+            obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
+            strand_rejected: vec![],
+        };
+        let mut models = IndelModels::new();
+        models.entry(b"chrM".to_vec()).or_default().push((12u32, model));
+
+        let corr: Corrections = HashMap::new();
+        let mut stats = DenoiseStats::default();
+        let (proc, modified) = apply_corrections(
+            &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
+        )
+        .unwrap();
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 0, "the read must not be rewritten -- it has no query base at 12");
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let rec = r.records().next().unwrap().unwrap();
+        assert_eq!(rec.seq().as_bytes(), seq.as_slice(), "SEQ must be untouched");
+        assert_eq!(rec.cigar().take(), CigarString(cigar), "CIGAR must be untouched");
+        assert_eq!(stats.reads_reassigned_ref_to_ins, 0, "no reassignment must be counted for a rejected edit");
+        assert_eq!(stats.indel_bases_inserted, 0, "no bases-inserted count for a rejected edit");
+        assert!(
+            stats.assignments_skipped_span_guard >= 1,
+            "the missing-aligned-base rejection must be counted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gained_deletion_needing_exactly_the_old_bound_is_now_rejected() {
+        // FIX 4: the match-run bound for a gained Del(m) must be `m + flank + 1`
+        // (anchor base emitted first, then `m` deleted bases, then `flank`
+        // genuine right-hand flank matches) -- the OLD bound `m + flank` was one
+        // short. Here `rguard`'s first Match run has length exactly 25, so from
+        // site 18 the remaining run is exactly 7 == m(2) + flank(5): the OLD
+        // bound (>= 7) would have let this through with one fewer flank base
+        // than the design requires; the NEW bound (>= 8) correctly rejects it.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_offbyone_bound");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        let seq = vec![b'A'; 35]; // 25 (M) + 10 (M) query bases; RefSkip consumes none
+        let cigar = vec![Cigar::Match(25), Cigar::RefSkip(3), Cigar::Match(10)];
+        write_cigar_bam(&inb, "chrM", 40, &[("rguard", 0, seq.as_slice(), cigar.clone(), false)]);
+
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), vec![b'A'; 40]);
+
+        let model = indel::IndelSiteModel {
+            kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(2), 0.9)],
+            eps: 0.15,
+            context_len: 1,
+            strand_biased: 0,
+            obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(2), 0.9)],
+            strand_rejected: vec![],
+        };
+        let mut models = IndelModels::new();
+        models.entry(b"chrM".to_vec()).or_default().push((18u32, model));
+
+        let corr: Corrections = HashMap::new();
+        let mut stats = DenoiseStats::default();
+        let (proc, modified) = apply_corrections(
+            &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
+        )
+        .unwrap();
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 0, "the read must not be rewritten -- its real flank is one base short");
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let rec = r.records().next().unwrap().unwrap();
+        assert_eq!(rec.seq().as_bytes(), seq.as_slice(), "SEQ must be untouched");
+        assert_eq!(rec.cigar().take(), CigarString(cigar), "CIGAR must be untouched");
+        assert!(
+            stats.assignments_skipped_span_guard >= 1,
+            "the one-short flank must be counted as a span-guard skip"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn shrinking_a_deletion_is_counted_as_bases_inserted_not_removed() {
+        // FIX 3: `Del(3) -> Del(1)` splices 2 reference bases BACK INTO the
+        // read (an insertion of read bases), so it must be booked as
+        // `indel_bases_inserted += 2`, not `indel_bases_removed`.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_shrink_counter");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        // 10M 3D 10M: this read's OWN deletion is anchored at 9.
+        let seq = vec![b'A'; 20];
+        let cigar = vec![Cigar::Match(10), Cigar::Del(3), Cigar::Match(10)];
+        write_cigar_bam(&inb, "chrM", 40, &[("rshrink", 0, seq.as_slice(), cigar.clone(), false)]);
+
+        // NOT a uniform-base reference: a homopolymer run would left-normalize
+        // this read's own Del(3) all the way to position 0 (refseq[a] ==
+        // refseq[a+3] at every a), moving it away from anchor 9 entirely and
+        // breaking this fixture's premise. A repeating ACGT reference keeps
+        // refseq[9] ('C') != refseq[12] ('A'), so normalization halts immediately.
+        let refseq: Vec<u8> = (0..40).map(|i| b"ACGT"[i % 4]).collect();
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), refseq);
+
+        // Decided site at 9 (this read's own anchor): Del(1) dominates 90/10
+        // over Ref, so the read's carried Del(3) snaps down to the kept Del(1)
+        // -- a shrink, not a revert to Ref.
+        let model = indel::IndelSiteModel {
+            kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(1), 0.9)],
+            eps: 0.15,
+            context_len: 1,
+            strand_biased: 0,
+            obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(1), 0.9)],
+            strand_rejected: vec![],
+        };
+        let mut models = IndelModels::new();
+        models.entry(b"chrM".to_vec()).or_default().push((9u32, model));
+
+        let corr: Corrections = HashMap::new();
+        let mut stats = DenoiseStats::default();
+        let (proc, modified) = apply_corrections(
+            &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
+        )
+        .unwrap();
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 1);
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let rec = r.records().next().unwrap().unwrap();
+        assert_eq!(
+            rec.cigar().take(),
+            CigarString(vec![Cigar::Match(10), Cigar::Del(1), Cigar::Match(12)]),
+            "the deletion must shrink to 1bp, splicing the other 2 ref bases back as matches"
+        );
+        assert_eq!(rec.seq().len(), 22, "the 2 restored reference bases must lengthen SEQ");
+        assert_eq!(stats.reads_reassigned_indel_to_indel, 1);
+        assert_eq!(
+            stats.indel_bases_inserted, 2,
+            "shrinking Del(3) -> Del(1) restores 2 bases to the read: bases INSERTED, not removed"
+        );
+        assert_eq!(
+            stats.indel_bases_removed, 0,
+            "the shrink must not be double-booked as bases removed"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gained_deletion_swallows_a_decided_site_inside_its_own_span() {
+        // FIX 6: a GAINED Del(3) at site 5 consumes reference positions 6..=8
+        // once `rewrite_read` applies it (the Match arm jumps `k += m` past
+        // them in one step). A second decided site at 7 -- inside that span --
+        // must not get an edit emitted for `rboth`: before FIX 6, the edit
+        // would be silently dropped by `rewrite_read` anyway (the invariant is
+        // preserved), but `reads_reassigned_ref_to_ins` and
+        // `indel_bases_inserted` would still have climbed for an edit that was
+        // never actually written -- the same "silent no-op, inflated counters"
+        // signature as CRITICAL 1.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_swallowed_span");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        let seq = vec![b'A'; 30];
+        let cigar = vec![Cigar::Match(30)];
+        write_cigar_bam(&inb, "chrM", 40, &[("rboth", 0, seq.as_slice(), cigar.clone(), false)]);
+
+        let mut refs = HashMap::new();
+        refs.insert(b"chrM".to_vec(), vec![b'A'; 40]);
+
+        // Site 5: Ref -> Del(3) dominates 90/10.
+        let del_model = indel::IndelSiteModel {
+            kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(3), 0.9)],
+            eps: 0.15,
+            context_len: 1,
+            strand_biased: 0,
+            obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(3), 0.9)],
+            strand_rejected: vec![],
+        };
+        // Site 7 (inside site 5's Del(3) span, 6..=8): Ref -> Ins("A")
+        // dominates 90/10. If reached, MAP assignment would genuinely want to
+        // move this read here too -- the point of FIX 6 is that it must never
+        // be reached at all for this read.
+        let ins_model = indel::IndelSiteModel {
+            kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
+            eps: 0.15,
+            context_len: 1,
+            strand_biased: 0,
+            obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
+            strand_rejected: vec![],
+        };
+        let mut models = IndelModels::new();
+        models
+            .entry(b"chrM".to_vec())
+            .or_default()
+            .extend([(5u32, del_model), (7u32, ins_model)]);
+
+        let corr: Corrections = HashMap::new();
+        let mut stats = DenoiseStats::default();
+        let (proc, modified) = apply_corrections(
+            &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
+        )
+        .unwrap();
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 1, "the site-5 deletion must still be applied");
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let rec = r.records().next().unwrap().unwrap();
+        assert_eq!(
+            rec.cigar().take(),
+            // `rewrite_read`'s Match arm emits the anchor base itself (ref pos
+            // 5) as part of the preceding Match run BEFORE splicing in the
+            // deletion, so positions 0..=5 (6 bases) merge into one Match op.
+            CigarString(vec![Cigar::Match(6), Cigar::Del(3), Cigar::Match(21)]),
+            "only the site-5 deletion may appear; no insertion from site 7"
+        );
+        assert_eq!(rec.seq().len(), 27, "only 3 ref bases lost, matching a single Del(3)");
+        assert_eq!(stats.reads_reassigned_ref_to_del, 1);
+        assert_eq!(stats.indel_bases_removed, 3);
+        assert_eq!(
+            stats.reads_reassigned_ref_to_ins, 0,
+            "site 7 must never be evaluated for this read, let alone counted as a reassignment"
+        );
+        assert_eq!(stats.indel_bases_inserted, 0, "no phantom insertion bases may be counted");
+        assert!(
+            stats.assignments_skipped_swallowed_by_gained_deletion >= 1,
+            "the swallowed site must be counted"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

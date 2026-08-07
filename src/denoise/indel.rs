@@ -444,6 +444,13 @@ pub fn assign_allele(observed: &Allele, m: &IndelSiteModel, o: &IndelOpts) -> As
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadEvent {
     pub norm_pos: u32,
+    /// The reference position of the last aligned base BEFORE the event, exactly
+    /// as the read's own CIGAR places it (before any left-normalization). This is
+    /// the coordinate `rewrite_read` actually keys its `Ins`/`Del` lookups on, via
+    /// `last_ref` -- it is NOT necessarily `norm_pos`. Left-normalization only
+    /// ever moves an event left, so `anchor >= norm_pos`; they coincide only when
+    /// the aligner already left-aligned the indel (e.g. in unique sequence).
+    pub anchor: u32,
     /// `None` means the indel is at or above `max_len`: untouchable, and a marker
     /// that this read must not be assigned at nearby sites either. Omitting it
     /// entirely would make the read indistinguishable from a clean REF observation
@@ -482,9 +489,9 @@ pub fn read_events(
                     if n < max_len {
                         let s = seq[qp..qp + n as usize].to_vec();
                         let (np, a) = normalize_left(refseq, anchor, &Allele::Ins(s));
-                        out.push(ReadEvent { norm_pos: np, allele: Some(a) });
+                        out.push(ReadEvent { norm_pos: np, anchor, allele: Some(a) });
                     } else {
-                        out.push(ReadEvent { norm_pos: anchor, allele: None });
+                        out.push(ReadEvent { norm_pos: anchor, anchor, allele: None });
                     }
                 }
                 qp += n as usize;
@@ -494,9 +501,9 @@ pub fn read_events(
                     let anchor = rp - 1;
                     if n < max_len {
                         let (np, a) = normalize_left(refseq, anchor, &Allele::Del(n));
-                        out.push(ReadEvent { norm_pos: np, allele: Some(a) });
+                        out.push(ReadEvent { norm_pos: np, anchor, allele: Some(a) });
                     } else {
-                        out.push(ReadEvent { norm_pos: anchor, allele: None });
+                        out.push(ReadEvent { norm_pos: anchor, anchor, allele: None });
                     }
                 }
                 rp += n;
@@ -975,7 +982,11 @@ mod tests {
         let cig = cs(vec![Cigar::Match(16), Cigar::Ins(1), Cigar::Match(13)]);
         let evs = read_events(0, &cig, seq, REF29, 5);
         assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].norm_pos, 7);
+        // The contrast this test exists for: the aligner's own CIGAR anchor (15)
+        // and the left-normalized site (7) genuinely differ. `rewrite_read` keys
+        // its Ins/Del lookups on `anchor`, not `norm_pos` -- see CRITICAL 1.
+        assert_eq!(evs[0].anchor, 15, "the aligner's own CIGAR anchor must be reported");
+        assert_eq!(evs[0].norm_pos, 7, "left-normalization must still pull the site to 7");
         assert_eq!(evs[0].allele, Some(Allele::Ins(b"A".to_vec())));
     }
 
@@ -987,7 +998,8 @@ mod tests {
         let cig = cs(vec![Cigar::Match(15), Cigar::Del(1), Cigar::Match(13)]);
         let evs = read_events(0, &cig, seq, REF29, 5);
         assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].norm_pos, 7);
+        assert_eq!(evs[0].anchor, 14, "the aligner's own CIGAR anchor must be reported");
+        assert_eq!(evs[0].norm_pos, 7, "left-normalization must still pull the site to 7");
         assert_eq!(evs[0].allele, Some(Allele::Del(1)));
     }
 
@@ -998,6 +1010,9 @@ mod tests {
         let cig = cs(vec![Cigar::Match(19), Cigar::Ins(1), Cigar::Match(10)]);
         let evs = read_events(0, &cig, seq, REF29, 5);
         assert_eq!(evs.len(), 1);
+        // In unique sequence anchor and normalized site coincide -- unlike the
+        // homopolymer fixtures above.
+        assert_eq!(evs[0].anchor, 18);
         assert_eq!(evs[0].norm_pos, 18);
         assert_eq!(evs[0].allele, Some(Allele::Ins(b"G".to_vec())));
     }
@@ -1013,6 +1028,8 @@ mod tests {
         let evs = read_events(0, &cig, seq, REF29, 5);
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].allele, None);
+        // The oversized case reports the same raw anchor in both fields.
+        assert_eq!(evs[0].anchor, 18);
         assert_eq!(evs[0].norm_pos, 18);
     }
 

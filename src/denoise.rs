@@ -281,9 +281,15 @@ pub struct DenoiseStats {
     pub substitution_matrix: [[u64; 4]; 4], // [from][to]
     // --- indel denoising (all zero unless --indels is enabled) ---
     pub indel_sites_examined: u64,
-    pub indel_sites_kept: u64,
-    pub indel_sites_strand_biased: u64,
+    /// Non-reference ALLELES (not sites) that survived candidacy across all sites.
+    pub indel_alt_alleles_kept: u64,
+    /// Non-reference ALLELES (not sites) rejected specifically as strand-biased.
+    pub indel_alt_alleles_strand_biased: u64,
     pub indel_events_examined: u64,
+    /// Votes dropped in pass 1 because the read that cast them does not actually
+    /// span the column its event left-normalized into (see CRITICAL 2). Depth for
+    /// that read already excludes it, so this only tracks the ALT side.
+    pub indel_events_out_of_span: u64,
     pub reads_reassigned_ref_to_ins: u64,
     pub reads_reassigned_ref_to_del: u64,
     pub reads_reassigned_indel_to_ref: u64,
@@ -292,8 +298,18 @@ pub struct DenoiseStats {
     pub indel_bases_removed: u64,
     /// Index = repeat-context length L; audits how much correction fired in long runs.
     pub reassignments_by_hp_length: Vec<u64>,
-    pub reads_skipped_span_guard: u64,
-    pub reads_skipped_unsupported_transition: u64,
+    /// (read, site) PAIRS skipped because the read lacks the match-context flank
+    /// the rewrite walk needs on one side or the other of the edit.
+    pub assignments_skipped_span_guard: u64,
+    /// (read, site) PAIRS skipped because the MAP target is only reachable through
+    /// a transition the rewrite walk does not support (cross-kind, or growing a
+    /// deletion).
+    pub assignments_skipped_unsupported_transition: u64,
+    /// (read, site) PAIRS skipped because the read carries its own untouchable
+    /// oversized indel close enough to this site that its alignment in this
+    /// window cannot be represented by the site's alleles. Filed separately from
+    /// the span guard: a distinct cause, not a coordinate-flank failure.
+    pub assignments_skipped_oversized_neighbor: u64,
 }
 
 fn compute_corrections(
@@ -345,7 +361,10 @@ fn compute_corrections(
         let mut col_depth = 0u32;
         let mut col_fwd = 0u32;
         let mut col_rev = 0u32;
-        let mut col_events: Vec<(indel::Allele, bool)> = Vec::new();
+        // (allele, reverse, read's own aligned span [rstart, rend)). The span
+        // travels with the event so it can be checked AFTER normalization, once
+        // we know which column the event actually folds into (see CRITICAL 2).
+        let mut col_events: Vec<(indel::Allele, bool, i64, i64)> = Vec::new();
 
         for a in col.alignments() {
             let rec = a.record();
@@ -361,11 +380,23 @@ fn compute_corrections(
                         bam::pileup::Indel::Ins(n) if n < iopts.max_len => {
                             let s: Vec<u8> =
                                 (0..n as usize).map(|i| rec.seq()[q + 1 + i]).collect();
-                            col_events.push((indel::Allele::Ins(s), rec.is_reverse()));
+                            let view = rec.cigar();
+                            col_events.push((
+                                indel::Allele::Ins(s),
+                                rec.is_reverse(),
+                                rec.pos(),
+                                view.end_pos(),
+                            ));
                             stats.indel_events_examined += 1;
                         }
                         bam::pileup::Indel::Del(n) if n < iopts.max_len => {
-                            col_events.push((indel::Allele::Del(n), rec.is_reverse()));
+                            let view = rec.cigar();
+                            col_events.push((
+                                indel::Allele::Del(n),
+                                rec.is_reverse(),
+                                rec.pos(),
+                                view.end_pos(),
+                            ));
                             stats.indel_events_examined += 1;
                         }
                         // Indel::None contributes depth only; an indel at or above
@@ -394,9 +425,20 @@ fn compute_corrections(
 
         if iopts.enabled {
             depths.insert((name.to_vec(), refpos as u32), (col_depth, col_fwd, col_rev));
-            for (allele, reverse) in col_events {
+            for (allele, reverse, rstart, rend) in col_events {
                 let (norm_pos, norm_allele) =
                     indel::normalize_left(refseq, refpos as u32, &allele);
+                // `normalize_left` walks the reference with no knowledge of read
+                // boundaries: a read whose alignment starts (or ends) inside a
+                // repeat can normalize an event to a column outside its own
+                // aligned span. Depth at that column already excludes this read
+                // (depth comes from the column map, and this read never appears
+                // there), so counting its ALT vote too would let alt_total exceed
+                // depth -- see CRITICAL 2. Drop the vote and count it instead.
+                if (norm_pos as i64) < rstart || (norm_pos as i64) >= rend {
+                    stats.indel_events_out_of_span += 1;
+                    continue;
+                }
                 sites
                     .entry((name.to_vec(), norm_pos))
                     .or_default()
@@ -459,9 +501,9 @@ fn compute_corrections(
             let model = indel::fit_indel_site(
                 &site, refseq, norm_pos, min_strand, strand_bias_p, homoplasmic_vaf, iopts,
             );
-            stats.indel_sites_strand_biased += model.strand_biased as u64;
+            stats.indel_alt_alleles_strand_biased += model.strand_biased as u64;
             // `kept` includes REF; count only surviving non-reference alleles.
-            stats.indel_sites_kept +=
+            stats.indel_alt_alleles_kept +=
                 model.kept.iter().filter(|(a, _)| *a != indel::Allele::Ref).count() as u64;
             models.entry(contig).or_default().push((norm_pos, model));
         }
@@ -509,121 +551,172 @@ fn apply_corrections(
             !(rec.is_secondary() || rec.is_supplementary() || rec.is_unmapped());
         if correctable {
             reads_processed += 1;
-            let contig = header_view.tid2name(rec.tid() as u32).to_vec();
-            match refs.get(&contig) {
-                Some(refseq) => {
-                    let mut edits = corrections.get(rec.qname()).cloned().unwrap_or_default();
+            // A mapped-but-contig-less record (tid == -1) is a degenerate BAM
+            // state. Casting -1 to u32 before calling `tid2name` is an unchecked
+            // pointer offset in rust-htslib (see IMPORTANT 4); guard it exactly
+            // like the missing-reference-contig case below and skip straight to
+            // the unconditional write at the bottom of the loop.
+            if rec.tid() >= 0 {
+                let contig = header_view.tid2name(rec.tid() as u32).to_vec();
+                match refs.get(&contig) {
+                    Some(refseq) => {
+                        let mut edits = corrections.get(rec.qname()).cloned().unwrap_or_default();
 
-                    if iopts.enabled {
-                        // `end_pos()` (exclusive alignment end on the reference) is only
-                        // defined on `CigarStringView`, which carries the record's POS;
-                        // it must be read before `.take()` discards that view down to a
-                        // plain `CigarString`.
-                        let view = rec.cigar();
-                        let rstart = rec.pos();
-                        let rend = view.end_pos();
-                        let cigar = view.take();
-                        let seq = rec.seq().as_bytes();
-                        let evs = indel::read_events(rstart, &cigar, &seq, refseq, iopts.max_len);
+                        if iopts.enabled {
+                            // `end_pos()` (exclusive alignment end on the reference) is only
+                            // defined on `CigarStringView`, which carries the record's POS;
+                            // it must be read before `.take()` discards that view down to a
+                            // plain `CigarString`.
+                            let view = rec.cigar();
+                            let rstart = rec.pos();
+                            let rend = view.end_pos();
+                            let cigar = view.take();
+                            let seq = rec.seq().as_bytes();
+                            let evs = indel::read_events(rstart, &cigar, &seq, refseq, iopts.max_len);
 
-                        // What this read carries at each normalized site, and where it has
-                        // an indel too large to represent.
-                        let mut carried: HashMap<u32, indel::Allele> = HashMap::new();
-                        let mut blocked: Vec<i64> = Vec::new();
-                        for e in &evs {
-                            match &e.allele {
-                                Some(a) => { carried.insert(e.norm_pos, a.clone()); }
-                                None => blocked.push(e.norm_pos as i64),
-                            }
-                        }
-
-                        let flank = iopts.flank as i64;
-                        // A gained deletion consumes up to max_len reference bases to the
-                        // right, so the right-hand requirement is larger than the left.
-                        let reach = flank + iopts.max_len as i64;
-
-                        if let Some(list) = models.get(&contig) {
-                            let lo = list.partition_point(|(p, _)| (*p as i64) < rstart);
-                            for (pos, model) in &list[lo..] {
-                                let s = *pos as i64;
-                                if s > rend {
-                                    break;
+                            // What this read carries at each normalized site -- the allele
+                            // AND the CIGAR anchor where that allele actually lives, since
+                            // `rewrite_read` keys its Ins/Del lookups on the anchor, not the
+                            // normalized site (see CRITICAL 1) -- and where it has an indel
+                            // too large to represent.
+                            let mut carried: HashMap<u32, (indel::Allele, u32)> = HashMap::new();
+                            let mut blocked: Vec<i64> = Vec::new();
+                            for e in &evs {
+                                match &e.allele {
+                                    Some(a) => { carried.insert(e.norm_pos, (a.clone(), e.anchor)); }
+                                    None => blocked.push(e.norm_pos as i64),
                                 }
-                                let observed =
-                                    carried.get(pos).cloned().unwrap_or(indel::Allele::Ref);
-                                let target = match indel::assign_allele(&observed, model, iopts) {
-                                    indel::Assignment::Keep => continue,
-                                    indel::Assignment::Refused => {
-                                        stats.reads_skipped_unsupported_transition += 1;
+                            }
+
+                            let flank = iopts.flank as i64;
+                            // A gained deletion consumes up to max_len reference bases to the
+                            // right, so the right-hand requirement is larger than the left.
+                            let reach = flank + iopts.max_len as i64;
+
+                            if let Some(list) = models.get(&contig) {
+                                let lo = list.partition_point(|(p, _)| (*p as i64) < rstart);
+                                for (pos, model) in &list[lo..] {
+                                    let s = *pos as i64;
+                                    if s > rend {
+                                        break;
+                                    }
+                                    let (observed, anchor) = carried
+                                        .get(pos)
+                                        .cloned()
+                                        .unwrap_or((indel::Allele::Ref, *pos));
+                                    let target = match indel::assign_allele(&observed, model, iopts) {
+                                        indel::Assignment::Keep => continue,
+                                        indel::Assignment::Refused => {
+                                            stats.assignments_skipped_unsupported_transition += 1;
+                                            continue;
+                                        }
+                                        indel::Assignment::Move(t) => t,
+                                    };
+                                    // Left-normalization only ever moves an event LEFT, so the
+                                    // read's own CIGAR anchor (where an observed indel actually
+                                    // lives) is always >= the normalized site position. The
+                                    // rewrite walk needs plain match context flanking whichever
+                                    // coordinate it will actually touch.
+                                    let far = (anchor as i64).max(s);
+                                    if s - flank < rstart || far + reach > rend {
+                                        stats.assignments_skipped_span_guard += 1;
                                         continue;
                                     }
-                                    indel::Assignment::Move(t) => t,
-                                };
-                                // The rewrite walk needs plain match context on both sides.
-                                if s - flank < rstart || s + reach > rend {
-                                    stats.reads_skipped_span_guard += 1;
-                                    continue;
-                                }
-                                // An oversized indel nearby means this read's alignment in
-                                // this window cannot be represented by the site's alleles.
-                                if blocked.iter().any(|b| (b - s).abs() <= reach) {
-                                    stats.reads_skipped_span_guard += 1;
-                                    continue;
-                                }
-                                match (&observed, &target) {
-                                    (indel::Allele::Ref, indel::Allele::Ins(s2)) => {
-                                        stats.reads_reassigned_ref_to_ins += 1;
-                                        stats.indel_bases_inserted += s2.len() as u64;
+                                    // An oversized indel nearby means this read's alignment in
+                                    // this window cannot be represented by the site's alleles.
+                                    if blocked.iter().any(|b| (b - s).abs() <= reach) {
+                                        stats.assignments_skipped_oversized_neighbor += 1;
+                                        continue;
                                     }
-                                    (indel::Allele::Ref, indel::Allele::Del(n)) => {
-                                        stats.reads_reassigned_ref_to_del += 1;
-                                        stats.indel_bases_removed += *n as u64;
+                                    match (&observed, &target) {
+                                        (indel::Allele::Ref, indel::Allele::Ins(s2)) => {
+                                            stats.reads_reassigned_ref_to_ins += 1;
+                                            stats.indel_bases_inserted += s2.len() as u64;
+                                        }
+                                        (indel::Allele::Ref, indel::Allele::Del(n)) => {
+                                            stats.reads_reassigned_ref_to_del += 1;
+                                            stats.indel_bases_removed += *n as u64;
+                                        }
+                                        (_, indel::Allele::Ref) => {
+                                            stats.reads_reassigned_indel_to_ref += 1;
+                                        }
+                                        (indel::Allele::Ins(from_s), indel::Allele::Ins(to_s)) => {
+                                            stats.reads_reassigned_indel_to_indel += 1;
+                                            if to_s.len() > from_s.len() {
+                                                stats.indel_bases_inserted +=
+                                                    (to_s.len() - from_s.len()) as u64;
+                                            } else if from_s.len() > to_s.len() {
+                                                stats.indel_bases_removed +=
+                                                    (from_s.len() - to_s.len()) as u64;
+                                            }
+                                        }
+                                        (indel::Allele::Del(from_n), indel::Allele::Del(to_n)) => {
+                                            stats.reads_reassigned_indel_to_indel += 1;
+                                            if to_n < from_n {
+                                                stats.indel_bases_removed += (from_n - to_n) as u64;
+                                            } else if to_n > from_n {
+                                                stats.indel_bases_inserted += (to_n - from_n) as u64;
+                                            }
+                                        }
+                                        _ => stats.reads_reassigned_indel_to_indel += 1,
                                     }
-                                    (_, indel::Allele::Ref) => {
-                                        stats.reads_reassigned_indel_to_ref += 1;
+                                    let l = model.context_len as usize;
+                                    if stats.reassignments_by_hp_length.len() <= l {
+                                        stats.reassignments_by_hp_length.resize(l + 1, 0);
                                     }
-                                    _ => stats.reads_reassigned_indel_to_indel += 1,
-                                }
-                                let l = model.context_len as usize;
-                                if stats.reassignments_by_hp_length.len() <= l {
-                                    stats.reassignments_by_hp_length.resize(l + 1, 0);
-                                }
-                                stats.reassignments_by_hp_length[l] += 1;
+                                    stats.reassignments_by_hp_length[l] += 1;
 
-                                edits.indels.push(rewrite::IndelEdit {
-                                    ref_pos: *pos,
-                                    from: observed,
-                                    to: target,
-                                });
+                                    // Direction determines which coordinate `rewrite_read`
+                                    // will actually look this edit up by (see CRITICAL 1):
+                                    // reverting/replacing an indel the read itself carries is
+                                    // found via `last_ref`, which is the CIGAR anchor; gaining
+                                    // an indel where the read has plain match context is found
+                                    // by walking that Match run at the normalized site.
+                                    let ref_pos = match &observed {
+                                        indel::Allele::Ref => *pos,
+                                        _ => anchor,
+                                    };
+                                    edits.indels.push(rewrite::IndelEdit {
+                                        ref_pos,
+                                        from: observed,
+                                        to: target,
+                                    });
+                                }
+                            }
+                            edits.indels.sort_by_key(|e| e.ref_pos);
+                        }
+
+                        if !edits.is_empty() {
+                            // Extract owned parts, rewrite, rebuild (aux preserved by set()).
+                            let qname = rec.qname().to_vec();
+                            let cigar = rec.cigar().take();
+                            let seq = rec.seq().as_bytes().to_vec();
+                            let qual = rec.qual().to_vec();
+                            let out =
+                                rewrite_read(rec.pos(), &cigar, &seq, &qual, &edits, refseq);
+                            // A non-empty edit list does not guarantee `rewrite_read`
+                            // actually changed anything -- CRITICAL 1's bug is exactly a
+                            // case where it silently didn't. Compare the real output.
+                            let changed = out.seq != seq || out.cigar != cigar;
+                            rec.set(&qname, Some(&out.cigar), &out.seq, &out.qual);
+                            if out.structure_changed {
+                                strip_stale_tags(&mut rec);
+                            }
+                            if changed {
+                                reads_modified += 1;
                             }
                         }
-                        edits.indels.sort_by_key(|e| e.ref_pos);
                     }
-
-                    if !edits.is_empty() {
-                        // Extract owned parts, rewrite, rebuild (aux preserved by set()).
-                        let qname = rec.qname().to_vec();
-                        let cigar = rec.cigar().take();
-                        let seq = rec.seq().as_bytes();
-                        let qual = rec.qual().to_vec();
-                        let out =
-                            rewrite_read(rec.pos(), &cigar, &seq, &qual, &edits, refseq);
-                        rec.set(&qname, Some(&out.cigar), &out.seq, &out.qual);
-                        if out.structure_changed {
-                            strip_stale_tags(&mut rec);
+                    None => {
+                        // Contig not in the supplied reference: do not rewrite
+                        // this record. Writing it through unchanged is safe;
+                        // fabricating a reference slice is not (it would let
+                        // the deletion-reversion path splice `N` filler into
+                        // real reads).
+                        if corrections.get(rec.qname()).is_some_and(|e| !e.is_empty()) {
+                            missing_ref_contigs.insert(contig.clone());
+                            missing_ref_reads += 1;
                         }
-                        reads_modified += 1;
-                    }
-                }
-                None => {
-                    // Contig not in the supplied reference: do not rewrite
-                    // this record. Writing it through unchanged is safe;
-                    // fabricating a reference slice is not (it would let
-                    // the deletion-reversion path splice `N` filler into
-                    // real reads).
-                    if corrections.get(rec.qname()).is_some_and(|e| !e.is_empty()) {
-                        missing_ref_contigs.insert(contig.clone());
-                        missing_ref_reads += 1;
                     }
                 }
             }
@@ -1160,7 +1253,7 @@ mod tests {
     //   8-15  AAAAAAAA   (an 8bp homopolymer run)
     //   16-28 CGTACGTACGTAC
     // Long enough that the shipped default --indel-flank 5 is satisfiable at the
-    // sites used below (normalized positions 7 and 18).
+    // sites used below (normalized positions 7 and 19).
     const REF29: &[u8] = b"ACGTACGTAAAAAAAACGTACGTACGTAC";
 
     // Build a BAM whose reads carry explicit CIGARs, so indel-bearing reads can be
@@ -1291,11 +1384,14 @@ mod tests {
         let (_corr, models, _stats) =
             compute_corrections(&bam, &indel_refs(), 2, 0.01, SB_P, HOM_VAF, &indels_on()).unwrap();
         let list = models.get(&b"chrM".to_vec()).expect("chrM must have sites");
-        assert!(list.len() >= 2, "expected at least two sites, got {}", list.len());
-        assert!(
-            list.windows(2).all(|w| w[0].0 <= w[1].0),
-            "site list must be sorted ascending by position"
-        );
+        // Assert the exact expected positions rather than comparing the list to
+        // its own sorted copy: with only two elements, an unsorted 2-element list
+        // equals its own `.sort()`ed copy about half the time by pure chance
+        // (whichever of the two orderings HashMap iteration happens to produce),
+        // so that comparison would pass about half the time even with the
+        // `sort_by_key` deleted.
+        let positions: Vec<u32> = list.iter().map(|(p, _)| *p).collect();
+        assert_eq!(positions, vec![7, 19], "sites must be exactly [7, 19], in that order");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1362,7 +1458,7 @@ mod tests {
         let iopts = indels_on();
         let (corr, models, mut stats) =
             compute_corrections(&bam, &refs, 2, 0.01, SB_P, HOM_VAF, &iopts).unwrap();
-        assert_eq!(stats.indel_sites_kept, 1, "the 90% insertion must survive candidacy");
+        assert_eq!(stats.indel_alt_alleles_kept, 1, "the 90% insertion must survive candidacy");
         apply_corrections(&bam, &outb, &corr, &refs, &models, &iopts, &mut stats).unwrap();
 
         let mut r = Reader::from_path(&outb).unwrap();
@@ -1410,27 +1506,103 @@ mod tests {
                 assert_eq!(rec.seq().as_bytes(), short_seq, "guarded read must be untouched");
             }
         }
-        assert!(stats.reads_skipped_span_guard >= 1, "the skip must be counted");
+        assert!(stats.assignments_skipped_span_guard >= 1, "the skip must be counted");
         assert_eq!(stats.reads_reassigned_ref_to_ins, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn read_carrying_an_oversized_indel_is_not_assigned_nearby() {
-        // A 6bp insertion exceeds max_len 5. The read must be left alone -- and in
-        // particular must not be treated as a clean REF observation and "repaired"
-        // into the site's kept allele.
+        // IMPORTANT 3: the original version of this fixture placed the site in
+        // UNIQUE sequence (context_len = 1, eps = 0.01). There, for a Ref-observing
+        // read MAP already returns Keep on the arithmetic alone (0.1 * 0.99 = 0.099
+        // beats 0.9 * 0.01 = 0.009), so the `blocked` mask is never even reached --
+        // the assertion held identically with the mask deleted.
+        //
+        // This version places the site inside the 8bp A-run (site 7), where eps is
+        // large enough that a Ref-observing read WOULD genuinely be repaired into
+        // the kept 90% insertion without the mask: eps(8) ~= 0.171, and
+        // 0.9 * 0.171 = 0.154 beats 0.1 * 0.829 = 0.083 (identical arithmetic to
+        // `near_homoplasmic_site_repairs_reads_that_dropped_the_indel` in
+        // indel.rs). `rbig` observes plain Ref at site 7 (its own event is
+        // elsewhere), so only the oversized-neighbor mask -- not the assignment
+        // math -- can be what leaves it untouched.
         let dir = std::env::temp_dir().join("himito_denoise_indel_large");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
         let outb = dir.join("out.bam");
-        let big_seq: &[u8] = b"ACGTACGTAAAAAAAACGTGGGGGGACGTACGTAC"; // 35bp
-        let big_cigar = vec![Cigar::Match(19), Cigar::Ins(6), Cigar::Match(10)];
+        // ref[0..9] + 6 spurious G's (oversized, anchor = 8, inside the run) +
+        // ref[9..29]. `rbig` carries no event of its own at site 7.
+        let mut big_seq: Vec<u8> = Vec::new();
+        big_seq.extend_from_slice(&REF29[0..9]);
+        big_seq.extend_from_slice(b"GGGGGG");
+        big_seq.extend_from_slice(&REF29[9..29]);
+        let big_cigar = vec![Cigar::Match(9), Cigar::Ins(6), Cigar::Match(20)];
         let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
         for (i, n) in NAMES.iter().enumerate() {
-            reads.push((n, 0, UNIQ_INS_SEQ, uniq_ins_cigar(), i % 2 == 0));
+            reads.push((n, 0, HP_INS_SEQ, hp_ins_cigar(), i % 2 == 0));
         }
-        reads.push(("rbig", 0, big_seq, big_cigar, false));
+        reads.push(("rbig", 0, big_seq.as_slice(), big_cigar.clone(), false));
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let refs = indel_refs();
+        let iopts = indels_on();
+        let (corr, models, mut stats) =
+            compute_corrections(&bam, &refs, 2, 0.01, SB_P, HOM_VAF, &iopts).unwrap();
+        assert_eq!(
+            stats.indel_alt_alleles_kept, 1,
+            "test premise: the 90% insertion at site 7 must clear candidacy"
+        );
+        apply_corrections(&bam, &outb, &corr, &refs, &models, &iopts, &mut stats).unwrap();
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let mut seen = false;
+        for rec in r.records() {
+            let rec = rec.unwrap();
+            if rec.qname() == b"rbig" {
+                assert_eq!(rec.seq().as_bytes(), big_seq.as_slice(), "oversized indel must be untouched");
+                assert_eq!(
+                    rec.cigar().take(),
+                    CigarString(big_cigar.clone()),
+                    "CIGAR must be untouched"
+                );
+                seen = true;
+            }
+        }
+        assert!(seen);
+        assert!(
+            stats.assignments_skipped_oversized_neighbor >= 1,
+            "the mask's skip must be counted, proving it is what fired"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- CRITICAL 1 regression: normalized position vs CIGAR anchor mismatch ----
+
+    #[test]
+    fn spurious_homopolymer_insertion_is_reverted_using_its_own_cigar_anchor() {
+        // 9 clean reads plus one (`rspur`) carrying a lone extra A inside the 8bp
+        // A-run, anchored by the aligner at reference index 15 (`HP_INS_SEQ`),
+        // which left-normalizes to site 7. The aligner's own CIGAR anchor (15)
+        // and the normalized site (7) genuinely differ here -- unlike every other
+        // pre-existing rewrite fixture, which sits in unique sequence where the
+        // two coincide.
+        //
+        // Before CRITICAL 1's fix, `apply_corrections` emitted the `IndelEdit`
+        // keyed at the NORMALIZED position (7). `rewrite_read` looks an `Ins`
+        // reversion up via `last_ref` -- the read's own CIGAR anchor (15) -- so
+        // the lookup at 7 found nothing and the `Ins` op was copied verbatim: a
+        // silent no-op that still incremented `reads_reassigned_indel_to_ref`.
+        // This test asserts the actual SEQ/CIGAR, not just the counter.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_anchor_mismatch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
+        }
+        reads.push(("rspur", 0, HP_INS_SEQ, hp_ins_cigar(), false));
         write_cigar_bam(&bam, "chrM", 29, &reads);
 
         let refs = indel_refs();
@@ -1440,12 +1612,137 @@ mod tests {
         apply_corrections(&bam, &outb, &corr, &refs, &models, &iopts, &mut stats).unwrap();
 
         let mut r = Reader::from_path(&outb).unwrap();
+        let mut seen = false;
         for rec in r.records() {
             let rec = rec.unwrap();
-            if rec.qname() == b"rbig" {
-                assert_eq!(rec.seq().as_bytes(), big_seq, "oversized indel must be untouched");
+            if rec.qname() == b"rspur" {
+                assert_eq!(
+                    rec.seq().as_bytes(), CLEAN_SEQ,
+                    "the spurious insertion must actually be removed from SEQ, not left in place"
+                );
+                assert_eq!(
+                    rec.cigar().to_string(), "29M",
+                    "CIGAR must actually collapse to a plain full-length match"
+                );
+                seen = true;
+            } else {
+                assert_eq!(rec.seq().as_bytes(), CLEAN_SEQ, "clean reads must be untouched");
             }
         }
+        assert!(seen);
+        assert_eq!(stats.reads_reassigned_indel_to_ref, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- CRITICAL 2 regression: depth/ALT sourced inconsistently across span ----
+
+    #[test]
+    fn indel_event_normalizing_outside_its_own_span_is_not_fabricated_into_a_site() {
+        // Four reads start at POS 10 -- inside the 8bp A-run (ref idx 8..=15) --
+        // and each carries an extra A anchored at ref idx 10 (inside their own
+        // aligned span). `normalize_left` walks the reference with no knowledge
+        // of read boundaries and pulls the event back to site 7, which lies
+        // BEFORE these reads' own start (10). Without the span check, this
+        // fabricates ALT support at site 7 for reads that never covered it: the
+        // per-column depth at site 7 (contributed only by the one fully-spanning
+        // read below) stays small while alt_total grows unbounded, letting
+        // alt_total exceed depth (the `debug_assert!` CRITICAL 2's probe tripped)
+        // and, in release, fabricating a homoplasmic insertion that would splice
+        // into the one genuinely reference-matching read.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_out_of_span");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        // seq = ref[10] + inserted 'A' + ref[11..29]; anchor = 10, inside this
+        // read's own span [10, 29) -- but normalizes to site 7, outside it.
+        let mut seq: Vec<u8> = Vec::new();
+        seq.push(REF29[10]);
+        seq.push(b'A');
+        seq.extend_from_slice(&REF29[11..29]);
+        let cigar = vec![Cigar::Match(1), Cigar::Ins(1), Cigar::Match(18)];
+
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        // One read spanning the WHOLE contig, clean, reference-matching -- this
+        // is the read that must come out unchanged. Written first: the pileup
+        // requires coordinate-sorted input, and this read's POS (0) precedes
+        // the others' (10).
+        reads.push(("rfull", 0, CLEAN_SEQ, clean_cigar(), false));
+        for (i, n) in ["r0", "r1", "r2", "r3"].iter().enumerate() {
+            reads.push((n, 10, seq.as_slice(), cigar.clone(), i % 2 == 0));
+        }
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let refs = indel_refs();
+        let iopts = indels_on();
+        let (corr, models, mut stats) =
+            compute_corrections(&bam, &refs, 2, 0.01, SB_P, HOM_VAF, &iopts).unwrap();
+
+        assert_eq!(
+            stats.indel_events_out_of_span, 4,
+            "all four out-of-span votes must be dropped and counted"
+        );
+        if let Some(list) = models.get(&b"chrM".to_vec()) {
+            assert!(
+                list.iter().all(|(p, _)| *p != 7),
+                "site 7 must not be fabricated from reads that never span it"
+            );
+        }
+
+        apply_corrections(&bam, &outb, &corr, &refs, &models, &iopts, &mut stats).unwrap();
+        let mut r = Reader::from_path(&outb).unwrap();
+        for rec in r.records() {
+            let rec = rec.unwrap();
+            if rec.qname() == b"rfull" {
+                assert_eq!(
+                    rec.seq().as_bytes(), CLEAN_SEQ,
+                    "the fully-spanning reference-matching read must be unchanged"
+                );
+                assert_eq!(rec.cigar().to_string(), "29M");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- IMPORTANT 4 regression: tid2name must not be called for tid == -1 ----
+
+    #[test]
+    fn apply_corrections_treats_mapped_record_with_no_contig_like_missing_ref() {
+        // A mapped record with tid == -1 is a degenerate BAM state. Casting -1 to
+        // u32 and calling `tid2name` on it is an unchecked pointer offset in
+        // rust-htslib; it must be guarded and the record written through
+        // unchanged, exactly like the missing-reference-contig path.
+        let dir = std::env::temp_dir().join("himito_denoise_tidless");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+        {
+            let mut header = Header::new();
+            let mut sq = HeaderRecord::new(b"SQ");
+            sq.push_tag(b"SN", "chrM");
+            sq.push_tag(b"LN", &6usize.to_string());
+            header.push_record(&sq);
+            let mut w = Writer::from_path(&inb, &header, Format::Bam).unwrap();
+            let mut rec = Record::new();
+            let seq = b"AAAAAA";
+            let quals = vec![30u8; 6];
+            rec.set(b"rtidless", Some(&CigarString(vec![Cigar::Match(6)])), seq, &quals);
+            // Deliberately do NOT set_tid: tid stays -1 (Record::new()'s default),
+            // but clearing the unmapped flag makes this record "correctable".
+            rec.unset_unmapped();
+            w.write(&rec).unwrap();
+        }
+
+        let refs = indel_refs();
+        let models = IndelModels::new();
+        let mut stats = DenoiseStats::default();
+        let corr: Corrections = HashMap::new();
+        let (proc, modified) = apply_corrections(
+            &inb, &outb, &corr, &refs, &models, &indel::IndelOpts::default(), &mut stats,
+        )
+        .unwrap(); // must not panic on an unchecked tid2name offset
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

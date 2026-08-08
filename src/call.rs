@@ -525,6 +525,10 @@ fn filter_vcf_record(
         if ref_allele.contains("N") {
             continue;
         }
+        let alt_allele = variant.alt_allele.as_str();
+        if alt_allele.contains("N") {
+            continue;
+        }
         
         filtered_var.push(variant.clone());
     }

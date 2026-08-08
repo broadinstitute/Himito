@@ -224,6 +224,8 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars) -> dict:
     var_precision = tp / len(detected_vars) if detected_vars else 0.0
     var_recall = tp / len(truth_vars) if truth_vars else 0.0
 
+    print(f"fp: {detected_vars - truth_vars}", file=sys.stderr)
+
     # --- shared variant set for tree metrics ---
     truth_tree_vars = {v for v in truth_parent if v != "ROOT"}
     recon_tree_vars = {v for v in recon_parent if v != "ROOT"}

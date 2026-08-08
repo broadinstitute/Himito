@@ -106,7 +106,7 @@ if [[ "$DTYPE" == ont-* ]]; then
   if [[ "$DENOISE_INDELS" == "1" ]]; then
     DENOISE_ARGS+=(--indels)
   fi
-  "$HIMITO" denoise -i "$BAM" -o "$DENOISED" -r "$REF" -d "$DTYPE" "${DENOISE_ARGS[@]}"
+  "$HIMITO" denoise -i "$BAM" -o "$DENOISED" -r "$REF" -d "$DTYPE" "${DENOISE_ARGS[@]}" --indels
   samtools index "$DENOISED"
   BUILD_BAM="$DENOISED"
   CALL_DATATYPE="ont-denoised"

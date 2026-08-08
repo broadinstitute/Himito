@@ -429,7 +429,7 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
                 .and_then(|d| d.get(0).and_then(|s| s.get(alt_idx).or_else(|| s.first())));
             let Some(&hf_val) = hf_val else { continue };
             let hf = hf_val as f64;
-            println!("hf_data: {:?} {} {}", hf, min_hf, max_hf);
+            // println!("hf_data: {:?} {} {}", hf, min_hf, max_hf);
             if hf >= min_hf && hf < max_hf {
                 let vid = format!("m.{pos}{ref_allele}>{alt_allele}");
                 // Keep the first occurrence of a variant id (deterministic across
@@ -681,7 +681,7 @@ pub fn start(
             HfMap::new()
         }
     };
-    println!("hf_map: {:?}", hf_map);
+    // println!("hf_map: {:?}", hf_map);
 
     info!("[1/6] Loading and filtering matrix: {}", matrix_file);
     let binary = load_and_filter_matrix(

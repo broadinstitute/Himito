@@ -222,6 +222,11 @@ competing one.
 denoising automatically for ONT data, but indel correction stays off there — you must
 run `Himito denoise --indels` yourself (as a stepwise, standalone call) to get it.
 
+**The ten defaults below are unvalidated starting points, not tuned claims** — they are
+pending a validation sweep against `lineage_sim` (graph/matrix cleanliness with no
+regression in tree score or indel precision/recall) before `--indels` is ever turned on
+by default anywhere in the pipeline.
+
 Indel-specific flags and their defaults (from `Himito denoise --help`):
 - `--indels`: enable small-indel (<5bp) correction in addition to substitutions [off by default]
 - `--indel-max-len <INT>`: exclusive upper bound on correctable indel length [default: 5]
@@ -245,13 +250,29 @@ the allele was rejected by the strand-bias gate — those are treated as suspect
 single-strand artifacts, which is precisely what this denoiser exists to remove, so the
 protection does not apply to them.
 
-**Known limitation — methylation tags are lost on length-changing edits.** Reads whose
-length changed as a result of an indel correction lose their `MM`/`ML`/`MN`
-(methylation) tags and their `NM`/`MD`/`cs` tags; these are indexed by the read's own
-base positions and cannot survive a length change. This is safe in the standard
-pipeline because methylation aggregation (`Himito methyl`) reads the *original* mt BAM,
-not the denoised one — but an indel-denoised BAM must not itself be used as a
-methylation input.
+**Sensitivity floor in repeats.** At stock defaults, the effective revert threshold for
+an allele at a site is `min(vaf_floor(L), protect_vaf)`, where `L` is the reference
+repeat-context length. Because `vaf_floor(6) ≈ 0.228 > protect_vaf (0.2)`, and
+`vaf_floor` only grows with `L`, that minimum is a **flat 0.2 for every repeat context
+`L >= 6`** — so `--indel-err-scale`, `--indel-err-cap`, `--indel-floor-mult`, and
+`--indel-vaf` have **no effect** in those contexts at the stock `--indel-protect-vaf`.
+Concretely: an indel below ~20% VAF inside a homopolymer or tandem repeat of length 6 or
+more will be reverted, full stop, regardless of how the other four flags are tuned —
+and homopolymers and tandem repeats of that length are exactly where ONT's indel error
+concentrates. Lowering `--indel-protect-vaf` is the only way to raise sensitivity below
+20% VAF in those contexts, and lowering it too far has its own failure mode (see above).
+
+**Known limitation — methylation tags are lost on any structurally-changed read.** A
+read loses its `MM`/`ML`/`MN` (methylation) tags and its `NM`/`MD`/`cs` tags whenever at
+least one indel edit was actually applied to it — a **structural** change, not a
+**length** change. Those are not the same trigger: an insertion at one site and a
+deletion at another site can offset each other, leaving the read's SEQ length
+unchanged while its CIGAR is rewritten and every downstream query offset still shifts.
+A length check would silently miss exactly that case. These tags are indexed by the
+read's own base positions and cannot survive either kind of change. This is safe in
+the standard pipeline because methylation aggregation (`Himito methyl`) reads the
+*original* mt BAM, not the denoised one — but an indel-denoised BAM must not itself be
+used as a methylation input.
 
 **Known limitation — do not re-run the denoiser on its own output.** Allele
 frequencies are computed once from the input BAM and decisions are applied once.

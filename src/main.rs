@@ -529,6 +529,57 @@ enum Commands {
     }
 }
 
+/// Validate the numeric `--indel-*` options at the CLI boundary. Only called
+/// when `--indels` is passed (see the `Denoise` arm below): a user who is not
+/// using the feature must never be blocked by it, however out-of-range its
+/// unused defaults might theoretically be set to by some other caller.
+///
+/// This validation deliberately lives here, not inside `IndelOpts` or any
+/// library function: the CLI is the boundary where a human-typed flag value
+/// first exists, and the error message needs the flag's own name, which only
+/// the CLI layer knows. Two of these are load-bearing, not cosmetic:
+/// `--indel-protect-vaf 0` protects EVERY non-strand-rejected read
+/// (`observed_vaf >= 0.0` is always true), so the only reads ever corrected
+/// are ones that failed a strand gate -- the exact inverse of "protect less,
+/// correct more" that a value of 0 looks like it should mean, and it would
+/// otherwise silently disable the feature while still exiting 0 with a valid
+/// BAM. `--indel-err-cap` above 0.5 is honoured by the candidacy floor
+/// (`vaf_floor` via `floor_mult * error_rate`) but `assign_allele` clamps
+/// `eps` to `[0.0, 0.5]` before using it for MAP assignment, so a cap above
+/// 0.5 would make the gate and the assignment step disagree about the error
+/// rate actually in effect.
+fn validate_indel_opts(o: &denoise::indel::IndelOpts) -> AnyhowResult<()> {
+    fn open_closed(flag: &str, v: f64, hi: f64) -> AnyhowResult<()> {
+        anyhow::ensure!(
+            v > 0.0 && v <= hi,
+            "--{flag} must be in (0, {hi}] (got {v})"
+        );
+        Ok(())
+    }
+    open_closed("indel-protect-vaf", o.protect_vaf, 1.0)?;
+    open_closed("indel-err0", o.err0, 0.5)?;
+    open_closed("indel-err-cap", o.err_cap, 0.5)?;
+    anyhow::ensure!(
+        o.err_scale >= 1.0,
+        "--indel-err-scale must be >= 1.0 (got {})", o.err_scale
+    );
+    anyhow::ensure!(
+        o.floor_mult >= 0.0,
+        "--indel-floor-mult must be >= 0.0 (got {})", o.floor_mult
+    );
+    open_closed("indel-delta", o.delta, 1.0)?;
+    open_closed("indel-vaf", o.vaf, 1.0)?;
+    anyhow::ensure!(
+        o.max_len >= 1,
+        "--indel-max-len must be >= 1 (got {})", o.max_len
+    );
+    anyhow::ensure!(
+        o.flank >= 1,
+        "--indel-flank must be >= 1 (got {})", o.flank
+    );
+    Ok(())
+}
+
 pub fn init_rayon_threads(threads: Option<usize>) -> AnyhowResult<()> {
     let Some(n) = threads else {
         return Ok(());
@@ -705,6 +756,14 @@ fn main() {
                 flank: indel_flank,
                 protect_vaf: indel_protect_vaf,
             };
+            // Only validate when --indels is actually in effect: a user who
+            // never opted into the feature must never be blocked by it.
+            if iopts.enabled {
+                if let Err(e) = validate_indel_opts(&iopts) {
+                    eprintln!("Error: {e:#}");
+                    std::process::exit(1);
+                }
+            }
             if let Err(e) = denoise::start(
                 &input, &output, &reference, &data_type, vaf, min_strand,
                 strand_bias_p, homoplasmic_vaf, &iopts, stats.as_ref(),
@@ -867,5 +926,117 @@ fn main() {
         }
     }
 
-    
+
+}
+
+#[cfg(test)]
+mod indel_opts_validation_tests {
+    use super::*;
+    use denoise::indel::IndelOpts;
+
+    fn opts() -> IndelOpts {
+        IndelOpts { enabled: true, ..Default::default() }
+    }
+
+    #[test]
+    fn shipped_defaults_pass_validation() {
+        assert!(validate_indel_opts(&opts()).is_ok());
+    }
+
+    #[test]
+    fn protect_vaf_zero_is_rejected() {
+        // FIX 4: --indel-protect-vaf 0 protects every non-strand-rejected
+        // read, so it is the exact inverse of "protect less, correct more"
+        // and must be rejected, not silently accepted with a zero exit code.
+        let mut o = opts();
+        o.protect_vaf = 0.0;
+        assert!(validate_indel_opts(&o).is_err());
+    }
+
+    #[test]
+    fn protect_vaf_one_is_accepted() {
+        let mut o = opts();
+        o.protect_vaf = 1.0;
+        assert!(validate_indel_opts(&o).is_ok());
+    }
+
+    #[test]
+    fn protect_vaf_above_one_is_rejected() {
+        let mut o = opts();
+        o.protect_vaf = 1.5;
+        assert!(validate_indel_opts(&o).is_err());
+    }
+
+    #[test]
+    fn err_cap_above_half_is_rejected() {
+        // FIX 4: the candidacy floor honours err_cap above 0.5, but
+        // `assign_allele` clamps eps to [0.0, 0.5] -- a cap above 0.5 would
+        // make the gate and the assignment step disagree.
+        let mut o = opts();
+        o.err_cap = 0.6;
+        assert!(validate_indel_opts(&o).is_err());
+    }
+
+    #[test]
+    fn err0_above_half_is_rejected() {
+        let mut o = opts();
+        o.err0 = 0.6;
+        assert!(validate_indel_opts(&o).is_err());
+    }
+
+    #[test]
+    fn err_scale_below_one_is_rejected() {
+        let mut o = opts();
+        o.err_scale = 0.5;
+        assert!(validate_indel_opts(&o).is_err());
+    }
+
+    #[test]
+    fn floor_mult_negative_is_rejected() {
+        let mut o = opts();
+        o.floor_mult = -1.0;
+        assert!(validate_indel_opts(&o).is_err());
+    }
+
+    #[test]
+    fn floor_mult_zero_is_accepted() {
+        let mut o = opts();
+        o.floor_mult = 0.0;
+        assert!(validate_indel_opts(&o).is_ok());
+    }
+
+    #[test]
+    fn delta_zero_is_rejected() {
+        let mut o = opts();
+        o.delta = 0.0;
+        assert!(validate_indel_opts(&o).is_err());
+    }
+
+    #[test]
+    fn delta_above_one_is_rejected() {
+        let mut o = opts();
+        o.delta = 1.5;
+        assert!(validate_indel_opts(&o).is_err());
+    }
+
+    #[test]
+    fn vaf_above_one_is_rejected() {
+        let mut o = opts();
+        o.vaf = 1.5;
+        assert!(validate_indel_opts(&o).is_err());
+    }
+
+    #[test]
+    fn max_len_zero_is_rejected() {
+        let mut o = opts();
+        o.max_len = 0;
+        assert!(validate_indel_opts(&o).is_err());
+    }
+
+    #[test]
+    fn flank_zero_is_rejected() {
+        let mut o = opts();
+        o.flank = 0;
+        assert!(validate_indel_opts(&o).is_err());
+    }
 }

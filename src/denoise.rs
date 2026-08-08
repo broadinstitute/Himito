@@ -2620,7 +2620,6 @@ mod tests {
     // double-counted ----
 
     #[test]
-    #[cfg(not(debug_assertions))]
     fn two_emitted_edits_sharing_ref_pos_and_kind_are_not_double_counted() {
         // Same CIGAR shape as CRITICAL 1's regression test in rewrite.rs --
         // 10M 1I 2D 1I 10M, where both `Ins` ops share ONE lookup key because
@@ -2632,15 +2631,14 @@ mod tests {
         // pass 2 emits when a read's two same-anchor events normalize to two
         // DIFFERENT sites that BOTH independently decide to revert.
         //
-        // `rewrite_read`'s internal map construction collapses the two into
-        // one entry and (in debug builds) trips the `debug_assert!` guarding
-        // exactly this collision -- a genuine construction bug pass 2 should
-        // never emit in practice, but reachable in principle in a release
-        // build, where the assert compiles out. This test therefore only
-        // runs in `--release` (see the sibling debug-only
-        // `duplicate_ref_pos_and_kind_trips_the_debug_assert` test in
-        // rewrite.rs, which covers the debug-build side of this same
-        // collision).
+        // FIX 1 (final-review round): `rewrite_read`'s internal map
+        // construction keeps the FIRST of the two entries and lets the
+        // second surface through `indel_edits_emitted_but_not_applied` --
+        // deterministically, in BOTH profiles, now that the debug-only
+        // panic that used to guard this exact collision is gone (see the
+        // sibling `duplicate_ref_pos_and_kind_keeps_the_first_edit_and_never_panics`
+        // test in rewrite.rs, which this test used to be split against by
+        // `#[cfg(debug_assertions)]` / `#[cfg(not(debug_assertions))]`).
         let dir = std::env::temp_dir().join("himito_denoise_indel_duplicate_emitted_edit");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -2706,9 +2704,14 @@ mod tests {
     }
 
     #[test]
-    fn start_with_indels_disabled_is_byte_identical_to_v1() {
-        // The opt-in guarantee: with the default IndelOpts, denoised output must not
-        // differ by a single byte from the substitution-only behavior.
+    fn start_with_indels_disabled_is_deterministic_across_runs() {
+        // NOTE (FIX 2a, final-review round): this only proves DETERMINISM --
+        // two independent runs of the SAME (current) code produce identical
+        // bytes. It does NOT prove byte-identity with the pre-branch v1
+        // behavior, because both runs go through the same (possibly
+        // CIGAR-folding) code path. See
+        // `start_with_indels_disabled_preserves_v1_cigar_on_substitution_reads`
+        // below for the actual v1 property that matters.
         let dir = std::env::temp_dir().join("himito_denoise_optin");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -2736,6 +2739,55 @@ mod tests {
             let rec = rec.unwrap();
             if rec.qname() == b"rins" {
                 assert_eq!(rec.seq().as_bytes(), UNIQ_INS_SEQ);
+                seen = true;
+            }
+        }
+        assert!(seen);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn start_with_indels_disabled_preserves_v1_cigar_on_substitution_reads() {
+        // FIX 2a/2b (final-review round): the opt-in guarantee that actually
+        // matters is not "two runs give the same bytes" (mere determinism --
+        // see the test above) but the real v1 property: with indels
+        // disabled, a read that receives a substitution must come out with
+        // its CIGAR UNCHANGED from the input. The error read's CIGAR uses
+        // `=`/`X` ops deliberately -- a bug that folds them into plain `M`
+        // (the general rewrite walk's behavior before the FIX 2
+        // substitutions-only fast path) is invisible on an all-`M` fixture.
+        let dir = std::env::temp_dir().join("himito_denoise_v1_cigar_identity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+        let reff = dir.join("ref.fa");
+        std::fs::write(&reff, ">chrM\nAAAAAA\n").unwrap();
+
+        // "AAGAAA" against ref "AAAAAA": one substitution at ref pos 2,
+        // encoded with `=`/`X` ops exactly as a real aligner might emit.
+        let err_cigar = vec![Cigar::Equal(2), Cigar::Diff(1), Cigar::Equal(3)];
+        let clean: &[u8] = b"AAAAAA";
+        let clean_names: [&str; 9] = ["r0","r1","r2","r3","r4","r5","r6","r7","r8"];
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in clean_names.iter().enumerate() {
+            reads.push((n, 0, clean, vec![Cigar::Match(6)], i % 2 == 0));
+        }
+        reads.push(("rerr", 0, b"AAGAAA", err_cigar.clone(), false));
+        write_cigar_bam(&inb, "chrM", 6, &reads);
+
+        start(&inb, &outb, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, &indel::IndelOpts::default(), None).unwrap();
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let mut seen = false;
+        for rec in r.records() {
+            let rec = rec.unwrap();
+            if rec.qname() == b"rerr" {
+                assert_eq!(rec.seq().as_bytes(), b"AAAAAA", "the substitution must still be corrected");
+                assert_eq!(
+                    rec.cigar().take(),
+                    CigarString(err_cigar.clone()),
+                    "CIGAR must be byte-identical to the input, `=`/`X` ops included"
+                );
                 seen = true;
             }
         }
@@ -2777,6 +2829,107 @@ mod tests {
         assert!(seen);
         let json = std::fs::read_to_string(&statsf).unwrap();
         assert!(json.contains("\"reads_reassigned_indel_to_ref\": 1"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- FIX 5 (final-review round): a genuine heteroplasmic indel must
+    // SURVIVE end-to-end, not just in a hand-built `IndelSiteModel` unit test ----
+
+    #[test]
+    fn genuine_heteroplasmic_indel_survives_end_to_end_via_candidacy_not_the_protect_vaf_backstop() {
+        // Every "heteroplasmy is preserved" assertion elsewhere in this suite
+        // is a unit test against a hand-constructed `IndelSiteModel` --
+        // exactly the layer a prior Critical proved can be handed an
+        // inverted VAF by pass 1. This is the end-to-end version: a real
+        // BAM, run through the real pileup and record-walk passes, asserting
+        // nothing fires on a genuine mixed site.
+        //
+        // Hand-verified against the design's eps(L)/floor(L) formulas at the
+        // 8bp homopolymer's context length (site 7, context_len 8, default
+        // IndelOpts):
+        //   error_rate(8) = min(0.01 * 1.5^7, 0.4) = 0.170859375
+        //   vaf_floor(8)  = max(0.05, 3.0 * 0.170859375) = 0.512578125
+        // A literal "4 of 10 reads" (40%) does NOT clear that floor
+        // (0.4 < 0.5126) -- at that VAF the site would only be rescued by
+        // the `--indel-protect-vaf` backstop, which is already covered by
+        // `substantial_allele_erased_from_candidacy_is_still_protected_at_assignment`
+        // in indel.rs, and relying on it here would be "passing for the
+        // wrong reason": it would not prove candidacy+MAP genuinely
+        // preserves heteroplasmy, only that the backstop does. 6 of 10
+        // (60%) DOES clear the floor while staying below `homoplasmic_vaf`
+        // (0.7 in this test module, so the strand-bias test still runs
+        // rather than being exempted) -- so this test uses 6 of 10, and the
+        // insertion genuinely enters `kept`, mirroring the design's own
+        // worked example (design doc, section 3.5: "40% INS / 60% REF...
+        // nothing flips", here as 60% INS / 40% REF).
+        let dir = std::env::temp_dir().join("himito_denoise_e2e_genuine_heteroplasmy");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        let names10: [&str; 10] = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"];
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        // 6 reads carrying the insertion (3 forward / 3 reverse) plus 4
+        // clean reads (2 forward / 2 reverse) -- both groups individually
+        // strand-balanced so neither can be rejected by a strand gate,
+        // isolating exactly the context-floor arithmetic this test checks.
+        for i in 0..6 {
+            reads.push((names10[i], 0, HP_INS_SEQ, hp_ins_cigar(), i % 2 == 0));
+        }
+        for i in 6..10 {
+            reads.push((names10[i], 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
+        }
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let refs = indel_refs();
+        let iopts = indels_on();
+        let (corr, models, mut stats) =
+            compute_corrections(&bam, &refs, 2, 0.01, SB_P, HOM_VAF, &iopts).unwrap();
+
+        let list = models.get(&b"chrM".to_vec()).expect("chrM must have a site at 7");
+        let (_, model) = list.iter().find(|(p, _)| *p == 7).expect("site at 7");
+        assert_eq!(model.context_len, 8, "test premise: site 7 is an 8bp homopolymer");
+        let ins = indel::Allele::Ins(b"A".to_vec());
+        let ins_vaf = model.obs_vaf.iter().find(|(a, _)| *a == ins).map(|(_, v)| *v);
+        assert!(
+            (ins_vaf.expect("insertion must be observed") - 0.6).abs() < 1e-9,
+            "test premise: the insertion's raw VAF must be exactly 60%, got {ins_vaf:?}"
+        );
+        assert!(
+            model.kept.iter().any(|(a, _)| *a == ins),
+            "60% must genuinely clear candidacy at context length 8 -- this must not be \
+             a protect_vaf rescue"
+        );
+        assert!(
+            model.kept.iter().any(|(a, _)| *a == indel::Allele::Ref),
+            "REF is always kept"
+        );
+
+        apply_corrections(&bam, &outb, &corr, &refs, &models, &iopts, &mut stats).unwrap();
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let mut seen = 0;
+        for (i, rec) in r.records().enumerate() {
+            let rec = rec.unwrap();
+            let (expected_seq, expected_cigar): (&[u8], Vec<Cigar>) = if i < 6 {
+                (HP_INS_SEQ, hp_ins_cigar())
+            } else {
+                (CLEAN_SEQ, clean_cigar())
+            };
+            assert_eq!(rec.seq().as_bytes(), expected_seq, "read {i} SEQ must be unchanged");
+            assert_eq!(
+                rec.cigar().take(),
+                CigarString(expected_cigar),
+                "read {i} CIGAR must be unchanged"
+            );
+            seen += 1;
+        }
+        assert_eq!(seen, 10);
+
+        assert_eq!(stats.reads_reassigned_ref_to_ins, 0);
+        assert_eq!(stats.reads_reassigned_ref_to_del, 0);
+        assert_eq!(stats.reads_reassigned_indel_to_ref, 0);
+        assert_eq!(stats.reads_reassigned_indel_to_indel, 0);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

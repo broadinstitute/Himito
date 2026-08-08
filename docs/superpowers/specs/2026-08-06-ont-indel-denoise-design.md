@@ -139,7 +139,14 @@ Protection is **narrowed to alleles the strand gates did not reject**. An allele
 
 ### 4.1 Edit representation
 
-Mixing position-preserving edits (substitutions, keyed by `qpos`) with length-changing ones is where this gets bug-prone. Both edit kinds already know their `ref_pos` at record time, so the correction payload is unified on **reference coordinates** and the write-back becomes a single left-to-right walk with no `qpos` arithmetic:
+Mixing position-preserving edits (substitutions, keyed by `qpos`) with length-changing ones is where this gets bug-prone. Both edit kinds are keyed by a reference-coordinate `ref_pos`, but **`IndelEdit.ref_pos` is not a single anchor convention — it is direction-dependent** (a Critical fix from implementation review, and the subtlest invariant in this feature):
+
+- When `from` is `Ref` (a **gained** indel), `ref_pos` is the left-normalized **site** position — a gained indel has no CIGAR anchor of its own to key on; it is keyed to wherever the write-back walk should splice it into the read's plain match context.
+- When `from` is `Ins` or `Del` (**reverting or replacing** an indel the read already carries), `ref_pos` is the read's **own CIGAR anchor** — the reference position of the last aligned base before that read's own event, exactly as htslib's pileup reports it — not the normalized site.
+
+Left-normalization only ever moves an event left, so the anchor is always `>= norm_pos`; the two coincide only in unique sequence, where the aligner already left-aligned the indel. Because of this, two `IndelEdit`s for the *same* read can legitimately share one `ref_pos` while differing in `from`'s kind (e.g. a read's own carried insertion being reverted, coinciding at the same coordinate with an unrelated gained deletion normalized to that same site); the write-back walk disambiguates by keying its internal lookup on `(ref_pos, kind_of(from))`, never on `ref_pos` alone.
+
+With that caveat, the write-back is still a single left-to-right walk with no `qpos` arithmetic:
 
 ```rust
 enum Allele { Ref, Ins(Vec<u8>), Del(u32) }
@@ -223,14 +230,23 @@ impl Default for IndelOpts { /* enabled: false */ }
 
 ## 6. Statistics
 
-`DenoiseStats` gains additive fields (JSON stays backward-compatible):
+`DenoiseStats` gains additive fields (JSON stays backward-compatible). This list matches the shipped field names in `src/denoise.rs`, which diverge from this design's original naming in three places (`indel_sites_kept` → `indel_alt_alleles_kept`, `indel_sites_strand_biased` → `indel_alt_alleles_strand_biased`, `reads_skipped_span_guard` → `assignments_skipped_span_guard`) and add several counters this section originally omitted:
 
-- `indel_sites_examined`, `indel_sites_kept`, `indel_sites_strand_biased`
-- `indel_events_examined`
-- `reads_reassigned_ref_to_ins`, `reads_reassigned_ref_to_del`, `reads_reassigned_indel_to_ref`, `reads_reassigned_indel_to_indel`
+- `indel_sites_examined` — normalized sites that reached a decision.
+- `indel_alt_alleles_kept` — non-reference ALLELES (not sites) that survived candidacy across all sites.
+- `indel_alt_alleles_strand_biased` — non-reference ALLELES rejected specifically by the strand-bias binomial test.
+- `indel_events_examined` — per-read indel events collected in pass 1.
+- `indel_events_out_of_span` — pass-1 ALT votes dropped because the voting read has no aligned query base at the column its event normalized into.
+- `indel_events_duplicate_site` — pass-1 ALT votes dropped because the same read already cast a vote at this site via a different one of its own events.
+- `reads_reassigned_ref_to_ins`, `reads_reassigned_ref_to_del`, `reads_reassigned_indel_to_ref`, `reads_reassigned_indel_to_indel` — reassignment counts by transition kind, booked from what the write-back walk actually applied.
 - `indel_bases_inserted`, `indel_bases_removed`
-- `reassignments_by_hp_length: Vec<u64>` — audit of how much correction fired inside long homopolymers
-- `reads_skipped_span_guard`
+- `reassignments_by_hp_length: Vec<u64>` — audit of how much correction fired inside long homopolymers, indexed by repeat-context length.
+- `assignments_skipped_span_guard` — (read, site) pairs skipped because the read lacks the match-context flank the write-back walk needs on one side or the other.
+- `assignments_skipped_unsupported_transition` — (read, site) pairs skipped because the MAP target is only reachable through a transition the write-back walk does not support (cross-kind, or growing a deletion).
+- `assignments_skipped_oversized_neighbor` — (read, site) pairs skipped because the read carries its own untouchable oversized indel too close to this site.
+- `assignments_skipped_ambiguous_carry` — (read, site) pairs skipped because the read's own CIGAR carries two different events that both normalize to this same site.
+- `assignments_skipped_swallowed_by_gained_deletion` — (read, site) pairs skipped because an earlier gained deletion emitted for this same read already consumed the reference span this site falls in.
+- `indel_edits_emitted_but_not_applied` — diagnostic, should normally be zero: edits pass 2 emitted that the write-back walk reports it never actually applied (a guard upstream mispredicted what the walk would do). A nonzero value means the read in question was simply left untouched, not that the BAM was corrupted.
 
 ## 7. Performance
 

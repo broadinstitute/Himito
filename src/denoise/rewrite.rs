@@ -165,23 +165,68 @@ pub fn rewrite_read(
         };
     }
 
+    if edits.indels.is_empty() {
+        // Substitutions-only fast path (FIX 2 in the final-review round):
+        // apply the subs directly to a copy of SEQ, resolving each `ref_pos`
+        // to a query offset by walking the CIGAR, and return the ORIGINAL
+        // CIGAR verbatim. This restores the actual v1 property -- a read that
+        // receives only a substitution must come out with its CIGAR UNCHANGED
+        // from the input -- which the general walk below breaks: it re-emits
+        // every aligned base as `Cigar::Match(1)`, folding any `=`/`X` ops
+        // into plain `M`, something v1 never did. `structure_changed` stays
+        // `false` and `applied` stays empty: a substitution alone never
+        // counts as an applied indel edit (see `RewriteResult::structure_changed`).
+        // This is also strictly faster than the general walk for the common
+        // case of a substitution-only correction.
+        let subs: HashMap<u32, u8> = edits.subs.iter().copied().collect();
+        let mut out_seq = seq.to_vec();
+        let mut rp: u32 = pos.max(0) as u32;
+        let mut qp: usize = 0;
+        for op in cigar.iter() {
+            match *op {
+                Cigar::Match(n) | Cigar::Equal(n) | Cigar::Diff(n) => {
+                    for k in 0..n {
+                        if let Some(&b) = subs.get(&(rp + k)) {
+                            out_seq[qp + k as usize] = b;
+                        }
+                    }
+                    qp += n as usize;
+                    rp += n;
+                }
+                Cigar::Ins(n) | Cigar::SoftClip(n) => qp += n as usize,
+                Cigar::Del(n) | Cigar::RefSkip(n) => rp += n,
+                Cigar::HardClip(_) | Cigar::Pad(_) => {}
+            }
+        }
+        return RewriteResult {
+            seq: out_seq,
+            qual: qual.to_vec(),
+            cigar: cigar.clone(),
+            structure_changed: false,
+            applied: HashSet::new(),
+        };
+    }
+
     let subs: HashMap<u32, u8> = edits.subs.iter().copied().collect();
     // Keyed by (ref_pos, kind_of(from)), not ref_pos alone (see FIX 1): two edits
     // for the same read can share a ref_pos while differing in `from`'s kind (a
     // gained indel keyed at a normalized site can coincide with this read's own
     // indel anchored at the same coordinate), and each of the three lookup sites
     // below wants its OWN kind specifically.
+    //
+    // Two edits can also legitimately share the IDENTICAL (ref_pos, kind): pass
+    // 2's two independent per-site decisions can each decide to reassign the same
+    // one of this read's own CIGAR events (see `apply_corrections`'s FIX 2
+    // construction comment in denoise.rs). This is ordinary input, not a
+    // construction bug to panic on -- keep the FIRST one seen (the same order
+    // `apply_corrections` walks `edits.indels` in when it books statistics) and
+    // let the second surface harmlessly through the caller's
+    // `indel_edits_emitted_but_not_applied` diagnostic instead of silently
+    // overwriting the first or aborting the whole BAM conversion.
     let mut indels: HashMap<(u32, EditKind), &IndelEdit> = HashMap::new();
     for e in &edits.indels {
         let key = (e.ref_pos, edit_kind(&e.from));
-        debug_assert!(
-            !indels.contains_key(&key),
-            "duplicate IndelEdit at ref_pos {}: two edits with the same `from` kind \
-             ({:?}) collide -- each (ref_pos, kind) pair must be unique per read",
-            e.ref_pos,
-            key.1
-        );
-        indels.insert(key, e);
+        indels.entry(key).or_insert(e);
     }
 
     let mut out_seq: Vec<u8> = Vec::with_capacity(seq.len() + 8);
@@ -244,13 +289,22 @@ pub fn rewrite_read(
                             (Allele::Ref, Allele::Del(m)) => {
                                 // The following m reference bases become a deletion.
                                 // The flank guard in denoise.rs guarantees they lie
-                                // inside this same match run.
-                                debug_assert!(k + m <= n, "Ref->Del ran past its match op");
-                                let m = (*m).min(n - k);
-                                push_op(&mut ops, Cigar::Del(m));
-                                k += m; // skip both the ref bases and their query partners
-                                applied.insert((cur, EditKind::Ref));
-                                structure_changed = true;
+                                // inside this same match run -- but if that guard
+                                // ever mispredicts (see FIX 3 in the final-review
+                                // round), refuse the edit outright rather than
+                                // truncating it into a SHORTER, different deletion
+                                // than the site decided: emitting a wrong edit is
+                                // worse than emitting none. The caller's
+                                // `indel_edits_emitted_but_not_applied` counter
+                                // records the miss, exactly like any other
+                                // guard-mispredicted edit.
+                                let m = *m;
+                                if k + m <= n {
+                                    push_op(&mut ops, Cigar::Del(m));
+                                    k += m; // skip both the ref bases and their query partners
+                                    applied.insert((cur, EditKind::Ref));
+                                    structure_changed = true;
+                                }
                             }
                             _ => {}
                         }
@@ -685,15 +739,21 @@ mod tests {
     }
 
     #[test]
-    #[cfg(debug_assertions)]
-    fn duplicate_ref_pos_and_kind_trips_the_debug_assert() {
-        // Two edits with the IDENTICAL (ref_pos, kind) pair -- both `from: Ref`
-        // at position 3 -- are a genuine construction bug (pass 2 should never
-        // emit two gained-indel edits at the same site for one read); the
-        // dedup guard must catch it rather than silently keeping whichever one
-        // happened to be inserted last. `debug_assert!` is compiled out in
-        // release, so this test is debug-only (see `#[cfg(debug_assertions)]`
-        // above) -- there is nothing for it to catch in a release build.
+    fn duplicate_ref_pos_and_kind_keeps_the_first_edit_and_never_panics() {
+        // FIX 1 (final-review round): two edits with the IDENTICAL (ref_pos,
+        // kind) pair -- both `from: Ref` at position 3 -- are a LEGITIMATE
+        // input, not a construction bug: pass 2's two independent per-site
+        // decisions can produce exactly this (see `apply_corrections`'s
+        // construction comment in denoise.rs). A prior `debug_assert!` here
+        // claimed this could never happen and would panic mid-BAM in a debug
+        // build while release silently let the second edit clobber the
+        // first; this test proves the current behavior, which is now
+        // identical in both profiles: the FIRST edit is applied, and the
+        // second is simply never reached by the walk, so the caller sees its
+        // key absent from `applied` and reports it through
+        // `indel_edits_emitted_but_not_applied` (exercised end-to-end by
+        // `two_emitted_edits_sharing_ref_pos_and_kind_are_not_double_counted`
+        // in denoise.rs).
         let c = cig(vec![Cigar::Match(8)]);
         let seq = b"ACGTAAAA".to_vec();
         let qual = vec![30u8; 8];
@@ -704,10 +764,63 @@ mod tests {
                 IndelEdit { ref_pos: 3, from: Allele::Ref, to: Allele::Del(1) },
             ],
         };
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            rewrite_read(0, &c, &seq, &qual, &edits, REF)
-        }));
-        assert!(result.is_err(), "a duplicate (ref_pos, kind) pair must trip the debug_assert");
+        let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
+        // The FIRST edit (Ref -> Ins) is the one applied...
+        assert_eq!(r.seq, b"ACGTAAAAA".to_vec());
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Ins(1), Cigar::Match(4)]));
+        // ...and its key appears exactly once in `applied` -- the SECOND
+        // edit (Ref -> Del) never gets a chance to run at all.
+        assert_eq!(r.applied.len(), 1);
+        assert!(r.applied.contains(&(3, EditKind::Ref)));
+        assert!(r.structure_changed);
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn gained_deletion_overrunning_its_match_op_is_refused_not_truncated() {
+        // FIX 3 (final-review round): a gained deletion whose span runs past
+        // the remaining length of its Match op must be REFUSED outright, not
+        // silently truncated into a SHORTER deletion than the site decided.
+        // `apply_corrections`'s own flank guard (`run >= m + flank + 1`)
+        // normally prevents this state from ever reaching `rewrite_read`, so
+        // it is constructed directly here to exercise the walk's own
+        // defense against a mispredicted guard.
+        let c = cig(vec![Cigar::Match(4)]);
+        let seq = b"ACGT".to_vec();
+        let qual = vec![30u8; 4];
+        let edits = ReadEdits {
+            subs: vec![],
+            // Anchored at ref 0, the first base of the only Match op: after
+            // that anchor base is emitted, only 3 bases remain in the op,
+            // but this edit asks for a 4bp deletion -- it cannot fit.
+            indels: vec![IndelEdit { ref_pos: 0, from: Allele::Ref, to: Allele::Del(4) }],
+        };
+        let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
+        assert_eq!(r.seq, seq, "the read must be unchanged when the deletion cannot fit");
+        assert_eq!(r.cigar, c, "CIGAR must be unchanged");
+        assert!(r.applied.is_empty(), "a refused edit must not appear in `applied`");
+        assert!(!r.structure_changed);
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn substitution_only_with_equal_and_diff_ops_preserves_cigar_verbatim() {
+        // FIX 2 (final-review round): the substitutions-only fast path must
+        // return the ORIGINAL CIGAR byte-for-byte, `=`/`X` ops included.
+        // Without it, the general walk re-emits every aligned base as
+        // `Cigar::Match(1)`, folding `=`/`X` into plain `M` -- something v1
+        // never did.
+        let c = cig(vec![Cigar::Equal(2), Cigar::Diff(1), Cigar::Equal(5)]);
+        let seq = b"ACGTAAAA".to_vec();
+        let qual = vec![30u8; 8];
+        let edits = ReadEdits { subs: vec![(2, b'T')], indels: vec![] };
+        let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
+        assert_eq!(r.cigar, c, "CIGAR must be byte-identical to the input, `=`/`X` ops included");
+        assert_eq!(r.seq, b"ACTTAAAA".to_vec());
+        assert_eq!(r.qual, qual);
+        assert!(!r.structure_changed);
+        assert!(r.applied.is_empty());
+        assert_invariants(&c, &r);
     }
 
     #[test]

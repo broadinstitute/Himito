@@ -559,19 +559,32 @@ fn validate_indel_opts(o: &denoise::indel::IndelOpts) -> AnyhowResult<()> {
     open_closed("indel-protect-vaf", o.protect_vaf, 1.0)?;
     open_closed("indel-err0", o.err0, 0.5)?;
     open_closed("indel-err-cap", o.err_cap, 0.5)?;
+    // Upper bounds matter as much as lower ones here: an unbounded multiplier can
+    // push `vaf_floor` past 1.0 at every context, leaving `--indel-protect-vaf` as
+    // the only thing keeping any allele -- a silent near-disable of exactly the kind
+    // the `--indel-protect-vaf 0` check above exists to prevent.
     anyhow::ensure!(
-        o.err_scale >= 1.0,
-        "--indel-err-scale must be >= 1.0 (got {})", o.err_scale
+        o.err_scale >= 1.0 && o.err_scale <= 10.0,
+        "--indel-err-scale must be in [1.0, 10.0] (got {})", o.err_scale
     );
     anyhow::ensure!(
-        o.floor_mult >= 0.0,
-        "--indel-floor-mult must be >= 0.0 (got {})", o.floor_mult
+        o.floor_mult >= 0.0 && o.floor_mult <= 100.0,
+        "--indel-floor-mult must be in [0.0, 100.0] (got {})", o.floor_mult
     );
     open_closed("indel-delta", o.delta, 1.0)?;
-    open_closed("indel-vaf", o.vaf, 1.0)?;
+    // `vaf` is only ever used as `max(vaf, floor_mult * error_rate(L))`, so 0 is a
+    // coherent setting meaning "no absolute floor, use the context-scaled one only".
     anyhow::ensure!(
-        o.max_len >= 1,
-        "--indel-max-len must be >= 1 (got {})", o.max_len
+        o.vaf >= 0.0 && o.vaf <= 1.0,
+        "--indel-vaf must be in [0, 1] (got {})", o.vaf
+    );
+    // The feature is specified and documented as small-indel (<5bp) correction; a
+    // large bound would let the rewrite walk emit correspondingly large gained
+    // deletions, well outside anything the site model was designed or validated for.
+    anyhow::ensure!(
+        (1..=20).contains(&o.max_len),
+        "--indel-max-len must be in [1, 20] (got {}); this feature targets small indels",
+        o.max_len
     );
     anyhow::ensure!(
         o.flank >= 1,

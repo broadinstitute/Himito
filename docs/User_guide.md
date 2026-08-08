@@ -255,7 +255,10 @@ an allele at a site is `min(vaf_floor(L), protect_vaf)`, where `L` is the refere
 repeat-context length. Because `vaf_floor(6) ≈ 0.228 > protect_vaf (0.2)`, and
 `vaf_floor` only grows with `L`, that minimum is a **flat 0.2 for every repeat context
 `L >= 6`** — so `--indel-err-scale`, `--indel-err-cap`, `--indel-floor-mult`, and
-`--indel-vaf` have **no effect** in those contexts at the stock `--indel-protect-vaf`.
+`--indel-vaf` have **no effect on whether an allele survives** in those contexts at the
+stock `--indel-protect-vaf`. They do still matter in two ways: `--indel-err-scale` and
+`--indel-err-cap` set the MAP crossover, so they govern *which* allele a sub-threshold
+read is moved to; and all four still bite at repeat contexts of 5 or less.
 Concretely: an indel below ~20% VAF inside a homopolymer or tandem repeat of length 6 or
 more will be reverted, full stop, regardless of how the other four flags are tuned —
 and homopolymers and tandem repeats of that length are exactly where ONT's indel error

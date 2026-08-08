@@ -413,16 +413,23 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
             (ref_allele, alts)
         };
 
-        // Read the HF FORMAT field (float, first sample). HF is Number=A, so the
-        // i-th value lines up with the i-th ALT; fall back to the first value for
+        // Read the HF FORMAT field (float, first sample). Prefer Himito's HF;
+        // fall back to AF when HF is absent. HF/AF are Number=A, so the i-th
+        // value lines up with the i-th ALT; fall back to the first value for
         // single-valued encodings.
-        let hf_data = rec.format(b"HF").float().ok();
+        let hf_data = rec
+            .format(b"HF")
+            .float()
+            .or_else(|_| rec.format(b"AF").float())
+            .ok();
+        
         for (alt_idx, alt_allele) in alt_alleles.iter().enumerate() {
             let hf_val = hf_data
                 .as_ref()
                 .and_then(|d| d.get(0).and_then(|s| s.get(alt_idx).or_else(|| s.first())));
             let Some(&hf_val) = hf_val else { continue };
             let hf = hf_val as f64;
+            println!("hf_data: {:?} {} {}", hf, min_hf, max_hf);
             if hf >= min_hf && hf < max_hf {
                 let vid = format!("m.{pos}{ref_allele}>{alt_allele}");
                 // Keep the first occurrence of a variant id (deterministic across
@@ -674,6 +681,7 @@ pub fn start(
             HfMap::new()
         }
     };
+    println!("hf_map: {:?}", hf_map);
 
     info!("[1/6] Loading and filtering matrix: {}", matrix_file);
     let binary = load_and_filter_matrix(

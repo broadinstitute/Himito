@@ -15,6 +15,7 @@ mod callnumts;
 mod lineage;
 mod scite;
 mod denoise;
+mod denoise_indel;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
@@ -555,7 +556,7 @@ enum Commands {
 /// `eps` to `[0.0, 0.5]` before using it for MAP assignment, so a cap above
 /// 0.5 would make the gate and the assignment step disagree about the error
 /// rate actually in effect.
-fn validate_indel_opts(o: &denoise::indel::IndelOpts) -> AnyhowResult<()> {
+fn validate_indel_opts(o: &denoise_indel::IndelOpts) -> AnyhowResult<()> {
     fn open_closed(flag: &str, v: f64, hi: f64) -> AnyhowResult<()> {
         anyhow::ensure!(
             v > 0.0 && v <= hi,
@@ -669,7 +670,7 @@ fn main() {
                     // Indel correction is on in QuickStart. Every other field keeps
                     // its `Default` value, which `validate_indel_opts` accepts as-is,
                     // so there is nothing to validate here.
-                    &denoise::indel::IndelOpts { enabled: true, ..Default::default() },
+                    &denoise_indel::IndelOpts { enabled: true, ..Default::default() },
                     None,
                 ) {
                     eprintln!("Warning: denoise failed ({e:#}); falling back to raw mt BAM.");
@@ -765,7 +766,7 @@ fn main() {
             indel_protect_vaf,
             stats,
         } => {
-            let iopts = denoise::indel::IndelOpts {
+            let iopts = denoise_indel::IndelOpts {
                 enabled: indels,
                 max_len: indel_max_len,
                 vaf: indel_vaf,
@@ -957,7 +958,7 @@ fn main() {
 #[cfg(test)]
 mod indel_opts_validation_tests {
     use super::*;
-    use denoise::indel::IndelOpts;
+    use denoise_indel::IndelOpts;
 
     fn opts() -> IndelOpts {
         IndelOpts { enabled: true, ..Default::default() }

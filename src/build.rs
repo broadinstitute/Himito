@@ -896,6 +896,26 @@ pub fn generate_cigar(
 }
 
 
+/// Read support for the edge that circularizes the reference path.
+///
+/// The mitochondrial genome is circular, but the graph is built linearly, so the
+/// reference enters at SOURCE and leaves at SINK. Circularizing splices the
+/// SINK-bound tail edge and the SOURCE-bound head edge into one edge whose
+/// sequence is `tail.seq + head.seq`. A read only supports that spliced edge if
+/// it traverses *both* halves - i.e. it actually wraps the origin - so the
+/// support set is the intersection, not the union: a read that stops at the
+/// linear end never enters the head portion.
+///
+/// Duplicates within `head` collapse, matching the `HashSet` semantics the
+/// caller already relies on for the tail half.
+fn circularized_edge_reads(tail: &HashSet<String>, head: &[String]) -> HashSet<String> {
+    let head_set: HashSet<&String> = head.iter().collect();
+    tail.iter()
+        .filter(|r| head_set.contains(r))
+        .cloned()
+        .collect()
+}
+
 pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &PathBuf, maxlength: usize, min_edge_reads: usize) {
     // Read reference records into a vector
     let ref_reader = Reader::from_file(reference_path).unwrap();
@@ -992,17 +1012,32 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
         l_ref_seq.push_str(&edge.seq.clone());
         l_ref_reads.extend(edge.reads.clone().iter().cloned());
     }
+    let mut head_read_count = 0usize;
+    let tail_read_count = l_ref_reads.len();
     if let Some(edge) = edge_info.get(&f_ref_edge) {
         l_ref_seq.push_str(&edge.seq.clone());
-        l_ref_reads.intersection(&edge.reads.clone().iter().cloned().collect::<HashSet<_>>());
+        head_read_count = edge.reads.len();
+        l_ref_reads = circularized_edge_reads(&l_ref_reads, &edge.reads);
     }
+    println!(
+        "circularized reference edge: {} reads (tail {}, head {})",
+        l_ref_reads.len(),
+        tail_read_count,
+        head_read_count
+    );
     edge_info.remove(&l_ref_edge);
     edge_info.remove(&f_ref_edge);
     edge_info.insert(l_ref_edge.clone(), EdgeInfo {
         seq: l_ref_seq,
         src: f_src_anchor.clone(),
         dst: f_dst_anchor.clone(),
-        reads: l_ref_reads.iter().cloned().collect(),
+        // Sorted so the emitted GFA is byte-reproducible: HashSet iteration
+        // order is not stable across runs.
+        reads: {
+            let mut r: Vec<String> = l_ref_reads.iter().cloned().collect();
+            r.sort();
+            r
+        },
         samples: HashSet::new(),
     });
     // Write final graph to disk.
@@ -1078,6 +1113,47 @@ mod tests {
             }
         }
         total
+    }
+
+    fn rs(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+    fn sorted(s: &HashSet<String>) -> Vec<String> {
+        let mut v: Vec<String> = s.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    /// The spliced edge is supported only by reads that wrap the origin, i.e.
+    /// that appear on BOTH the SINK-bound tail and the SOURCE-bound head. The
+    /// original code called `.intersection()` and discarded the iterator, so the
+    /// head half was ignored entirely and the tail's reads passed through whole.
+    #[test]
+    fn circularized_edge_reads_keeps_only_reads_on_both_halves() {
+        let tail = rs(&["r_wrap1", "r_tail_only", "r_wrap2"]);
+        let head = ["r_wrap1".to_string(), "r_head_only".to_string(), "r_wrap2".to_string()];
+
+        let got = circularized_edge_reads(&tail, &head);
+
+        assert_eq!(sorted(&got), vec!["r_wrap1", "r_wrap2"]);
+        // The pre-fix no-op behaviour was to return the tail unchanged.
+        assert_ne!(sorted(&got), sorted(&tail));
+    }
+
+    #[test]
+    fn circularized_edge_reads_handles_disjoint_and_empty_halves() {
+        // No read wraps the origin: the spliced edge has no support.
+        assert!(circularized_edge_reads(&rs(&["a", "b"]), &["c".to_string()]).is_empty());
+        // Either half missing collapses to empty, never to the other half.
+        assert!(circularized_edge_reads(&rs(&[]), &["a".to_string()]).is_empty());
+        assert!(circularized_edge_reads(&rs(&["a"]), &[]).is_empty());
+    }
+
+    #[test]
+    fn circularized_edge_reads_collapses_duplicate_head_entries() {
+        // EdgeInfo.reads is a Vec, so the head half can repeat a read name.
+        let got = circularized_edge_reads(&rs(&["a", "b"]), &["a".to_string(), "a".to_string()]);
+        assert_eq!(sorted(&got), vec!["a"]);
     }
 
     /// The scoring parameters must make the clean two-gap edit outscore the

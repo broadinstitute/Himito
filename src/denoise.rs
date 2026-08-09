@@ -6,10 +6,11 @@ use log::{info, warn};
 use rust_htslib::bam::{self, Read, Reader};
 use rust_htslib::bam::record::CigarString;
 
-use crate::denoise::rewrite::{rewrite_read, strip_stale_tags};
+use crate::denoise_indel::{rewrite_read, strip_stale_tags};
 
-pub(crate) mod indel;
-pub(crate) mod rewrite;
+// The site model and the read rewrite now live in one flat module. This alias
+// keeps the `indel::`-qualified call sites below reading as they always have.
+use crate::denoise_indel as indel;
 
 pub(crate) const NQ: usize = 94; // Phred qualities 0..=93
 
@@ -262,7 +263,7 @@ fn map_allele(observed: usize, q: u8, m: &SiteModel) -> usize {
     best
 }
 
-pub type Corrections = HashMap<Vec<u8>, rewrite::ReadEdits>;
+pub type Corrections = HashMap<Vec<u8>, indel::ReadEdits>;
 
 /// Decided indel sites, per contig, SORTED ASCENDING BY POSITION so the write-back
 /// pass can binary-search the sites a read spans.
@@ -628,7 +629,7 @@ fn apply_corrections(
                         // `IndelEdit` itself) so `reassignments_by_hp_length` can be
                         // booked AFTER `rewrite_read` reports which edits it actually
                         // applied (see FIX 1 in the task-9 review round).
-                        let mut edit_context_len: HashMap<(u32, rewrite::EditKind), usize> = HashMap::new();
+                        let mut edit_context_len: HashMap<(u32, indel::EditKind), usize> = HashMap::new();
 
                         if iopts.enabled {
                             // `end_pos()` (exclusive alignment end on the reference) is only
@@ -810,10 +811,10 @@ fn apply_corrections(
                                     // APPLIED -- making any future instance of that class a
                                     // harmless missed correction with honest statistics.
                                     edit_context_len.insert(
-                                        (ref_pos, rewrite::edit_kind(&observed)),
+                                        (ref_pos, indel::edit_kind(&observed)),
                                         model.context_len as usize,
                                     );
-                                    edits.indels.push(rewrite::IndelEdit {
+                                    edits.indels.push(indel::IndelEdit {
                                         ref_pos,
                                         from: observed,
                                         to: target,
@@ -858,7 +859,7 @@ fn apply_corrections(
                             // one-shot semantics FIX 1 gave the internal Ins/Del lookups.
                             let mut applied = out.applied;
                             for edit in &edits.indels {
-                                let key = (edit.ref_pos, rewrite::edit_kind(&edit.from));
+                                let key = (edit.ref_pos, indel::edit_kind(&edit.from));
                                 if !applied.remove(&key) {
                                     stats.indel_edits_emitted_but_not_applied += 1;
                                     continue;
@@ -1302,7 +1303,7 @@ mod tests {
         let mut corr: Corrections = HashMap::new();
         corr.insert(
             b"rerr".to_vec(),
-            rewrite::ReadEdits { subs: vec![(2u32, b'A')], indels: vec![] },
+            indel::ReadEdits { subs: vec![(2u32, b'A')], indels: vec![] },
         );
         let mut refs = HashMap::new();
         refs.insert(b"chrM".to_vec(), b"AAAAAA".to_vec());
@@ -1455,7 +1456,7 @@ mod tests {
         let mut corr: Corrections = HashMap::new();
         corr.insert(
             b"rerr".to_vec(),
-            rewrite::ReadEdits { subs: vec![(2u32, b'A')], indels: vec![] },
+            indel::ReadEdits { subs: vec![(2u32, b'A')], indels: vec![] },
         );
         // Deliberately do NOT insert "chrM" -- simulates a BAM whose contig is
         // missing from the supplied reference FASTA.
@@ -2554,9 +2555,9 @@ mod tests {
         let mut corr: Corrections = HashMap::new();
         corr.insert(
             b"rvictim".to_vec(),
-            rewrite::ReadEdits {
+            indel::ReadEdits {
                 subs: vec![],
-                indels: vec![rewrite::IndelEdit {
+                indels: vec![indel::IndelEdit {
                     ref_pos: 11,
                     from: indel::Allele::Ref,
                     to: indel::Allele::Ins(b"A".to_vec()),
@@ -2663,15 +2664,15 @@ mod tests {
         let mut corr: Corrections = HashMap::new();
         corr.insert(
             b"rdup".to_vec(),
-            rewrite::ReadEdits {
+            indel::ReadEdits {
                 subs: vec![],
                 indels: vec![
-                    rewrite::IndelEdit {
+                    indel::IndelEdit {
                         ref_pos: 9,
                         from: indel::Allele::Ins(b"T".to_vec()),
                         to: indel::Allele::Ref,
                     },
-                    rewrite::IndelEdit {
+                    indel::IndelEdit {
                         ref_pos: 9,
                         from: indel::Allele::Ins(b"C".to_vec()),
                         to: indel::Allele::Ref,

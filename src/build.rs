@@ -621,9 +621,18 @@ fn alignment_to_cigar(operations: &[AlignmentOperation]) -> String {
 }
 
 fn gap_open_aligner(reference: &str, sequence: &str) -> String {
-    let score = |a: u8, b: u8| if a == b { 1i32 } else { -1i32 };
-    // Create an aligner with the same scoring parameters
-    let mut aligner = Aligner::with_capacity(sequence.len(), reference.len(), -5, -1, &score); // match_score=0, mismatch_score=-6, gap_open=-5, gap_extend=-3
+    // match=0, mismatch=-6, gap_open=-5, gap_extend=-3.
+    //
+    // The key relation is mismatch (-6) being *dearer* than a gap open (-5).
+    // Inside a homopolymer/tandem-repeat run that is what lets the correct
+    // two-gap edit outscore the one-gap-plus-mismatch shortcut: at chrM:310
+    // (a lone T flanked by poly-C) representing the extra C's as 3I..1I costs
+    // -22, while folding one of them into a T>C substitution costs -23. Under
+    // the previous match=+1/mismatch=-1/gap_extend=-1 settings the shortcut
+    // won, and chrM:310 was emitted as a false near-homoplasmic T>C "SNP"
+    // alongside a same-run C insertion.
+    let score = |a: u8, b: u8| if a == b { 0i32 } else { -6i32 };
+    let mut aligner = Aligner::with_capacity(sequence.len(), reference.len(), -5, -3, &score);
 
     // Perform the alignment
     let alignment = aligner.global(sequence.as_bytes(), reference.as_bytes());
@@ -632,13 +641,11 @@ fn gap_open_aligner(reference: &str, sequence: &str) -> String {
     let cigar = alignment_to_cigar(&alignment.operations);
     // println!("{:?}", cigar);
 
-    // A single gap-open (-5) is pricier than a single mismatch (-1), so inside
-    // a homopolymer/tandem-repeat run the optimal-scoring alignment above will
-    // sometimes fold part of a real indel into an adjacent base as a spurious
-    // substitution instead of a clean insertion/deletion (e.g. chrM:310, a
-    // lone T flanked by poly-C, gets reported as a false near-homoplasmic
-    // T>C "SNP" alongside a same-run C insertion). That substitution is
-    // score-optimal but not the minimal/correct edit - normalize it away.
+    // Safety net. The scoring above already prefers the clean two-gap edit in
+    // a homopolymer run, so the chrM:310-style artifact no longer reaches here.
+    // It still fires where a spurious substitution survives scoring - a length-1
+    // X against an I/D run whose orphaned base occurs inside that run can always
+    // be re-anchored losslessly, and is not a real substitution.
     normalize_homopolymer_indels(&cigar, reference, sequence)
 }
 
@@ -1071,6 +1078,52 @@ mod tests {
             }
         }
         total
+    }
+
+    /// The scoring parameters must make the clean two-gap edit outscore the
+    /// one-gap-plus-mismatch shortcut inside a homopolymer run. This is the
+    /// property the aligner's match/mismatch/gap settings exist to provide, and
+    /// it is what the normalizer tests below can't see (they start from a
+    /// hardcoded CIGAR). Real chrM 287-330 poly-C window from NA12877.
+    #[test]
+    fn aligner_emits_no_spurious_snp_in_polyc_run() {
+        let ref_seq = "AAAAATTTCCACCAAACCCCCCCTCCCCCGCTTCTGGCCACAGC";
+        let alt_seq = "AAAAATTTCCACCAAACCCCCCCCCCTCCCCCCGCTTCTGGCCACAGC";
+
+        // Insertion direction, and its exact ref<->alt mirror.
+        for (r, a) in [(ref_seq, alt_seq), (alt_seq, ref_seq)] {
+            let cigar = gap_open_aligner(r, a);
+            assert!(
+                !cigar.contains('X'),
+                "poly-C indel must not be reported as a substitution, got {}",
+                cigar
+            );
+            assert_eq!(ref_consumed(&cigar), r.len());
+            assert_eq!(reconstruct_alt(&cigar, r, a), a);
+        }
+    }
+
+    /// The gap-friendly scoring must not start swallowing real substitutions:
+    /// an isolated SNP stays a single X, and an isolated deletion stays a D.
+    #[test]
+    fn aligner_preserves_isolated_snp_and_deletion() {
+        let snp = gap_open_aligner("ACGTACGTACGTACGT", "ACGTACGAACGTACGT");
+        assert_eq!(snp, "7=1X8=");
+
+        let del = gap_open_aligner("ACGTACGTTTTACGTACGT", "ACGTACGTACGTACGT");
+        assert_eq!(ref_consumed(&del), 19);
+        assert_eq!(reconstruct_alt(&del, "ACGTACGTTTTACGTACGT", "ACGTACGTACGTACGT"), "ACGTACGTACGTACGT");
+        assert!(del.contains('D') && !del.contains('X'), "got {}", del);
+    }
+
+    /// Identical sequences, and the degenerate empty-alt edge.
+    #[test]
+    fn aligner_handles_trivial_inputs() {
+        let same = gap_open_aligner("ACGTACGTAC", "ACGTACGTAC");
+        assert_eq!(same, "10=");
+
+        let empty = gap_open_aligner("ACGTACGTAC", "");
+        assert_eq!(empty, "10D");
     }
 
     #[test]

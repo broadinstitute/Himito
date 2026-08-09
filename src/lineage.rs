@@ -648,6 +648,41 @@ pub fn write_haplotype_map(hap_matrix: &HaplotypeMatrix, path: &str) -> Result<(
 }
 
 
+/// Per-data-type SCITE error rates, with explicit values always winning.
+///
+/// `None` means "not supplied on the command line", so the data-type default
+/// applies; `Some(v)` is used verbatim. Mirrors `call::resolve_thresholds`.
+///
+/// The defaults come from the fp/fn sweeps in `lineage_eval`
+/// (`sweep_fpfn.sh`, scored by `score_lineage.py`):
+///
+/// * `pacbio` (HiFi) - every cell of the 5x6 grid (fp 0.0005-0.02,
+///   fn 0.01-0.2) reached `ad_f1 == 1.0`, so HiFi is insensitive here and any
+///   in-grid value works. `fp = 0.005` / `fn = 0.05` sits comfortably inside.
+/// * `ont-denoised` - denoising removes most per-read noise, so the rates drop
+///   accordingly.
+/// * `ont-r9` / `ont-r10` - the raw-ONT sweep is driven almost entirely by
+///   `fn`: `ad_f1` holds at its 0.375 plateau for `fn <= 0.05` and collapses to
+///   0.118 at `fn >= 0.1`, while `fp` is near-irrelevant across 0-0.02. The
+///   default therefore sits at the top of the safe `fn` range.
+pub fn resolve_error_rates(
+    data_type: &str,
+    fp_rate: Option<f64>,
+    fn_rate: Option<f64>,
+) -> (f64, f64) {
+    let (default_fp, default_fn) = match data_type {
+        "pacbio" => (0.005, 0.05),
+        "ont-denoised" => (0.0001, 0.001),
+        // ont-r9 / ont-r10 and anything else: raw long-read noise levels.
+        _ => (0.001, 0.05),
+    };
+
+    (
+        fp_rate.unwrap_or(default_fp),
+        fn_rate.unwrap_or(default_fn),
+    )
+}
+
 pub fn start(
     matrix_file: &str,
     vcf_file: Option<&str>,
@@ -656,6 +691,7 @@ pub fn start(
     min_presence: usize,
     min_absence: usize,
     min_reads: usize,
+    data_type: &str,
     fp_rate: f64,
     fn_rate: f64,
     mcmc_iterations: usize,
@@ -663,10 +699,15 @@ pub fn start(
     mcmc_seed: u64,
     output_prefix: &str,
 ) -> Result<()> {
+    env_logger::init();
+    if !matches!(data_type, "pacbio" | "ont-r9" | "ont-r10" | "ont-denoised") {
+        anyhow::bail!(
+            "data type must be pacbio, ont-r9, ont-r10 or ont-denoised (got {data_type})"
+        );
+    }
     info!("Starting lineage analysis...");
-
-    // sweep_optimization
-    //hifi fp>=0.005, > fn <= 0.15
+    info!("Data type {data_type}: SCITE fp={fp_rate}, fn={fn_rate}");
+    //ont-denoise fp=0.0001 fn=0.001
 
     // ── Step 1: load VCF HF values, then filter the binary matrix ─────────────
     // The VCF is optional: without it, no HF filter is applied and every variant
@@ -770,6 +811,32 @@ mod tests {
 
     fn hf_map(names: &[&str]) -> HfMap {
         names.iter().map(|n| (n.to_string(), 0.5)).collect()
+    }
+
+    #[test]
+    fn resolve_error_rates_presets_differ_per_data_type() {
+        assert_eq!(resolve_error_rates("pacbio", None, None), (0.005, 0.05));
+        assert_eq!(resolve_error_rates("ont-denoised", None, None), (0.0001, 0.001));
+        assert_eq!(resolve_error_rates("ont-r10", None, None), (0.001, 0.05));
+        assert_eq!(resolve_error_rates("ont-r9", None, None), (0.001, 0.05));
+        // pacbio and ont-denoised must not collapse onto the raw-ONT fallback.
+        assert_ne!(
+            resolve_error_rates("pacbio", None, None),
+            resolve_error_rates("ont-r10", None, None)
+        );
+    }
+
+    #[test]
+    fn resolve_error_rates_explicit_values_override_the_preset() {
+        // Either side can be overridden independently; the other keeps its preset.
+        assert_eq!(resolve_error_rates("pacbio", Some(0.02), None), (0.02, 0.05));
+        assert_eq!(resolve_error_rates("pacbio", None, Some(0.2)), (0.005, 0.2));
+        assert_eq!(
+            resolve_error_rates("ont-denoised", Some(0.01), Some(0.1)),
+            (0.01, 0.1)
+        );
+        // 0.0 is a real user choice, not "unset".
+        assert_eq!(resolve_error_rates("ont-r10", Some(0.0), Some(0.0)), (0.0, 0.0));
     }
 
     #[test]

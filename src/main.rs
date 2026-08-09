@@ -503,13 +503,20 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 3)]
         min_reads: usize,
 
+        /// data type, pacbio, ont-r9, ont-r10, ont-denoised; selects the
+        /// default SCITE fp/fn rates
+        #[clap(short, long, value_parser, default_value = "pacbio")]
+        data_type: String,
+
         /// SCITE false-positive rate (alpha): P(observed=1 | true=0)
-        #[clap(long, value_parser, default_value_t = 0.001)]
-        fp_rate: f64,
+        /// (optional; preset by data type)
+        #[clap(long, value_parser)]
+        fp_rate: Option<f64>,
 
         /// SCITE false-negative rate (beta): P(observed=0 | true=1)
-        #[clap(long, value_parser, default_value_t = 0.05)]
-        fn_rate: f64,
+        /// (optional; preset by data type)
+        #[clap(long, value_parser)]
+        fn_rate: Option<f64>,
 
         /// number of MCMC iterations per chain
         #[clap(long, value_parser, default_value_t = 5000)]
@@ -659,9 +666,10 @@ fn main() {
                 if let Err(e) = denoise::start(
                     &mt_output, &denoised, &reference_path, &data_type,
                     vaf_threshold as f64, 2, 0.01, 0.7,
-                    // Indel correction stays off in QuickStart until the lineage_sim
-                    // validation gate in the design doc passes.
-                    &denoise::indel::IndelOpts::default(),
+                    // Indel correction is on in QuickStart. Every other field keeps
+                    // its `Default` value, which `validate_indel_opts` accepts as-is,
+                    // so there is nothing to validate here.
+                    &denoise::indel::IndelOpts { enabled: true, ..Default::default() },
                     None,
                 ) {
                     eprintln!("Warning: denoise failed ({e:#}); falling back to raw mt BAM.");
@@ -907,6 +915,7 @@ fn main() {
             min_presence,
             min_absence,
             min_reads,
+            data_type,
             fp_rate,
             fn_rate,
             mcmc_iterations,
@@ -918,6 +927,8 @@ fn main() {
             let vcf_file = vcf_file
                 .as_deref()
                 .map(|p| p.to_str().expect("vcf-file path is not valid UTF-8"));
+            let (fp_rate, fn_rate) =
+                lineage::resolve_error_rates(&data_type, fp_rate, fn_rate);
             if let Err(e) = lineage::start(
                 matrix_file,
                 vcf_file,
@@ -926,6 +937,7 @@ fn main() {
                 min_presence,
                 min_absence,
                 min_reads,
+                &data_type,
                 fp_rate,
                 fn_rate,
                 mcmc_iterations,

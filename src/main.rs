@@ -114,9 +114,25 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.1)]
         indel_false_threshold: f64,
 
-        /// heteroplasmic frequency threshold for permutation test 
+        /// heteroplasmic frequency threshold for permutation test
         #[clap(long, value_parser )]
         permutation_frequency_threshold: Option<f64>,
+
+        /// permutation rounds per variant. The smallest attainable p-value is
+        /// 1/(rounds+1), so this must leave headroom below --p-value-threshold after
+        /// Benjamini-Hochberg. Cost scales linearly; lower it to speed up large graphs.
+        #[clap(long, value_parser, default_value_t = 1000)]
+        permutation_rounds: usize,
+
+        /// what to do with strand-skewed variants: flag them in FILTER, or additionally
+        /// drop low-VAF SNPs outright (default: drop for ont-denoised, flag otherwise)
+        #[clap(long, value_enum)]
+        strand_bias_action: Option<call::StrandBiasAction>,
+
+        /// heteroplasmic-frequency ceiling below which a strand-skewed SNP is dropped
+        /// rather than merely flagged (only used with --strand-bias-action drop)
+        #[clap(long, value_parser, default_value_t = 0.10)]
+        strand_bias_drop_max_hf: f64,
 
     },
 
@@ -356,6 +372,22 @@ enum Commands {
         /// heteroplasmic frequency threshold for permutation test (optional, preset by data-type)
         #[clap(long, value_parser)]
         permutation_frequency_threshold: Option<f64>,
+
+        /// permutation rounds per variant. The smallest attainable p-value is
+        /// 1/(rounds+1), so this must leave headroom below --p-value-threshold after
+        /// Benjamini-Hochberg. Cost scales linearly; lower it to speed up large graphs.
+        #[clap(long, value_parser, default_value_t = 1000)]
+        permutation_rounds: usize,
+
+        /// what to do with strand-skewed variants: flag them in FILTER, or additionally
+        /// drop low-VAF SNPs outright (default: drop for ont-denoised, flag otherwise)
+        #[clap(long, value_enum)]
+        strand_bias_action: Option<call::StrandBiasAction>,
+
+        /// heteroplasmic-frequency ceiling below which a strand-skewed SNP is dropped
+        /// rather than merely flagged (only used with --strand-bias-action drop)
+        #[clap(long, value_parser, default_value_t = 0.10)]
+        strand_bias_drop_max_hf: f64,
     },
 
     /// Extract Major Haplotype as Fasta file from Graph
@@ -638,6 +670,9 @@ fn main() {
             strand_bias_threshold,
             indel_false_threshold,
             permutation_frequency_threshold,
+            permutation_rounds,
+            strand_bias_action,
+            strand_bias_drop_max_hf,
         } => {
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold_) =
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold, permutation_frequency_threshold);
@@ -707,6 +742,9 @@ fn main() {
                 strand_bias_threshold,
                 indel_false_threshold,
                 permutation_frequency_threshold_,
+                permutation_rounds,
+                strand_bias_action,
+                strand_bias_drop_max_hf,
             );
             let annotated_graph_output = output_prefix.with_extension("gfa");
             let methyl_output = output_prefix.with_extension("bed");
@@ -821,6 +859,9 @@ fn main() {
             strand_bias_threshold,
             indel_false_threshold,
             permutation_frequency_threshold,
+            permutation_rounds,
+            strand_bias_action,
+            strand_bias_drop_max_hf,
         } => {
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, frequency_threshold, permutation_frequency_threshold);
@@ -839,6 +880,9 @@ fn main() {
                 strand_bias_threshold,
                 indel_false_threshold,
                 permutation_frequency_threshold,
+                permutation_rounds,
+                strand_bias_action,
+                strand_bias_drop_max_hf,
             );
         }
 

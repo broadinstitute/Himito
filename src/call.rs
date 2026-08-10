@@ -14,7 +14,7 @@ use csv::Writer;
 use ndarray::{Array2, Axis, s};
 use rand::seq::SliceRandom;
 use rand::thread_rng;
-use statrs::distribution::{Normal, ContinuousCDF, Binomial, DiscreteCDF};
+use statrs::distribution::{Binomial, DiscreteCDF};
 use regex::Regex;
 use adjustp::{adjust, Procedure};
 use bio::io::fasta::{Reader, Record};
@@ -778,56 +778,74 @@ fn genotype_jaccard_similarity(a: &[f64], b: &[f64]) -> f64 {
     intersection_count as f64 / union_count as f64
 }
 
-/// Generate a null distribution through permutation testing
+/// Sum of Jaccard coefficients between one genotype vector and every OTHER variant's
+/// row. Rows are compared by index rather than by `generate_variant_name`, so two
+/// variants that happen to render to the same name cannot silently exclude each other.
+fn sum_jaccard_against_others(vector_data: &[f64], self_index: usize, rows: &[Vec<f64>]) -> f64 {
+    rows.iter()
+        .enumerate()
+        .filter(|(j, _)| *j != self_index)
+        .map(|(_, other)| genotype_jaccard_similarity(vector_data, other))
+        .sum()
+}
+
+/// Generate a PER-VARIANT null distribution through permutation testing, keyed by
+/// `generate_variant_name`.
+///
+/// The summary statistic is a SUM of Jaccard coefficients over every other variant, so
+/// it scales with how many reads carry the variant. Pooling all variants' draws into one
+/// null (as this did originally) therefore turned the test into a depth filter: a
+/// variant supported by 5 reads was z-scored against a null dominated by variants
+/// supported by hundreds, landing far below the pooled mean and yielding p ~ 1 no matter
+/// how tightly it co-segregated. Conversely a high-depth artifact cleared the pooled bar
+/// on read count alone. Since `shuffle_genotypes` permutes a variant's own values among
+/// its own covered reads, it already preserves that variant's alt count -- so each
+/// variant's draws are the correct null FOR THAT VARIANT and simply need to be kept
+/// apart rather than concatenated.
+///
+/// Variants whose alt frequency exceeds `threshold` are near-homoplasmic: they are the
+/// co-occurrence backbone the candidates are scored against, not candidates themselves,
+/// and are omitted from the returned map (as before).
 fn get_null_distribution(
     filtered_var: &Vec<Variant>,
-    matrix: &Array2<f64>, 
+    matrix: &Array2<f64>,
     permutation_round: usize,
     threshold: f64
-) -> Vec<f64> {
+) -> HashMap<String, Vec<f64>> {
 
-    let bar = ProgressBar::new(permutation_round as u64);
-    let summary_statistics = (0..permutation_round).into_par_iter().flat_map(|_|  {
-        bar.inc(1);
-        let mut local_stats = Vec::new();
-        let mut rng = thread_rng();
+    let bar = ProgressBar::new(filtered_var.len() as u64);
+    // Materialize the rows ONCE. The inner loop compares against every other row on
+    // every round, and re-collecting each `ArrayView1` per comparison made the
+    // allocation count scale with rounds x variants^2.
+    let rows: Vec<Vec<f64>> = (0..filtered_var.len())
+        .map(|j| matrix.slice(s![j, ..]).iter().copied().collect())
+        .collect();
 
-        for (i, variant) in filtered_var.iter().enumerate() {
-            let index = generate_variant_name(variant);
-            let vector = matrix.slice(s![i, ..]);
-            
+    let nulls: Vec<(String, Vec<f64>)> = filtered_var
+        .par_iter()
+        .enumerate()
+        .filter_map(|(i, variant)| {
+            bar.inc(1);
+
             // Skip vectors with frequency > threshold
-            let frequency = alt_frequency(vector);
-            if frequency > threshold {
-                continue;
+            if alt_frequency(matrix.slice(s![i, ..])) > threshold {
+                return None;
             }
 
-            // Shuffle genotypes only among covered reads; keep NaN positions fixed
-            let vector_data: Vec<f64> = vector.iter().copied().collect();
-            let shuffled = shuffle_genotypes(&vector_data, &mut rng);
+            let mut rng = thread_rng();
+            let draws: Vec<f64> = (0..permutation_round)
+                .map(|_| {
+                    // Shuffle genotypes only among covered reads; keep NaN positions fixed
+                    let shuffled = shuffle_genotypes(&rows[i], &mut rng);
+                    sum_jaccard_against_others(&shuffled, i, &rows)
+                })
+                .collect();
 
-            let mut all_coefficients = Vec::new();
-
-            for (j, other_variant) in filtered_var.iter().enumerate() {
-                let other_index = generate_variant_name(other_variant);
-                if index == other_index {
-                    continue;
-                }
-
-                let other_vector = matrix.slice(s![j, ..]);
-                let other_data: Vec<f64> = other_vector.iter().copied().collect();
-
-                let coor = genotype_jaccard_similarity(&shuffled, &other_data);
-                all_coefficients.push(coor);
-            }
-           
-            local_stats.push(all_coefficients.iter().sum());
-        }
-        local_stats
-    }).collect::<Vec<f64>>();
+            Some((generate_variant_name(variant), draws))
+        })
+        .collect();
     bar.finish();
-    summary_statistics
-    
+    nulls.into_iter().collect()
 }
 
 /// Calculate statistics for observed data
@@ -837,47 +855,38 @@ fn calculate_observation_statistics(
     matrix: &Array2<f64>, 
 ) -> f64 {
 
-    let vector = matrix.slice(s![index, ..]);
-    let vector_data: Vec<f64> = vector.iter().copied().collect();
-    let mut all_coefficients = Vec::new();
-
-    for (i, variant) in filtered_var.iter().enumerate() {
-        if i == index {
-            continue;
-        }
-
-        let other_vector = matrix.slice(s![i, ..]);
-        let other_data: Vec<f64> = other_vector.iter().copied().collect();
-
-        let coor = genotype_jaccard_similarity(&vector_data, &other_data);
-        all_coefficients.push(coor);
-    }
-    
-    all_coefficients.iter().sum()
+    let rows: Vec<Vec<f64>> = (0..filtered_var.len())
+        .map(|j| matrix.slice(s![j, ..]).iter().copied().collect())
+        .collect();
+    sum_jaccard_against_others(&rows[index], index, &rows)
 }
 
-/// Calculate p-value using z-score approach
-fn calculate_p_value(statistics: &[f64], observation: f64) -> f64 {
-    let n = statistics.len() as f64;
-    
-    // Calculate mean
-    let mu = statistics.iter().sum::<f64>() / n;
-    
-    // Calculate standard deviation
-    let variance = statistics.iter()
-        .map(|&x| (x - mu).powi(2))
-        .sum::<f64>() / n;
-    let sigma = variance.sqrt();
-    // println!("{:?}, {}", statistics, observation);
-    
-    let z_score = (observation - mu) / sigma;
-    
-    // Calculate p-value using normal distribution CDF
-    let normal = Normal::new(0.0, 1.0).unwrap();
-    if z_score.is_nan() {
+/// One-sided empirical (rank) p-value: the fraction of `null` draws that reach or
+/// exceed `observation`, with the standard add-one correction in both numerator and
+/// denominator.
+///
+/// This replaces a z-score against a normal CDF. The statistic is a sum of Jaccard
+/// coefficients bounded below by zero and strongly right-skewed -- for a scattered
+/// artifact most draws are exactly 0.0 -- so a normal approximation is a poor fit and
+/// its degenerate cases needed a NaN guard (sigma == 0 whenever every draw ties, which
+/// is the COMMON case for a low-VAF variant, not a rare one). A rank p-value is exact
+/// under the permutation null and needs no distributional assumption.
+///
+/// The add-one makes the smallest attainable p-value `1 / (R + 1)`, which is the honest
+/// floor: R permutations cannot supply evidence beyond that. It also means R must be
+/// large enough for the floor to sit below the significance threshold with room for the
+/// Benjamini-Hochberg correction -- at R = 100 the floor is 0.0099, which leaves no
+/// resolution at all against a 0.01 threshold.
+///
+/// An empty null carries no evidence, so it yields 1.0. Callers must treat that as
+/// "untestable" rather than feeding it to BH, where a p-value of 1.0 reads as a
+/// confirmed artifact.
+pub(crate) fn empirical_p_value(null: &[f64], observation: f64) -> f64 {
+    if null.is_empty() {
         return 1.0;
     }
-    return 1.0 - normal.cdf(z_score);
+    let at_or_above = null.iter().filter(|&&x| x >= observation).count();
+    (at_or_above + 1) as f64 / (null.len() + 1) as f64
 }
 
 /// Build a map from read name (BAM qname) to strand (true = reverse, false = forward),
@@ -926,7 +935,34 @@ pub(crate) fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64)
     (2.0 * lower.min(upper)).min(1.0)
 }
 
-/// Flag (but never drop) variants whose alt-supporting reads are significantly strand-skewed
+/// What `filter_strand_bias` does with a variant it finds strand-skewed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum StrandBiasAction {
+    /// Set `FILTER=Strand_bias` but keep the call in the VCF (historical behaviour).
+    Flag,
+    /// Additionally REMOVE strand-skewed low-VAF SNPs outright.
+    Drop,
+}
+
+/// Resolve the strand-bias action for a data type, honouring an explicit CLI choice.
+///
+/// Only `ont-denoised` defaults to dropping. Its SNPs are the ones with no other
+/// discriminative filter, and denoising has already erased the strictly single-strand
+/// artifacts (`fit_site`'s per-strand candidacy gate maps them to reference), so a call
+/// that is STILL strand-skewed after denoising has survived a filter designed to catch
+/// it. PacBio and raw ONT keep flag-only behaviour.
+pub fn resolve_strand_bias_action(
+    data_type: &str,
+    explicit: Option<StrandBiasAction>,
+) -> StrandBiasAction {
+    explicit.unwrap_or(if data_type == "ont-denoised" {
+        StrandBiasAction::Drop
+    } else {
+        StrandBiasAction::Flag
+    })
+}
+
+/// Flag (and, under `StrandBiasAction::Drop`, remove) variants whose alt-supporting reads are significantly strand-skewed
 /// relative to the library's forward/reverse composition; flagged variants get
 /// `filter = Some("Strand_bias")` so the call survives in the VCF with FILTER set accordingly.
 /// Variants with fewer than `min_reads`
@@ -948,6 +984,8 @@ fn filter_strand_bias(
     p_threshold: f64,
     min_reads: usize,
     homoplasmic_frequency_threshold: f64,
+    action: StrandBiasAction,
+    drop_max_hf: f64,
 ) -> (Vec<Variant>, Array2<f64>) {
     let mut keep_idx = Vec::new();
     let mut kept = Vec::new();
@@ -993,6 +1031,20 @@ fn filter_strand_bias(
 
         let p_value = strand_bias_pvalue(fwd, rev, expected_fwd_frac);
         if p_value < p_threshold {
+            // The drop is deliberately narrow: SNPs only, and only below `drop_max_hf`.
+            // Indels already have `Potential_Artifact` to catch them, and above the
+            // ceiling a skew is likelier to be fragmented read attribution across
+            // near-duplicate graph edges than a single-strand sequencing artifact.
+            if action == StrandBiasAction::Drop
+                && variant.variant_type == "SNP"
+                && hf < drop_max_hf
+            {
+                println!(
+                    "Strand-biased (dropped), {:?}, fwd={}, rev={}, hf={:.4}, p={:.3e}",
+                    name, fwd, rev, hf, p_value
+                );
+                continue;
+            }
             // flag but keep: downstream FILTER combines this with other filters (e.g.
             // Potential_Artifact) instead of dropping the call
             variant.filter = Some("Strand_bias".to_string());
@@ -1021,42 +1073,56 @@ fn permutation_test(
 ) -> (Vec<Variant>, Array2<f64>, Vec<String>) {
 
     let bar = ProgressBar::new(filtered_var.len() as u64);
-    let statistics = get_null_distribution(filtered_var, &matrix, permutation_round, permutation_frequency_threshold);
-    let (indices, collected_values): (Vec<_>, Vec<_>) = (0..filtered_var.len()).into_par_iter().map(|i| {
+    let nulls = get_null_distribution(filtered_var, &matrix, permutation_round, permutation_frequency_threshold);
+    let collected_values: Vec<Option<(f64, String)>> = (0..filtered_var.len()).into_par_iter().map(|i| {
         bar.inc(1);
-        let current_variant = filtered_var[i].clone();
-        let index = generate_variant_name(&current_variant);
-        // let frequency = filtered_var[i].allele_count as f64 / *coverage.get(&filtered_var[i].pos).unwrap() as f64;
-        // let frequency = row.sum() / row.len() as f64;
-        let frequency = current_variant.allele_count as f64 / *coverage.get(&current_variant.pos).unwrap() as f64;
+        let current_variant = &filtered_var[i];
+        let index = generate_variant_name(current_variant);
+        // A variant whose position carries no coverage entry cannot be scored; the
+        // original `.unwrap()` here panicked on that instead of leaving it untested.
+        let depth = coverage.get(&current_variant.pos).copied().unwrap_or(0);
+        let frequency = if depth == 0 {
+            0.0
+        } else {
+            current_variant.allele_count as f64 / depth as f64
+        };
 
         if frequency > heteroplasmic_error_threshold {
-            return (Ok(i), None);
+            return None;
         }
         // exclude large indel
         if (current_variant.ref_allele.len() as i32 - current_variant.alt_allele.len() as i32).abs() > 50 {
-            return (Ok(i), None);
+            return None;
         }
 
-        let variant = filtered_var[i].clone();
-        let ref_allele = variant.ref_allele;
-        let alt_allele = variant.alt_allele;
+        let is_snp = current_variant.ref_allele.len() == 1 && current_variant.alt_allele.len() == 1;
 
-        // For PacBio: exclude SNPs from permutation test (PacBio has high accuracy for SNPs)
-        // For ONT: include SNPs in permutation test but with stricter filtering
-        // ONT has higher error rates, so we need the permutation test to filter false positives
-        if (ref_allele.len() == 1 && alt_allele.len() == 1) && (data_type == "pacbio" || data_type == "ont-denoised") {
-            return (Ok(i), None);
+        // PacBio: exclude SNPs from the permutation test -- its SNP accuracy is high
+        // enough that the co-occurrence test costs more true low-VAF heteroplasmies
+        // than it saves false positives.
+        //
+        // ONT, INCLUDING `ont-denoised`: test SNPs. Denoising is a per-base quality
+        // model, so it strips the RANDOM error it can see and leaves the SYSTEMATIC
+        // error -- which carries high base qualities -- untouched. Exempting denoised
+        // SNPs here left them with no discriminative filter anywhere in the pipeline:
+        // `filter_strand_bias` only flagged, and `Potential_Artifact` is indel-only.
+        // That gap is exactly where the residual low-VAF SNP false positives came from.
+        if is_snp && data_type == "pacbio" {
+            return None;
         }
-        // Note: For ONT, SNPs go through permutation test which should help filter false positives
-        // If precision is still low, consider adjusting p_value_threshold or frequency_threshold
 
-        let observation = calculate_observation_statistics(&filtered_var,  i, &matrix);
-        let p_value = calculate_p_value(&statistics, observation);
-        (Err(index.clone()), Some((p_value, index.clone())))
+        // No null draws for this variant (it sits above `permutation_frequency_threshold`
+        // by MATRIX alt frequency even though allele_count/coverage admitted it here --
+        // the two denominators can disagree). Absent evidence is not evidence of an
+        // artifact: leave it untested rather than handing BH a p-value of 1.0.
+        let null = match nulls.get(&index) {
+            Some(n) if !n.is_empty() => n,
+            _ => return None,
+        };
 
- 
-    }).unzip(); 
+        let observation = calculate_observation_statistics(&filtered_var, i, &matrix);
+        Some((empirical_p_value(null, observation), index))
+    }).collect();
 
 
     let mut raw_p_values = Vec::new();
@@ -1151,6 +1217,9 @@ pub fn start(
     strand_bias_threshold: f64,
     indel_false_threshold: f64,
     permutation_frequency_threshold: f64,
+    permutation_rounds: usize,
+    strand_bias_action: Option<StrandBiasAction>,
+    strand_bias_drop_max_hf: f64,
 ) {
     if data_type != "pacbio" && data_type != "ont-r9" && data_type != "ont-r10" && data_type != "ont-denoised" {
         eprintln!("Error: data type must be pacbio or ont-r9 or ont-r10 or ont-denoised");
@@ -1184,17 +1253,25 @@ pub fn start(
     // } else {
     //     (0.001, 0.2)    // PacBio: original thresholds
     // };
-    let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&matrix, p_value_threshold, heteroplasmic_frequency_threshold, 100, &var_record, &coverage, permutation_frequency_threshold, data_type);
-
-    // strand-bias filter: drop variants whose alt reads are strand-skewed relative to the
-    // library composition (only when a BAM is provided so per-read strand is available)
-    let (permu_filtered_var, filtered_matrix) = match bam_file {
+    // Strand-bias filtering runs BEFORE the permutation test, not after.
+    //
+    // The permutation test scores a variant by how strongly it co-segregates with the
+    // OTHER variants in the matrix. Error-prone ONT reads carry many errors at once, so
+    // systematic artifacts co-occur with each other on the same bad reads and produce a
+    // high Jaccard sum that is indistinguishable from a real lineage. Leaving known
+    // strand-skewed artifacts in the matrix therefore fed them into both the null and
+    // every observation, teaching the test that artifacts are real evidence. Removing
+    // them first means the co-occurrence backbone is built only from calls that already
+    // survived an independent, read-level check.
+    let action = resolve_strand_bias_action(data_type, strand_bias_action);
+    let (sb_filtered_var, sb_matrix) = match bam_file {
         Some(bam) => {
             let (strand_map, fwd_frac) = build_strand_map(bam);
             println!("Library forward-strand fraction: {:.3}", fwd_frac);
+            println!("Strand-bias action: {:?} (SNPs below HF {:.3})", action, strand_bias_drop_max_hf);
             filter_strand_bias(
-                &permu_filtered_var,
-                &filtered_matrix,
+                &var_record,
+                &matrix,
                 &read_record,
                 &strand_map,
                 &coverage,
@@ -1202,10 +1279,14 @@ pub fn start(
                 strand_bias_threshold,
                 2,
                 permutation_frequency_threshold,
+                action,
+                strand_bias_drop_max_hf,
             )
         }
-        None => (permu_filtered_var, filtered_matrix),
+        None => (var_record.clone(), matrix.clone()),
     };
+
+    let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&sb_matrix, p_value_threshold, heteroplasmic_frequency_threshold, permutation_rounds, &sb_filtered_var, &coverage, permutation_frequency_threshold, data_type);
 
     // write filtered vcf
     let _ = write_vcf(
@@ -1507,5 +1588,297 @@ mod tests {
         assert_eq!(matrix[[1, col("r_alt1")]], 0.0);
         assert_eq!(matrix[[0, col("r_alt2")]], 1.0);
         assert_eq!(matrix[[1, col("r_alt2")]], 1.0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-variant permutation null + empirical p-value
+    // ---------------------------------------------------------------------
+
+    fn snp(pos: usize, alt: &str, allele_count: usize) -> Variant {
+        Variant {
+            pos,
+            ref_allele: "T".to_string(),
+            alt_allele: alt.to_string(),
+            variant_type: "SNP".to_string(),
+            allele_count,
+            filter: None,
+        }
+    }
+
+    fn indel(pos: usize, ref_allele: &str, alt: &str, allele_count: usize) -> Variant {
+        Variant {
+            pos,
+            ref_allele: ref_allele.to_string(),
+            alt_allele: alt.to_string(),
+            variant_type: if ref_allele.len() > alt.len() { "DEL" } else { "INS" }.to_string(),
+            allele_count,
+            filter: None,
+        }
+    }
+
+    #[test]
+    fn empirical_p_value_counts_null_at_or_above_observation() {
+        // (1 + #{null >= obs}) / (R + 1): the +1 keeps p strictly positive, so a
+        // variant can never be credited with more evidence than R rounds can supply.
+        let null = vec![0.0, 1.0, 2.0, 3.0];
+        // 3 of 4 null draws reach 1.0 => (1 + 3) / 5
+        assert!((empirical_p_value(&null, 1.0) - 0.8).abs() < 1e-12);
+        // nothing beats an observation above the whole null => floor of 1 / (R + 1)
+        assert!((empirical_p_value(&null, 99.0) - 0.2).abs() < 1e-12);
+        // everything beats an observation below the whole null
+        assert!((empirical_p_value(&null, -1.0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn empirical_p_value_of_empty_null_is_one() {
+        // No null draws means no evidence, which must never look significant.
+        assert_eq!(empirical_p_value(&[], 42.0), 1.0);
+    }
+
+    #[test]
+    fn null_distribution_is_keyed_per_variant_and_preserves_alt_count() {
+        // The summary statistic is a SUM of Jaccard coefficients, so it scales with a
+        // variant's alt-read count. Pooling every variant's draws into one null makes
+        // the test a depth filter: a low-count variant is scored against a null built
+        // mostly from high-count variants. Each variant must get its own null.
+        // Three variants, so each null is a SUM over two comparisons. With only two
+        // variants the two nulls would each reduce to the single symmetric Jaccard
+        // J(v0, v1) and be equal by construction, testing nothing.
+        let variants = vec![snp(100, "A", 8), snp(200, "C", 2), snp(300, "G", 10)];
+        let n_reads = 20;
+        let mut matrix = Array2::<f64>::zeros((3, n_reads));
+        for j in 0..n_reads {
+            matrix[[0, j]] = if j < 8 { 1.0 } else { 0.0 };  // 0.40 alt frequency
+            matrix[[1, j]] = if j < 2 { 1.0 } else { 0.0 };  // 0.10
+            matrix[[2, j]] = if j < 10 { 1.0 } else { 0.0 }; // 0.50, the shared anchor
+        }
+
+        let rounds = 64;
+        let nulls = get_null_distribution(&variants, &matrix, rounds, 0.9);
+
+        let n0 = generate_variant_name(&variants[0]);
+        let n1 = generate_variant_name(&variants[1]);
+        assert_eq!(nulls.len(), 3, "one null per variant");
+        assert_eq!(nulls[&n0].len(), rounds, "one draw per round for v0");
+        assert_eq!(nulls[&n1].len(), rounds, "one draw per round for v1");
+
+        // Shuffling preserves each variant's own alt count, so the two nulls live on
+        // different scales -- exactly the confound that pooling them destroyed.
+        let mean = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
+        assert!(
+            mean(&nulls[&n0]) > mean(&nulls[&n1]),
+            "the 8-read variant's null must sit above the 2-read variant's"
+        );
+    }
+
+    #[test]
+    fn null_distribution_skips_variants_above_the_frequency_threshold() {
+        // Near-homoplasmic variants are the co-occurrence backbone, not candidates;
+        // they are excluded from the null exactly as before the per-variant rewrite.
+        let variants = vec![snp(100, "A", 9), snp(200, "C", 2)];
+        let mut matrix = Array2::<f64>::zeros((2, 10));
+        for j in 0..10 {
+            matrix[[0, j]] = if j < 9 { 1.0 } else { 0.0 };
+            matrix[[1, j]] = if j < 2 { 1.0 } else { 0.0 };
+        }
+
+        let nulls = get_null_distribution(&variants, &matrix, 8, 0.7);
+
+        assert!(
+            !nulls.contains_key(&generate_variant_name(&variants[0])),
+            "a variant at 0.9 alt frequency must not get a null at threshold 0.7"
+        );
+        assert!(nulls.contains_key(&generate_variant_name(&variants[1])));
+    }
+
+    // ---------------------------------------------------------------------
+    // SNP admission into the permutation test
+    // ---------------------------------------------------------------------
+
+    /// Two co-segregating variants carried by the same 3 of 30 reads (a real lineage),
+    /// plus one SNP scattered across 3 reads that share no lineage (an artifact).
+    fn lineage_and_artifact() -> (Vec<Variant>, Array2<f64>, HashMap<usize, usize>) {
+        let variants = vec![
+            snp(100, "A", 3),                 // lineage member
+            indel(200, "TT", "T", 3),         // lineage member (indel: always tested)
+            snp(300, "G", 3),                 // scattered artifact
+        ];
+        let n_reads = 30;
+        let mut matrix = Array2::<f64>::zeros((3, n_reads));
+        for j in 0..n_reads {
+            // reads 0,1,2 carry the lineage
+            let lin = if j < 3 { 1.0 } else { 0.0 };
+            matrix[[0, j]] = lin;
+            matrix[[1, j]] = lin;
+            // reads 10,17,24 carry the artifact -- disjoint from the lineage
+            matrix[[2, j]] = if j == 10 || j == 17 || j == 24 { 1.0 } else { 0.0 };
+        }
+        let coverage: HashMap<usize, usize> =
+            [(100, n_reads), (200, n_reads), (300, n_reads)].into_iter().collect();
+        (variants, matrix, coverage)
+    }
+
+    #[test]
+    fn permutation_test_evaluates_snps_for_ont_denoised() {
+        // Denoising strips the RANDOM error its quality model can see and leaves the
+        // SYSTEMATIC error behind, so a denoised ONT SNP still needs the co-occurrence
+        // test. Skipping SNPs here left `ont-denoised` with no SNP filter at all:
+        // `filter_strand_bias` only flags, and `Potential_Artifact` is indel-only.
+        let (variants, matrix, coverage) = lineage_and_artifact();
+        let artifact = generate_variant_name(&variants[2]);
+
+        let (kept, _m, _names) = permutation_test(
+            &matrix, 0.5, 0.9, 200, &variants, &coverage, 0.9, "ont-denoised",
+        );
+        let kept_names: Vec<String> = kept.iter().map(generate_variant_name).collect();
+
+        assert!(
+            !kept_names.contains(&artifact),
+            "a scattered SNP must be testable, and rejected, under ont-denoised"
+        );
+    }
+
+    #[test]
+    fn permutation_test_still_exempts_snps_for_pacbio() {
+        // PacBio SNP accuracy is high enough that the co-occurrence test costs more
+        // real low-VAF heteroplasmies than it saves false positives. Unchanged.
+        let (variants, matrix, coverage) = lineage_and_artifact();
+        let artifact = generate_variant_name(&variants[2]);
+
+        let (kept, _m, _names) = permutation_test(
+            &matrix, 0.5, 0.9, 200, &variants, &coverage, 0.9, "pacbio",
+        );
+        let kept_names: Vec<String> = kept.iter().map(generate_variant_name).collect();
+
+        assert!(
+            kept_names.contains(&artifact),
+            "pacbio must keep SNPs exempt from the permutation test"
+        );
+    }
+
+    #[test]
+    fn permutation_test_keeps_a_variant_with_no_null_draws() {
+        // `get_null_distribution` filters on the MATRIX alt frequency while the test
+        // loop filters on allele_count/coverage. The two can disagree, leaving a
+        // tested variant with an empty null. That is missing evidence, not evidence
+        // of an artifact, so the variant must be kept untested rather than dropped.
+        let variants = vec![snp(100, "A", 2), snp(200, "C", 2)];
+        let mut matrix = Array2::<f64>::zeros((2, 10));
+        for j in 0..10 {
+            // Both variants are alt in 9/10 reads => matrix frequency 0.9, above the
+            // 0.7 null threshold, so neither gets a null...
+            matrix[[0, j]] = if j < 9 { 1.0 } else { 0.0 };
+            matrix[[1, j]] = if j < 9 { 1.0 } else { 0.0 };
+        }
+        // ...but allele_count/coverage is 2/100 = 0.02, well under the test's own
+        // 0.5 heteroplasmic threshold, so both are admitted for testing.
+        let coverage: HashMap<usize, usize> = [(100, 100), (200, 100)].into_iter().collect();
+
+        let (kept, _m, _names) = permutation_test(
+            &matrix, 0.5, 0.5, 16, &variants, &coverage, 0.7, "ont-denoised",
+        );
+
+        assert_eq!(kept.len(), 2, "variants with an empty null must be kept, not dropped");
+    }
+
+    // ---------------------------------------------------------------------
+    // Strand-bias filter: drop vs flag
+    // ---------------------------------------------------------------------
+
+    /// One low-VAF SNP supported by 10 reads, all on the forward strand, against a
+    /// library that is 50/50 -- the signature of a systematic ONT artifact.
+    fn strand_skewed_snp() -> (
+        Vec<Variant>,
+        Array2<f64>,
+        HashMap<String, Vec<serde_json::Value>>,
+        HashMap<String, bool>,
+        HashMap<usize, usize>,
+    ) {
+        let variants = vec![snp(100, "A", 10)];
+        let name = generate_variant_name(&variants[0]);
+        let matrix = Array2::<f64>::zeros((1, 10));
+
+        let reads: Vec<serde_json::Value> =
+            (0..10).map(|i| json!(format!("r{i}"))).collect();
+        let read_record: HashMap<String, Vec<serde_json::Value>> =
+            [(name, reads)].into_iter().collect();
+        // every supporting read is forward
+        let strand_map: HashMap<String, bool> =
+            (0..10).map(|i| (format!("r{i}"), false)).collect();
+        let coverage: HashMap<usize, usize> = [(100, 200)].into_iter().collect();
+        (variants, matrix, read_record, strand_map, coverage)
+    }
+
+    #[test]
+    fn strand_bias_drops_low_vaf_snps_under_the_drop_action() {
+        let (variants, matrix, read_record, strand_map, coverage) = strand_skewed_snp();
+
+        let (kept, kept_matrix) = filter_strand_bias(
+            &variants, &matrix, &read_record, &strand_map, &coverage,
+            0.5, 0.01, 2, 0.7, StrandBiasAction::Drop, 0.10,
+        );
+
+        assert!(kept.is_empty(), "a strand-skewed low-VAF SNP must be dropped, not flagged");
+        assert_eq!(kept_matrix.nrows(), 0, "the matrix must lose the dropped row");
+    }
+
+    #[test]
+    fn strand_bias_only_flags_under_the_flag_action() {
+        let (variants, matrix, read_record, strand_map, coverage) = strand_skewed_snp();
+
+        let (kept, _m) = filter_strand_bias(
+            &variants, &matrix, &read_record, &strand_map, &coverage,
+            0.5, 0.01, 2, 0.7, StrandBiasAction::Flag, 0.10,
+        );
+
+        assert_eq!(kept.len(), 1, "flag mode must keep the call");
+        assert_eq!(kept[0].filter.as_deref(), Some("Strand_bias"));
+    }
+
+    #[test]
+    fn strand_bias_drop_action_spares_indels_and_higher_vaf_snps() {
+        // The drop is deliberately narrow: it targets the low-VAF SNPs that denoising
+        // leaves behind. Indels already have `Potential_Artifact`, and a SNP above the
+        // drop ceiling is common enough that strand skew is likelier to be fragmented
+        // read attribution than a single-strand artifact.
+        let (_v, _m, read_record_snp, strand_map, _c) = strand_skewed_snp();
+
+        // Same evidence, but the call sits at 10/50 = 0.20 VAF, above the 0.10 ceiling.
+        let variants = vec![snp(100, "A", 10)];
+        let matrix = Array2::<f64>::zeros((1, 10));
+        let coverage: HashMap<usize, usize> = [(100, 50)].into_iter().collect();
+        let (kept, _m) = filter_strand_bias(
+            &variants, &matrix, &read_record_snp, &strand_map, &coverage,
+            0.5, 0.01, 2, 0.7, StrandBiasAction::Drop, 0.10,
+        );
+        assert_eq!(kept.len(), 1, "a SNP above the drop ceiling is flagged, not dropped");
+        assert_eq!(kept[0].filter.as_deref(), Some("Strand_bias"));
+
+        // An indel with identical strand evidence at the same low VAF survives too.
+        let ivariants = vec![indel(100, "TT", "T", 10)];
+        let iname = generate_variant_name(&ivariants[0]);
+        let ireads: Vec<serde_json::Value> = (0..10).map(|i| json!(format!("r{i}"))).collect();
+        let iread_record: HashMap<String, Vec<serde_json::Value>> =
+            [(iname, ireads)].into_iter().collect();
+        let icoverage: HashMap<usize, usize> = [(100, 200)].into_iter().collect();
+        let (ikept, _m) = filter_strand_bias(
+            &ivariants, &matrix, &iread_record, &strand_map, &icoverage,
+            0.5, 0.01, 2, 0.7, StrandBiasAction::Drop, 0.10,
+        );
+        assert_eq!(ikept.len(), 1, "indels are never dropped by the strand-bias filter");
+    }
+
+    #[test]
+    fn resolve_strand_bias_action_drops_only_for_denoised_ont() {
+        // PacBio and raw ONT keep the historical flag-only behaviour; the drop is
+        // opt-in for the one data type whose SNPs have no other filter.
+        assert_eq!(resolve_strand_bias_action("ont-denoised", None), StrandBiasAction::Drop);
+        assert_eq!(resolve_strand_bias_action("pacbio", None), StrandBiasAction::Flag);
+        assert_eq!(resolve_strand_bias_action("ont-r10", None), StrandBiasAction::Flag);
+        // An explicit CLI choice always wins.
+        assert_eq!(
+            resolve_strand_bias_action("ont-denoised", Some(StrandBiasAction::Flag)),
+            StrandBiasAction::Flag
+        );
     }
 }

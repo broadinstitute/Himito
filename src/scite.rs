@@ -774,8 +774,12 @@ pub fn write_read_lineage_newick(
     Ok(())
 }
 
-/// Reorder mutations on each maximal unary path by nesting (AF tie-break).
-/// Accepts a path reorder only if tree log-likelihood does not drop by more than 1e-6.
+/// Reorder mutations on each maximal unary path by allele frequency (nesting
+/// tie-break). Accepts a path reorder only if tree log-likelihood does not drop
+/// by more than 1e-6.
+///
+/// AF is primary because ONT false negatives inflate “child without parent”
+/// counts and can invert co-occurrence nesting toward the wrong order.
 pub fn polish_unary_path_order(
     tree: &MutationTree,
     matrix: &BinaryMatrix,
@@ -796,14 +800,14 @@ pub fn polish_unary_path_order(
             .iter()
             .map(|&i| matrix.variants[i].as_str())
             .collect();
-        let ordered = order_path_by_nesting(&path, matrix);
+        let ordered = order_path_by_af(&path, matrix);
         let ordered_names: Vec<&str> = ordered
             .iter()
             .map(|&i| matrix.variants[i].as_str())
             .collect();
         if ordered == path {
             info!(
-                "[SCITE] Unary-path polish skip (already nesting-ordered): {}",
+                "[SCITE] Unary-path polish skip (already AF-ordered): {}",
                 path_names.join(" → ")
             );
             continue;
@@ -901,7 +905,7 @@ fn nesting_p_m_given_o(matrix: &BinaryMatrix, m: usize, o: usize) -> f64 {
     }
 }
 
-fn order_path_by_nesting(path: &[usize], matrix: &BinaryMatrix) -> Vec<usize> {
+fn order_path_by_af(path: &[usize], matrix: &BinaryMatrix) -> Vec<usize> {
     let mut scored: Vec<(usize, f64, f64)> = path
         .iter()
         .map(|&m| {
@@ -916,10 +920,10 @@ fn order_path_by_nesting(path: &[usize], matrix: &BinaryMatrix) -> Vec<usize> {
                     / others.len() as f64
             };
             let af = allele_frequency(matrix, m);
-            (m, nest, af)
+            (m, af, nest)
         })
         .collect();
-    // Ancestral → derived: higher nest, then higher AF.
+    // Ancestral → derived: higher AF first (ONT-robust); nesting only breaks ties.
     scored.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -1578,13 +1582,13 @@ mod tests {
     }
 
     #[test]
-    fn polish_unary_path_order_restores_nesting_preferred_order() {
-        // Truth nesting: A(0) ancestral to B(1). Reversed tree has B under ROOT, A under B.
+    fn polish_unary_path_order_restores_af_preferred_order() {
+        // Higher AF on A, lower on B; reversed tree has B under ROOT, A under B.
         let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
         let matrix = BinaryMatrix {
             variants: vec!["A".into(), "B".into()],
             reads: (0..10).map(|i| format!("r{i}")).collect(),
-            // 6 A-only, 4 both, 0 B-only → clear A→B nesting
+            // 6 A-only, 4 both, 0 B-only → AF(A)=1.0, AF(B)=0.4
             data: vec![
                 vec![Some(1); 10],
                 vec![Some(0); 6].into_iter().chain(vec![Some(1); 4]).collect(),
@@ -1598,9 +1602,8 @@ mod tests {
     }
 
     #[test]
-    fn polish_unary_path_order_is_noop_when_order_already_matches_nesting() {
-        // Correct A→B already matches nesting; polish must leave parents unchanged
-        // (covers the reject/no-op path of the LL gate when the candidate equals current).
+    fn polish_unary_path_order_is_noop_when_order_already_matches_af() {
+        // Correct A→B already matches AF order; polish must leave parents unchanged.
         let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.001 };
         let matrix = BinaryMatrix {
             variants: vec!["A".into(), "B".into()],
@@ -1617,19 +1620,16 @@ mod tests {
 
     #[test]
     fn polish_unary_path_order_moves_distal_children_to_new_tip() {
-        // Path ROOT→0→1 with distal children 2,3 under tip 1. Nesting prefers 1 ancestral to 0.
+        // Path ROOT→0→1 with distal children 2,3 under tip 1. AF prefers 1 ancestral to 0.
         let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
-        // Variants: 0,1 on path; 2,3 distal (unique to their branches).
-        // Nesting for {0,1}: make 1 look ancestral to 0 (1 present whenever 0 is).
         let matrix = BinaryMatrix {
             variants: vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
             reads: (0..8).map(|i| format!("r{i}")).collect(),
             data: vec![
-                // m0: present in reads 4..7 only
+                // m0: present in reads 4..7 only → lower AF
                 vec![Some(0); 4].into_iter().chain(vec![Some(1); 4]).collect(),
-                // m1: present in all reads 0..7 (ancestral to m0)
+                // m1: present in all reads 0..7 → higher AF (ancestral)
                 vec![Some(1); 8],
-                // m2: tip lineage under old tip
                 vec![Some(0); 6].into_iter().chain(vec![Some(1); 2]).collect(),
                 vec![Some(0); 4].into_iter().chain(vec![Some(1); 2]).chain(vec![Some(0); 2]).collect(),
             ],
@@ -1687,6 +1687,10 @@ mod tests {
         assert_eq!(polished.parent[ix("m.12183G>C")], root);
         assert_eq!(polished.parent[ix("m.2358A>C")], ix("m.15258A>C"));
         assert_eq!(polished.parent[ix("m.14577T>A")], ix("m.2358A>C"));
+        // AF order on the long chain is 11749 → 12477 → 7102 (truth).
+        assert_eq!(polished.parent[ix("m.11749A>T")], root);
+        assert_eq!(polished.parent[ix("m.12477T>G")], ix("m.11749A>T"));
+        assert_eq!(polished.parent[ix("m.7102T>C")], ix("m.12477T>G"));
         assert!(ll1 > ll0 + 1.0, "expected large LL gain from fixing flipped lineages");
     }
 }

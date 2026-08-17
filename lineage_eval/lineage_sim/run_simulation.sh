@@ -6,6 +6,8 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 OUTDIR="" PROFILE="ont-r10" PVAL=0.1
+# SCITE rates forwarded to run_eval.sh / Himito lineage (same defaults as run_eval.sh).
+FP=0.001 FN=0.05
 SEEDS="" NMUTS="" DEPTHS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -15,11 +17,13 @@ while [[ $# -gt 0 ]]; do
     --n-mutations) NMUTS="$2"; shift 2;;
     --depths) DEPTHS="$2"; shift 2;;
     --pval) PVAL="$2"; shift 2;;
+    --fp) FP="$2"; shift 2;;
+    --fn) FN="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" && -n "$SEEDS" && -n "$NMUTS" && -n "$DEPTHS" ]] || {
-  echo "usage: --outdir DIR --seeds \"...\" --n-mutations \"...\" --depths \"...\" [--profile P] [--pval P]" >&2
+  echo "usage: --outdir DIR --seeds \"...\" --n-mutations \"...\" --depths \"...\" [--profile P] [--pval P] [--fp F] [--fn F]" >&2
   exit 1
 }
 
@@ -31,7 +35,7 @@ n_s=$(wc -w <<<"$SEEDS")
 n_m=$(wc -w <<<"$NMUTS")
 n_d=$(wc -w <<<"$DEPTHS")
 n_cells=$((n_s * n_m * n_d))
-echo "sweep: ${n_cells} cells (${n_s}×${n_m}×${n_d}), profile=$PROFILE pval=$PVAL" >&2
+echo "sweep: ${n_cells} cells (${n_s}×${n_m}×${n_d}), profile=$PROFILE pval=$PVAL fp=$FP fn=$FN" >&2
 
 i=0
 n_ok=0
@@ -47,7 +51,9 @@ for seed in $SEEDS; do
            --n-mutations "$nmut" \
            --total-depth "$depth" \
            --seed "$seed" \
-           --pval "$PVAL"; then
+           --pval "$PVAL" \
+           --fp "$FP" \
+           --fn "$FN"; then
         cell_metrics="$cell/metrics.tsv"
         if [[ ! -f "$cell_metrics" || ! -s "$cell_metrics" ]]; then
           echo "missing metrics at $cell_metrics (skipped)" >&2

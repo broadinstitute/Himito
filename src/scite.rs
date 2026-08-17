@@ -783,12 +783,29 @@ pub fn polish_unary_path_order(
 ) -> MutationTree {
     let mut current = tree.clone();
     let paths = maximal_unary_paths(&current);
+    info!(
+        "[SCITE] Unary-path polish: {} maximal unary path(s) (len≥2) over {} variants",
+        paths.len(),
+        tree.n_mutations
+    );
     for path in paths {
         if path.len() < 2 {
             continue;
         }
+        let path_names: Vec<&str> = path
+            .iter()
+            .map(|&i| matrix.variants[i].as_str())
+            .collect();
         let ordered = order_path_by_nesting(&path, matrix);
+        let ordered_names: Vec<&str> = ordered
+            .iter()
+            .map(|&i| matrix.variants[i].as_str())
+            .collect();
         if ordered == path {
+            info!(
+                "[SCITE] Unary-path polish skip (already nesting-ordered): {}",
+                path_names.join(" → ")
+            );
             continue;
         }
         let candidate = apply_path_reorder(&current, &path, &ordered);
@@ -796,16 +813,20 @@ pub fn polish_unary_path_order(
         let ll_new = tree_log_likelihood(matrix, &candidate, rates);
         if ll_new >= ll_old - 1e-6 {
             info!(
-                "[SCITE] Unary-path polish accepted on {} mutations (ΔLL={:.3})",
+                "[SCITE] Unary-path polish accepted on {} mutations (ΔLL={:.3}): {} → {}",
                 path.len(),
-                ll_new - ll_old
+                ll_new - ll_old,
+                path_names.join(" → "),
+                ordered_names.join(" → ")
             );
             current = candidate;
         } else {
             info!(
-                "[SCITE] Unary-path polish rejected on {} mutations (ΔLL={:.3})",
+                "[SCITE] Unary-path polish rejected on {} mutations (ΔLL={:.3}): {} → {}",
                 path.len(),
-                ll_new - ll_old
+                ll_new - ll_old,
+                path_names.join(" → "),
+                ordered_names.join(" → ")
             );
         }
     }
@@ -1621,5 +1642,51 @@ mod tests {
         assert_eq!(polished.parent[0], 1);
         assert_eq!(polished.parent[2], 0);
         assert_eq!(polished.parent[3], 0);
+    }
+
+    #[test]
+    fn polish_fixes_fully_flipped_ont_eval_tree() {
+        let mat = std::env::var("HIMITO_TEST_MATRIX").unwrap_or_else(|_| {
+            format!("{}/lineage_eval/lineage_sim/tmp/eval_ont_r10/himito/sim.matrix.csv", env!("CARGO_MANIFEST_DIR"))
+        });
+        let vcf = std::env::var("HIMITO_TEST_VCF").unwrap_or_else(|_| {
+            format!("{}/lineage_eval/lineage_sim/tmp/eval_ont_r10/himito/sim.vcf", env!("CARGO_MANIFEST_DIR"))
+        });
+        let hf = lineage::parse_vcf(&vcf, 0.01, 0.95).unwrap();
+        let binary = lineage::load_and_filter_matrix(&mat, &hf, 2, 1, 0.01, 0.95).unwrap();
+        let n = binary.variants.len();
+        let root = n;
+        let ix = |name: &str| {
+            binary.variants.iter().position(|v| v == name).unwrap_or_else(|| panic!("missing {name} in {:?}", binary.variants))
+        };
+        let mut parent = vec![root; n + 1];
+        parent[root] = root;
+        let flipped = [
+            ("m.12477T>G", "ROOT"),
+            ("m.11749A>T", "m.12477T>G"),
+            ("m.7102T>C", "m.11749A>T"),
+            ("m.5967T>C", "ROOT"),
+            ("m.12183G>C", "m.5967T>C"),
+            ("m.15258A>C", "ROOT"),
+            ("m.1700T>A", "m.15258A>C"),
+            ("m.14577T>A", "m.15258A>C"),
+            ("m.2358A>C", "m.14577T>A"),
+            ("m.8171T>A", "ROOT"),
+        ];
+        for (child, par) in flipped {
+            let c = ix(child);
+            parent[c] = if par == "ROOT" { root } else { ix(par) };
+        }
+        let tree = MutationTree { n_mutations: n, parent };
+        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let ll0 = tree_log_likelihood(&binary, &tree, &rates);
+        let polished = polish_unary_path_order(&tree, &binary, &rates);
+        let ll1 = tree_log_likelihood(&binary, &polished, &rates);
+        eprintln!("n_vars={n} ll0={ll0:.3} ll1={ll1:.3} delta={:.3}", ll1 - ll0);
+        assert_eq!(polished.parent[ix("m.5967T>C")], ix("m.12183G>C"));
+        assert_eq!(polished.parent[ix("m.12183G>C")], root);
+        assert_eq!(polished.parent[ix("m.2358A>C")], ix("m.15258A>C"));
+        assert_eq!(polished.parent[ix("m.14577T>A")], ix("m.2358A>C"));
+        assert!(ll1 > ll0 + 1.0, "expected large LL gain from fixing flipped lineages");
     }
 }

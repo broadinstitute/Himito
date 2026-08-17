@@ -106,7 +106,7 @@ task Modkit_entropy_task{
         boot_disk_gb:       50,
         preemptible_tries:  1,
         max_retries:        1,
-        docker:             "hangsuunc/modkit:v1"
+        docker:             "us.gcr.io/broad-dsp-lrma/hangsuunc/methylationanalysis:v2"
     }
     RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])
     runtime {

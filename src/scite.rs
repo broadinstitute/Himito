@@ -774,6 +774,165 @@ pub fn write_read_lineage_newick(
     Ok(())
 }
 
+/// Reorder mutations on each maximal unary path by nesting (AF tie-break).
+/// Accepts a path reorder only if tree log-likelihood does not drop by more than 1e-6.
+pub fn polish_unary_path_order(
+    tree: &MutationTree,
+    matrix: &BinaryMatrix,
+    rates: &ErrorRates,
+) -> MutationTree {
+    let mut current = tree.clone();
+    let paths = maximal_unary_paths(&current);
+    for path in paths {
+        if path.len() < 2 {
+            continue;
+        }
+        let ordered = order_path_by_nesting(&path, matrix);
+        if ordered == path {
+            continue;
+        }
+        let candidate = apply_path_reorder(&current, &path, &ordered);
+        let ll_old = tree_log_likelihood(matrix, &current, rates);
+        let ll_new = tree_log_likelihood(matrix, &candidate, rates);
+        if ll_new >= ll_old - 1e-6 {
+            info!(
+                "[SCITE] Unary-path polish accepted on {} mutations (ΔLL={:.3})",
+                path.len(),
+                ll_new - ll_old
+            );
+            current = candidate;
+        } else {
+            info!(
+                "[SCITE] Unary-path polish rejected on {} mutations (ΔLL={:.3})",
+                path.len(),
+                ll_new - ll_old
+            );
+        }
+    }
+    current
+}
+
+/// Maximal unary paths: each is a sequence of ≥1 mutation nodes where every
+/// non-final node has exactly one child. Starts only at nodes whose parent is
+/// the root or a branching node (≠1 child).
+fn maximal_unary_paths(tree: &MutationTree) -> Vec<Vec<usize>> {
+    let children = tree.children_of();
+    let root = tree.root();
+    let mut paths = Vec::new();
+    for start in 0..tree.n_mutations {
+        let p = tree.parent[start];
+        let parent_is_branch = p == root || children[p].len() != 1;
+        if !parent_is_branch {
+            continue;
+        }
+        let mut path = vec![start];
+        let mut cur = start;
+        while children[cur].len() == 1 {
+            let nxt = children[cur][0];
+            if nxt >= tree.n_mutations {
+                break;
+            }
+            path.push(nxt);
+            cur = nxt;
+        }
+        if path.len() >= 2 {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn allele_frequency(matrix: &BinaryMatrix, m: usize) -> f64 {
+    let mut n0 = 0usize;
+    let mut n1 = 0usize;
+    for &cell in &matrix.data[m] {
+        match cell {
+            Some(0) => n0 += 1,
+            Some(1) => n1 += 1,
+            _ => {}
+        }
+    }
+    let denom = n0 + n1;
+    if denom == 0 {
+        0.0
+    } else {
+        n1 as f64 / denom as f64
+    }
+}
+
+/// P(m | o) among jointly called reads; 0.5 if never observed together with o=1.
+fn nesting_p_m_given_o(matrix: &BinaryMatrix, m: usize, o: usize) -> f64 {
+    let mut n11 = 0usize;
+    let mut n01 = 0usize;
+    for (&cm, &co) in matrix.data[m].iter().zip(matrix.data[o].iter()) {
+        let (Some(vm), Some(vo)) = (cm, co) else { continue };
+        if vo == 1 && vm == 1 {
+            n11 += 1;
+        } else if vo == 1 && vm == 0 {
+            n01 += 1;
+        }
+    }
+    let denom = n11 + n01;
+    if denom == 0 {
+        0.5
+    } else {
+        n11 as f64 / denom as f64
+    }
+}
+
+fn order_path_by_nesting(path: &[usize], matrix: &BinaryMatrix) -> Vec<usize> {
+    let mut scored: Vec<(usize, f64, f64)> = path
+        .iter()
+        .map(|&m| {
+            let others: Vec<usize> = path.iter().copied().filter(|&o| o != m).collect();
+            let nest = if others.is_empty() {
+                0.5
+            } else {
+                others
+                    .iter()
+                    .map(|&o| nesting_p_m_given_o(matrix, m, o))
+                    .sum::<f64>()
+                    / others.len() as f64
+            };
+            let af = allele_frequency(matrix, m);
+            (m, nest, af)
+        })
+        .collect();
+    // Ancestral → derived: higher nest, then higher AF.
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    scored.into_iter().map(|(m, _, _)| m).collect()
+}
+
+fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usize]) -> MutationTree {
+    debug_assert_eq!(old_path.len(), new_order.len());
+    let children = tree.children_of();
+    let external_parent = tree.parent[old_path[0]];
+    let old_tip = *old_path.last().unwrap();
+    let new_tip = *new_order.last().unwrap();
+
+    let mut parent = tree.parent.clone();
+    parent[new_order[0]] = external_parent;
+    for i in 1..new_order.len() {
+        parent[new_order[i]] = new_order[i - 1];
+    }
+    // Distal children of the old tip (not on the unary path) follow the new tip.
+    let on_path: std::collections::HashSet<usize> = old_path.iter().copied().collect();
+    for &c in &children[old_tip] {
+        if !on_path.contains(&c) {
+            parent[c] = new_tip;
+        }
+    }
+    MutationTree {
+        n_mutations: tree.n_mutations,
+        parent,
+    }
+}
+
 /// Run the MCMC mutation-tree search (starting from an NJ-tree-derived guess
 /// when one can be built), attach every read to its best-fitting node, and
 /// write all four SCITE output files with the given `output_prefix`.
@@ -813,6 +972,10 @@ pub fn run_scite_pipeline(
     let rates = ErrorRates { fp_rate, fn_rate };
     let (tree, ll) = run_mcmc_multichain(binary, &rates, n_iterations, n_chains, initial_tree.as_ref(), seed);
     info!("[SCITE] Best tree log-likelihood: {ll:.3}");
+
+    let tree = polish_unary_path_order(&tree, binary, &rates);
+    let ll_polish = tree_log_likelihood(binary, &tree, &rates);
+    info!("[SCITE] After unary-path polish log-likelihood: {ll_polish:.3}");
 
     let cleaned = attach_all_reads(binary, &tree, &rates);
 
@@ -1391,5 +1554,72 @@ mod tests {
             content,
             "(H0001_n3:1[&&NHX:mutation=mA:reads=3],H0000_n5:0[&&NHX:reads=5])ROOT;\n"
         );
+    }
+
+    #[test]
+    fn polish_unary_path_order_restores_nesting_preferred_order() {
+        // Truth nesting: A(0) ancestral to B(1). Reversed tree has B under ROOT, A under B.
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+        let matrix = BinaryMatrix {
+            variants: vec!["A".into(), "B".into()],
+            reads: (0..10).map(|i| format!("r{i}")).collect(),
+            // 6 A-only, 4 both, 0 B-only → clear A→B nesting
+            data: vec![
+                vec![Some(1); 10],
+                vec![Some(0); 6].into_iter().chain(vec![Some(1); 4]).collect(),
+            ],
+        };
+        let reversed = MutationTree { n_mutations: 2, parent: vec![1, 2, 2] };
+        let polished = polish_unary_path_order(&reversed, &matrix, &rates);
+        // A under ROOT, B under A
+        assert_eq!(polished.parent[0], 2);
+        assert_eq!(polished.parent[1], 0);
+    }
+
+    #[test]
+    fn polish_unary_path_order_is_noop_when_order_already_matches_nesting() {
+        // Correct A→B already matches nesting; polish must leave parents unchanged
+        // (covers the reject/no-op path of the LL gate when the candidate equals current).
+        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.001 };
+        let matrix = BinaryMatrix {
+            variants: vec!["A".into(), "B".into()],
+            reads: (0..10).map(|i| format!("r{i}")).collect(),
+            data: vec![
+                vec![Some(1); 10],
+                vec![Some(0); 6].into_iter().chain(vec![Some(1); 4]).collect(),
+            ],
+        };
+        let correct = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        let polished = polish_unary_path_order(&correct, &matrix, &rates);
+        assert_eq!(polished.parent, correct.parent);
+    }
+
+    #[test]
+    fn polish_unary_path_order_moves_distal_children_to_new_tip() {
+        // Path ROOT→0→1 with distal children 2,3 under tip 1. Nesting prefers 1 ancestral to 0.
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+        // Variants: 0,1 on path; 2,3 distal (unique to their branches).
+        // Nesting for {0,1}: make 1 look ancestral to 0 (1 present whenever 0 is).
+        let matrix = BinaryMatrix {
+            variants: vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
+            reads: (0..8).map(|i| format!("r{i}")).collect(),
+            data: vec![
+                // m0: present in reads 4..7 only
+                vec![Some(0); 4].into_iter().chain(vec![Some(1); 4]).collect(),
+                // m1: present in all reads 0..7 (ancestral to m0)
+                vec![Some(1); 8],
+                // m2: tip lineage under old tip
+                vec![Some(0); 6].into_iter().chain(vec![Some(1); 2]).collect(),
+                vec![Some(0); 4].into_iter().chain(vec![Some(1); 2]).chain(vec![Some(0); 2]).collect(),
+            ],
+        };
+        // parent: 0→root(4), 1→0, 2→1, 3→1
+        let tree = MutationTree { n_mutations: 4, parent: vec![4, 0, 1, 1, 4] };
+        let polished = polish_unary_path_order(&tree, &matrix, &rates);
+        // After reorder: 1 under ROOT, 0 under 1, distal 2 and 3 under new tip 0
+        assert_eq!(polished.parent[1], 4);
+        assert_eq!(polished.parent[0], 1);
+        assert_eq!(polished.parent[2], 0);
+        assert_eq!(polished.parent[3], 0);
     }
 }

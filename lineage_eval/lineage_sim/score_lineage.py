@@ -63,6 +63,16 @@ def _pc_edges(parent_map: dict[str, str], keep: set[str]) -> set[tuple[str, str]
     return edges
 
 
+def _ue_edges(parent_map: dict[str, str], keep: set[str]) -> set[frozenset[str]]:
+    """Undirected parent--child edges restricted to `keep` (excludes ROOT edges)."""
+    return {frozenset(e) for e in _pc_edges(parent_map, keep)}
+
+
+def _path_undirected_pairs(anc_pairs: set[tuple[str, str]]) -> set[frozenset[str]]:
+    """Direction-agnostic ancestor--descendant pairs."""
+    return {frozenset(p) for p in anc_pairs}
+
+
 def _tree_graph(parent_map: dict[str, str]) -> dict[str, set[str]]:
     """Undirected adjacency over all tree nodes (variants + ROOT).
 
@@ -243,6 +253,24 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars) -> dict:
     recon_edges = _pc_edges(recon_parent, shared)
     pc_recall = (len(truth_edges & recon_edges) / len(truth_edges)) if truth_edges else 0.0
 
+    truth_ue = _ue_edges(truth_parent, shared)
+    recon_ue = _ue_edges(recon_parent, shared)
+    ue_inter = truth_ue & recon_ue
+    ue_precision = len(ue_inter) / len(recon_ue) if recon_ue else 0.0
+    ue_recall = len(ue_inter) / len(truth_ue) if truth_ue else 0.0
+
+    truth_clades = _clades(truth_anc, shared)
+    recon_clades = _clades(recon_anc, shared)
+    clade_inter = truth_clades & recon_clades
+    clade_precision = len(clade_inter) / len(recon_clades) if recon_clades else 0.0
+    clade_recall = len(clade_inter) / len(truth_clades) if truth_clades else 0.0
+
+    truth_path_u = _path_undirected_pairs(tp_pairs)
+    recon_path_u = _path_undirected_pairs(rp_pairs)
+    path_u_inter = truth_path_u & recon_path_u
+    path_undirected_precision = len(path_u_inter) / len(recon_path_u) if recon_path_u else 0.0
+    path_undirected_recall = len(path_u_inter) / len(truth_path_u) if truth_path_u else 0.0
+
     # --- topology distances on the shared variant set ---
     rf, rf_norm = robinson_foulds(truth_anc, recon_anc, shared)
     quartet_dist, quartet_norm = quartet_distance(truth_parent, recon_parent, shared)
@@ -262,13 +290,25 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars) -> dict:
         "rf_norm": rf_norm,
         "quartet_dist": quartet_dist,
         "quartet_norm": quartet_norm,
+        "ue_precision": ue_precision,
+        "ue_recall": ue_recall,
+        "ue_f1": _f1(ue_precision, ue_recall),
+        "clade_precision": clade_precision,
+        "clade_recall": clade_recall,
+        "clade_f1": _f1(clade_precision, clade_recall),
+        "path_undirected_precision": path_undirected_precision,
+        "path_undirected_recall": path_undirected_recall,
+        "path_undirected_f1": _f1(path_undirected_precision, path_undirected_recall),
     }
 
 
 FIELDS = ["profile", "fp", "fn", "n_truth_vars", "n_detected_vars", "n_shared",
           "var_precision", "var_recall", "var_f1",
           "ad_precision", "ad_recall", "ad_f1", "pc_recall",
-          "rf", "rf_norm", "quartet_dist", "quartet_norm"]
+          "rf", "rf_norm", "quartet_dist", "quartet_norm",
+          "ue_precision", "ue_recall", "ue_f1",
+          "clade_precision", "clade_recall", "clade_f1",
+          "path_undirected_precision", "path_undirected_recall", "path_undirected_f1"]
 
 
 def main() -> None:

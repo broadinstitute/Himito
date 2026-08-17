@@ -817,7 +817,7 @@ pub fn polish_unary_path_order(
         let ll_new = tree_log_likelihood(matrix, &candidate, rates);
         if ll_new >= ll_old - 1e-6 {
             info!(
-                "[SCITE] Unary-path polish accepted on {} mutations (ΔLL={:.3}): {} → {}",
+                "[SCITE] Unary-path polish accepted on {} mutations (ΔLL={:.3}): [{}] => [{}]",
                 path.len(),
                 ll_new - ll_old,
                 path_names.join(" → "),
@@ -826,7 +826,7 @@ pub fn polish_unary_path_order(
             current = candidate;
         } else {
             info!(
-                "[SCITE] Unary-path polish rejected on {} mutations (ΔLL={:.3}): {} → {}",
+                "[SCITE] Unary-path polish rejected on {} mutations (ΔLL={:.3}): [{}] => [{}]",
                 path.len(),
                 ll_new - ll_old,
                 path_names.join(" → "),

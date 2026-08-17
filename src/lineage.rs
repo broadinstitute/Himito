@@ -672,7 +672,7 @@ pub fn resolve_error_rates(
 ) -> (f64, f64) {
     let (default_fp, default_fn) = match data_type {
         "pacbio" => (0.005, 0.05),
-        "ont-denoised" => (0.0001, 0.001),
+        "ont-denoised" => (0.0001, 0.01),
         "ont-r10" => (0.001, 0.05),
         "ont-r9" => (0.001, 0.05),
         // ont-r9 / ont-r10 and anything else: raw long-read noise levels.

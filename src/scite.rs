@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::fs::File;
 use anyhow::{Context, Result};
@@ -52,7 +53,19 @@ impl Mask {
         let word = i / 64;
         word < self.words.len() && (self.words[word] & (1u64 << (i % 64))) != 0
     }
+
+    /// Number of set bits (mutations carried).
+    #[inline]
+    pub fn count_ones(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
 }
+
+/// Log-likelihood differences below this are treated as exact ties. Attachment
+/// and unary-path ordering both have genuinely flat regions (see
+/// `polish_unary_path_order`), and resolving those by float noise makes the
+/// output depend on iteration order rather than on the data.
+const LL_TIE_EPS: f64 = 1e-9;
 
 /// A SCITE-style mutation tree: `n_mutations` mutation nodes (ids
 /// `0..n_mutations`, in the same order as `BinaryMatrix::variants`) plus one
@@ -187,6 +200,12 @@ pub fn attachment_log_likelihood(
 
 /// The tree node (mutation node or root) whose implied genotype best
 /// explains `profile` under `rates`, together with that best log-likelihood.
+///
+/// Ties are broken parsimoniously: among nodes that explain the read equally
+/// well, the one carrying the fewest mutations wins. A read that is uncovered
+/// at a variant pays nothing for having it imputed as alt, so without this
+/// tie-break every partially-covered read drifts to the deepest tied node and
+/// `attach_all_reads` writes alt calls that no observation supports.
 pub fn best_attachment(
     profile: &[Option<u8>],
     tree: &MutationTree,
@@ -194,12 +213,17 @@ pub fn best_attachment(
 ) -> (usize, f64) {
     let mut best_node = tree.root();
     let mut best_ll = f64::NEG_INFINITY;
+    let mut best_muts = usize::MAX;
     for node in 0..=tree.n_mutations {
         let mask = tree.ancestor_mask(node);
         let ll = attachment_log_likelihood(profile, &mask, rates);
-        if ll > best_ll {
-            best_ll = ll;
+        let n_muts = mask.count_ones();
+        let strictly_better = ll > best_ll + LL_TIE_EPS;
+        let tied_and_simpler = (ll - best_ll).abs() <= LL_TIE_EPS && n_muts < best_muts;
+        if strictly_better || tied_and_simpler {
+            best_ll = best_ll.max(ll);
             best_node = node;
+            best_muts = n_muts;
         }
     }
     (best_node, best_ll)
@@ -659,36 +683,173 @@ pub fn write_molecule_summary(matrix: &CleanedMatrix, path: &str) -> Result<()> 
     Ok(())
 }
 
-pub fn write_mutation_tree(tree: &MutationTree, matrix: &CleanedMatrix, path: &str) -> Result<()> {
+/// How much evidence pins the order of one parent→child edge.
+///
+/// Both fields are `None` when the parent is the root: there is no mutation
+/// above to swap with, so the edge has no order to support.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EdgeEvidence {
+    /// Log-likelihood (nats) lost by swapping this mutation with its parent.
+    /// Near zero means the two could be exchanged without the data noticing.
+    pub support_ll: Option<f64>,
+    /// `(n_child_without_parent, n_parent_without_child)` over reads calling
+    /// both sites. A near-tie here means the order is a coin flip even when
+    /// `support_ll` looks large, because each read of margin is worth
+    /// `ln((1-β)/β)` nats — at β = 0.05 that is 2.94 nats for a single read.
+    pub counts: Option<(usize, usize)>,
+}
+
+/// Significance level for the count margin behind an edge's order.
+const ORDER_SIGN_TEST_ALPHA: f64 = 0.05;
+/// Minimum likelihood margin (nats) for an edge's order to count as resolved.
+const ORDER_MIN_SUPPORT_LL: f64 = 1.0;
+
+impl EdgeEvidence {
+    /// Whether the data actually resolves this edge's parent→child direction:
+    /// `Some(true)` resolved, `Some(false)` arbitrary, `None` no order to resolve
+    /// (the parent is the root).
+    ///
+    /// Both tests must pass. The likelihood margin alone is not enough, because
+    /// each read of count margin is worth `ln((1-β)/β)` nats — 2.94 at β = 0.05 —
+    /// so a single read can look like decisive evidence. The sign test on the
+    /// counts asks the blunter question: would a margin this large arise from a
+    /// coin flip? On the ont-r10 eval set this pair of tests separates every
+    /// correctly-ordered edge (p ≤ 0.047) from both arbitrary ones (p = 0.5).
+    pub fn order_resolved(&self) -> Option<bool> {
+        let (n_child, n_parent) = self.counts?;
+        let support = self.support_ll?;
+        if support < ORDER_MIN_SUPPORT_LL {
+            return Some(false);
+        }
+        Some(sign_test_p(n_child, n_parent) < ORDER_SIGN_TEST_ALPHA)
+    }
+}
+
+/// Two-sided-in-spirit sign test on a count margin: `P(X ≥ max(a, b))` for
+/// `X ~ Binomial(a + b, 0.5)`. Returns 1.0 for an empty table.
+fn sign_test_p(a: usize, b: usize) -> f64 {
+    let n = a + b;
+    if n == 0 {
+        return 1.0;
+    }
+    let k = a.max(b);
+    let ln_half_pow = (n as f64) * 0.5f64.ln();
+    (k..=n)
+        .map(|i| (lchoose(n as f64, i as f64) + ln_half_pow).exp())
+        .sum::<f64>()
+        .min(1.0)
+}
+
+/// Log-likelihood lost by swapping `node` with its parent, i.e. the evidence
+/// pinning this edge's direction. `None` when the parent is the root.
+///
+/// This is the same quantity the unary-path hill climb maximises, reported so a
+/// reader can tell an order the data insists on from one that was picked
+/// arbitrarily off a flat likelihood.
+pub fn edge_order_support(
+    tree: &MutationTree,
+    matrix: &BinaryMatrix,
+    rates: &ErrorRates,
+    node: usize,
+) -> Option<f64> {
+    let parent = tree.parent[node];
+    if parent == tree.root() || node == tree.root() {
+        return None;
+    }
+    let swapped = swap_labels(tree, node, parent);
+    Some(tree_log_likelihood(matrix, tree, rates) - tree_log_likelihood(matrix, &swapped, rates))
+}
+
+/// [`EdgeEvidence`] for every mutation node, indexed by mutation id.
+pub fn edge_evidence(
+    tree: &MutationTree,
+    matrix: &BinaryMatrix,
+    rates: &ErrorRates,
+) -> Vec<EdgeEvidence> {
+    (0..tree.n_mutations)
+        .map(|node| {
+            let parent = tree.parent[node];
+            if parent == tree.root() {
+                EdgeEvidence { support_ll: None, counts: None }
+            } else {
+                EdgeEvidence {
+                    support_ll: edge_order_support(tree, matrix, rates, node),
+                    counts: Some(orientation_counts(matrix, node, parent)),
+                }
+            }
+        })
+        .collect()
+}
+
+fn format_support(support: Option<f64>) -> String {
+    match support {
+        Some(s) => format!("{s:.3}"),
+        None => "NA".to_string(),
+    }
+}
+
+pub fn write_mutation_tree(
+    tree: &MutationTree,
+    matrix: &CleanedMatrix,
+    evidence: &[EdgeEvidence],
+    path: &str,
+) -> Result<()> {
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
-    writeln!(w, "node_id\tvariant\tparent_id\tparent_variant\tn_reads_attached")?;
+    writeln!(
+        w,
+        "node_id\tvariant\tparent_id\tparent_variant\tn_reads_attached\t\
+         order_support_ll\tn_child_without_parent\tn_parent_without_child"
+    )?;
     let node_name = |id: usize| -> String {
         if id == tree.root() { "ROOT".to_string() } else { matrix.variants[id].clone() }
     };
     for node in 0..=tree.n_mutations {
         let parent = tree.parent[node];
         let n_reads = matrix.attachment.iter().filter(|&&a| a == node).count();
-        writeln!(w, "{node}\t{}\t{parent}\t{}\t{n_reads}", node_name(node), node_name(parent))?;
+        let ev = evidence.get(node);
+        let support = format_support(ev.and_then(|e| e.support_ll));
+        let (n_child, n_parent) = match ev.and_then(|e| e.counts) {
+            Some((c, p)) => (c.to_string(), p.to_string()),
+            None => ("NA".to_string(), "NA".to_string()),
+        };
+        writeln!(
+            w,
+            "{node}\t{}\t{parent}\t{}\t{n_reads}\t{support}\t{n_child}\t{n_parent}",
+            node_name(node),
+            node_name(parent)
+        )?;
     }
     Ok(())
 }
 
 /// Recursively emit the Newick token for the subtree at `node`. `edge_muts` are
-/// the mutations accumulated (ancestral→derived) on the branch leading into the
-/// node that will actually be emitted here — pass-through mutation nodes fold
-/// their mutation into this list rather than becoming their own node.
+/// the mutation ids accumulated (ancestral→derived) on the branch leading into
+/// the node that will actually be emitted here — pass-through mutation nodes fold
+/// their mutation into this list rather than becoming their own node. Each branch
+/// reports an `order_support` list parallel to its `mutation` list, so a collapsed
+/// run whose internal order the data does not resolve is visible as such.
 fn emit_lineage_node(
     node: usize,
-    edge_muts: &[String],
+    edge_muts: &[usize],
     tree: &MutationTree,
     children: &[Vec<usize>],
     haps_by_node: &[Vec<(String, usize)>],
     variants: &[String],
+    evidence: &[EdgeEvidence],
 ) -> String {
     let is_root = node == tree.root();
     let child_nodes = &children[node];
     let haps = &haps_by_node[node];
     let n_effective = child_nodes.len() + haps.len();
+    let mut_names = |muts: &[usize]| -> String {
+        muts.iter().map(|&m| variants[m].as_str()).collect::<Vec<&str>>().join(",")
+    };
+    let mut_support = |muts: &[usize]| -> String {
+        muts.iter()
+            .map(|&m| format_support(evidence.get(m).and_then(|e| e.support_ll)))
+            .collect::<Vec<String>>()
+            .join(",")
+    };
 
     // Collapse: a non-root node with a single effective child is dissolved.
     if !is_root && n_effective == 1 {
@@ -696,15 +857,16 @@ fn emit_lineage_node(
             // Single child-lineage: recurse, appending this node's edge mutations.
             let c = child_nodes[0];
             let mut muts = edge_muts.to_vec();
-            muts.push(variants[c].clone());
-            return emit_lineage_node(c, &muts, tree, children, haps_by_node, variants);
+            muts.push(c);
+            return emit_lineage_node(c, &muts, tree, children, haps_by_node, variants, evidence);
         } else {
             // Single haplotype tip: the mutation(s) ride on that tip's branch.
             let (hid, count) = &haps[0];
             return format!(
-                "{hid}_n{count}:{}[&&NHX:mutation={}:reads={count}]",
+                "{hid}_n{count}:{}[&&NHX:mutation={}:order_support={}:reads={count}]",
                 edge_muts.len(),
-                edge_muts.join(",")
+                mut_names(edge_muts),
+                mut_support(edge_muts)
             );
         }
     }
@@ -712,8 +874,7 @@ fn emit_lineage_node(
     // Otherwise this node is emitted (branch point, root, or dead-end).
     let mut tokens: Vec<String> = Vec::new();
     for &c in child_nodes {
-        let muts = vec![variants[c].clone()];
-        tokens.push(emit_lineage_node(c, &muts, tree, children, haps_by_node, variants));
+        tokens.push(emit_lineage_node(c, &[c], tree, children, haps_by_node, variants, evidence));
     }
 
     if is_root {
@@ -733,12 +894,16 @@ fn emit_lineage_node(
     }
 
     let blen = edge_muts.len();
-    let muts = edge_muts.join(",");
+    let muts = mut_names(edge_muts);
+    let support = mut_support(edge_muts);
     if tokens.is_empty() {
         // Dead-end ancestral node (no descendants, no reads) — keep the mutation.
-        format!("anc{node}:{blen}[&&NHX:mutation={muts}]")
+        format!("anc{node}:{blen}[&&NHX:mutation={muts}:order_support={support}]")
     } else {
-        format!("({})anc{node}:{blen}[&&NHX:mutation={muts}]", tokens.join(","))
+        format!(
+            "({})anc{node}:{blen}[&&NHX:mutation={muts}:order_support={support}]",
+            tokens.join(",")
+        )
     }
 }
 
@@ -746,11 +911,14 @@ fn emit_lineage_node(
 /// to `path`. Tips are haplotypes (labeled `H<id>_n<reads>`, with a machine-
 /// readable `reads` NHX field); branches carry the mutations acquired, and
 /// pass-through mutation nodes are collapsed so mutations ride on a single
-/// branch (comma-joined, ancestral→derived).
+/// branch (comma-joined, ancestral→derived). Each branch also carries an
+/// `order_support` list parallel to `mutation`: the nats of likelihood pinning
+/// each mutation above the next, or `NA` where there is no mutation above.
 pub fn write_read_lineage_newick(
     tree: &MutationTree,
     hap_matrix: &HaplotypeMatrix,
     rates: &ErrorRates,
+    evidence: &[EdgeEvidence],
     path: &str,
 ) -> Result<()> {
     let children = tree.children_of();
@@ -767,6 +935,7 @@ pub fn write_read_lineage_newick(
         &children,
         &haps_by_node,
         &hap_matrix.variants,
+        evidence,
     );
 
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
@@ -774,12 +943,27 @@ pub fn write_read_lineage_newick(
     Ok(())
 }
 
-/// Reorder mutations on each maximal unary path by allele frequency (nesting
-/// tie-break). Accepts a path reorder only if tree log-likelihood does not drop
-/// by more than 1e-6.
+/// Re-order the mutations on each maximal unary path towards the maximum-
+/// likelihood ordering, using the orientation ranking (see
+/// [`order_path_by_orientation`]) as both the starting candidate and the
+/// tie-break on likelihood-flat stretches.
 ///
-/// AF is primary because ONT false negatives inflate “child without parent”
-/// counts and can invert co-occurrence nesting toward the wrong order.
+/// Why a path needs polishing at all: on a unary path only the reads that
+/// attach to an *interior* node distinguish one ordering from another, and a
+/// false negative at the ancestral mutation turns a "carries both" read into a
+/// "carries only the child" read — precisely the observation that argues for the
+/// reversed order. So the MCMC's choice of ordering along a chain is decided by
+/// a handful of reads, and where no read attaches in the interior the likelihood
+/// is exactly flat and the choice is pure noise.
+///
+/// The search is a hill climb over adjacent transpositions. Swapping two
+/// neighbours on a unary path changes exactly one implied genotype (the prefix
+/// between them), which makes it the natural elementary move; a full-path
+/// candidate, in contrast, is all-or-nothing, so one bad pair anywhere on a long
+/// path throws away every other correction. A swap is taken when it strictly
+/// improves the likelihood, or when the likelihood is tied and the swap moves
+/// towards the orientation-preferred order — the latter is what makes flat
+/// stretches deterministic instead of iteration-order dependent.
 pub fn polish_unary_path_order(
     tree: &MutationTree,
     matrix: &BinaryMatrix,
@@ -796,41 +980,86 @@ pub fn polish_unary_path_order(
         if path.len() < 2 {
             continue;
         }
-        let path_names: Vec<&str> = path
-            .iter()
-            .map(|&i| matrix.variants[i].as_str())
-            .collect();
-        let ordered = order_path_by_af(&path, matrix);
-        let ordered_names: Vec<&str> = ordered
-            .iter()
-            .map(|&i| matrix.variants[i].as_str())
-            .collect();
-        if ordered == path {
-            info!(
-                "[SCITE] Unary-path polish skip (already AF-ordered): {}",
-                path_names.join(" → ")
-            );
-            continue;
+        let names = |order: &[usize]| -> String {
+            order
+                .iter()
+                .map(|&i| matrix.variants[i].as_str())
+                .collect::<Vec<&str>>()
+                .join(" → ")
+        };
+        let start_names = names(&path);
+        let ll_start = tree_log_likelihood(matrix, &current, rates);
+
+        // Rank preferred by the data-driven orientation statistic; used to seed
+        // the climb and to break exact likelihood ties in a fixed direction.
+        let preferred = order_path_by_orientation(&path, matrix);
+        let rank: HashMap<usize, usize> =
+            preferred.iter().enumerate().map(|(i, &m)| (m, i)).collect();
+
+        let mut order = path.clone();
+        let mut ll = ll_start;
+        let mut swaps = 0usize;
+        let mut seeded = false;
+
+        // Seed with the full orientation ordering when it does not cost likelihood.
+        if preferred != order {
+            let candidate = apply_path_reorder(&current, &order, &preferred);
+            let ll_candidate = tree_log_likelihood(matrix, &candidate, rates);
+            if ll_candidate >= ll - 1e-6 {
+                current = candidate;
+                order = preferred.clone();
+                ll = ll_candidate;
+                seeded = true;
+            }
         }
-        let candidate = apply_path_reorder(&current, &path, &ordered);
-        let ll_old = tree_log_likelihood(matrix, &current, rates);
-        let ll_new = tree_log_likelihood(matrix, &candidate, rates);
-        if ll_new >= ll_old - 1e-6 {
+
+        // Hill climb on adjacent transpositions. Each accepted move either
+        // strictly raises the likelihood or strictly reduces the number of
+        // inversions against `rank` at equal likelihood, so this terminates; the
+        // pass cap is belt-and-braces against float noise.
+        let max_passes = order.len() * order.len() + 8;
+        for _ in 0..max_passes {
+            let mut improved = false;
+            for i in 0..order.len() - 1 {
+                let mut trial_order = order.clone();
+                trial_order.swap(i, i + 1);
+                let trial = apply_path_reorder(&current, &order, &trial_order);
+                let trial_ll = tree_log_likelihood(matrix, &trial, rates);
+                let strictly_better = trial_ll > ll + LL_TIE_EPS;
+                let tied_and_preferred = (trial_ll - ll).abs() <= LL_TIE_EPS
+                    && rank[&trial_order[i]] < rank[&order[i]];
+                if strictly_better || tied_and_preferred {
+                    current = trial;
+                    order = trial_order;
+                    ll = ll.max(trial_ll);
+                    swaps += 1;
+                    improved = true;
+                }
+            }
+            if !improved {
+                break;
+            }
+        }
+
+        if order == path {
             info!(
-                "[SCITE] Unary-path polish accepted on {} mutations (ΔLL={:.3}): [{}] => [{}]",
+                "[SCITE] Unary-path polish: {} mutations unchanged [{}]",
                 path.len(),
-                ll_new - ll_old,
-                path_names.join(" → "),
-                ordered_names.join(" → ")
+                start_names
             );
-            current = candidate;
         } else {
+            let how = match (seeded, swaps) {
+                (true, 0) => "orientation order adopted".to_string(),
+                (true, n) => format!("orientation order adopted, then {n} swap(s)"),
+                (false, n) => format!("{n} swap(s)"),
+            };
             info!(
-                "[SCITE] Unary-path polish rejected on {} mutations (ΔLL={:.3}): [{}] => [{}]",
+                "[SCITE] Unary-path polish: {} mutations reordered ({how}, ΔLL={:.3}): \
+                 [{}] => [{}]",
                 path.len(),
-                ll_new - ll_old,
-                path_names.join(" → "),
-                ordered_names.join(" → ")
+                ll - ll_start,
+                start_names,
+                names(&order)
             );
         }
     }
@@ -905,8 +1134,58 @@ fn nesting_p_m_given_o(matrix: &BinaryMatrix, m: usize, o: usize) -> f64 {
     }
 }
 
-fn order_path_by_af(path: &[usize], matrix: &BinaryMatrix) -> Vec<usize> {
-    let mut scored: Vec<(usize, f64, f64)> = path
+/// Coverage-matched orientation counts for the pair `(m, o)`, over reads that
+/// call *both* sites: `(n10, n01)` = (m alt & o ref, m ref & o alt).
+fn orientation_counts(matrix: &BinaryMatrix, m: usize, o: usize) -> (usize, usize) {
+    let mut n10 = 0usize;
+    let mut n01 = 0usize;
+    for (&cm, &co) in matrix.data[m].iter().zip(matrix.data[o].iter()) {
+        let (Some(vm), Some(vo)) = (cm, co) else { continue };
+        match (vm, vo) {
+            (1, 0) => n10 += 1,
+            (0, 1) => n01 += 1,
+            _ => {}
+        }
+    }
+    (n10, n01)
+}
+
+/// Signed orientation score of `m` against the other mutations on its path:
+/// `Σ_o (n10 - n01)`, positive when `m` tends to be the one seen *without* its
+/// partner and therefore the more ancestral of the pair.
+///
+/// Under a perfect phylogeny with false-negative rate β, if `m` is ancestral to
+/// `o` then a `(m=0, o=1)` read requires a dropout at `m` (probability β) while
+/// `(m=1, o=0)` reads are genuine, so the pairwise log-likelihood ratio between
+/// the two orientations is `(n10 - n01) · ln((1-β)/β)`. That weight is a
+/// positive constant shared by every pair on the path, so it scales the score
+/// without changing the ordering and is left out. Summing the signed pairwise
+/// margins and sorting (a Borda ranking of the orientation tournament) is the
+/// standard cheap approximation to minimum-violation ranking; the likelihood
+/// hill climb in `polish_unary_path_order` then refines it.
+///
+/// This is deliberately restricted to jointly covered reads: comparing raw
+/// allele frequencies across sites with different depth is not meaningful, and
+/// mitochondrial coverage is uneven enough (read ends, NUMT filtering) for that
+/// bias to invert the order on its own.
+fn orientation_score(matrix: &BinaryMatrix, m: usize, path: &[usize]) -> i64 {
+    path.iter()
+        .filter(|&&o| o != m)
+        .map(|&o| {
+            let (n10, n01) = orientation_counts(matrix, m, o);
+            n10 as i64 - n01 as i64
+        })
+        .sum()
+}
+
+/// Ancestral → derived ordering of the mutations on one unary path.
+///
+/// Primary key is the coverage-matched pairwise orientation score; allele
+/// frequency (a marginal statistic, which also uses reads covering only one of
+/// the two sites) breaks its ties, then mean nesting, then the variant index so
+/// the result is deterministic on genuinely tied data.
+fn order_path_by_orientation(path: &[usize], matrix: &BinaryMatrix) -> Vec<usize> {
+    let mut scored: Vec<(usize, i64, f64, f64)> = path
         .iter()
         .map(|&m| {
             let others: Vec<usize> = path.iter().copied().filter(|&o| o != m).collect();
@@ -919,18 +1198,16 @@ fn order_path_by_af(path: &[usize], matrix: &BinaryMatrix) -> Vec<usize> {
                     .sum::<f64>()
                     / others.len() as f64
             };
-            let af = allele_frequency(matrix, m);
-            (m, af, nest)
+            (m, orientation_score(matrix, m, path), allele_frequency(matrix, m), nest)
         })
         .collect();
-    // Ancestral → derived: higher AF first (ONT-robust); nesting only breaks ties.
     scored.sort_by(|a, b| {
-        b.1.partial_cmp(&a.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        b.1.cmp(&a.1)
             .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal))
             .then_with(|| a.0.cmp(&b.0))
     });
-    scored.into_iter().map(|(m, _, _)| m).collect()
+    scored.into_iter().map(|(m, _, _, _)| m).collect()
 }
 
 fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usize]) -> MutationTree {
@@ -1004,11 +1281,36 @@ pub fn run_scite_pipeline(
 
     let cleaned = attach_all_reads(binary, &tree, &rates);
 
+    // Per-edge order evidence: how much likelihood pins each mutation above its
+    // parent, and the read counts behind it. Reported rather than acted on — a
+    // near-tie means the pipeline had to pick one of several equally good orders.
+    let evidence = edge_evidence(&tree, binary, &rates);
+    let unresolved: Vec<String> = (0..tree.n_mutations)
+        .filter(|&m| evidence[m].order_resolved() == Some(false))
+        .map(|m| {
+            let (n_child, n_parent) = evidence[m].counts.unwrap_or((0, 0));
+            format!(
+                "{} under {} ({:.2} nats, {n_child} vs {n_parent} reads)",
+                binary.variants[m],
+                binary.variants[tree.parent[m]],
+                evidence[m].support_ll.unwrap_or(0.0)
+            )
+        })
+        .collect();
+    if !unresolved.is_empty() {
+        info!(
+            "[SCITE] {} edge(s) whose order this data does not resolve — they could \
+             be exchanged with their parent: {}",
+            unresolved.len(),
+            unresolved.join("; ")
+        );
+    }
+
     write_cleaned_matrix(&cleaned, &format!("{output_prefix}.cleaned_matrix.csv"))?;
     write_variant_cooccurrence(&cleaned, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
     write_raw_variant_cooccurrence(binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
     write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
-    write_mutation_tree(&tree, &cleaned, &format!("{output_prefix}.mutation_tree.tsv"))?;
+    write_mutation_tree(&tree, &cleaned, &evidence, &format!("{output_prefix}.mutation_tree.tsv"))?;
 
     // Deduplicate the SCITE-cleaned reads into haplotypes for the lineage tree.
     // Keep the tree's variant set/order (no prevalence re-filter) so the mutation
@@ -1023,7 +1325,13 @@ pub fn run_scite_pipeline(
             .collect(),
     };
     let cleaned_hap_matrix = lineage::deduplicate(&cleaned_binary, min_reads);
-    write_read_lineage_newick(&tree, &cleaned_hap_matrix, &rates, &format!("{output_prefix}.read_lineage.nwk"))?;
+    write_read_lineage_newick(
+        &tree,
+        &cleaned_hap_matrix,
+        &rates,
+        &evidence,
+        &format!("{output_prefix}.read_lineage.nwk"),
+    )?;
 
     Ok(())
 }
@@ -1111,6 +1419,53 @@ mod tests {
         let (node, ll) = best_attachment(&profile, &tree, &rates);
         assert_eq!(node, 0);
         assert!((ll - expected_ll).abs() < 1e-12);
+    }
+
+    #[test]
+    fn best_attachment_prefers_the_fewest_mutations_among_equally_likely_nodes() {
+        // Chain root(2) -> A(0) -> B(1). The read is uncovered at A and an
+        // explicit ref at B, so ROOT and A explain it identically well. ROOT is
+        // the parsimonious choice; attaching to A would invent an alt call at A.
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let profile = vec![None, Some(0)];
+
+        let (node, ll) = best_attachment(&profile, &tree, &rates);
+        assert_eq!(node, tree.root());
+        // The likelihood is unchanged by the tie-break: one true-negative call.
+        assert!((ll - (1.0 - rates.fp_rate).ln()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn best_attachment_of_a_fully_uncovered_read_is_the_root() {
+        // No observed call at all -> every node has log-likelihood 0. The read
+        // carries no evidence, so it must not be assigned any mutation.
+        let tree = MutationTree { n_mutations: 3, parent: vec![3, 0, 1, 3] };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let profile = vec![None, None, None];
+
+        let (node, ll) = best_attachment(&profile, &tree, &rates);
+        assert_eq!(node, tree.root());
+        assert_eq!(ll, 0.0);
+    }
+
+    #[test]
+    fn attach_all_reads_does_not_fabricate_alt_calls_for_uncovered_sites() {
+        // r_partial is uncovered at A and an explicit ref at B: attaching it
+        // below A would write A=1 into the cleaned matrix out of nothing.
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let matrix = BinaryMatrix {
+            variants: vec!["A".to_string(), "B".to_string()],
+            reads: vec!["r_both".to_string(), "r_partial".to_string()],
+            data: vec![vec![Some(1), None], vec![Some(1), Some(0)]],
+        };
+
+        let cleaned = attach_all_reads(&matrix, &tree, &rates);
+
+        assert_eq!(cleaned.attachment[1], tree.root());
+        assert_eq!(cleaned.data[0], vec![1, 0]);
+        assert_eq!(cleaned.data[1], vec![1, 0]);
     }
 
     #[test]
@@ -1430,16 +1785,21 @@ mod tests {
     fn write_mutation_tree_lists_every_node_with_parent_and_attached_read_count() {
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
         let matrix = small_cleaned_matrix();
+        let evidence = vec![
+            EdgeEvidence { support_ll: None, counts: None },
+            EdgeEvidence { support_ll: Some(4.25), counts: Some((3, 7)) },
+        ];
         let path = std::env::temp_dir().join("himito_test_write_mutation_tree.tsv");
-        write_mutation_tree(&tree, &matrix, path.to_str().unwrap()).unwrap();
+        write_mutation_tree(&tree, &matrix, &evidence, path.to_str().unwrap()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(
             content,
-            "node_id\tvariant\tparent_id\tparent_variant\tn_reads_attached\n\
-             0\tA\t2\tROOT\t1\n\
-             1\tB\t0\tA\t1\n\
-             2\tROOT\t2\tROOT\t0\n"
+            "node_id\tvariant\tparent_id\tparent_variant\tn_reads_attached\t\
+             order_support_ll\tn_child_without_parent\tn_parent_without_child\n\
+             0\tA\t2\tROOT\t1\tNA\tNA\tNA\n\
+             1\tB\t0\tA\t1\t4.250\t3\t7\n\
+             2\tROOT\t2\tROOT\t0\tNA\tNA\tNA\n"
         );
     }
 
@@ -1538,17 +1898,27 @@ mod tests {
         };
 
         let path = std::env::temp_dir().join("himito_test_read_lineage.nwk");
-        write_read_lineage_newick(&tree, &hap_matrix, &rates, path.to_str().unwrap()).unwrap();
+        // mA hangs from the root (no order to support); the rest carry evidence.
+        let evidence = vec![
+            EdgeEvidence { support_ll: None, counts: None },
+            EdgeEvidence { support_ll: Some(12.5), counts: Some((0, 9)) },
+            EdgeEvidence { support_ll: Some(0.0), counts: Some((2, 2)) },
+            EdgeEvidence { support_ll: Some(3.0), counts: Some((1, 4)) },
+        ];
+        write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, path.to_str().unwrap())
+            .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
         // No haplotype carries zero mutations, so the ancestral root state is
-        // materialised as a synthetic zero-read tip (Hroot) under ROOT.
+        // materialised as a synthetic zero-read tip (Hroot) under ROOT. Each
+        // branch reports the per-mutation order support alongside the mutations,
+        // so a collapsed run of mutations whose order is arbitrary is visible.
         assert_eq!(
             content,
-            "((H0_n9:1[&&NHX:mutation=mC:reads=9],\
-             (H1_n7:0[&&NHX:reads=7],H2_n4:0[&&NHX:reads=4])anc3:1[&&NHX:mutation=mD],\
-             H3_n2:0[&&NHX:reads=2])anc1:2[&&NHX:mutation=mA,mB],\
+            "((H0_n9:1[&&NHX:mutation=mC:order_support=0.000:reads=9],\
+             (H1_n7:0[&&NHX:reads=7],H2_n4:0[&&NHX:reads=4])anc3:1[&&NHX:mutation=mD:order_support=3.000],\
+             H3_n2:0[&&NHX:reads=2])anc1:2[&&NHX:mutation=mA,mB:order_support=NA,12.500],\
              Hroot_n0:0[&&NHX:reads=0])ROOT;\n"
         );
     }
@@ -1571,13 +1941,16 @@ mod tests {
         };
 
         let path = std::env::temp_dir().join("himito_test_read_lineage_root_tip.nwk");
-        write_read_lineage_newick(&tree, &hap_matrix, &rates, path.to_str().unwrap()).unwrap();
+        let evidence = vec![EdgeEvidence { support_ll: None, counts: None }];
+        write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, path.to_str().unwrap())
+            .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
         assert_eq!(
             content,
-            "(H0001_n3:1[&&NHX:mutation=mA:reads=3],H0000_n5:0[&&NHX:reads=5])ROOT;\n"
+            "(H0001_n3:1[&&NHX:mutation=mA:order_support=NA:reads=3],\
+             H0000_n5:0[&&NHX:reads=5])ROOT;\n"
         );
     }
 
@@ -1616,6 +1989,195 @@ mod tests {
         let correct = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
         let polished = polish_unary_path_order(&correct, &matrix, &rates);
         assert_eq!(polished.parent, correct.parent);
+    }
+
+    /// Build a matrix from per-variant cell tokens: '1' alt, '0' ref, '.' uncovered.
+    fn matrix_from_rows(names: &[&str], rows: &[&str]) -> BinaryMatrix {
+        let n_reads = rows[0].len();
+        BinaryMatrix {
+            variants: names.iter().map(|s| s.to_string()).collect(),
+            reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
+            data: rows
+                .iter()
+                .map(|row| {
+                    row.chars()
+                        .map(|c| match c {
+                            '1' => Some(1),
+                            '0' => Some(0),
+                            '.' => None,
+                            other => panic!("bad cell {other}"),
+                        })
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn path_order_uses_jointly_covered_counts_not_coverage_biased_allele_frequency() {
+        // A is ancestral: among the 4 reads covering both sites it appears once
+        // without B and never the other way round. But A is only covered in
+        // those 4 reads (AF 2/4 = 0.50) while B is covered in all 20
+        // (AF 12/20 = 0.60), so a global-AF sort puts B first — the per-variant
+        // denominators are not comparable. The coverage-matched pairwise counts
+        // (n10 = 1, n01 = 0) put A first.
+        let matrix = matrix_from_rows(
+            &["A", "B"],
+            &[
+                "1100................",
+                "10001111111111100000",
+            ],
+        );
+        assert!(allele_frequency(&matrix, 0) < allele_frequency(&matrix, 1));
+        assert_eq!(order_path_by_orientation(&[0, 1], &matrix), vec![0, 1]);
+        assert_eq!(order_path_by_orientation(&[1, 0], &matrix), vec![0, 1]);
+    }
+
+    #[test]
+    fn path_order_falls_back_to_allele_frequency_when_joint_counts_are_tied() {
+        // A and B never appear apart among jointly covered reads (n10 = n01 = 0),
+        // so the pairwise statistic is uninformative. The marginal counts still
+        // rank A ancestral, using reads that cover only one of the two sites.
+        let matrix = matrix_from_rows(
+            &["A", "B"],
+            &[
+                "11001111",
+                "1100....",
+            ],
+        );
+        assert_eq!(order_path_by_orientation(&[1, 0], &matrix), vec![0, 1]);
+    }
+
+    #[test]
+    fn polish_reorders_a_path_that_a_global_af_sort_leaves_untouched() {
+        // Same coverage-biased pair as above, with the tree already in the wrong
+        // order (B ancestral). A global-AF sort agrees with the wrong order and
+        // therefore proposes nothing at all.
+        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let matrix = matrix_from_rows(
+            &["A", "B"],
+            &[
+                "1100................",
+                "10001111111111100000",
+            ],
+        );
+        let wrong = MutationTree { n_mutations: 2, parent: vec![1, 2, 2] };
+        let polished = polish_unary_path_order(&wrong, &matrix, &rates);
+        assert_eq!(polished.parent[0], 2, "A should hang from the root");
+        assert_eq!(polished.parent[1], 0, "B should hang from A");
+    }
+
+    #[test]
+    fn polish_keeps_climbing_after_the_first_candidate_ordering() {
+        // Starting chain ROOT -> 2 -> 1 -> 0 (LL -15.706). The orientation sort
+        // proposes 2 -> 0 -> 1, which is an improvement (LL -9.716) but not the
+        // best ordering: 0 -> 2 -> 1 scores -6.722 and is the exhaustive ML over
+        // all six permutations. A single accept/reject on one candidate stops at
+        // the first improvement; adjacent swaps reach the optimum.
+        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let matrix = matrix_from_rows(
+            &["m0", "m1", "m2"],
+            &["10010001111", "0.101.0010.", "101010011.."],
+        );
+        let tree = MutationTree { n_mutations: 3, parent: vec![1, 2, 3, 3] };
+
+        let polished = polish_unary_path_order(&tree, &matrix, &rates);
+
+        assert_eq!(polished.parent[0], 3, "m0 should hang from the root");
+        assert_eq!(polished.parent[2], 0, "m2 should hang from m0");
+        assert_eq!(polished.parent[1], 2, "m1 should hang from m2");
+        let ll = tree_log_likelihood(&matrix, &polished, &rates);
+        assert!(ll > -6.73, "expected the exhaustive-ML likelihood, got {ll}");
+    }
+
+    #[test]
+    fn polish_is_deterministic_and_terminates_on_a_likelihood_flat_path() {
+        // All three variants are carried as a block, so no read attaches to an
+        // interior node and every one of the six orderings has the same
+        // likelihood. The climb must settle on the orientation-preferred order
+        // (index order, since every statistic ties here) instead of cycling.
+        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let matrix = matrix_from_rows(
+            &["A", "B", "C"],
+            &["111111110000", "111111110000", "111111110000"],
+        );
+        let flipped = MutationTree { n_mutations: 3, parent: vec![1, 2, 3, 3] };
+
+        let polished = polish_unary_path_order(&flipped, &matrix, &rates);
+
+        assert_eq!(polished.parent[0], 3);
+        assert_eq!(polished.parent[1], 0);
+        assert_eq!(polished.parent[2], 1);
+        let before = tree_log_likelihood(&matrix, &flipped, &rates);
+        let after = tree_log_likelihood(&matrix, &polished, &rates);
+        assert!((after - before).abs() < 1e-9, "flat path: {before} vs {after}");
+    }
+
+    #[test]
+    fn edge_order_support_is_flat_when_no_read_separates_two_mutations() {
+        // Same block-carried data: nothing distinguishes A above B from B above
+        // A, so the edge carries no evidence at all.
+        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let matrix = matrix_from_rows(
+            &["A", "B", "C"],
+            &["111111110000", "111111110000", "111111110000"],
+        );
+        let chain = MutationTree { n_mutations: 3, parent: vec![3, 0, 1, 3] };
+
+        assert_eq!(edge_order_support(&chain, &matrix, &rates, 0), None, "parent is the root");
+        let s1 = edge_order_support(&chain, &matrix, &rates, 1).unwrap();
+        let s2 = edge_order_support(&chain, &matrix, &rates, 2).unwrap();
+        assert!(s1.abs() < 1e-9, "expected no evidence, got {s1}");
+        assert!(s2.abs() < 1e-9, "expected no evidence, got {s2}");
+    }
+
+    #[test]
+    fn edge_order_support_is_large_when_reads_pin_the_order() {
+        // Six reads carry A without B, none carry B without A, so putting B
+        // above A would have to explain all six as dropouts at B.
+        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let matrix = matrix_from_rows(&["A", "B"], &["1111111111", "1111000000"]);
+        let chain = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+
+        let support = edge_order_support(&chain, &matrix, &rates, 1).unwrap();
+        assert!(support > 5.0, "expected decisive evidence, got {support}");
+    }
+
+    #[test]
+    fn order_resolved_flags_a_near_tie_even_when_the_likelihood_looks_confident() {
+        // Numbers taken from the ont-r10 eval set. The inverted edge carries ~6
+        // nats of likelihood — which reads as confident — but its count margin is
+        // one read (sign-test p = 0.5), so the order is not actually resolved.
+        let inverted = EdgeEvidence { support_ll: Some(5.989), counts: Some((8, 9)) };
+        assert_eq!(inverted.order_resolved(), Some(false));
+
+        // A flat likelihood is unresolved whatever the counts say.
+        let flat = EdgeEvidence { support_ll: Some(0.0), counts: Some((4, 5)) };
+        assert_eq!(flat.order_resolved(), Some(false));
+
+        // Genuinely supported edges from the same tree: lopsided counts.
+        for counts in [(3usize, 28usize), (2, 29), (7, 16), (11, 23)] {
+            let ev = EdgeEvidence { support_ll: Some(26.9), counts: Some(counts) };
+            assert_eq!(ev.order_resolved(), Some(true), "{counts:?} should be resolved");
+        }
+
+        // No mutation above: there is no order to resolve.
+        let root_edge = EdgeEvidence { support_ll: None, counts: None };
+        assert_eq!(root_edge.order_resolved(), None);
+    }
+
+    #[test]
+    fn edge_evidence_reports_the_counts_behind_each_order() {
+        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let matrix = matrix_from_rows(&["A", "B"], &["110", "101"]);
+        let chain = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+
+        let evidence = edge_evidence(&chain, &matrix, &rates);
+        assert_eq!(evidence[0].counts, None, "A hangs from the root");
+        assert_eq!(evidence[0].support_ll, None);
+        // B without A: read 3. A without B: read 2.
+        assert_eq!(evidence[1].counts, Some((1, 1)));
+        assert!(evidence[1].support_ll.is_some());
     }
 
     #[test]
@@ -1687,10 +2249,32 @@ mod tests {
         assert_eq!(polished.parent[ix("m.12183G>C")], root);
         assert_eq!(polished.parent[ix("m.2358A>C")], ix("m.15258A>C"));
         assert_eq!(polished.parent[ix("m.14577T>A")], ix("m.2358A>C"));
-        // AF order on the long chain is 11749 → 12477 → 7102 (truth).
         assert_eq!(polished.parent[ix("m.11749A>T")], root);
-        assert_eq!(polished.parent[ix("m.12477T>G")], ix("m.11749A>T"));
-        assert_eq!(polished.parent[ix("m.7102T>C")], ix("m.12477T>G"));
+
+        // The long chain is recovered as 11749 → {12477, 7102}: 11749 ancestral to
+        // both, as in the truth tree. The order *within* the 12477/7102 pair is not
+        // recoverable from this data set and is deliberately not asserted:
+        //   * the pairwise counts are n10 = 8 vs n01 = 9 — a one-read margin
+        //     (sign-test p ≈ 0.7), so the coverage-matched evidence is a coin flip;
+        //   * the truth order (12477 ancestral) needs 9 dropouts at 12477 while the
+        //     reverse needs 8 at 7102, so *any* likelihood with a symmetric
+        //     false-negative rate prefers the reverse, by ≈ 6 nats;
+        //   * the full pipeline on this same data already returns the reverse
+        //     (`sim_lineage.mutation_tree.tsv`), and did so before this polish
+        //     existed — the old whole-path rule only reached the truth order from
+        //     this artificially flipped starting tree, not from the MCMC's tree.
+        // `edge_order_support` is what surfaces the ambiguity to the user.
+        let chain = [ix("m.12477T>G"), ix("m.7102T>C")];
+        let deep = if polished.parent[chain[0]] == chain[1] { chain[0] } else { chain[1] };
+        let shallow = if deep == chain[0] { chain[1] } else { chain[0] };
+        assert_eq!(polished.parent[shallow], ix("m.11749A>T"));
+        assert_eq!(polished.parent[deep], shallow);
+        let (n10, n01) = orientation_counts(&binary, chain[0], chain[1]);
+        assert!(
+            (n10 as i64 - n01 as i64).abs() <= 2,
+            "this pair is expected to be a near-tie (n10={n10}, n01={n01})"
+        );
+
         assert!(ll1 > ll0 + 1.0, "expected large LL gain from fixing flipped lineages");
     }
 }

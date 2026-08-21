@@ -5,10 +5,14 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-OUTDIR="" PROFILE="ont-r10" PVAL=0.1
+# PVAL default matches run_eval.sh / run_himito.sh, where the choice of 1 over
+# 0.1 is documented: at 0.1 the caller emits an empty VCF for these cells.
+OUTDIR="" PROFILE="ont-r10" PVAL=1
 # SCITE rates forwarded to run_eval.sh / Himito lineage (same defaults as run_eval.sh).
 FP=0.001 FN=0.05
 SEEDS="" NMUTS="" DEPTHS=""
+# Forwarded to run_eval.sh when set; empty = use each script's own default.
+MIN_HF="" MAX_HF="" SIM_MIN_HF="" SIM_MAX_HF="" INTERNAL_KEEP=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -19,11 +23,22 @@ while [[ $# -gt 0 ]]; do
     --pval) PVAL="$2"; shift 2;;
     --fp) FP="$2"; shift 2;;
     --fn) FN="$2"; shift 2;;
+    --min-hf) MIN_HF="$2"; shift 2;;
+    --max-hf) MAX_HF="$2"; shift 2;;
+    --sim-min-hf) SIM_MIN_HF="$2"; shift 2;;
+    --sim-max-hf) SIM_MAX_HF="$2"; shift 2;;
+    --internal-keep) INTERNAL_KEEP="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
+EVAL_ARGS=()
+[[ -n "$MIN_HF" ]] && EVAL_ARGS+=(--min-hf "$MIN_HF")
+[[ -n "$MAX_HF" ]] && EVAL_ARGS+=(--max-hf "$MAX_HF")
+[[ -n "$SIM_MIN_HF" ]] && EVAL_ARGS+=(--sim-min-hf "$SIM_MIN_HF")
+[[ -n "$SIM_MAX_HF" ]] && EVAL_ARGS+=(--sim-max-hf "$SIM_MAX_HF")
+[[ -n "$INTERNAL_KEEP" ]] && EVAL_ARGS+=(--internal-keep "$INTERNAL_KEEP")
 [[ -n "$OUTDIR" && -n "$SEEDS" && -n "$NMUTS" && -n "$DEPTHS" ]] || {
-  echo "usage: --outdir DIR --seeds \"...\" --n-mutations \"...\" --depths \"...\" [--profile P] [--pval P] [--fp F] [--fn F]" >&2
+  echo "usage: --outdir DIR --seeds \"...\" --n-mutations \"...\" --depths \"...\" [--profile P] [--pval P] [--fp F] [--fn F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F]" >&2
   exit 1
 }
 
@@ -53,7 +68,8 @@ for seed in $SEEDS; do
            --seed "$seed" \
            --pval "$PVAL" \
            --fp "$FP" \
-           --fn "$FN"; then
+           --fn "$FN" \
+           "${EVAL_ARGS[@]+"${EVAL_ARGS[@]}"}"; then
         cell_metrics="$cell/metrics.tsv"
         if [[ ! -f "$cell_metrics" || ! -s "$cell_metrics" ]]; then
           echo "missing metrics at $cell_metrics (skipped)" >&2

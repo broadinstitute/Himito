@@ -19,8 +19,16 @@ OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05 KMER=21
 # CALL_DATATYPE here is always "pacbio" or "ont-denoised", so that's the
 # branch that applies for every profile this script supports.
 
-MINIMAL_AC=2 VAF=0.01 PVAL=0.1 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
+MINIMAL_AC=2 VAF=0.01 PVAL=1 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
 STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1
+# PVAL=1 (permutation test effectively disabled) is required for this harness to
+# call anything at all. At PVAL=0.1 the simulated ont-r10 n=10 cells produce an
+# EMPTY VCF -- not a single one of the ten truth SNVs survives, even though the
+# reads plainly carry them at 4-17% HF and `-p 1` calls all ten as PASS. That
+# makes every downstream lineage metric zero, and it is why the committed
+# benchmarks under lineage_eval/benchmark_results (which have var_f1 ~ 1.0)
+# cannot be reproduced with a 0.1 default. Lower this only alongside a check
+# that truth SNVs are still called.
 # MIN_EDGE_READS deliberately diverges from quick-start's hardcoded 2: the gate is
 # now inclusive (>= N reads), and 1 CIGARs every read-supported edge. At 2, ~98% of
 # edges on this ONT graph go un-CIGARed and the reads reaching a bubble through them

@@ -15,6 +15,35 @@ from dataclasses import dataclass, field
 # clean SNV benchmark.
 AVOID_RANGES = [(1, 40), (295, 320), (3105, 3110), (16180, 16200), (16560, 16569)]
 
+# Fraction of an internal node's mass held back for its own terminal clone,
+# rather than passed down to its children.
+#
+# This is the identifiability knob for *mutation order*. On a unary path the
+# parent's own clone is the only thing that produces "parent without child"
+# reads, at mass `keep`, while the child sits at `1 - keep`. Sequencing dropout
+# at rate `fn` fakes "child without parent" reads at mass `(1 - keep) * fn`, so
+# the true orientation only outvotes the artefact when
+#
+#     keep / (1 - keep)  >>  fn
+#
+# At keep=0.10 that ratio is 0.111, which does not clear a realistic ONT dropout
+# of ~0.10 — the two signals cancel and the order of a 3-mutation chain becomes a
+# coin flip (observed on the n=10 ont-r10 eval: 8 vs 9 reads, sign-test p ~ 0.5,
+# with intermediate clones near 1% of molecules).
+#
+# Raising `keep` costs depth, though: children sit at `1 - keep` of the parent, so
+# a larger keep drives the deepest mutation of a big tree toward the caller's
+# detection floor. Measured worst-case truth HF at n=10 over seeds 1-5:
+#
+#     keep   order margin   min truth HF
+#     0.10       1.11x          0.037     <- order is a coin flip
+#     0.20       2.50x          0.020     <- resolvable, still 2x the 0.01 floor
+#     0.30       4.29x          0.010     <- at the floor; costs variant recall
+#
+# 0.20 is the balance: it takes the order from unresolvable to resolvable while
+# keeping every truth variant at twice the detection limit.
+DEFAULT_INTERNAL_KEEP = 0.20
+
 
 @dataclass
 class Node:
@@ -86,12 +115,21 @@ def build_tree(seq: str, n_mutations: int, rng: random.Random) -> Tree:
     return Tree(nodes=nodes)
 
 
-def assign_frequencies(tree: Tree, ref_fraction: float, min_hf: float, max_hf: float, rng: random.Random) -> None:
+def assign_frequencies(
+    tree: Tree,
+    ref_fraction: float,
+    min_hf: float,
+    max_hf: float,
+    rng: random.Random,
+    internal_keep: float = DEFAULT_INTERNAL_KEEP,
+) -> None:
     """Assign each node a *stay* fraction, then propagate cumulative frequency
     top-down. The root reserves `ref_fraction` of molecules as mutation-free
     reference reads (so no mutation reaches 100% -> everything stays < max_hf).
-    Every node keeps a floor of its incoming frequency for its own clone, so
-    every mutation ends strictly inside (0.01, 0.95)."""
+    Every node keeps `internal_keep` of its incoming frequency for its own clone,
+    so every mutation ends strictly inside (0.01, 0.95) and — more importantly —
+    every internal node keeps enough terminal reads for its position in the chain
+    to be recoverable. See `DEFAULT_INTERNAL_KEEP` for why that floor matters."""
     # Root gets total mass 1.0; it keeps ref_fraction for the reference clone.
     tree.nodes[0].cum_freq = 1.0
 
@@ -104,10 +142,9 @@ def assign_frequencies(tree: Tree, ref_fraction: float, min_hf: float, max_hf: f
         available = incoming * (1.0 - reserve)
         if not kids:
             return
-        # Give each child a share; keep >= 10% of `available` for this node's
-        # own clone so internal nodes still have terminal reads.
-        keep = 0.10
-        share_pool = available * (1.0 - keep)
+        # Give each child a share; hold back `internal_keep` of `available` for
+        # this node's own clone so internal nodes still have terminal reads.
+        share_pool = available * (1.0 - internal_keep)
         weights = [rng.uniform(0.5, 1.0) for _ in kids]
         wsum = sum(weights)
         for k, w in zip(kids, weights):
@@ -118,8 +155,9 @@ def assign_frequencies(tree: Tree, ref_fraction: float, min_hf: float, max_hf: f
     for node in tree.nodes[1:]:
         if not (min_hf < node.cum_freq < max_hf):
             raise ValueError(
-                f"node {node.id} has cum_freq={node.cum_freq:.6f} outside (0.01, 0.95); "
-                "try a smaller --n-mutations or a different --seed"
+                f"node {node.id} has cum_freq={node.cum_freq:.6f} outside "
+                f"({min_hf}, {max_hf}); try a smaller --n-mutations, a lower "
+                "--internal-keep, or a different --seed"
             )
 
 
@@ -196,6 +234,14 @@ def main() -> None:
     ap.add_argument("--reference", default=os.path.join(_repo, "rCRS.fasta"))
     ap.add_argument("--n-mutations", type=int, default=10)
     ap.add_argument("--ref-fraction", type=float, default=0.15)
+    ap.add_argument(
+        "--internal-keep",
+        type=float,
+        default=DEFAULT_INTERNAL_KEEP,
+        help="fraction of an internal node's mass kept for its own terminal "
+        "clone; controls whether mutation order along a chain is recoverable "
+        f"under sequencing dropout (default {DEFAULT_INTERNAL_KEEP})",
+    )
     ap.add_argument("--min-hf", type=float, default=0.01)
     ap.add_argument("--max-hf", type=float, default=0.99)
     ap.add_argument("--seed", type=int, default=42)
@@ -208,7 +254,14 @@ def main() -> None:
         rng = random.Random(args.seed + attempt)
         tree = build_tree(seq, args.n_mutations, rng)
         try:
-            assign_frequencies(tree, args.ref_fraction, args.min_hf, args.max_hf, rng)
+            assign_frequencies(
+                tree,
+                args.ref_fraction,
+                args.min_hf,
+                args.max_hf,
+                rng,
+                internal_keep=args.internal_keep,
+            )
             break
         except ValueError as exc:
             if attempt == max_attempts - 1:

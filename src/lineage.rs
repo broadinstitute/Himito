@@ -818,7 +818,7 @@ mod tests {
     #[test]
     fn resolve_error_rates_presets_differ_per_data_type() {
         assert_eq!(resolve_error_rates("pacbio", None, None), (0.005, 0.05));
-        assert_eq!(resolve_error_rates("ont-denoised", None, None), (0.0001, 0.001));
+        assert_eq!(resolve_error_rates("ont-denoised", None, None), (0.0001, 0.01));
         assert_eq!(resolve_error_rates("ont-r10", None, None), (0.001, 0.05));
         assert_eq!(resolve_error_rates("ont-r9", None, None), (0.001, 0.05));
         // pacbio and ont-denoised must not collapse onto the raw-ONT fallback.

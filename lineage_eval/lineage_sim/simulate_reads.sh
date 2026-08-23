@@ -23,16 +23,19 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
-[[ -n "$OUTDIR" && -n "$PROFILE" ]] || { echo "usage: --outdir DIR --profile {hifi,ont-r10} [--total-depth N] [--seed N]" >&2; exit 1; }
+[[ -n "$OUTDIR" && -n "$PROFILE" ]] || { echo "usage: --outdir DIR --profile {hifi,ont-r10,ont-denoised} [--total-depth N] [--seed N]" >&2; exit 1; }
 
 # ONT uses pbsim3's qshmm method so reads carry realistic per-base quality
 # scores (errhmm emits placeholder Q0 '!' quals, which break any quality-aware
 # caller/denoiser). HiFi stays on errhmm (its reads are consensus-polished by
 # ccs, and no QSHMM-SEQUEL model ships with pbsim3).
+#
+# ont-denoised has no distinct read model -- denoising happens later in
+# run_himito.sh -- so its reads are simulated exactly like ont-r10.
 case "$PROFILE" in
-  hifi)     METHOD="errhmm"; MODEL_NAME="ERRHMM-SEQUEL.model"; PASS=10;;
-  ont-r10)  METHOD="qshmm";  MODEL_NAME="QSHMM-ONT-HQ.model"; PASS=1;;
-  *) echo "profile must be hifi or ont-r10" >&2; exit 1;;
+  hifi)                  METHOD="errhmm"; MODEL_NAME="ERRHMM-SEQUEL.model"; PASS=10;;
+  ont-r10|ont-denoised)  METHOD="qshmm";  MODEL_NAME="QSHMM-ONT-HQ.model"; PASS=1;;
+  *) echo "profile must be hifi or ont-r10 or ont-denoised" >&2; exit 1;;
 esac
 MODEL="$PBSIM_MODEL_DIR/$MODEL_NAME"
 if [[ ! -f "$MODEL" && -f "$DEFAULT_MODEL_DIR/$MODEL_NAME" ]]; then

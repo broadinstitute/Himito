@@ -21,6 +21,17 @@ OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05 KMER=21
 
 MINIMAL_AC=2 VAF=0.01 PVAL=1 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
 STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1
+# denoise's keep threshold, decoupled from the caller's -v. quick-start ties the two
+# together, but they answer different questions: -v is a raw HF cut on a called
+# variant, while this one is compared against the site model's EM estimate, which
+# discounts alt observations explainable as quality-weighted error. That makes it a
+# sharper filter on noise sites whose raw HF overlaps real low-frequency
+# heteroplasmies.
+#
+# 0.03 is the sweep optimum over the n=10 depth>=300 cells (see sweep_denoise_vaf.sh
+# and DENOISE_KEEP_VAF in src/main.rs): variant precision 0.837 -> 0.967 with recall
+# held at 1.000 and ad_f1 within 0.003 of best. Empty = follow --vaf.
+DENOISE_VAF=0.03
 # PVAL=1 (permutation test effectively disabled) is required for this harness to
 # call anything at all. At PVAL=0.1 the simulated ont-r10 n=10 cells produce an
 # EMPTY VCF -- not a single one of the ten truth SNVs survives, even though the
@@ -51,6 +62,7 @@ while [[ $# -gt 0 ]]; do
     --himito) HIMITO="$2"; shift 2;;
     --minimal-ac) MINIMAL_AC="$2"; shift 2;;
     --vaf) VAF="$2"; shift 2;;
+    --denoise-vaf) DENOISE_VAF="$2"; shift 2;;
     --pval) PVAL="$2"; shift 2;;
     --frequency-threshold) FREQ_THRESHOLD="$2"; shift 2;;
     --permutation-frequency-threshold) PERM_FREQ_THRESHOLD="$2"; shift 2;;
@@ -65,7 +77,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$OUTDIR" && -n "$PROFILE" ]] || {
   echo "usage: --outdir DIR --profile {hifi,ont-r10} [--sample S] [--fp F] [--fn F]" >&2
-  echo "  [--minimal-ac N] [--vaf V] [--pval P] [--frequency-threshold F]" >&2
+  echo "  [--minimal-ac N] [--vaf V] [--denoise-vaf V] [--pval P] [--frequency-threshold F]" >&2
   echo "  [--permutation-frequency-threshold F] [--strand-bias-threshold F]" >&2
   echo "  [--indel-false-threshold F] [--min-edge-reads N] [--min-hf F] [--max-hf F]" >&2
   exit 1
@@ -73,8 +85,9 @@ done
 
 case "$PROFILE" in
   hifi)    MMPRESET="map-hifi"; DTYPE="pacbio";;
-  ont-r10) MMPRESET="lr:hq";  DTYPE="ont-denoised";;
-  *) echo "profile must be hifi or ont-r10" >&2; exit 1;;
+  ont-r10) MMPRESET="lr:hq";  DTYPE="ont-r10";;
+  ont-denoised) MMPRESET="lr:hq";  DTYPE="ont-denoised";;
+  *) echo "profile must be hifi or ont-r10 or ont-denoised" >&2; exit 1;;
 esac
 
 HDIR="$OUTDIR/himito"; mkdir -p "$HDIR"
@@ -100,21 +113,24 @@ samtools index "$BAM"
 # values, and match the Denoise subcommand's CLI defaults, so they're left
 # implicit below.
 #
-# Indel denoising is OFF by default, matching quick-start. Set DENOISE_INDELS=1 to
-# run the off-vs-on comparison the design's ship gate requires:
-#   GFA edge/anchor count and matrix column count must drop, with no regression in
-#   the lineage tree score or small-indel precision/recall.
-DENOISE_INDELS="${DENOISE_INDELS:-0}"
+# Indel denoising is ON by default. It used to be documented as off with a
+# DENOISE_INDELS=1 opt-in, but `--indels` was ALSO appended unconditionally to the
+# command below, so the switch was dead and indel denoising ran every time -- which
+# is the configuration every committed benchmark here was produced under. Turning it
+# genuinely off costs almost everything: on seed1_mut10_depth300 the VCF goes from 19
+# PASS SNVs / 1 indel to 1 PASS SNV / 10 indels, because uncorrected indel artifacts
+# crowd the graph and matrix. Set DENOISE_INDELS=0 to run the off-vs-on comparison.
+DENOISE_INDELS="${DENOISE_INDELS:-1}"
 
 BUILD_BAM="$BAM"
 CALL_DATATYPE="$DTYPE"
-if [[ "$DTYPE" == ont-* ]]; then
+if [[ "$DTYPE" == ont-denoised ]]; then
   DENOISED="$HDIR/aln.denoised.bam"
-  DENOISE_ARGS=(--vaf "$VAF" --min-strand 2 --stats "$HDIR/denoise_stats.json")
+  DENOISE_ARGS=(--vaf "${DENOISE_VAF:-$VAF}" --min-strand 2 --stats "$HDIR/denoise_stats.json")
   if [[ "$DENOISE_INDELS" == "1" ]]; then
     DENOISE_ARGS+=(--indels)
   fi
-  "$HIMITO" denoise -i "$BAM" -o "$DENOISED" -r "$REF" -d "$DTYPE" "${DENOISE_ARGS[@]}" --indels
+  "$HIMITO" denoise -i "$BAM" -o "$DENOISED" -r "$REF" -d "$DTYPE" "${DENOISE_ARGS[@]}"
   samtools index "$DENOISED"
   BUILD_BAM="$DENOISED"
   CALL_DATATYPE="ont-denoised"

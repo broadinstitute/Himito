@@ -246,6 +246,18 @@ fn fit_site(
 }
 
 fn map_allele(observed: usize, q: u8, m: &SiteModel) -> usize {
+    // An observation of an allele the site model already kept is evidence FOR that
+    // allele, so it stands as observed. Re-scoring it by freq * P(obs | truth) would
+    // resolve ties by the frequency prior, and since a heteroplasmy's prior is by
+    // definition much smaller than reference's, that reverts every low-quality minor
+    // observation to ref while never converting ref the other way. The asymmetry both
+    // shrinks the minor allele and, because sites are corrected independently,
+    // multiplicatively destroys co-occurrence between heteroplasmies on the same read
+    // -- which is the linkage the lineage step needs to order nested mutations.
+    if m.kept.get(observed).copied().unwrap_or(false) {
+        return observed;
+    }
+
     let eq = phred_to_e(q);
     let mut best = observed;
     let mut best_val = -1.0f64;
@@ -1078,12 +1090,50 @@ mod tests {
         // read instead of correcting it. A ref observation must stay ref.
         assert_eq!(map_allele(0, q(0), &m), 0);
         // At the clamp the likelihood is flat (1 - e == e/3 == 0.25), so a Q0 base
-        // carries no evidence and correction falls back to the frequency prior:
-        // every observation collapses to the most frequent kept allele (here ref).
-        // That is degenerate-input behavior, but it never invents a third base.
+        // carries no evidence of its own. Both A and G were kept, so each stands as
+        // observed rather than collapsing to the more frequent one -- deciding a kept
+        // heteroplasmy by the frequency prior is what erases minor alleles.
+        assert_eq!(map_allele(2, q(0), &m), 2);
+        // The alleles the model rejected have no evidence and no prior, so they fall
+        // back to the most frequent kept allele. Nothing ever invents a third base.
         for observed in 0..4 {
-            assert_eq!(map_allele(observed, q(0), &m), 0, "observed={observed}");
+            let got = map_allele(observed, q(0), &m);
+            let want = if m.kept[observed] { observed } else { 0 };
+            assert_eq!(got, want, "observed={observed}");
         }
+    }
+
+    #[test]
+    fn low_quality_observations_of_a_kept_alt_are_not_reverted_to_ref() {
+        // A ~8% heteroplasmy in ONT-quality reads: the alt clears the keep rule, so
+        // the site model has already ruled it real. Reads carrying it must keep it.
+        //
+        // Scoring each observation by freq * P(obs | truth) instead reverts the alt
+        // whenever freq[ref] * e/3 > freq[alt] * (1 - e) -- with 0.92/0.08 that is
+        // every base under Q7. Real ONT qualities at these sites center on Q4-Q9, so
+        // this silently deletes ~40% of the evidence for every minor allele. Worse,
+        // it is applied per site independently, so a read spanning two heteroplasmies
+        // keeps both only ~0.6^2 of the time: co-occurrence counts collapse and
+        // nested variants look mutually exclusive, which breaks lineage ordering.
+        // Qualities span Q3-Q20 for both alleles, the spread pbsim's ONT model emits
+        // at these sites; a single flat quality would make an 8% alt indistinguishable
+        // from the error rate and the keep rule would (correctly) reject it.
+        let quals = [3u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20];
+        let mut obs = vec![];
+        for i in 0..736 { obs.push((0usize, q(quals[i % quals.len()]), i % 2 == 0)); }
+        for i in 0..64 { obs.push((2usize, q(quals[i % quals.len()]), i % 2 == 0)); }
+        let c = column(0, &obs);
+        let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
+        assert!(m.kept[0] && m.kept[2], "both ref and the 8% alt must be kept");
+
+        // The alt is kept, so an observation of it stands regardless of quality.
+        for ql in [q(0), q(4), q(6), q(7), q(30)] {
+            assert_eq!(map_allele(2, ql, &m), 2, "kept alt reverted at Q{ql}");
+            assert_eq!(map_allele(0, ql, &m), 0, "ref reverted at Q{ql}");
+        }
+        // Alleles the model rejected are still errors and still correct to ref.
+        assert_eq!(map_allele(1, q(6), &m), 0);
+        assert_eq!(map_allele(3, q(6), &m), 0);
     }
 
     #[test]

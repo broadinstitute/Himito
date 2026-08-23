@@ -17,6 +17,20 @@ mod scite;
 mod denoise;
 mod denoise_indel;
 
+/// Keep threshold for denoise's per-site substitution model: an eligible non-ref
+/// allele survives only if the site model's EM frequency estimate reaches this.
+///
+/// Deliberately NOT the caller's `--vaf`, which the two used to share. That one is a
+/// raw HF cut on an already-called variant; this one is compared against a
+/// quality-weighted estimate that discounts alt observations explainable as error,
+/// which makes it far sharper on noise whose raw HF overlaps real heteroplasmies.
+///
+/// 0.03 was chosen by sweeping 0.01-0.04 over the 20 ont-r10 n=10 depth>=300 cells in
+/// lineage_eval: it lifts variant precision 0.837 -> 0.967 while holding variant
+/// recall at 1.000 and ancestor-descendant F1 within 0.003 of the optimum. Above
+/// 0.04 recall starts falling (0.965) as real low-frequency heteroplasmies drop out.
+pub const DENOISE_KEEP_VAF: f64 = 0.03;
+
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
 #[clap(version = env!("CARGO_PKG_VERSION"))]
@@ -227,7 +241,7 @@ enum Commands {
         data_type: String,
 
         /// minimal VAF for an allele to be kept (below this it is corrected away)
-        #[clap(long, value_parser, default_value_t = 0.01)]
+        #[clap(long, value_parser, default_value_t = DENOISE_KEEP_VAF)]
         vaf: f64,
 
         /// minimal observations required on EACH strand for allele candidacy
@@ -701,7 +715,11 @@ fn main() {
                 // and call.rs's own permutation/homoplasmic threshold).
                 if let Err(e) = denoise::start(
                     &mt_output, &denoised, &reference_path, &data_type,
-                    vaf_threshold as f64, 2, 0.01, 0.7,
+                    // Denoise's keep threshold, NOT `vaf_threshold`. Passing the
+                    // caller's HF cut here made the two impossible to tune apart, and
+                    // at 0.01 the site model keeps marginal noise alleles whose reads
+                    // then reach the VCF (precision 0.837 vs 0.967 at 0.03).
+                    DENOISE_KEEP_VAF, 2, 0.01, 0.7,
                     // Indel correction is on in QuickStart. Every other field keeps
                     // its `Default` value, which `validate_indel_opts` accepts as-is,
                     // so there is nothing to validate here.

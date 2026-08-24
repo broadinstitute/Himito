@@ -79,4 +79,3 @@ python "$HERE/score_lineage.py" \
   --metrics-out "$OUTDIR/metrics.tsv"
 
 echo "=== metrics ($OUTDIR/metrics.tsv) ==="
-column -t "$OUTDIR/metrics.tsv"

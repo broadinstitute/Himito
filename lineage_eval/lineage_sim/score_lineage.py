@@ -24,7 +24,14 @@ def parse_mutation_tree(path: str) -> dict[str, str]:
 
 
 def ancestor_sets(parent_map: dict[str, str]) -> dict[str, set[str]]:
-    """variant -> set of STRICT ancestors (excludes self and ROOT)."""
+    """variant -> set of ancestors, including ROOT (excludes self).
+
+    ROOT is the universal ancestor of every variant, so it is always present in
+    each set. Metrics that operate purely on the variant taxa (clades, RF) drop
+    ROOT again by restricting to their ``keep`` set; the ancestor-descendant pair
+    metric keeps it so that identical star topologies score as a perfect match
+    instead of collapsing to an empty pair set.
+    """
     anc = {}
     for v in parent_map:
         if v == "ROOT":
@@ -36,6 +43,7 @@ def ancestor_sets(parent_map: dict[str, str]) -> dict[str, set[str]]:
             steps += 1
             if steps > len(parent_map):  # guard against malformed cycles
                 break
+        acc.add("ROOT")
         anc[v] = acc
     return anc
 
@@ -243,8 +251,12 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars) -> dict:
 
     truth_anc = ancestor_sets(truth_parent)
     recon_anc = ancestor_sets(recon_parent)
-    tp_pairs = _anc_pairs(truth_anc, shared)
-    rp_pairs = _anc_pairs(recon_anc, shared)
+    # ROOT is the shared ancestor of every variant, so include it in the pair
+    # metrics; otherwise two identical star topologies (all variants attached to
+    # ROOT) yield no ancestor-descendant pairs and score 0 instead of 1.
+    ad_keep = shared | {"ROOT"}
+    tp_pairs = _anc_pairs(truth_anc, ad_keep)
+    rp_pairs = _anc_pairs(recon_anc, ad_keep)
     inter = tp_pairs & rp_pairs
     ad_recall = len(inter) / len(tp_pairs) if tp_pairs else 0.0
     ad_precision = len(inter) / len(rp_pairs) if rp_pairs else 0.0

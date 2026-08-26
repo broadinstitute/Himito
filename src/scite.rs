@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use rand::Rng;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use log::info;
+use log::{info, warn};
 use statrs::function::gamma::ln_gamma;
 use adjustp::{adjust, Procedure};
 
@@ -256,6 +256,146 @@ fn subtree_all_carry(tree: &lineage::Tree, hap_matrix: &HaplotypeMatrix, node_id
     true
 }
 
+/// The half-open reference interval `[start, end)` a variant's REF allele
+/// occupies, in the 1-based coordinates Himito variant names use.
+///
+/// Two variants whose intervals overlap are mutually-exclusive alleles — a
+/// single molecule cannot carry both — so they must never lie on one
+/// root-to-leaf path. Comparing intervals rather than start positions is what
+/// catches a deletion against a substitution *inside* the deleted span:
+/// `m.310TAA>T` covers `[310, 313)` and `m.311A>G` covers `[311, 312)`, which
+/// share no start position but cannot coexist on one molecule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariantSpan {
+    pub start: u64,
+    pub end: u64,
+}
+
+impl VariantSpan {
+    pub fn overlaps(&self, other: &VariantSpan) -> bool {
+        self.start < other.end && other.start < self.end
+    }
+}
+
+/// Parse the REF interval out of an `m.<pos><ref>><alt>` name (as built by
+/// `call::generate_variant_name` and `lineage.rs`): `m.310T>C` → `[310, 311)`,
+/// `m.310TAA>T` → `[310, 313)`, `m.310T>TC` → `[310, 311)`.
+///
+/// Indel names anchor on the base *before* the event, and that anchor base is
+/// included in the interval. That is deliberately conservative: it keeps an
+/// indel exclusive with a substitution at its anchor (`m.310T>TC` vs
+/// `m.310T>C`), which is correct under VCF allele semantics — both names assert
+/// a different content for base 310 — at the cost of also separating a deletion
+/// from a substitution at the retained anchor base. Splitting those onto sibling
+/// branches is the safe direction to err.
+///
+/// A name with no parseable position gets a unique one-base sentinel interval
+/// far past any real coordinate, so it can never spuriously conflict with
+/// another variant. `ok` is false in that case so callers can report it.
+fn parse_variant_span(variant: &str, index: usize) -> (VariantSpan, bool) {
+    let rest = variant.trim_start_matches("m.");
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+
+    let Ok(start) = digits.parse::<u64>() else {
+        let sentinel = u64::MAX - 1 - index as u64;
+        return (VariantSpan { start: sentinel, end: sentinel + 1 }, false);
+    };
+
+    // REF allele: everything between the position and the `>`. `-` is Himito's
+    // placeholder for "no anchor base available" (an indel at the very start of
+    // a reference block); treat it as one base so it still conflicts locally
+    // rather than with nothing at all.
+    let ref_allele = rest[digits.len()..].split('>').next().unwrap_or("");
+    let ref_len = match ref_allele {
+        "" | "-" => 1,
+        a => a.len() as u64,
+    };
+
+    (VariantSpan { start, end: start.saturating_add(ref_len) }, true)
+}
+
+/// Per-variant REF intervals, indexed like `variants`.
+///
+/// Warns if any name is unparseable: the sentinel fallback makes such a variant
+/// unconstrained, so a wholesale naming-convention change would silently turn
+/// the exclusivity guarantee into a no-op. This makes that failure loud.
+pub fn variant_spans(variants: &[String]) -> Vec<VariantSpan> {
+    let mut spans = Vec::with_capacity(variants.len());
+    let mut unparsed: Vec<&str> = Vec::new();
+    for (i, v) in variants.iter().enumerate() {
+        let (span, ok) = parse_variant_span(v, i);
+        if !ok {
+            unparsed.push(v.as_str());
+        }
+        spans.push(span);
+    }
+    if !unparsed.is_empty() {
+        let examples: Vec<&str> = unparsed.iter().copied().take(5).collect();
+        warn!(
+            "[SCITE] {}/{} variant name(s) carry no parseable reference position \
+             (expected `m.<pos><ref>><alt>`, e.g. m.310T>C); they are exempt from \
+             same-locus exclusivity{}. Examples: {}",
+            unparsed.len(),
+            variants.len(),
+            if unparsed.len() == variants.len() {
+                " — the constraint is inactive for this run"
+            } else {
+                ""
+            },
+            examples.join(", ")
+        );
+    }
+    spans
+}
+
+/// Whether any mutation in `tree` has a strict ancestor whose REF interval
+/// overlaps its own — i.e. two mutually-exclusive alleles placed on one lineage.
+pub fn violates_position_exclusivity(tree: &MutationTree, spans: &[VariantSpan]) -> bool {
+    (0..tree.n_mutations).any(|node| {
+        let span = spans[node];
+        let mut cur = tree.parent[node];
+        while cur != tree.root() {
+            if spans[cur].overlaps(&span) {
+                return true;
+            }
+            cur = tree.parent[cur];
+        }
+        false
+    })
+}
+
+/// Return a tree equal to `tree` except that every mutation whose REF interval
+/// overlaps one of its ancestors' is lifted to become a sibling of the
+/// shallowest such ancestor, so no two overlapping alleles remain on one
+/// root-to-leaf path. The reattachment target is always an ancestor of the moved
+/// node (never inside its own subtree), so the result stays acyclic; each move
+/// strictly decreases that node's depth, so the loop terminates.
+pub fn enforce_position_exclusivity(tree: &MutationTree, spans: &[VariantSpan]) -> MutationTree {
+    let mut result = tree.clone();
+    loop {
+        let mut changed = false;
+        for node in 0..result.n_mutations {
+            let span = spans[node];
+            let mut cur = result.parent[node];
+            let mut shallowest_conflict = None;
+            while cur != result.root() {
+                if spans[cur].overlaps(&span) {
+                    shallowest_conflict = Some(cur);
+                }
+                cur = result.parent[cur];
+            }
+            if let Some(ancestor) = shallowest_conflict {
+                result.parent[node] = result.parent[ancestor];
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    result
+}
+
 /// Build an initial mutation tree from the Neighbor-Joining haplotype tree:
 /// each mutation is ranked by the size (in attached reads) of the largest NJ
 /// subtree entirely carrying it, then chained in descending order.
@@ -284,7 +424,10 @@ pub fn from_nj_tree(hap_matrix: &HaplotypeMatrix, nj_tree: &lineage::Tree) -> Mu
         prev = m;
     }
 
-    MutationTree { n_mutations: n, parent }
+    // The clonality-ranked chain can stack mutually-exclusive overlapping
+    // alleles on one path; split them onto sibling branches before search.
+    let tree = MutationTree { n_mutations: n, parent };
+    enforce_position_exclusivity(&tree, &variant_spans(&hap_matrix.variants))
 }
 
 fn sample_two_distinct(n: usize, rng: &mut impl Rng) -> (usize, usize) {
@@ -422,13 +565,20 @@ pub fn run_mcmc(
     rng: &mut impl Rng,
 ) -> (MutationTree, f64) {
     let n = matrix.variants.len();
+    let spans = variant_spans(&matrix.variants);
     let mut current = initial_tree.cloned().unwrap_or_else(|| MutationTree::random(n, rng));
+    current = enforce_position_exclusivity(&current, &spans);
     let mut current_ll = tree_log_likelihood(matrix, &current, rates);
     let mut best = current.clone();
     let mut best_ll = current_ll;
 
     for _ in 0..n_iterations {
         let (proposal, nbh_correction) = propose_move(&current, rng);
+        // Hard constraint: never let two mutually-exclusive overlapping
+        // alleles share a root-to-leaf path.
+        if violates_position_exclusivity(&proposal, &spans) {
+            continue;
+        }
         let proposal_ll = tree_log_likelihood(matrix, &proposal, rates);
 
         let acceptance = nbh_correction * (proposal_ll - current_ll).exp();
@@ -1265,6 +1415,23 @@ pub fn run_scite_pipeline(
         if initial_tree.is_some() { "derived from Neighbor-Joining haplotype tree" } else { "random (NJ tree unavailable)" }
     );
 
+    // Overlap is not transitive (a deletion can overlap two substitutions that
+    // do not overlap each other), so report the constrained pairs rather than
+    // grouping into sites. Index order keeps the log deterministic.
+    let spans = variant_spans(&binary.variants);
+    let conflict_pairs: Vec<String> = (0..spans.len())
+        .flat_map(|i| (i + 1..spans.len()).map(move |j| (i, j)))
+        .filter(|&(i, j)| spans[i].overlaps(&spans[j]))
+        .map(|(i, j)| format!("{}/{}", binary.variants[i], binary.variants[j]))
+        .collect();
+    if !conflict_pairs.is_empty() {
+        info!(
+            "[SCITE] Same-locus exclusivity active for {} overlapping allele pair(s): {}",
+            conflict_pairs.len(),
+            conflict_pairs.join(", ")
+        );
+    }
+
     info!(
         "[SCITE] {} variants, {} reads. Running MCMC: {n_chains} chains x {n_iterations} iterations",
         binary.variants.len(),
@@ -1276,6 +1443,7 @@ pub fn run_scite_pipeline(
     info!("[SCITE] Best tree log-likelihood: {ll:.3}");
 
     let tree = polish_unary_path_order(&tree, binary, &rates);
+    let tree = enforce_position_exclusivity(&tree, &spans);
     let ll_polish = tree_log_likelihood(binary, &tree, &rates);
     info!("[SCITE] After unary-path polish log-likelihood: {ll_polish:.3}");
 
@@ -1526,6 +1694,190 @@ mod tests {
         let tree = from_nj_tree(&hap_matrix, &nj_tree);
         // A ranked ahead of B -> A's parent is root, B's parent is A.
         assert_eq!(tree.parent, vec![2, 0, 2]);
+    }
+
+    fn span(start: u64, end: u64) -> VariantSpan {
+        VariantSpan { start, end }
+    }
+
+    #[test]
+    fn variant_spans_parses_ref_interval_and_falls_back_uniquely() {
+        let variants = vec![
+            "m.310T>C".to_string(),      // SNP: one base
+            "m.310T>TC".to_string(),     // insertion anchored at 310
+            "m.310TAA>T".to_string(),    // deletion of 311-312, anchored at 310
+            "m.8274C>T".to_string(),
+            "m.5->AC".to_string(),       // Himito's "no anchor base" REF placeholder
+            "m.7A>-".to_string(),         // ...and the ALT-side placeholder
+            "A".to_string(),
+            "B".to_string(),
+        ];
+        let s = variant_spans(&variants);
+        assert_eq!(s[0], span(310, 311));
+        assert_eq!(s[1], span(310, 311));
+        assert_eq!(s[2], span(310, 313));
+        assert_eq!(s[3], span(8274, 8275));
+        assert_eq!(s[4], span(5, 6));
+        assert_eq!(s[5], span(7, 8));
+        // Non-parseable names never collide with each other or with real loci.
+        assert!(!s[6].overlaps(&s[7]));
+        assert!(s[6].start > 8274 && s[7].start > 8274);
+    }
+
+    #[test]
+    fn variant_spans_flags_a_deletion_against_a_substitution_inside_its_span() {
+        // The gap a start-position-only check misses: 311 lies inside the
+        // deletion's REF span but shares no start coordinate with it.
+        let variants = vec!["m.310TAA>T".to_string(), "m.311A>G".to_string()];
+        let s = variant_spans(&variants);
+        assert!(s[0].overlaps(&s[1]));
+
+        // ...while the base just past the deletion is untouched and free to
+        // sit anywhere on the same lineage.
+        let outside = variant_spans(&["m.310TAA>T".to_string(), "m.313G>A".to_string()]);
+        assert!(!outside[0].overlaps(&outside[1]));
+    }
+
+    #[test]
+    fn violates_position_exclusivity_flags_overlapping_alleles_on_one_path() {
+        // spans: 16126(0) -> 310(1) -> 310(2), a chain.
+        let spans = vec![span(16126, 16127), span(310, 311), span(310, 311)];
+        let chain = MutationTree { n_mutations: 3, parent: vec![3, 0, 1, 3] };
+        assert!(violates_position_exclusivity(&chain, &spans));
+
+        // Same two 310 alleles as siblings under 16126: no path carries both.
+        let branched = MutationTree { n_mutations: 3, parent: vec![3, 0, 0, 3] };
+        assert!(!violates_position_exclusivity(&branched, &spans));
+    }
+
+    #[test]
+    fn violates_position_exclusivity_flags_a_deletion_over_its_deleted_bases() {
+        // m.310TAA>T [310,313) with m.311A>G [311,312) beneath it.
+        let spans = vec![span(310, 313), span(311, 312)];
+        let chain = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        assert!(violates_position_exclusivity(&chain, &spans));
+    }
+
+    #[test]
+    fn enforce_position_exclusivity_splits_overlapping_alleles_to_siblings() {
+        // 16126(0) -> 310T>TC(1) -> 310T>C(2): the impossible chain.
+        let spans = vec![span(16126, 16127), span(310, 311), span(310, 311)];
+        let chain = MutationTree { n_mutations: 3, parent: vec![3, 0, 1, 3] };
+        let fixed = enforce_position_exclusivity(&chain, &spans);
+        // 310T>C is lifted to become a sibling of 310T>TC, both under 16126.
+        assert_eq!(fixed.parent, vec![3, 0, 0, 3]);
+        assert!(!violates_position_exclusivity(&fixed, &spans));
+    }
+
+    #[test]
+    fn enforce_position_exclusivity_resolves_three_overlapping_alleles() {
+        // 500(0) -> 310(1) -> 310(2) -> 310(3): needs more than one pass, since
+        // lifting node 2 leaves node 3 still under it.
+        let spans = vec![
+            span(500, 501),
+            span(310, 311),
+            span(310, 311),
+            span(310, 311),
+        ];
+        let chain = MutationTree { n_mutations: 4, parent: vec![4, 0, 1, 2, 4] };
+        let fixed = enforce_position_exclusivity(&chain, &spans);
+        assert_eq!(fixed.parent, vec![4, 0, 0, 0, 4]);
+        assert!(!violates_position_exclusivity(&fixed, &spans));
+    }
+
+    #[test]
+    fn enforce_position_exclusivity_always_returns_an_acyclic_tree() {
+        // Heavy overlap (12 variants over 4 loci, one of them a wide deletion)
+        // is the stress case for the lift-to-sibling loop.
+        let mut spans = Vec::new();
+        for i in 0..12u64 {
+            let locus = (i % 4) * 10;
+            // Every fourth variant is a 5-base deletion straddling its neighbours.
+            let width = if i % 4 == 0 { 5 } else { 1 };
+            spans.push(span(locus, locus + width));
+        }
+        for seed in 0..500u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let tree = MutationTree::random(12, &mut rng);
+            let fixed = enforce_position_exclusivity(&tree, &spans);
+            assert_valid_tree(&fixed);
+            assert!(
+                !violates_position_exclusivity(&fixed, &spans),
+                "seed {seed} left an overlapping pair on one path"
+            );
+        }
+    }
+
+    #[test]
+    fn from_nj_tree_breaks_an_overlapping_chain_off_the_clonality_ranking() {
+        // Two haplotypes: one carrying m.310T>C, one carrying m.310T>TC. The
+        // clonality chain would stack them; the two alleles must end up on
+        // separate branches instead.
+        let hap_matrix = HaplotypeMatrix {
+            variants: vec!["m.310T>C".to_string(), "m.310T>TC".to_string()],
+            haplotypes: vec![
+                lineage::Haplotype {
+                    id: "H0".to_string(),
+                    profile: vec![Some(1), Some(0)],
+                    reads: vec!["r0".to_string()],
+                    count: 1,
+                },
+                lineage::Haplotype {
+                    id: "H1".to_string(),
+                    profile: vec![Some(0), Some(1)],
+                    reads: vec!["r1".to_string()],
+                    count: 1,
+                },
+            ],
+        };
+        let dist = lineage::hamming_distance_matrix(&hap_matrix);
+        let nj_tree = lineage::neighbor_joining(&dist, &hap_matrix).unwrap();
+        let tree = from_nj_tree(&hap_matrix, &nj_tree);
+        assert!(!violates_position_exclusivity(
+            &tree,
+            &variant_spans(&hap_matrix.variants)
+        ));
+    }
+
+    #[test]
+    fn run_mcmc_never_places_same_position_alleles_on_one_path() {
+        // m.16126T>C is the shared ancestor; m.310T>TC and m.310T>C are its two
+        // mutually-exclusive descendants (never co-observed on a read).
+        let variants = vec![
+            "m.16126T>C".to_string(),
+            "m.310T>TC".to_string(),
+            "m.310T>C".to_string(),
+        ];
+        let mut anc = Vec::new(); // 16126
+        let mut ins = Vec::new(); // 310T>TC
+        let mut sub = Vec::new(); // 310T>C
+        let mut push = |a: u8, i: u8, s: u8, n: usize, av: &mut Vec<Option<u8>>, iv: &mut Vec<Option<u8>>, sv: &mut Vec<Option<u8>>| {
+            for _ in 0..n {
+                av.push(Some(a));
+                iv.push(Some(i));
+                sv.push(Some(s));
+            }
+        };
+        push(1, 1, 0, 6, &mut anc, &mut ins, &mut sub); // 16126 + insertion
+        push(1, 0, 1, 6, &mut anc, &mut ins, &mut sub); // 16126 + substitution
+        push(1, 0, 0, 3, &mut anc, &mut ins, &mut sub); // 16126 only
+        push(0, 0, 0, 3, &mut anc, &mut ins, &mut sub); // germline
+
+        let n_reads = anc.len();
+        let matrix = BinaryMatrix {
+            variants: variants.clone(),
+            reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
+            data: vec![anc, ins, sub],
+        };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let mut rng = StdRng::seed_from_u64(11);
+        let (tree, _ll) = run_mcmc(&matrix, &rates, 3000, None, &mut rng);
+
+        let spans = variant_spans(&variants);
+        assert!(
+            !violates_position_exclusivity(&tree, &spans),
+            "the two position-310 alleles must never lie on one root-to-leaf path"
+        );
     }
 
     #[test]

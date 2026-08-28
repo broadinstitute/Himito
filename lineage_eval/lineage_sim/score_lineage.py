@@ -232,11 +232,126 @@ def detected_variants_from_vcf(path: str) -> set[str]:
     return set(detected_variants_with_hf_from_vcf(path))
 
 
+def parse_clone_haplotypes(path: str) -> set[frozenset[str]]:
+    """Truth clones from simulate_tree.py's clones.tsv, as variant sets.
+
+    The mutation-free `ref` clone becomes the empty set; `score_haplotypes`
+    drops it. Frequencies are deliberately ignored -- see `score_haplotypes`
+    for why read fractions are not a usable abundance estimate here.
+    """
+    haps = set()
+    with open(path) as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            haps.add(frozenset(v for v in row["variant_path"].split(",") if v))
+    return haps
+
+
+def parse_matrix_haplotypes(path: str) -> dict[frozenset[str], int]:
+    """Reconstructed haplotypes from Himito's lineage matrix -> read counts.
+
+    The matrix is variants (rows) x reads (columns); reads sharing a genotype
+    pattern are one haplotype, which is exactly the grouping Himito reports in
+    <prefix>.cleaned_haplotype_map.tsv. Only '1' counts as present: the pre-clean
+    matrix writes an empty cell for "read does not span this site", and reading
+    that as a mutation would invent haplotypes.
+    """
+    with open(path) as fh:
+        rows = list(csv.reader(fh))
+    if not rows:
+        return {}
+    variants = [r[0] for r in rows[1:]]
+    counts: dict[frozenset[str], int] = {}
+    for i in range(len(rows[0]) - 1):
+        hap = frozenset(
+            v for v, row in zip(variants, rows[1:])
+            if len(row) > i + 1 and row[i + 1] == "1"
+        )
+        counts[hap] = counts.get(hap, 0) + 1
+    return counts
+
+
+def _restrict_counts(haps: dict[frozenset[str], int], keep: set[str]) -> dict[frozenset[str], int]:
+    """Collapse haplotypes onto `keep`, merging any that become identical.
+
+    Two haplotypes differing only by a variant outside `keep` are the same
+    haplotype once restricted, so their read counts must be summed rather than
+    counted as two distinct reconstructions.
+    """
+    out: dict[frozenset[str], int] = {}
+    for hap, n in haps.items():
+        k = hap & keep
+        out[k] = out.get(k, 0) + n
+    return out
+
+
+def score_haplotypes(
+    truth_haps: set[frozenset[str]],
+    recon_haps: dict[frozenset[str], int],
+    shared_vars: set[str],
+) -> dict:
+    """Exact variant-set agreement between truth clones and reconstructed haplotypes.
+
+    A truth clone and a reconstructed haplotype match when their variant sets are
+    equal, scored two ways:
+
+    * strict -- full variant sets, so a false-positive or missed call breaks the
+      match. This is what a downstream consumer of the haplotype map actually gets.
+    * shared -- both sides first intersected with `shared_vars` (truth & detected),
+      the same restriction the tree metrics use. Isolates "reads grouped into the
+      wrong clones" from "the caller added junk", which ``var_precision`` measures
+      already.
+
+    The empty (mutation-free) haplotype is excluded from both sides and from
+    ``hap_read_frac``. It is not a clone: a read lands there whenever it fails to
+    span any variant site, so on seed5_mut10_depth1000 that bin holds 1226 reads of
+    which only 590 are genuinely reference -- the other 636 come from mutant clones.
+    Scoring it as a recovered reference clone would add a free true positive to
+    every run, and putting its reads in the denominator would make ``hap_read_frac``
+    track read length rather than reconstruction quality.
+
+    For the same reason no abundance metric is reported: a haplotype's read count
+    is not proportional to its clone frequency, so read fractions cannot be compared
+    against the truth frequencies in clones.tsv. Per-site heteroplasmy is available
+    from the VCF's HF field instead.
+    """
+    truth = {h for h in truth_haps if h}
+    recon = {h: n for h, n in recon_haps.items() if h}
+
+    matched = truth & set(recon)
+    precision = len(matched) / len(recon) if recon else 0.0
+    recall = len(matched) / len(truth) if truth else 0.0
+
+    truth_s = {h & shared_vars for h in truth}
+    truth_s.discard(frozenset())
+    # A haplotype built only from false-positive variants restricts to the empty
+    # set; drop it here too rather than let it match the excluded reference bin.
+    recon_s = {h: n for h, n in _restrict_counts(recon, shared_vars).items() if h}
+    matched_s = truth_s & set(recon_s)
+    precision_s = len(matched_s) / len(recon_s) if recon_s else 0.0
+    recall_s = len(matched_s) / len(truth_s) if truth_s else 0.0
+
+    reads_total = sum(recon.values())
+    reads_matched = sum(n for h, n in recon.items() if h in matched)
+
+    return {
+        "n_truth_clones": len(truth),
+        "n_recon_haps": len(recon),
+        "hap_precision": precision,
+        "hap_recall": recall,
+        "hap_f1": _f1(precision, recall),
+        "hap_s_precision": precision_s,
+        "hap_s_recall": recall_s,
+        "hap_s_f1": _f1(precision_s, recall_s),
+        "hap_read_frac": reads_matched / reads_total if reads_total else 0.0,
+    }
+
+
 def _f1(p: float, r: float) -> float:
     return 0.0 if (p + r) == 0 else 2 * p * r / (p + r)
 
 
-def score(truth_parent, recon_parent, truth_vars, detected_vars) -> dict:
+def score(truth_parent, recon_parent, truth_vars, detected_vars,
+          truth_haps=None, recon_haps=None) -> dict:
     # --- variant detection (tree-independent) ---
     tp = len(truth_vars & detected_vars)
     var_precision = tp / len(detected_vars) if detected_vars else 0.0
@@ -261,21 +376,15 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars) -> dict:
     ad_recall = len(inter) / len(tp_pairs) if tp_pairs else 0.0
     ad_precision = len(inter) / len(rp_pairs) if rp_pairs else 0.0
 
-    truth_edges = _pc_edges(truth_parent, shared)
-    recon_edges = _pc_edges(recon_parent, shared)
-    pc_recall = (len(truth_edges & recon_edges) / len(truth_edges)) if truth_edges else 0.0
+    # truth_edges = _pc_edges(truth_parent, shared)
+    # recon_edges = _pc_edges(recon_parent, shared)
+    # pc_recall = (len(truth_edges & recon_edges) / len(truth_edges)) if truth_edges else 0.0
 
-    truth_ue = _ue_edges(truth_parent, shared)
-    recon_ue = _ue_edges(recon_parent, shared)
-    ue_inter = truth_ue & recon_ue
-    ue_precision = len(ue_inter) / len(recon_ue) if recon_ue else 0.0
-    ue_recall = len(ue_inter) / len(truth_ue) if truth_ue else 0.0
-
-    truth_clades = _clades(truth_anc, shared)
-    recon_clades = _clades(recon_anc, shared)
-    clade_inter = truth_clades & recon_clades
-    clade_precision = len(clade_inter) / len(recon_clades) if recon_clades else 0.0
-    clade_recall = len(clade_inter) / len(truth_clades) if truth_clades else 0.0
+    # truth_clades = _clades(truth_anc, shared)
+    # recon_clades = _clades(recon_anc, shared)
+    # clade_inter = truth_clades & recon_clades
+    # clade_precision = len(clade_inter) / len(recon_clades) if recon_clades else 0.0
+    # clade_recall = len(clade_inter) / len(truth_clades) if truth_clades else 0.0
 
     truth_path_u = _path_undirected_pairs(tp_pairs)
     recon_path_u = _path_undirected_pairs(rp_pairs)
@@ -283,9 +392,24 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars) -> dict:
     path_undirected_precision = len(path_u_inter) / len(recon_path_u) if recon_path_u else 0.0
     path_undirected_recall = len(path_u_inter) / len(truth_path_u) if truth_path_u else 0.0
 
+    # --- haplotype (clone) recovery ---
+    # Restricted on truth & detected, not on `shared`: `shared` is a property of
+    # the two mutation trees, while a haplotype can only be built out of variants
+    # the caller actually emitted.
+    if truth_haps is None or recon_haps is None:
+        hap = {f: "NA" for f in HAP_FIELDS}
+    else:
+        hap = score_haplotypes(truth_haps, recon_haps, truth_vars & detected_vars)
+
     # --- topology distances on the shared variant set ---
     rf, rf_norm = robinson_foulds(truth_anc, recon_anc, shared)
-    quartet_dist, quartet_norm = quartet_distance(truth_parent, recon_parent, shared)
+    # quartet_dist, quartet_norm = quartet_distance(truth_parent, recon_parent, shared)
+    # truth_ue = _ue_edges(truth_parent, shared)
+    # recon_ue = _ue_edges(recon_parent, shared)
+    # ue_inter = truth_ue & recon_ue
+    # ue_precision = len(ue_inter) / len(recon_ue) if recon_ue else 0.0
+    # ue_recall = len(ue_inter) / len(truth_ue) if truth_ue else 0.0
+
 
     return {
         "n_truth_vars": len(truth_vars),
@@ -297,30 +421,38 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars) -> dict:
         "ad_precision": ad_precision,
         "ad_recall": ad_recall,
         "ad_f1": _f1(ad_precision, ad_recall),
-        "pc_recall": pc_recall,
+        # "pc_recall": pc_recall,
         "rf": rf,
         "rf_norm": rf_norm,
-        "quartet_dist": quartet_dist,
-        "quartet_norm": quartet_norm,
-        "ue_precision": ue_precision,
-        "ue_recall": ue_recall,
-        "ue_f1": _f1(ue_precision, ue_recall),
-        "clade_precision": clade_precision,
-        "clade_recall": clade_recall,
-        "clade_f1": _f1(clade_precision, clade_recall),
+        # "quartet_dist": quartet_dist,
+        # "quartet_norm": quartet_norm,
+        # "ue_precision": ue_precision,
+        # "ue_recall": ue_recall,
+        # "ue_f1": _f1(ue_precision, ue_recall),
+        # "clade_precision": clade_precision,
+        # "clade_recall": clade_recall,
+        # "clade_f1": _f1(clade_precision, clade_recall),
         "path_undirected_precision": path_undirected_precision,
         "path_undirected_recall": path_undirected_recall,
         "path_undirected_f1": _f1(path_undirected_precision, path_undirected_recall),
+        **hap,
     }
 
 
+# Haplotype columns, kept separate so they can be filled with "NA" in one place
+# when --recon-matrix/--truth-clones are not supplied.
+HAP_FIELDS = ["n_truth_clones", "n_recon_haps",
+              "hap_precision", "hap_recall", "hap_f1",
+              "hap_s_precision", "hap_s_recall", "hap_s_f1",
+              "hap_read_frac"]
+
+# Appended to, never reordered: sweep_fpfn.sh reads this table by column position
+# (var_f1 = $9, ad_f1 = $12).
 FIELDS = ["profile", "fp", "fn", "n_truth_vars", "n_detected_vars", "n_shared",
           "var_precision", "var_recall", "var_f1",
-          "ad_precision", "ad_recall", "ad_f1", "pc_recall",
-          "rf", "rf_norm", "quartet_dist", "quartet_norm",
-          "ue_precision", "ue_recall", "ue_f1",
-          "clade_precision", "clade_recall", "clade_f1",
-          "path_undirected_precision", "path_undirected_recall", "path_undirected_f1"]
+          "ad_precision", "ad_recall", "ad_f1",
+          "rf", "rf_norm",
+          "path_undirected_precision", "path_undirected_recall", "path_undirected_f1"] + HAP_FIELDS
 
 
 def main() -> None:
@@ -329,6 +461,12 @@ def main() -> None:
     ap.add_argument("--recon-tree", required=True)
     ap.add_argument("--truth-variants", required=True)
     ap.add_argument("--vcf", required=True)
+    # Optional pair: Himito's per-read genotype matrix and the simulator's clone
+    # table. Supply both to get the hap_* columns; omit both and they read NA.
+    ap.add_argument("--recon-matrix", default="",
+                    help="Himito <prefix>.cleaned_matrix.csv (reconstructed haplotypes)")
+    ap.add_argument("--truth-clones", default="",
+                    help="simulate_tree.py truth/clones.tsv (truth clone genomes)")
     ap.add_argument("--profile", default="NA")
     ap.add_argument("--fp", default="NA")
     ap.add_argument("--fn", default="NA")
@@ -341,7 +479,15 @@ def main() -> None:
     detected_hf = detected_variants_with_hf_from_vcf(args.vcf)
     detected = set(detected_hf)
 
-    m = score(truth_pm, recon_pm, truth_vars, detected)
+    if bool(args.recon_matrix) != bool(args.truth_clones):
+        ap.error("--recon-matrix and --truth-clones must be given together")
+    truth_haps = recon_haps = None
+    if args.recon_matrix:
+        truth_haps = parse_clone_haplotypes(args.truth_clones)
+        recon_haps = parse_matrix_haplotypes(args.recon_matrix)
+
+    m = score(truth_pm, recon_pm, truth_vars, detected,
+              truth_haps=truth_haps, recon_haps=recon_haps)
     row = {"profile": args.profile, "fp": args.fp, "fn": args.fn, **m}
 
     def fmt(x):

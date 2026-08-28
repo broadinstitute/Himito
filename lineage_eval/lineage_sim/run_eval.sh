@@ -75,6 +75,8 @@ python "$HERE/score_lineage.py" \
   --recon-tree "$OUTDIR/himito/sim_lineage.mutation_tree.tsv" \
   --truth-variants "$OUTDIR/truth/truth_variants.txt" \
   --vcf "$OUTDIR/himito/sim.vcf" \
+  --recon-matrix "$OUTDIR/himito/sim_lineage.cleaned_matrix.csv" \
+  --truth-clones "$OUTDIR/truth/clones.tsv" \
   --profile "$PROFILE" --fp "$FP" --fn "$FN" \
   --metrics-out "$OUTDIR/metrics.tsv"
 

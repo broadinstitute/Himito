@@ -57,14 +57,26 @@ If GitHub, Docker Hub, or `crates.io` are slow or unreachable, use the **Zenodo 
                                     -d pacbio
 
 ```
-If you are analyzing high coverage samples, remember to set ```--maximal-mt-depth``` to a reasonable number
+If you are analyzing high coverage samples, remember to set ```--maximal-mt-depth``` to a reasonable number. -d accepts: pacbio (default), ont-r9, ont-r10, ont-denoised
+
 
 ## Details
-### build Himito graph
+
+### Filter NUMTs-derived reads
 ```
 # filter NUMTs-derived reads
 ./target/release/Himito filter -i <input.bam> -c <chromosome in bam, e.g. "chrM"> -m <mt_output.bam> -n <numts_output.bam>
+```
 
+### Update: Denoise ONT reads before graph construction
+For ONT R9 and R10 data, we recommend running Himito denoise to correct ONT reads in a BAM before graph construction. Denoising is a per-base model: it removes the *random* ONT error it can see, but leaves *systematic* error, which carries high base qualities, untouched. `ont-denoised` therefore keeps the ONT thresholds and the permutation co-occurrence test on SNPs (unlike `pacbio`, which exempts SNPs), and additionally makes the strand-bias filter **drop** strand-skewed low-VAF SNPs instead of only tagging them `FILTER=Strand_bias`. A call that is still strand-skewed after denoising has survived a filter designed to catch exactly that artifact, so it is discarded.
+
+```
+./target/release/Himito denoise -i <mt_output_bam> -r <NC_012920.1.fasta> -d <ont-r10/ont-r9> -o <denoised_bam> 
+```
+
+### build Himito graph
+```
 # construct graph
 ./target/release/Himito build -i <mt_output.bam> -k <kmer_size> -r <NC_012920.1.fasta> -o <output.gfa>
 
@@ -80,30 +92,20 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ./target/release/Himito correct -g <output.gfa> -b <bwt_file, e.g. sr_msbwt.npy> -o <corrected.gfa> -m <minimal_supporting_sr> -q <query_length, should be less than short read length>
 ```
 ### Downstream analysis
+#### call variants from graph, default for pacbio.
 ```
-# call variants from graph, default for pacbio.
-# -d accepts: pacbio (default), ont-r9, ont-r10, ont-denoised
 ./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf>
 ```
-
-#### `-d ont-denoised`
-Use this data type when the graph was built from reads that have already been error-corrected by `Himito denoise` (this is what `quick-start -d ont-denoised` does internally). Denoising is a per-base model: it removes the *random* ONT error it can see, but leaves *systematic* error, which carries high base qualities, untouched. `ont-denoised` therefore keeps the ONT thresholds and the permutation co-occurrence test on SNPs (unlike `pacbio`, which exempts SNPs), and additionally makes the strand-bias filter **drop** strand-skewed low-VAF SNPs instead of only tagging them `FILTER=Strand_bias`. A call that is still strand-skewed after denoising has survived a filter designed to catch exactly that artifact, so it is discarded.
-
-The drop behaviour needs read-level strand evidence, so pass the denoised BAM with `--input-bam`; without it the strand-bias step is skipped entirely. Only SNPs with heteroplasmic frequency below `--strand-bias-drop-max-hf` (default 0.10) are dropped — higher-frequency calls are still merely flagged. Use `--strand-bias-action flag` to restore the tag-only behaviour of the other data types.
-
+#### extract major haplotype from graph
 ```
-./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> \
-                             -d ont-denoised --input-bam <mt.denoised.bam> -o <output.vcf>
-```
-
-```
-# extract major haplotype from graph
 ./target/release/Himito asm -g <output.gfa>  -o <output.majorhaplotpe.fasta> -s <header string, e.g. "HG002 major haplotype">
+```
 
-# call methylation signals
+#### call methylation signals
+```
 ./target/release/Himito methyl -g <output.annotated.gfa> -p <min_prob> -b <mt_test.bam> -o <methyl.bed>
-
-# enumerate all possible haplotypes within windows
+```
+#### enumerate all possible haplotypes within windows (deprecated)
 ./target/release/Himito minorhap -g <output.gfa> -o <output.allhaplotype.fasta> -s <sample_id>
 ```
 

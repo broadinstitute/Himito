@@ -81,9 +81,22 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ```
 ### Downstream analysis
 ```
-# call variants from graph, default for pacbio, change <-d ont> to ont data
+# call variants from graph, default for pacbio.
+# -d accepts: pacbio (default), ont-r9, ont-r10, ont-denoised
 ./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf>
+```
 
+#### `-d ont-denoised`
+Use this data type when the graph was built from reads that have already been error-corrected by `Himito denoise` (this is what `quick-start -d ont-denoised` does internally). Denoising is a per-base model: it removes the *random* ONT error it can see, but leaves *systematic* error, which carries high base qualities, untouched. `ont-denoised` therefore keeps the ONT thresholds and the permutation co-occurrence test on SNPs (unlike `pacbio`, which exempts SNPs), and additionally makes the strand-bias filter **drop** strand-skewed low-VAF SNPs instead of only tagging them `FILTER=Strand_bias`. A call that is still strand-skewed after denoising has survived a filter designed to catch exactly that artifact, so it is discarded.
+
+The drop behaviour needs read-level strand evidence, so pass the denoised BAM with `--input-bam`; without it the strand-bias step is skipped entirely. Only SNPs with heteroplasmic frequency below `--strand-bias-drop-max-hf` (default 0.10) are dropped — higher-frequency calls are still merely flagged. Use `--strand-bias-action flag` to restore the tag-only behaviour of the other data types.
+
+```
+./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> \
+                             -d ont-denoised --input-bam <mt.denoised.bam> -o <output.vcf>
+```
+
+```
 # extract major haplotype from graph
 ./target/release/Himito asm -g <output.gfa>  -o <output.majorhaplotpe.fasta> -s <header string, e.g. "HG002 major haplotype">
 

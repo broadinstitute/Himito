@@ -57,7 +57,7 @@ task Build {
     }
 
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:v1"
+        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/lr-truvari:v1"
         memory: "2 GB"
         cpu: 1
         disks: "local-disk 10 SSD"

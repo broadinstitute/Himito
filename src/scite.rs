@@ -430,7 +430,13 @@ pub fn from_nj_tree(hap_matrix: &HaplotypeMatrix, nj_tree: &lineage::Tree) -> Mu
     enforce_position_exclusivity(&tree, &variant_spans(&hap_matrix.variants))
 }
 
+/// Two distinct indices in `0..n` by rejection sampling.
+///
+/// Panics when `n < 2`: with fewer than two mutations there is no such pair, and
+/// the rejection loop would otherwise spin forever. Callers must screen for that
+/// (see [`propose_move`], which skips both swap moves in that case).
 fn sample_two_distinct(n: usize, rng: &mut impl Rng) -> (usize, usize) {
+    assert!(n >= 2, "sample_two_distinct needs at least 2 nodes (got {n})");
     let first = rng.random_range(0..n);
     let mut second = rng.random_range(0..n);
     while second == first {
@@ -542,6 +548,12 @@ pub fn propose_swap_subtrees(tree: &MutationTree, rng: &mut impl Rng) -> (Mutati
 /// `0.4` swap-labels, `0.05` swap-subtrees), renormalized to sum to 1 since
 /// this plan has no error-rate move at all.
 pub fn propose_move(tree: &MutationTree, rng: &mut impl Rng) -> (MutationTree, f64) {
+    // With 0 or 1 mutations only one tree exists, and both swap moves need two
+    // distinct mutation nodes to pick from. Propose the current tree unchanged
+    // (always accepted, no state change) rather than sampling an impossible pair.
+    if tree.n_mutations < 2 {
+        return (tree.clone(), 1.0);
+    }
     let r: f64 = rng.random();
     if r < 0.55 {
         (propose_prune_reattach(tree, rng), 1.0)
@@ -571,6 +583,13 @@ pub fn run_mcmc(
     let mut current_ll = tree_log_likelihood(matrix, &current, rates);
     let mut best = current.clone();
     let mut best_ll = current_ll;
+
+    // A single mutation (or none) admits exactly one tree — it hangs off the
+    // root — so there is nothing to search. Return it directly instead of
+    // burning `n_iterations` no-op proposals.
+    if n < 2 {
+        return (current, current_ll);
+    }
 
     for _ in 0..n_iterations {
         let (proposal, nbh_correction) = propose_move(&current, rng);
@@ -1399,11 +1418,24 @@ pub fn run_scite_pipeline(
     min_reads: usize,
     output_prefix: &str,
 ) -> Result<()> {
-    if binary.variants.len() < 2 {
+    if binary.variants.is_empty() {
         anyhow::bail!(
-            "SCITE requires at least 2 variants (got {}); \
-             relax --min-hf / --min-presence / --min-absence thresholds.",
-            binary.variants.len()
+            "SCITE requires at least 1 variant (got 0); \
+             relax --min-hf / --min-presence / --min-absence thresholds."
+        );
+    }
+    // One variant is a valid, if degenerate, run: the tree can only be
+    // root → variant, so there is no topology to search and no variant pair to
+    // score. Every output file is still produced (the two co-occurrence tables
+    // are header-only), which keeps single-variant samples in the same reporting
+    // format as the rest.
+    let single_variant = binary.variants.len() == 1;
+    if single_variant {
+        info!(
+            "[SCITE] Only 1 variant ({}) passed filtering: the mutation tree is \
+             fixed (root → variant), so the MCMC search and unary-path polish are \
+             skipped and the pairwise co-occurrence tables will be empty.",
+            binary.variants[0]
         );
     }
     let dist = lineage::hamming_distance_matrix(hap_matrix);
@@ -1433,9 +1465,14 @@ pub fn run_scite_pipeline(
     }
 
     info!(
-        "[SCITE] {} variants, {} reads. Running MCMC: {n_chains} chains x {n_iterations} iterations",
+        "[SCITE] {} variants, {} reads. {}",
         binary.variants.len(),
-        binary.reads.len()
+        binary.reads.len(),
+        if single_variant {
+            "Only one tree is possible; skipping MCMC.".to_string()
+        } else {
+            format!("Running MCMC: {n_chains} chains x {n_iterations} iterations")
+        }
     );
 
     let rates = ErrorRates { fp_rate, fn_rate };
@@ -2189,6 +2226,72 @@ mod tests {
             ".read_lineage.nwk",
         ] {
             std::fs::remove_file(format!("{prefix}{suffix}")).ok();
+        }
+    }
+
+    #[test]
+    fn run_scite_pipeline_handles_a_single_variant() {
+        // One variant: the only possible tree is root → m.A, the co-occurrence
+        // tables have no pair to report, and the swap proposals (which need two
+        // distinct mutation nodes) must never be reached.
+        let matrix = BinaryMatrix {
+            variants: vec!["m.100A>G".to_string()],
+            reads: (0..10).map(|i| format!("r{i}")).collect(),
+            data: vec![vec![Some(1); 7]
+                .into_iter()
+                .chain(vec![Some(0); 2])
+                .chain([None])
+                .collect()],
+        };
+        let hap_matrix = lineage::deduplicate(&matrix, 1);
+
+        let prefix = std::env::temp_dir()
+            .join("himito_test_scite_pipeline_1var")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 500, 2, 123, 1, &prefix).unwrap();
+
+        let tree_tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
+        // The mutation hangs directly off the root, with no order to resolve.
+        assert!(
+            tree_tsv.contains("0\tm.100A>G\t1\tROOT\t"),
+            "expected m.100A>G under ROOT, got:\n{tree_tsv}"
+        );
+        // Header-only co-occurrence tables: a single variant forms no pair.
+        for suffix in [".variant_cooccurrence.tsv", ".raw_variant_cooccurrence.tsv"] {
+            let content = std::fs::read_to_string(format!("{prefix}{suffix}")).unwrap();
+            assert_eq!(content.lines().count(), 1, "expected header only in {suffix}");
+        }
+        let nwk = std::fs::read_to_string(format!("{prefix}.read_lineage.nwk")).unwrap();
+        assert!(nwk.contains("mutation=m.100A>G"), "got newick: {nwk}");
+
+        for suffix in [
+            ".cleaned_matrix.csv",
+            ".variant_cooccurrence.tsv",
+            ".raw_variant_cooccurrence.tsv",
+            ".molecule_summary.tsv",
+            ".mutation_tree.tsv",
+            ".read_lineage.nwk",
+        ] {
+            let path = format!("{prefix}{suffix}");
+            assert!(std::path::Path::new(&path).exists(), "expected output file {path} to exist");
+            std::fs::remove_file(&path).ok();
+        }
+    }
+
+    #[test]
+    fn propose_move_leaves_a_single_mutation_tree_unchanged() {
+        // Guards the infinite rejection loop in `sample_two_distinct`: with one
+        // mutation the swap moves have no second node to draw, so `propose_move`
+        // must return the current tree instead of proposing one.
+        let tree = MutationTree { n_mutations: 1, parent: vec![1, 1] };
+        let mut rng = StdRng::seed_from_u64(4);
+        for _ in 0..100 {
+            let (proposal, correction) = propose_move(&tree, &mut rng);
+            assert_eq!(proposal.parent, tree.parent);
+            assert_eq!(correction, 1.0);
         }
     }
 

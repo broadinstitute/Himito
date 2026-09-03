@@ -195,9 +195,15 @@ Required Parameters:
 
 Commonly used optional parameters (run `Himito denoise --help` for the full list):
 - -d, --data-type <STRING>: only `ont-*` is denoised, others pass through unchanged [default: ont-r10]
-- --vaf <FLOAT>: minimal VAF for a substitution allele to be kept [default: 0.01]
-- --min-strand <INT>: minimal observations required on each strand for allele candidacy [default: 2]
+- --vaf <FLOAT>: minimal VAF for a substitution allele to be kept [default: 0.03]
 - --stats <FILE>: optional path to write denoise statistics as JSON
+
+The strand-candidacy gates are no longer flags. Minimal per-strand observations
+(2), the strand-bias p-value threshold (0.01) and the near-homoplasmic exemption
+(0.95) are fixed as the `DENOISE_MIN_STRAND`, `DENOISE_STRAND_BIAS_P` and
+`DENOISE_HOMOPLASMIC_VAF` constants in `src/main.rs`. They were previously
+`--min-strand`, `--strand-bias-p` and `--homoplasmic-vaf`; no caller ever set
+any of them to anything but the default.
 
 Example:
 ```
@@ -207,7 +213,7 @@ Example:
 #### Small-indel denoising (ONT, opt-in)
 
 `Himito denoise --indels` extends substitution correction to indels shorter than
-`--indel-max-len` (default 5, exclusive — so lengths 1-4). Reads are reassigned at
+`IndelOpts::max_len` (5, exclusive — so lengths 1-4). Reads are reassigned at
 left-normalized indel sites in both directions: a read can lose a spurious indel,
 gain a consensus indel it dropped, or snap from one indel allele to another of the
 same kind.
@@ -218,30 +224,33 @@ in unique sequence, because that is where ONT's indel errors concentrate. A read
 leaves its own allele when that allele's frequency falls below `eps / (1 - eps)` of a
 competing one.
 
-**Not enabled by Quick Start.** `Himito quick-start` already runs substitution
-denoising automatically for ONT data, but indel correction stays off there — you must
-run `Himito denoise --indels` yourself (as a stepwise, standalone call) to get it.
+**Enabled by Quick Start.** `Himito quick-start` runs substitution denoising
+automatically for ONT data **and turns indel correction on** (`IndelOpts {
+enabled: true, .. }` in the QuickStart arm of `src/main.rs`). Running
+`Himito denoise --indels` yourself is only needed for a standalone, stepwise run.
 
-**The ten defaults below are unvalidated starting points, not tuned claims** — they are
-pending a validation sweep against `lineage_sim` (graph/matrix cleanliness with no
-regression in tree score or indel precision/recall) before `--indels` is ever turned on
-by default anywhere in the pipeline.
+**The model constants below are unvalidated starting points, not tuned claims** — they
+are pending a validation sweep against `lineage_sim` (graph/matrix cleanliness with no
+regression in tree score or indel precision/recall).
 
-Indel-specific flags and their defaults (from `Himito denoise --help`):
+Indel flags (from `Himito denoise --help`):
 - `--indels`: enable small-indel (<5bp) correction in addition to substitutions [off by default]
-- `--indel-max-len <INT>`: exclusive upper bound on correctable indel length [default: 5]
-- `--indel-vaf <FLOAT>`: absolute minimal VAF floor for an indel allele to be kept [default: 0.05]
-- `--indel-err0 <FLOAT>`: per-junction indel error probability in unique sequence [default: 0.01]
-- `--indel-err-scale <FLOAT>`: multiplicative growth of the indel error rate per extra repeat copy [default: 1.5]
-- `--indel-err-cap <FLOAT>`: ceiling on the context-scaled indel error rate [default: 0.4]
-- `--indel-floor-mult <FLOAT>`: candidacy floor is at least this multiple of the local indel error rate [default: 3]
-- `--indel-delta <FLOAT>`: decay of error mass per unit of net-length distance between alleles [default: 0.3]
-- `--indel-flank <INT>`: reads must extend this many bases past a site on both sides to be reassigned [default: 5]
 - `--indel-protect-vaf <FLOAT>`: an allele carried by at least this fraction of reads at a site is never corrected away, whatever candidacy says [default: 0.2]
+
+The rest of the indel model is fixed in `IndelOpts::default()`
+(`src/denoise_indel.rs`) rather than exposed as flags: `max_len` 5 (exclusive, so
+lengths 1-4), `vaf` 0.05, `err0` 0.01, `err_scale` 1.5, `err_cap` 0.4,
+`floor_mult` 3.0, `delta` 0.3, `flank` 5. These were once the
+`--indel-max-len` / `--indel-vaf` / `--indel-err0` / `--indel-err-scale` /
+`--indel-err-cap` / `--indel-floor-mult` / `--indel-delta` / `--indel-flank`
+flags. Nothing in the repository ever set one, and as the sensitivity note below
+explains, four of them cannot change whether an allele survives in the repeat
+contexts that actually matter. `--indel-protect-vaf` stays a flag because it is
+the one lever that does.
 
 **Why `--indel-protect-vaf` exists.** In deep repeat contexts (e.g. the mtDNA poly-C
 tracts at m.303-315 and m.16184-16193) the candidacy floor computed from
-`--indel-floor-mult` and the repeat-scaled error rate can exceed 1.0, so no allele
+`floor_mult` and the repeat-scaled error rate can exceed 1.0, so no allele
 could ever clear it. Without a guard, every read carrying a real indel in these
 regions would be reverted to reference, destroying genuine heteroplasmy in exactly the
 loci where it concentrates. `--indel-protect-vaf` fixes this: any allele carried by at
@@ -254,13 +263,15 @@ protection does not apply to them.
 an allele at a site is `min(vaf_floor(L), protect_vaf)`, where `L` is the reference
 repeat-context length. Because `vaf_floor(6) ≈ 0.228 > protect_vaf (0.2)`, and
 `vaf_floor` only grows with `L`, that minimum is a **flat 0.2 for every repeat context
-`L >= 6`** — so `--indel-err-scale`, `--indel-err-cap`, `--indel-floor-mult`, and
-`--indel-vaf` have **no effect on whether an allele survives** in those contexts at the
-stock `--indel-protect-vaf`. They do still matter in two ways: `--indel-err-scale` and
-`--indel-err-cap` set the MAP crossover, so they govern *which* allele a sub-threshold
-read is moved to; and all four still bite at repeat contexts of 5 or less.
+`L >= 6`** — so `err_scale`, `err_cap`, `floor_mult`, and `vaf` have **no effect on
+whether an allele survives** in those contexts at the stock `--indel-protect-vaf`.
+They do still matter in two ways: `err_scale` and `err_cap` set the MAP crossover, so
+they govern *which* allele a sub-threshold read is moved to; and all four still bite at
+repeat contexts of 5 or less. This is why they are compile-time constants rather than
+flags — tuning them from the command line could not have moved the sensitivity floor
+where it matters.
 Concretely: an indel below ~20% VAF inside a homopolymer or tandem repeat of length 6 or
-more will be reverted, full stop, regardless of how the other four flags are tuned —
+more will be reverted, full stop, regardless of how the other four constants are set —
 and homopolymers and tandem repeats of that length are exactly where ONT's indel error
 concentrates. Lowering `--indel-protect-vaf` is the only way to raise sensitivity below
 20% VAF in those contexts, and lowering it too far has its own failure mode (see above).

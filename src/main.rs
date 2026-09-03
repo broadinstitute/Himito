@@ -31,6 +31,60 @@ mod denoise_indel;
 /// 0.04 recall starts falling (0.965) as real low-frequency heteroplasmies drop out.
 pub const DENOISE_KEEP_VAF: f64 = 0.03;
 
+/// Minimal observations required on EACH strand for an allele to be a candidate.
+///
+/// Was `--min-strand`. Every caller in the repo — QuickStart, both eval scripts,
+/// and every unit test — used 2, so the flag never did anything but restate its
+/// own default.
+pub const DENOISE_MIN_STRAND: u32 = 2;
+
+/// p-value threshold for the per-allele strand-bias test (binomial, against the
+/// column's own forward fraction); alleles below it lose candidacy.
+///
+/// Was `--strand-bias-p`. `0.0` disables the test entirely — a path `fit_site`'s
+/// unit tests still exercise, which is why the plumbing below keeps this as a
+/// parameter even though no CLI flag sets it any more.
+pub const DENOISE_STRAND_BIAS_P: f64 = 0.01;
+
+/// Within-column frequency at or above which an allele skips the strand-bias
+/// test (a single-strand artifact cannot reach a near-homoplasmic frequency).
+///
+/// Was `--homoplasmic-vaf`. Note this is the *standalone denoise* value; the
+/// QuickStart pipeline deliberately passes 0.7 instead (see the `QuickStart`
+/// arm), matching `call.rs`'s own homoplasmic threshold.
+pub const DENOISE_HOMOPLASMIC_VAF: f64 = 0.95;
+
+/// The data types Himito accepts wherever a `-d/--data-type` is taken.
+///
+/// Used as the clap `PossibleValuesParser` set so an unrecognised value is
+/// rejected before any work starts. This matters because the fp/fn preset
+/// lookup in `lineage::resolve_error_rates` has a catch-all arm: without this
+/// list a typo'd `-d ont-10` would silently run to completion with raw-ONT
+/// rates and exit 0.
+pub const DATA_TYPES: [&str; 4] = ["pacbio", "ont-r9", "ont-r10", "ont-denoised"];
+
+/// Minimal reads a variant must be present in / absent from for `lineage` to
+/// treat it as informative (it needs both to place a bifurcation).
+///
+/// Were `--min-presence` / `--min-absence`. Nothing in the repo — no WDL, no
+/// eval script, no doc — ever set either, and `git log -S` finds no commit that
+/// ever did.
+pub const LINEAGE_MIN_PRESENCE: usize = 2;
+pub const LINEAGE_MIN_ABSENCE: usize = 1;
+
+/// Minimal reads backing a haplotype for `lineage` to report it.
+///
+/// Was `--min-reads`. Drops low-count haplotypes from the haplotype maps and
+/// from the tips of `<prefix>.read_lineage.nwk`.
+pub const LINEAGE_MIN_READS: usize = 3;
+
+/// RNG seed for the SCITE MCMC search, fixed so runs are reproducible.
+///
+/// Was `--mcmc-seed`. Every invocation in the repo used the default 42;
+/// `--mcmc-iterations` and `--mcmc-chains` remain flags because
+/// `lineage_eval/lineage_sim/sweep_fpfn.sh` does vary those two.
+pub const LINEAGE_MCMC_SEED: u64 = 42;
+
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
 #[clap(version = env!("CARGO_PKG_VERSION"))]
@@ -244,55 +298,9 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = DENOISE_KEEP_VAF)]
         vaf: f64,
 
-        /// minimal observations required on EACH strand for allele candidacy
-        #[clap(long, value_parser, default_value_t = 2)]
-        min_strand: u32,
-
-        /// p-value threshold for the per-allele strand-bias test (binomial, against the
-        /// column's own forward fraction); alleles below it lose candidacy. 0 disables.
-        #[clap(long, value_parser, default_value_t = 0.01)]
-        strand_bias_p: f64,
-
-        /// alleles at or above this within-column frequency skip the strand-bias test
-        /// (a single-strand artifact cannot reach a near-homoplasmic frequency)
-        #[clap(long, value_parser, default_value_t = 0.95)]
-        homoplasmic_vaf: f64,
-
         /// enable small-indel (<5bp) correction in addition to substitutions
         #[clap(long, value_parser, default_value_t = false)]
         indels: bool,
-
-        /// exclusive upper bound on correctable indel length (5 = lengths 1..=4)
-        #[clap(long, value_parser, default_value_t = 5)]
-        indel_max_len: u32,
-
-        /// absolute minimal VAF floor for an indel allele to be kept
-        #[clap(long, value_parser, default_value_t = 0.05)]
-        indel_vaf: f64,
-
-        /// per-junction indel error probability in unique sequence
-        #[clap(long, value_parser, default_value_t = 0.01)]
-        indel_err0: f64,
-
-        /// multiplicative growth of the indel error rate per extra repeat copy
-        #[clap(long, value_parser, default_value_t = 1.5)]
-        indel_err_scale: f64,
-
-        /// ceiling on the context-scaled indel error rate
-        #[clap(long, value_parser, default_value_t = 0.4)]
-        indel_err_cap: f64,
-
-        /// candidacy floor is at least this multiple of the local indel error rate
-        #[clap(long, value_parser, default_value_t = 3.0)]
-        indel_floor_mult: f64,
-
-        /// decay of error mass per unit of net-length distance between alleles
-        #[clap(long, value_parser, default_value_t = 0.3)]
-        indel_delta: f64,
-
-        /// reads must extend this many bases past a site on both sides to be reassigned
-        #[clap(long, value_parser, default_value_t = 5)]
-        indel_flank: usize,
 
         /// an allele carried by at least this fraction of reads at a site is never
         /// corrected away, whatever candidacy says (protects real heteroplasmy in
@@ -533,26 +541,19 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.01)]
         min_hf: f64,
 
-        /// maximal heteroplasmic frequency (exclusive) for a variant to be considered;
-        /// default of 1.0 excludes fixed/homoplasmic variants (HF == 0.95)
+        /// maximal heteroplasmic frequency (exclusive) for a variant to be
+        /// considered; the default excludes fixed/homoplasmic variants (HF >= 0.95)
         #[clap(long, value_parser, default_value_t = 0.95)]
         max_hf: f64,
 
-        /// minimal number of reads a variant must be present in to be informative
-        #[clap(long, value_parser, default_value_t = 2)]
-        min_presence: usize,
-
-        /// minimal number of reads a variant must be absent from to be informative
-        #[clap(long, value_parser, default_value_t = 1)]
-        min_absence: usize,
-
-        /// minimal number of reads required to report a haplotype
-        #[clap(long, value_parser, default_value_t = 3)]
-        min_reads: usize,
-
         /// data type, pacbio, ont-r9, ont-r10, ont-denoised; selects the
         /// default SCITE fp/fn rates
-        #[clap(short, long, value_parser, default_value = "pacbio")]
+        #[clap(
+            short,
+            long,
+            default_value = "pacbio",
+            value_parser = clap::builder::PossibleValuesParser::new(DATA_TYPES)
+        )]
         data_type: String,
 
         /// SCITE false-positive rate (alpha): P(observed=1 | true=0)
@@ -573,76 +574,36 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 3)]
         mcmc_chains: usize,
 
-        /// RNG seed for the MCMC search (reproducible runs)
-        #[clap(long, value_parser, default_value_t = 42)]
-        mcmc_seed: u64,
-
         /// output prefix; writes <prefix>.haplotype_map.tsv
         #[clap(short, long, value_parser, required = true)]
         output_prefix: String,
     }
 }
 
-/// Validate the numeric `--indel-*` options at the CLI boundary. Only called
-/// when `--indels` is passed (see the `Denoise` arm below): a user who is not
-/// using the feature must never be blocked by it, however out-of-range its
-/// unused defaults might theoretically be set to by some other caller.
+/// Validate the user-settable `--indel-*` options at the CLI boundary. Only
+/// called when `--indels` is passed (see the `Denoise` arm below): a user who is
+/// not using the feature must never be blocked by it.
 ///
 /// This validation deliberately lives here, not inside `IndelOpts` or any
 /// library function: the CLI is the boundary where a human-typed flag value
 /// first exists, and the error message needs the flag's own name, which only
-/// the CLI layer knows. Two of these are load-bearing, not cosmetic:
-/// `--indel-protect-vaf 0` protects EVERY non-strand-rejected read
-/// (`observed_vaf >= 0.0` is always true), so the only reads ever corrected
-/// are ones that failed a strand gate -- the exact inverse of "protect less,
-/// correct more" that a value of 0 looks like it should mean, and it would
-/// otherwise silently disable the feature while still exiting 0 with a valid
-/// BAM. `--indel-err-cap` above 0.5 is honoured by the candidacy floor
-/// (`vaf_floor` via `floor_mult * error_rate`) but `assign_allele` clamps
-/// `eps` to `[0.0, 0.5]` before using it for MAP assignment, so a cap above
-/// 0.5 would make the gate and the assignment step disagree about the error
-/// rate actually in effect.
+/// the CLI layer knows.
+///
+/// Only `protect_vaf` is checked, because it is the only numeric field a flag
+/// can still set. The rest of `IndelOpts` now always holds
+/// `IndelOpts::default()`, whose values are in range by construction — checking
+/// a number the user cannot type would be dead code.
+///
+/// `--indel-protect-vaf 0` is load-bearing, not cosmetic: it protects EVERY
+/// non-strand-rejected read (`observed_vaf >= 0.0` is always true), so the only
+/// reads ever corrected are ones that failed a strand gate — the exact inverse
+/// of the "protect less, correct more" a value of 0 looks like it should mean,
+/// and it would otherwise silently disable the feature while still exiting 0
+/// with a valid BAM.
 fn validate_indel_opts(o: &denoise_indel::IndelOpts) -> AnyhowResult<()> {
-    fn open_closed(flag: &str, v: f64, hi: f64) -> AnyhowResult<()> {
-        anyhow::ensure!(
-            v > 0.0 && v <= hi,
-            "--{flag} must be in (0, {hi}] (got {v})"
-        );
-        Ok(())
-    }
-    open_closed("indel-protect-vaf", o.protect_vaf, 1.0)?;
-    open_closed("indel-err0", o.err0, 0.5)?;
-    open_closed("indel-err-cap", o.err_cap, 0.5)?;
-    // Upper bounds matter as much as lower ones here: an unbounded multiplier can
-    // push `vaf_floor` past 1.0 at every context, leaving `--indel-protect-vaf` as
-    // the only thing keeping any allele -- a silent near-disable of exactly the kind
-    // the `--indel-protect-vaf 0` check above exists to prevent.
     anyhow::ensure!(
-        o.err_scale >= 1.0 && o.err_scale <= 10.0,
-        "--indel-err-scale must be in [1.0, 10.0] (got {})", o.err_scale
-    );
-    anyhow::ensure!(
-        o.floor_mult >= 0.0 && o.floor_mult <= 100.0,
-        "--indel-floor-mult must be in [0.0, 100.0] (got {})", o.floor_mult
-    );
-    open_closed("indel-delta", o.delta, 1.0)?;
-    // `vaf` is only ever used as `max(vaf, floor_mult * error_rate(L))`, so 0 is a
-    // coherent setting meaning "no absolute floor, use the context-scaled one only".
-    anyhow::ensure!(
-        o.vaf >= 0.0 && o.vaf <= 1.0,
-        "--indel-vaf must be in [0, 1] (got {})", o.vaf
-    );
-    // The feature is specified and documented as small-indel (<5bp) correction; a
-    // large bound would let the rewrite walk emit correspondingly large gained
-    // deletions, well outside anything the site model was designed or validated for.
-    anyhow::ensure!(
-        (1..=20).contains(&o.max_len),
-        "--indel-max-len must be in [1, 20] (got {}); this feature targets small indels",
-        o.max_len
-    );
-    anyhow::ensure!(
-        o.flank >= 1,
-        "--indel-flank must be >= 1 (got {})", o.flank
+        o.protect_vaf > 0.0 && o.protect_vaf <= 1.0,
+        "--indel-protect-vaf must be in (0, 1] (got {})", o.protect_vaf
     );
     Ok(())
 }
@@ -710,16 +671,20 @@ fn main() {
             // applies the ONT permutation-test SNP filtering those reads need.
             let (build_bam, data_type_) = if data_type == "ont-denoised" {
                 let denoised = output_prefix.with_extension("mt.denoised.bam");
-                // Denoise defaults for the combined pipeline: min_strand 2, strand-bias
-                // p 0.01, near-homoplasmic exemption at 0.7 (matching the Denoise CLI
-                // and call.rs's own permutation/homoplasmic threshold).
+                // Denoise settings for the combined pipeline. The strand gates are
+                // the shared constants; the near-homoplasmic exemption is
+                // deliberately 0.7 here — matching `call.rs`'s own
+                // permutation/homoplasmic threshold — and NOT the standalone
+                // denoise value in `DENOISE_HOMOPLASMIC_VAF` (0.95). The two paths
+                // have always differed; an earlier version of this comment claimed
+                // they matched, which was wrong.
                 if let Err(e) = denoise::start(
                     &mt_output, &denoised, &reference_path, &data_type,
                     // Denoise's keep threshold, NOT `vaf_threshold`. Passing the
                     // caller's HF cut here made the two impossible to tune apart, and
                     // at 0.01 the site model keeps marginal noise alleles whose reads
                     // then reach the VCF (precision 0.837 vs 0.967 at 0.03).
-                    DENOISE_KEEP_VAF, 2, 0.01, 0.7,
+                    DENOISE_KEEP_VAF, DENOISE_MIN_STRAND, DENOISE_STRAND_BIAS_P, 0.7,
                     // Indel correction is on in QuickStart. Every other field keeps
                     // its `Default` value, which `validate_indel_opts` accepts as-is,
                     // so there is nothing to validate here.
@@ -807,32 +772,17 @@ fn main() {
             reference,
             data_type,
             vaf,
-            min_strand,
-            strand_bias_p,
-            homoplasmic_vaf,
             indels,
-            indel_max_len,
-            indel_vaf,
-            indel_err0,
-            indel_err_scale,
-            indel_err_cap,
-            indel_floor_mult,
-            indel_delta,
-            indel_flank,
             indel_protect_vaf,
             stats,
         } => {
+            // Every field except `enabled` and `protect_vaf` keeps its `Default`
+            // value: the flags that used to set them all shipped defaults
+            // identical to `IndelOpts::default()` and nothing ever overrode them.
             let iopts = denoise_indel::IndelOpts {
                 enabled: indels,
-                max_len: indel_max_len,
-                vaf: indel_vaf,
-                err0: indel_err0,
-                err_scale: indel_err_scale,
-                err_cap: indel_err_cap,
-                floor_mult: indel_floor_mult,
-                delta: indel_delta,
-                flank: indel_flank,
                 protect_vaf: indel_protect_vaf,
+                ..Default::default()
             };
             // Only validate when --indels is actually in effect: a user who
             // never opted into the feature must never be blocked by it.
@@ -843,8 +793,8 @@ fn main() {
                 }
             }
             if let Err(e) = denoise::start(
-                &input, &output, &reference, &data_type, vaf, min_strand,
-                strand_bias_p, homoplasmic_vaf, &iopts, stats.as_ref(),
+                &input, &output, &reference, &data_type, vaf, DENOISE_MIN_STRAND,
+                DENOISE_STRAND_BIAS_P, DENOISE_HOMOPLASMIC_VAF, &iopts, stats.as_ref(),
             ) {
                 eprintln!("Error running denoise: {e:#}");
                 std::process::exit(1);
@@ -975,15 +925,11 @@ fn main() {
             vcf_file,
             min_hf,
             max_hf,
-            min_presence,
-            min_absence,
-            min_reads,
             data_type,
             fp_rate,
             fn_rate,
             mcmc_iterations,
             mcmc_chains,
-            mcmc_seed,
             output_prefix,
         } => {
             let matrix_file = matrix_file.to_str().expect("matrix-file path is not valid UTF-8");
@@ -997,15 +943,14 @@ fn main() {
                 vcf_file,
                 min_hf,
                 max_hf,
-                min_presence,
-                min_absence,
-                min_reads,
-                &data_type,
+                LINEAGE_MIN_PRESENCE,
+                LINEAGE_MIN_ABSENCE,
+                LINEAGE_MIN_READS,
                 fp_rate,
                 fn_rate,
                 mcmc_iterations,
                 mcmc_chains,
-                mcmc_seed,
+                LINEAGE_MCMC_SEED,
                 &output_prefix,
             ) {
                 eprintln!("Error running lineage analysis: {:#}", e);
@@ -1055,76 +1000,9 @@ mod indel_opts_validation_tests {
         assert!(validate_indel_opts(&o).is_err());
     }
 
-    #[test]
-    fn err_cap_above_half_is_rejected() {
-        // FIX 4: the candidacy floor honours err_cap above 0.5, but
-        // `assign_allele` clamps eps to [0.0, 0.5] -- a cap above 0.5 would
-        // make the gate and the assignment step disagree.
-        let mut o = opts();
-        o.err_cap = 0.6;
-        assert!(validate_indel_opts(&o).is_err());
-    }
-
-    #[test]
-    fn err0_above_half_is_rejected() {
-        let mut o = opts();
-        o.err0 = 0.6;
-        assert!(validate_indel_opts(&o).is_err());
-    }
-
-    #[test]
-    fn err_scale_below_one_is_rejected() {
-        let mut o = opts();
-        o.err_scale = 0.5;
-        assert!(validate_indel_opts(&o).is_err());
-    }
-
-    #[test]
-    fn floor_mult_negative_is_rejected() {
-        let mut o = opts();
-        o.floor_mult = -1.0;
-        assert!(validate_indel_opts(&o).is_err());
-    }
-
-    #[test]
-    fn floor_mult_zero_is_accepted() {
-        let mut o = opts();
-        o.floor_mult = 0.0;
-        assert!(validate_indel_opts(&o).is_ok());
-    }
-
-    #[test]
-    fn delta_zero_is_rejected() {
-        let mut o = opts();
-        o.delta = 0.0;
-        assert!(validate_indel_opts(&o).is_err());
-    }
-
-    #[test]
-    fn delta_above_one_is_rejected() {
-        let mut o = opts();
-        o.delta = 1.5;
-        assert!(validate_indel_opts(&o).is_err());
-    }
-
-    #[test]
-    fn vaf_above_one_is_rejected() {
-        let mut o = opts();
-        o.vaf = 1.5;
-        assert!(validate_indel_opts(&o).is_err());
-    }
-
-    #[test]
-    fn max_len_zero_is_rejected() {
-        let mut o = opts();
-        o.max_len = 0;
-        assert!(validate_indel_opts(&o).is_err());
-    }
-
-    #[test]
-    fn flank_zero_is_rejected() {
-        let mut o = opts();
-        o.flank = 0;
-        assert!(validate_indel_opts(&o).is_err());
-    }
+    // The former per-field range tests (err_cap, err0, err_scale, floor_mult,
+    // delta, vaf, max_len, flank) were deleted along with the flags that set
+    // those fields. They now always hold `IndelOpts::default()`, which
+    // `shipped_defaults_pass_validation` above covers; a test that pokes a
+    // value no user can supply would only be testing the poke.
 }

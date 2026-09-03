@@ -65,8 +65,6 @@ impl ColumnCounts {
         self.strand[allele][if reverse { 1 } else { 0 }] += 1;
     }
 
-    // Used by the pileup pass (next task); harmless-until-then dead-code allow.
-    #[allow(dead_code)]
     fn non_ref(&self) -> u32 {
         (0..4)
             .filter(|&a| Some(a) != self.ref_idx)
@@ -398,7 +396,7 @@ fn compute_corrections(
 
         let mut counts = ColumnCounts::new(ref_idx);
         // Remember each usable observation to correct after the fit.
-        let mut obs: Vec<(Vec<u8>, usize, usize, u8)> = Vec::new(); // (qname, qpos, allele, qual)
+        let mut obs: Vec<(Vec<u8>, usize, u8)> = Vec::new(); // (qname, allele, qual)
 
         // Indel collection MUST happen here, before the `non_ref() == 0` skip below:
         // that gate is about non-reference SUBSTITUTIONS, and a column with a
@@ -471,7 +469,7 @@ fn compute_corrections(
             };
             let qual = rec.qual()[qpos];
             counts.add(allele, qual, rec.is_reverse());
-            obs.push((rec.qname().to_vec(), qpos, allele, qual));
+            obs.push((rec.qname().to_vec(), allele, qual));
         }
 
         if iopts.enabled {
@@ -523,7 +521,7 @@ fn compute_corrections(
         stats.alt_alleles_strand_biased += model.strand_biased_alts as u64;
 
         let mut changed = false;
-        for (qname, _qpos, allele, qual) in obs {
+        for (qname, allele, qual) in obs {
             let corr = map_allele(allele, qual, &model);
             if corr != allele {
                 corrections
@@ -1534,7 +1532,7 @@ mod tests {
     //   0-7   ACGTACGT
     //   8-15  AAAAAAAA   (an 8bp homopolymer run)
     //   16-28 CGTACGTACGTAC
-    // Long enough that the shipped default --indel-flank 5 is satisfiable at the
+    // Long enough that the shipped default flank of 5 is satisfiable at the
     // sites used below (normalized positions 7 and 19).
     const REF29: &[u8] = b"ACGTACGTAAAAAAAACGTACGTACGTAC";
 

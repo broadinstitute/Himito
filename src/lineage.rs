@@ -27,44 +27,6 @@ pub struct Tree {
 }
 
 impl Tree {
-    pub fn leaves(&self) -> Vec<usize> {
-        self.nodes
-            .iter()
-            .filter(|n| n.is_leaf)
-            .map(|n| n.id)
-            .collect()
-    }
-
-    /// Iterative post-order traversal (children before parent).
-    pub fn post_order(&self) -> Vec<usize> {
-        let mut result = Vec::with_capacity(self.nodes.len());
-        let mut stack: Vec<(usize, bool)> = vec![(self.root, false)];
-        while let Some((id, done)) = stack.pop() {
-            if done {
-                result.push(id);
-            } else {
-                stack.push((id, true));
-                for &child in self.nodes[id].children.iter().rev() {
-                    stack.push((child, false));
-                }
-            }
-        }
-        result
-    }
-
-    /// Iterative pre-order traversal (parent before children).
-    pub fn pre_order(&self) -> Vec<usize> {
-        let mut result = Vec::with_capacity(self.nodes.len());
-        let mut stack = vec![self.root];
-        while let Some(id) = stack.pop() {
-            result.push(id);
-            for &child in self.nodes[id].children.iter().rev() {
-                stack.push(child);
-            }
-        }
-        result
-    }
-
     /// Sum of `read_count` over all leaves in the subtree rooted at `node_id`.
     pub fn subtree_read_count(&self, node_id: usize) -> usize {
         let mut total = 0usize;
@@ -441,29 +403,64 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
     Ok(map)
 }
 
+/// How a variant's heteroplasmic frequency is judged during matrix filtering.
+///
+/// These are one enum rather than three independent parameters (`hf_map`,
+/// `min_hf`, `max_hf`) because **exactly one of the two ways applies per run**,
+/// and the old signature could not say so: it took all three and decided
+/// between them at the use site with `hf_map.is_empty()`. That left `min_hf` and
+/// `max_hf` silently inert on the with-VCF path — already baked into the map by
+/// [`parse_vcf`] — and made an empty-but-present map indistinguishable from "no
+/// VCF given", which silently downgraded a VCF run whose variants all fell
+/// outside the band into a matrix-derived one. The enum makes the choice
+/// structural, so neither can happen.
+pub enum HfFilter {
+    /// A VCF was supplied. [`parse_vcf`] already applied the HF band while
+    /// building this map, so membership in it *is* the filter — including when
+    /// the map is empty, which correctly keeps nothing.
+    FromVcf(HfMap),
+    /// No VCF was supplied. Recompute HF from the matrix and keep
+    /// `min <= hf < max`.
+    FromMatrix { min: f64, max: f64 },
+}
+
+impl HfFilter {
+    /// Whether a variant named `vid`, observed at alt frequency `freq` among the
+    /// reads that cover it, passes the heteroplasmy filter.
+    fn keeps(&self, vid: &str, freq: f64) -> bool {
+        match self {
+            HfFilter::FromVcf(map) => map.contains_key(vid),
+            HfFilter::FromMatrix { min, max } => freq >= *min && freq < *max,
+        }
+    }
+
+    /// Whether the decision for `vid` can be made from its name alone, before
+    /// the row is parsed. True only on the VCF path, where the verdict does not
+    /// depend on the observed frequency.
+    fn rejects_by_name(&self, vid: &str) -> bool {
+        matches!(self, HfFilter::FromVcf(_)) && !self.keeps(vid, 0.0)
+    }
+}
+
 /// Read `matrix_path` (Himito `.matrix.csv`) and apply filters:
 ///
 /// * **Prevalence** — keep rows where the variant is present in ≥ `min_presence`
 ///   reads AND absent from ≥ `min_absence` reads (guarantees a bifurcation).
-/// * **HF bounds** — keep rows with `min_hf ≤ HF < max_hf`. When a VCF was
-///   provided (`hf_map` non-empty) the HF comes from the VCF and this function
-///   only checks membership. When no VCF was provided (`hf_map` empty) the HF is
-///   recomputed from the matrix as `present / (present + absent)` — alt calls
-///   over *covered* reads — matching Himito's `HF = allele_count / read_depth`,
-///   so the with-/without-VCF variant sets agree.
+/// * **Heteroplasmy** — per `hf`; see [`HfFilter`]. The matrix-derived frequency
+///   is `present / (present + absent)` — alt calls over *covered* reads — which
+///   matches Himito's VCF `HF = allele_count / read_depth`, so the with-VCF and
+///   without-VCF variant sets agree.
 ///
 /// Counts are binarised: any count ≥ 1 becomes 1.
 pub fn load_and_filter_matrix(
     matrix_path: &str,
-    hf_map: &HfMap,   // contains only variants that already passed HF filtering
+    hf: &HfFilter,
     min_presence: usize,
     min_absence: usize,
-    min_hf: f64,
-    max_hf: f64,
 ) -> Result<BinaryMatrix> {
     let file = std::fs::File::open(matrix_path)
         .with_context(|| format!("Cannot read matrix CSV: {matrix_path}"))?;
-    parse_binary_matrix(file, hf_map, min_presence, min_absence, min_hf, max_hf)
+    parse_binary_matrix(file, hf, min_presence, min_absence)
 }
 
 /// `Read`-generic core of [`load_and_filter_matrix`] so it can be exercised
@@ -471,11 +468,9 @@ pub fn load_and_filter_matrix(
 /// `None` = missing/uncovered (empty cell in the CSV).
 fn parse_binary_matrix<R: std::io::Read>(
     reader: R,
-    hf_map: &HfMap,
+    hf: &HfFilter,
     min_presence: usize,
     min_absence: usize,
-    min_hf: f64,
-    max_hf: f64,
 ) -> Result<BinaryMatrix> {
     let mut rdr = csv::Reader::from_reader(reader);
     let headers = rdr.headers()?.clone();
@@ -488,7 +483,9 @@ fn parse_binary_matrix<R: std::io::Read>(
         let rec = result?;
         let vid = rec[0].to_string();
 
-        if !hf_map.is_empty() && !hf_map.contains_key(&vid) {
+        // Cheap early skip: on the VCF path the verdict needs only the name, so
+        // rows that cannot survive are never parsed.
+        if hf.rejects_by_name(&vid) {
             continue;
         }
 
@@ -510,18 +507,16 @@ fn parse_binary_matrix<R: std::io::Read>(
             continue;
         }
 
-        // No-VCF fallback HF: alt calls over *covered* reads (present + absent),
+        // Matrix-derived HF: alt calls over *covered* reads (present + absent),
         // NOT row.len(). This mirrors Himito's VCF `HF = allele_count / read_depth`
         // so the homoplasmy filter keeps the same variants with and without a VCF.
         // Uncovered (`None`) cells must be excluded from the denominator.
         let covered = present + absent;
         let freq = if covered > 0 { present as f64 / covered as f64 } else { 0.0 };
 
-        if hf_map.is_empty() && (freq < min_hf || freq >= max_hf) {
+        if !hf.keeps(&vid, freq) {
             continue;
         }
-
-        // println!("vid: {}, freq: {}", vid, freq);
 
         variants.push(vid);
         data.push(row);
@@ -673,9 +668,11 @@ pub fn resolve_error_rates(
     let (default_fp, default_fn) = match data_type {
         "pacbio" => (0.005, 0.05),
         "ont-denoised" => (0.0001, 0.01),
-        "ont-r10" => (0.001, 0.05),
-        "ont-r9" => (0.001, 0.05),
-        // ont-r9 / ont-r10 and anything else: raw long-read noise levels.
+        // ont-r9 / ont-r10 and anything else: raw long-read noise levels. The
+        // two raw-ONT chemistries shared this tuple with the fallback arm, so
+        // they are folded into it here. They stay distinct elsewhere —
+        // `call::resolve_thresholds` gives them different p-value/frequency
+        // defaults — which is why both remain in `main.rs`'s `DATA_TYPES`.
         _ => (0.001, 0.05),
     };
 
@@ -693,7 +690,6 @@ pub fn start(
     min_presence: usize,
     min_absence: usize,
     min_reads: usize,
-    data_type: &str,
     fp_rate: f64,
     fn_rate: f64,
     mcmc_iterations: usize,
@@ -702,39 +698,31 @@ pub fn start(
     output_prefix: &str,
 ) -> Result<()> {
     env_logger::init();
-    if !matches!(data_type, "pacbio" | "ont-r9" | "ont-r10" | "ont-denoised") {
-        anyhow::bail!(
-            "data type must be pacbio, ont-r9, ont-r10 or ont-denoised (got {data_type})"
-        );
-    }
+    // No `data_type` parameter: the rates arrive already resolved by
+    // `resolve_error_rates`, and the accepted-vocabulary check now lives on the
+    // clap flag itself (`main.rs`'s `DATA_TYPES`), so an unrecognised value is
+    // rejected before any file is opened rather than here.
     info!("Starting lineage analysis...");
-    info!("Data type {data_type}: SCITE fp={fp_rate}, fn={fn_rate}");
-    //ont-denoise fp=0.0001 fn=0.001
+    info!("SCITE fp={fp_rate}, fn={fn_rate}");
 
-    // ── Step 1: load VCF HF values, then filter the binary matrix ─────────────
-    // The VCF is optional: without it, no HF filter is applied and every variant
-    // in the matrix is retained (an empty HfMap disables HF filtering downstream).
-    let hf_map = match vcf_file {
+    // ── Step 1: decide how HF is judged, then filter the binary matrix ────────
+    // The VCF is optional, and which branch runs is exactly what decides where
+    // `min_hf`/`max_hf` are consumed: `parse_vcf` applies them while building the
+    // map, or the matrix path applies them to a frequency it computes itself.
+    // They are never applied twice, and never ignored.
+    let hf = match vcf_file {
         Some(path) => {
             info!("[1/6] Parsing VCF: {}", path);
-            parse_vcf(path, min_hf, max_hf)?
+            HfFilter::FromVcf(parse_vcf(path, min_hf, max_hf)?)
         }
         None => {
-            info!("[1/6] No VCF provided; skipping HF filter (all matrix variants retained).");
-            HfMap::new()
+            info!("[1/6] No VCF provided; HF recomputed from the matrix itself.");
+            HfFilter::FromMatrix { min: min_hf, max: max_hf }
         }
     };
-    // println!("hf_map: {:?}", hf_map);
 
     info!("[1/6] Loading and filtering matrix: {}", matrix_file);
-    let binary = load_and_filter_matrix(
-        &matrix_file,
-        &hf_map,
-        min_presence,
-        min_absence,
-        min_hf,
-        max_hf,
-    )?;
+    let binary = load_and_filter_matrix(matrix_file, &hf, min_presence, min_absence)?;
     if binary.variants.is_empty() {
         anyhow::bail!(
             "No informative variants remain after filtering. \
@@ -748,7 +736,12 @@ pub fn start(
     // write how many haplotypes and how many heteroplasmic variants on each haplotype
     info!("[2/6] Found {} haplotypes across {} variants.", hap_matrix.haplotypes.len(), hap_matrix.variants.len());
     if hap_matrix.haplotypes.is_empty() {
-        anyhow::bail!("No haplotypes remain after --min-reads filtering.");
+        anyhow::bail!(
+            "No haplotypes remain: every distinct read profile is backed by fewer \
+             than {min_reads} reads. This usually means the input is too shallow \
+             or too noisy; widening --min-hf / --max-hf admits more variants and \
+             so more distinguishable haplotypes."
+        );
     }
     // Diagnostic: variant pairs violating the infinite-sites assumption (all four
     // gametes observed) hint at recurrent/back mutation or recombination.
@@ -765,7 +758,12 @@ pub fn start(
 
     // ── Step 3: SCITE mutation-tree search (NJ-informed MCMC) ─────────────────
     info!("[3/6] Running SCITE mutation-tree search...");
-    crate::scite::run_scite_pipeline(
+    // Returns the cleaned reads already deduplicated into haplotypes. This used
+    // to be recovered by re-reading `cleaned_matrix.csv` back off disk and
+    // deduplicating it a second time with fully-permissive thresholds; the
+    // result was provably the same matrix, since both paths dedup the same cells
+    // with the same `min_reads` and the same deterministic ordering.
+    let cleaned_hap_matrix = crate::scite::run_scite_pipeline(
         &binary,
         &hap_matrix,
         fp_rate,
@@ -778,25 +776,23 @@ pub fn start(
     )?;
 
     // ── Step 4: write final haplotype map (filtered by SCITE) ─────────────────
-    info!("[4/6] Deduplicating cleaned reads into haplotypes...");
-    // The cleaned matrix already contains exactly the variants the tree was built
-    // on; re-applying prevalence/HF filters here would re-drop variants after
-    // imputation (which removed the `None` cells and can push a variant to
-    // absent==0 or freq==1.0), making the no-VCF output diverge from the VCF one.
-    // Pass fully-permissive thresholds so this reload only deduplicates.
-    let cleaned_binary = load_and_filter_matrix(
-        &format!("{}.cleaned_matrix.csv", output_prefix),
-        &hf_map,
-        0,
-        0,
-        0.0,
-        f64::INFINITY,
-    )?;
-    let cleaned_hap_matrix = deduplicate(&cleaned_binary, min_reads);
-    // write how many haplotypes and how many heteroplasmic variants on each haplotype
-    info!("[4/6] Found {} haplotypes across {} variants.", cleaned_hap_matrix.haplotypes.len(), cleaned_hap_matrix.variants.len());
+    // No re-filtering here, by design: the cleaned matrix holds exactly the
+    // variants the tree was built on, and re-applying prevalence/HF filters after
+    // imputation (which removed the `None` cells, and can push a variant to
+    // absent == 0 or freq == 1.0) would re-drop variants and make the no-VCF
+    // output diverge from the VCF one.
+    info!(
+        "[4/6] Cleaned reads deduplicated into {} haplotypes across {} variants.",
+        cleaned_hap_matrix.haplotypes.len(),
+        cleaned_hap_matrix.variants.len()
+    );
     if cleaned_hap_matrix.haplotypes.is_empty() {
-        anyhow::bail!("No haplotypes remain after --min-reads filtering.");
+        anyhow::bail!(
+            "No haplotypes remain: every distinct read profile is backed by fewer \
+             than {min_reads} reads. This usually means the input is too shallow \
+             or too noisy; widening --min-hf / --max-hf admits more variants and \
+             so more distinguishable haplotypes."
+        );
     }
     // Global haplotype map (all variants)
     let hmap_path = format!("{}.cleaned_haplotype_map.tsv", output_prefix);
@@ -811,8 +807,10 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    fn hf_map(names: &[&str]) -> HfMap {
-        names.iter().map(|n| (n.to_string(), 0.5)).collect()
+    /// An `HfFilter::FromVcf` holding exactly `names`, as `parse_vcf` would have
+    /// produced it after applying the HF band.
+    fn from_vcf(names: &[&str]) -> HfFilter {
+        HfFilter::FromVcf(names.iter().map(|n| (n.to_string(), 0.5)).collect())
     }
 
     #[test]
@@ -844,12 +842,8 @@ mod tests {
     #[test]
     fn load_and_filter_matrix_preserves_missing_values() {
         let csv = "variant,r1,r2,r3\nm.100A>G,1,0,\nm.200C>T,0,1,1\n";
-        let hf = hf_map(&["m.100A>G", "m.200C>T"]);
-        let min_presence = 1;
-        let min_absence = 1;
-        let min_hf = 0.0;
-        let max_hf = 1.0;
-        let matrix = parse_binary_matrix(Cursor::new(csv), &hf, min_presence, min_absence, min_hf, max_hf).unwrap();
+        let hf = from_vcf(&["m.100A>G", "m.200C>T"]);
+        let matrix = parse_binary_matrix(Cursor::new(csv), &hf, 1, 1).unwrap();
 
         assert_eq!(matrix.variants, vec!["m.100A>G", "m.200C>T"]);
         assert_eq!(matrix.reads, vec!["r1", "r2", "r3"]);
@@ -866,8 +860,8 @@ mod tests {
     fn load_and_filter_matrix_prevalence_filter_does_not_count_missing_as_absent() {
         // present=1 (r1), absent=0 (no explicit ref call) -> fails min_absence=1
         let csv = "variant,r1,r2\nm.100A>G,1,\n";
-        let hf = hf_map(&["m.100A>G"]);
-        let matrix = parse_binary_matrix(Cursor::new(csv), &hf, 1, 1, 0.0, 1.0).unwrap();
+        let hf = from_vcf(&["m.100A>G"]);
+        let matrix = parse_binary_matrix(Cursor::new(csv), &hf, 1, 1).unwrap();
         assert!(matrix.variants.is_empty());
     }
 
@@ -1085,30 +1079,28 @@ mod vcf_parity_tests {
 
         let (min_presence, min_absence, min_hf, max_hf) = (1usize, 1usize, 0.2f64, 0.85f64);
 
-        // "With VCF": hf_map holds exactly the variants whose HF is in range, as
-        // parse_vcf would produce (HF computed as alt/coverage).
+        // "With VCF": the map holds exactly the variants whose HF is in range, as
+        // parse_vcf would produce (HF computed as alt/coverage). Note the band
+        // itself is NOT passed here any more — under `FromVcf` it is already
+        // spent, which is precisely what the enum makes unstateable.
         let mut with_vcf_hf = HfMap::new();
         with_vcf_hf.insert("m.100A>G".to_string(), 0.50);
         with_vcf_hf.insert("m.200C>T".to_string(), 0.25);
 
         let with_vcf = parse_binary_matrix(
             Cursor::new(csv.clone()),
-            &with_vcf_hf,
+            &HfFilter::FromVcf(with_vcf_hf),
             min_presence,
             min_absence,
-            min_hf,
-            max_hf,
         )
         .unwrap();
 
-        // "Without VCF": empty hf_map -> frequency recomputed from the matrix.
+        // "Without VCF": frequency recomputed from the matrix against the band.
         let without_vcf = parse_binary_matrix(
             Cursor::new(csv),
-            &HfMap::new(),
+            &HfFilter::FromMatrix { min: min_hf, max: max_hf },
             min_presence,
             min_absence,
-            min_hf,
-            max_hf,
         )
         .unwrap();
 
@@ -1127,15 +1119,37 @@ mod vcf_parity_tests {
         let csv = build_csv(&[("m.500A>C", ["1", "1", "0", "0", "", "", "", "", "", ""])]);
         let kept = parse_binary_matrix(
             Cursor::new(csv),
-            &HfMap::new(),
+            &HfFilter::FromMatrix { min: 0.30, max: 0.85 },
             1,
             1,
-            0.30f64,
-            0.85f64,
         )
         .unwrap();
         // Covered-read denominator (0.50) retains it; the old row.len() denominator
         // (0.20 < 0.30) would have dropped it.
         assert_eq!(kept.variants, vec!["m.500A>C"]);
+    }
+
+    #[test]
+    fn a_vcf_matching_no_variants_keeps_nothing_rather_than_falling_back() {
+        // BEHAVIOR CHANGE, deliberate. A VCF whose variants all fall outside the
+        // HF band yields an empty map. The old three-parameter signature decided
+        // "is a VCF in play?" by `hf_map.is_empty()`, so an empty map was
+        // indistinguishable from "no VCF given" and the matrix-derived band
+        // silently took over — filtering by a criterion the user never asked
+        // for, and admitting variants the VCF had excluded. `FromVcf` says
+        // which mode is in play independently of how many entries it holds.
+        let csv = build_csv(&[("m.100A>G", ["1", "1", "1", "0", "0", "0", "", "", "", ""])]);
+        let kept = parse_binary_matrix(
+            Cursor::new(csv),
+            &HfFilter::FromVcf(HfMap::new()),
+            1,
+            1,
+        )
+        .unwrap();
+        assert!(
+            kept.variants.is_empty(),
+            "an empty VCF map must keep nothing, got {:?}",
+            kept.variants
+        );
     }
 }

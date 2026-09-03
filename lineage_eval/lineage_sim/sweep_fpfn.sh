@@ -13,7 +13,7 @@ FN_GRID="0.02 0.05 0.1 0.2"
 # var_precision across sweep cells -- only which variants enter the SCITE matrix.
 MIN_HF=0.01 MAX_HF=0.95
 # Sweeps re-run full MCMC per cell; use a lighter budget than the CLI defaults
-# (10000×4). Override for a final high-quality pass if needed.
+# (5000 iterations × 3 chains). Override for a final high-quality pass if needed.
 MCMC_ITERS="${MCMC_ITERS:-2000}"
 MCMC_CHAINS="${MCMC_CHAINS:-2}"
 while [[ $# -gt 0 ]]; do

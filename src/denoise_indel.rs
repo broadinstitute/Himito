@@ -1366,7 +1366,12 @@ pub struct RewriteResult {
 }
 
 /// Total reference bases consumed by a CIGAR (M/=/X/D/N). The rewrite invariant.
-pub fn ref_consumed(c: &CigarString) -> u32 {
+///
+/// Test-only: the rewrite path maintains this invariant structurally, so nothing
+/// in production recomputes it. `rewrite_preserves_ref_consumption` and friends
+/// assert it explicitly, which is the whole point of keeping this around.
+#[cfg(test)]
+fn ref_consumed(c: &CigarString) -> u32 {
     c.iter()
         .map(|op| match op {
             Cigar::Match(n) | Cigar::Equal(n) | Cigar::Diff(n) | Cigar::Del(n) | Cigar::RefSkip(n) => *n,

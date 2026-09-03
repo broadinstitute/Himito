@@ -9,7 +9,7 @@ use log::{info, warn};
 use statrs::function::gamma::ln_gamma;
 use adjustp::{adjust, Procedure};
 
-use crate::lineage::{self, BinaryMatrix, HaplotypeMatrix, load_and_filter_matrix};
+use crate::lineage::{self, BinaryMatrix, HaplotypeMatrix};
 
 /// A growable bitset over mutation/variant ids, backed by `Vec<u64>` words.
 ///
@@ -1406,7 +1406,13 @@ fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usiz
 
 /// Run the MCMC mutation-tree search (starting from an NJ-tree-derived guess
 /// when one can be built), attach every read to its best-fitting node, and
-/// write all four SCITE output files with the given `output_prefix`.
+/// write all SCITE output files with the given `output_prefix`.
+///
+/// Returns the SCITE-cleaned reads deduplicated into haplotypes — the same
+/// matrix that backs the tips of `<output_prefix>.read_lineage.nwk`. The caller
+/// needs exactly this to write `<prefix>.cleaned_haplotype_map.tsv`; handing it
+/// back is what lets `lineage::start` skip re-reading `cleaned_matrix.csv` off
+/// disk and deduplicating it a second time.
 pub fn run_scite_pipeline(
     binary: &BinaryMatrix,
     hap_matrix: &HaplotypeMatrix,
@@ -1417,11 +1423,11 @@ pub fn run_scite_pipeline(
     seed: u64,
     min_reads: usize,
     output_prefix: &str,
-) -> Result<()> {
+) -> Result<HaplotypeMatrix> {
     if binary.variants.is_empty() {
         anyhow::bail!(
             "SCITE requires at least 1 variant (got 0); \
-             relax --min-hf / --min-presence / --min-absence thresholds."
+             relax the --min-hf / --max-hf thresholds."
         );
     }
     // One variant is a valid, if degenerate, run: the tree can only be
@@ -1538,7 +1544,7 @@ pub fn run_scite_pipeline(
         &format!("{output_prefix}.read_lineage.nwk"),
     )?;
 
-    Ok(())
+    Ok(cleaned_hap_matrix)
 }
 
 #[cfg(test)]
@@ -2669,8 +2675,8 @@ mod tests {
         let vcf = std::env::var("HIMITO_TEST_VCF").unwrap_or_else(|_| {
             format!("{}/lineage_eval/lineage_sim/tmp/eval_ont_r10/himito/sim.vcf", env!("CARGO_MANIFEST_DIR"))
         });
-        let hf = lineage::parse_vcf(&vcf, 0.01, 0.95).unwrap();
-        let binary = lineage::load_and_filter_matrix(&mat, &hf, 2, 1, 0.01, 0.95).unwrap();
+        let hf = lineage::HfFilter::FromVcf(lineage::parse_vcf(&vcf, 0.01, 0.95).unwrap());
+        let binary = lineage::load_and_filter_matrix(&mat, &hf, 2, 1).unwrap();
         let n = binary.variants.len();
         let root = n;
         let ix = |name: &str| {

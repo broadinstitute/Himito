@@ -108,10 +108,12 @@ samtools index "$BAM"
 
 # Denoise ONT reads before graph construction (no-op for hifi/pacbio).
 # quick-start ties denoise's --vaf to the SAME vaf_threshold used for calling
-# (main.rs: `vaf_threshold as f64`); --min-strand 2 and the strand-bias
-# defaults (0.01 p / 0.7 homoplasmic-exempt) are quick-start's own hardcoded
-# values, and match the Denoise subcommand's CLI defaults, so they're left
-# implicit below.
+# (main.rs: `vaf_threshold as f64`). The strand gates are no longer flags at all:
+# min-strand (2) and the strand-bias p (0.01) are the DENOISE_MIN_STRAND /
+# DENOISE_STRAND_BIAS_P constants in main.rs, identical on both paths. The
+# near-homoplasmic exemption does NOT match: quick-start uses 0.7, the standalone
+# denoise subcommand uses 0.95 (DENOISE_HOMOPLASMIC_VAF). This script runs
+# `denoise` directly, so it benchmarks at 0.95.
 #
 # Indel denoising is ON by default. It used to be documented as off with a
 # DENOISE_INDELS=1 opt-in, but `--indels` was ALSO appended unconditionally to the
@@ -126,7 +128,7 @@ BUILD_BAM="$BAM"
 CALL_DATATYPE="$DTYPE"
 if [[ "$DTYPE" == ont-denoised ]]; then
   DENOISED="$HDIR/aln.denoised.bam"
-  DENOISE_ARGS=(--vaf "${DENOISE_VAF:-$VAF}" --min-strand 2 --stats "$HDIR/denoise_stats.json")
+  DENOISE_ARGS=(--vaf "${DENOISE_VAF:-$VAF}" --stats "$HDIR/denoise_stats.json")
   if [[ "$DENOISE_INDELS" == "1" ]]; then
     DENOISE_ARGS+=(--indels)
   fi
@@ -158,7 +160,7 @@ fi
 
 # Lineage: SCITE mutation-tree reconstruction.
 "$HIMITO" lineage -m "$HDIR/sim.matrix.csv" -v "$HDIR/sim.vcf" \
-  --fp-rate "$FP" --fn-rate "$FN" --min-hf 0.01 --max-hf 0.95 \
+  --fp-rate "$FP" --fn-rate "$FN" --min-hf "$MIN_HF" --max-hf "$MAX_HF" \
   -o "$HDIR/sim_lineage"
 
 echo "himito done: $HDIR/sim_lineage.mutation_tree.tsv"

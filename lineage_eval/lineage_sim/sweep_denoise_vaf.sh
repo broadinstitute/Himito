@@ -36,7 +36,7 @@ for v in $VAFS; do
     # --indels matches run_himito.sh: without it, uncorrected indel artifacts crowd
     # out the SNVs entirely and every threshold scores the same (and badly).
     "$H" denoise -i "$BAM" -o "$HD/dn.bam" -r "$REF" -d ont-denoised --indels \
-      --vaf "$v" --min-strand 2 --stats "$HD/denoise_stats.json" >>"$log" 2>&1 \
+      --vaf "$v" --stats "$HD/denoise_stats.json" >>"$log" 2>&1 \
       || { echo "DENOISEFAIL v$v $c"; continue; }
     samtools index "$HD/dn.bam" >>"$log" 2>&1
     "$H" build -i "$HD/dn.bam" -r "$REF" -k 21 -o "$HD/sim.gfa" -l 3000 \

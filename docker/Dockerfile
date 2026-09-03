@@ -7,6 +7,7 @@ RUN apt-get install -y --no-install-recommends git ssh build-essential make cmak
 RUN git config --global http.sslverify false
 RUN git clone https://github.com/broadinstitute/Himito.git \ 
     && cd Himito \
+    && git checkout hs_lineage_ \
     && cargo build --release
 
 RUN cargo install msbwt2 \

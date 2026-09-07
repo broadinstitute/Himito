@@ -18,6 +18,7 @@ use statrs::distribution::{Binomial, DiscreteCDF};
 use regex::Regex;
 use adjustp::{adjust, Procedure};
 use bio::io::fasta::{Reader, Record};
+use crate::denoise_indel::{normalize_left, Allele};
 use rust_htslib::bam::{Read as HtsRead, Reader as BamReader};
 
 #[derive(Debug, Clone)]
@@ -297,11 +298,15 @@ fn record_variant_reads(
     }
 }
 
+/// `left_align` carries the reference sequence when `--left-align` is on, and is
+/// `None` otherwise: left-alignment is impossible without the reference, so the
+/// dependency is expressed in the type rather than as a separate bool.
 pub fn get_variant(
     graph: &mut GraphicalGenome,
     k: usize,
     ref_name: &str,
     ref_length: usize,
+    left_align: Option<&[u8]>,
 ) -> (
     Vec<Variant>,
     HashMap<usize, usize>,
@@ -374,7 +379,19 @@ pub fn get_variant(
             refstart as usize,
             allele_count,
         );
+        // Align BEFORE `var` is extended and before the read records are keyed, so
+        // the returned variants and the `read_record`/`cover_record` keys are
+        // generated from the same tuples -- `construct_matrix` looks its rows up by
+        // name, so a mismatch here would silently produce an all-NaN matrix.
+        //
+        // Alignment runs on the CIRCULARIZED positions, which are guaranteed to lie
+        // in [0, ref_length) and so are always valid reference indices; the raw
+        // positions of a wrap-around bubble are not.
         let variants_circular = circuliarize_variants(variants.clone(), ref_length);
+        let variants_circular = match left_align {
+            Some(refseq) => left_align_variants(&variants_circular, refseq),
+            None => variants_circular,
+        };
         var.extend(variants_circular.clone());
 
         for (pos, count) in poscounts.iter() {
@@ -403,6 +420,83 @@ pub fn get_variant(
         );
     }
     (var, coverage, read_record, cover_record)
+}
+
+/// Shift every indel maximally leftward so that, however the aligner happened to
+/// anchor it, equivalent spellings of one event share a single canonical
+/// representation -- the canonicalization `bcftools norm` performs. SNPs pass
+/// through untouched, and the alleles are already parsimonious (one anchor base
+/// plus the event), so no trimming step is needed.
+///
+/// This is an order- and length-preserving 1:1 map. `record_variant_reads` zips
+/// the raw and circularized variant vectors BY INDEX -- the raw position selects
+/// the covering bubble while the aligned one becomes the matrix key -- so a
+/// variant that cannot be aligned must be returned in place, never dropped.
+fn left_align_variants(variants: &[Variant], refseq: &[u8]) -> Vec<Variant> {
+    variants
+        .iter()
+        .map(|v| left_align_variant(v, refseq))
+        .collect()
+}
+
+fn left_align_variant(variant: &Variant, refseq: &[u8]) -> Variant {
+    // `normalize_left` indexes an indel by its anchor: the last reference base
+    // BEFORE the event. `pos` here is the 0-based first inserted/deleted base,
+    // so the anchor is at `pos - 1`. A variant with no anchor base -- an
+    // insertion at a bubble start, where `get_variants_from_cigar` writes REF
+    // "-", or an event circularization folded onto position 0 -- has nothing to
+    // shift relative to and comes back unchanged.
+    if variant.pos == 0
+        || variant.ref_allele.is_empty()
+        || variant.alt_allele.is_empty()
+        || variant.ref_allele == "-"
+        || variant.alt_allele == "-"
+    {
+        return variant.clone();
+    }
+
+    let allele = match variant.variant_type.as_str() {
+        // ALT is the anchor base followed by the inserted sequence.
+        "INS" => match variant.alt_allele.as_bytes().get(1..) {
+            Some(inserted) => Allele::Ins(inserted.to_vec()),
+            None => return variant.clone(),
+        },
+        // REF is the anchor base followed by the deleted sequence.
+        "DEL" => Allele::Del((variant.ref_allele.len() - 1) as u32),
+        _ => return variant.clone(),
+    };
+
+    let (anchor, normalized) = normalize_left(refseq, (variant.pos - 1) as u32, &allele);
+    let anchor = anchor as usize;
+
+    // Rebuild both alleles from the reference at the NEW anchor rather than
+    // editing the old strings, so the anchor base is always the true reference
+    // base there. A shift that ran off the end of the reference leaves the
+    // variant alone rather than emitting a truncated allele.
+    let anchor_base = match refseq.get(anchor..anchor + 1) {
+        Some(base) => String::from_utf8_lossy(base).to_string(),
+        None => return variant.clone(),
+    };
+    let (ref_allele, alt_allele) = match &normalized {
+        Allele::Ins(inserted) => (
+            anchor_base.clone(),
+            format!("{}{}", anchor_base, String::from_utf8_lossy(inserted)),
+        ),
+        Allele::Del(n) => match refseq.get(anchor..anchor + 1 + *n as usize) {
+            Some(deleted) => (String::from_utf8_lossy(deleted).to_string(), anchor_base),
+            None => return variant.clone(),
+        },
+        Allele::Ref => return variant.clone(),
+    };
+
+    Variant {
+        pos: anchor + 1,
+        ref_allele,
+        alt_allele,
+        variant_type: variant.variant_type.clone(),
+        allele_count: variant.allele_count,
+        filter: variant.filter.clone(),
+    }
 }
 
 fn collapse_identical_records(variants: Vec<Variant>, ref_length: usize) -> Vec<Variant> {
@@ -542,7 +636,8 @@ fn write_vcf(
     sample_id: &str,
     referencename:&str,
     referencelength:usize,
-    indel_false_threshold: f64
+    indel_false_threshold: f64,
+    left_align: bool,
 ) -> std::io::Result<()> {
     let mut file = File::create(Path::new(output_file))?;
 
@@ -550,6 +645,9 @@ fn write_vcf(
     writeln!(file, "##fileformat=VCFv4.2")?;
     writeln!(file, "##reference={}", referencename)?;
     writeln!(file, "##contig=<ID={},length={}>", referencename, referencelength)?;
+    if left_align {
+        writeln!(file, "##HimitoNormalization=left-aligned")?;
+    }
     writeln!(
         file,
         "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">"
@@ -1220,6 +1318,7 @@ pub fn start(
     permutation_rounds: usize,
     strand_bias_action: Option<StrandBiasAction>,
     strand_bias_drop_max_hf: f64,
+    left_align: bool,
 ) {
     if data_type != "pacbio" && data_type != "ont-r9" && data_type != "ont-r10" && data_type != "ont-denoised" {
         eprintln!("Error: data type must be pacbio or ont-r9 or ont-r10 or ont-denoised");
@@ -1235,7 +1334,13 @@ pub fn start(
     let graph = agg::GraphicalGenome::load_graph(graph_file).unwrap();
     
     let (variants, coverage, read_record, cover_record) =
-        get_variant(&mut graph.clone(), k, &ref_header, ref_seq.len());
+        get_variant(
+            &mut graph.clone(),
+            k,
+            &ref_header,
+            ref_seq.len(),
+            if left_align { Some(ref_seq.as_bytes()) } else { None },
+        );
     let collapsed_var = collapse_identical_records(variants, ref_seq.len());
     let filtered_var = filter_vcf_record(&collapsed_var, &coverage, minimal_ac, hf_threshold);
     // modified, exclude filtered data for FPs
@@ -1296,7 +1401,8 @@ pub fn start(
         sample_id,
         &ref_header,
         ref_seq.len(),
-        indel_false_threshold
+        indel_false_threshold,
+        left_align,
     );
     // write matrix
     let matrix_output = output_file.with_extension("matrix.csv");
@@ -1866,6 +1972,396 @@ mod tests {
             0.5, 0.01, 2, 0.7, StrandBiasAction::Drop, 0.10,
         );
         assert_eq!(ikept.len(), 1, "indels are never dropped by the strand-bias filter");
+    }
+
+    // ===================================================================
+    // Left-alignment (--left-align)
+    // ===================================================================
+
+    /// `TCAAAAGCTT` - a 4bp A-run at indices 2..6 preceded by a C, so a 1bp
+    /// deletion anywhere in the run has room to shift left and a definite
+    /// stopping point that is not the contig start.
+    const HOMOPOLYMER_REF: &[u8] = b"TCAAAAGCTT";
+
+    /// Build a DEL the way `get_variants_from_cigar` does: `pos` is the 0-based
+    /// first deleted base and REF carries the preceding anchor base.
+    fn del_at(refseq: &[u8], pos: usize, len: usize, allele_count: usize) -> Variant {
+        Variant {
+            pos,
+            ref_allele: String::from_utf8(refseq[pos - 1..pos + len].to_vec()).unwrap(),
+            alt_allele: String::from_utf8(refseq[pos - 1..pos].to_vec()).unwrap(),
+            variant_type: "DEL".to_string(),
+            allele_count,
+            filter: None,
+        }
+    }
+
+    /// Build an INS the way `get_variants_from_cigar` does: `pos` is the 0-based
+    /// position the inserted bases sit before, REF is the anchor base at `pos-1`
+    /// and ALT is that anchor base followed by the inserted sequence.
+    fn ins_at(refseq: &[u8], pos: usize, inserted: &str, allele_count: usize) -> Variant {
+        let anchor = String::from_utf8(refseq[pos - 1..pos].to_vec()).unwrap();
+        Variant {
+            pos,
+            ref_allele: anchor.clone(),
+            alt_allele: format!("{}{}", anchor, inserted),
+            variant_type: "INS".to_string(),
+            allele_count,
+            filter: None,
+        }
+    }
+
+    #[test]
+    fn left_align_shifts_homopolymer_deletion_to_start_of_run() {
+        // The aligner put the deleted A at the END of the run (index 5). bcftools
+        // norm reports this at the base before the run: POS 2, REF CA, ALT C.
+        let v = del_at(HOMOPOLYMER_REF, 5, 1, 3);
+        let aligned = left_align_variants(&[v], HOMOPOLYMER_REF);
+
+        assert_eq!(aligned[0].pos, 2);
+        assert_eq!(aligned[0].ref_allele, "CA");
+        assert_eq!(aligned[0].alt_allele, "C");
+        assert_eq!(aligned[0].variant_type, "DEL");
+        assert_eq!(aligned[0].allele_count, 3, "alignment must not touch evidence");
+    }
+
+    #[test]
+    fn left_align_shifts_homopolymer_insertion_to_start_of_run() {
+        // An extra A appended to the run: REF A, ALT AA at pos 6. Shifting left
+        // re-anchors it on the C, so the reported anchor base changes to C.
+        let v = ins_at(HOMOPOLYMER_REF, 6, "A", 3);
+        let aligned = left_align_variants(&[v], HOMOPOLYMER_REF);
+
+        assert_eq!(aligned[0].pos, 2);
+        assert_eq!(aligned[0].ref_allele, "C");
+        assert_eq!(aligned[0].alt_allele, "CA");
+        assert_eq!(aligned[0].variant_type, "INS");
+    }
+
+    #[test]
+    fn left_align_rotates_multi_base_insertion_across_a_tandem_repeat() {
+        // `TTAGAGAGC`: an AG dinucleotide repeat at 2..8. Inserting a further AG
+        // unit at the end of the run is the same event as inserting it at the
+        // start, but only if the inserted string rotates as the anchor moves --
+        // a naive shift that kept ALT as "TAG" spelled backwards would corrupt it.
+        let refseq: &[u8] = b"TTAGAGAGC";
+        let v = ins_at(refseq, 8, "AG", 2);
+        let aligned = left_align_variants(&[v], refseq);
+
+        assert_eq!(aligned[0].pos, 2);
+        assert_eq!(aligned[0].ref_allele, "T");
+        assert_eq!(aligned[0].alt_allele, "TAG");
+    }
+
+    #[test]
+    fn left_align_leaves_indels_in_unique_sequence_untouched() {
+        // Deleting the G of ...TTGCA... has nowhere to go: the base entering the
+        // deletion (T) differs from the base leaving it (G).
+        let refseq: &[u8] = b"ACGTTGCA";
+        let v = del_at(refseq, 5, 1, 4);
+        let aligned = left_align_variants(&[v.clone()], refseq);
+
+        assert_eq!(aligned[0].pos, v.pos);
+        assert_eq!(aligned[0].ref_allele, v.ref_allele);
+        assert_eq!(aligned[0].alt_allele, v.alt_allele);
+    }
+
+    #[test]
+    fn left_align_leaves_snps_untouched() {
+        // A SNP inside the homopolymer would shift if it were treated as an indel.
+        let v = Variant {
+            pos: 4,
+            ref_allele: "A".to_string(),
+            alt_allele: "G".to_string(),
+            variant_type: "SNP".to_string(),
+            allele_count: 7,
+            filter: None,
+        };
+        let aligned = left_align_variants(&[v.clone()], HOMOPOLYMER_REF);
+
+        assert_eq!(aligned[0].pos, 4);
+        assert_eq!(aligned[0].ref_allele, "A");
+        assert_eq!(aligned[0].alt_allele, "G");
+    }
+
+    #[test]
+    fn left_align_preserves_length_and_order_for_anchorless_variants() {
+        // `record_variant_reads` zips the raw and circularized variant vectors BY
+        // INDEX, so dropping or reordering an unalignable variant here would
+        // silently attribute one variant's cover-reads to another -- no panic,
+        // just a wrong matrix. Anchorless variants must pass through in place.
+        //
+        // Two cannot be aligned: an insertion at the start of a bubble, where
+        // `get_variants_from_cigar` writes REF "-" because there is no preceding
+        // base, and a deletion that circularization folded onto position 0.
+        let anchorless_ins = Variant {
+            pos: 3,
+            ref_allele: "-".to_string(),
+            alt_allele: "-".to_string(),
+            variant_type: "INS".to_string(),
+            allele_count: 2,
+            filter: None,
+        };
+        let at_origin = Variant {
+            pos: 0,
+            ref_allele: "TC".to_string(),
+            alt_allele: "T".to_string(),
+            variant_type: "DEL".to_string(),
+            allele_count: 5,
+            filter: None,
+        };
+        let shiftable = del_at(HOMOPOLYMER_REF, 5, 1, 3);
+
+        let input = vec![anchorless_ins.clone(), shiftable, at_origin.clone()];
+        let aligned = left_align_variants(&input, HOMOPOLYMER_REF);
+
+        assert_eq!(aligned.len(), 3, "1:1 map: no filtering, no deduplication");
+        // Index 0 and 2 are untouched, and stay at their original indices.
+        assert_eq!(aligned[0].ref_allele, anchorless_ins.ref_allele);
+        assert_eq!(aligned[0].allele_count, anchorless_ins.allele_count);
+        assert_eq!(aligned[2].pos, at_origin.pos);
+        assert_eq!(aligned[2].ref_allele, at_origin.ref_allele);
+        // Index 1 is the one that moved.
+        assert_eq!(aligned[1].pos, 2);
+    }
+
+    #[test]
+    fn left_align_does_not_shift_past_the_reference_start() {
+        // `AAAAC`: the run reaches the start of the reference, so the shift runs
+        // out of room and stops with the anchor on the very first base (POS 1)
+        // rather than underflowing or wrapping around the circular origin.
+        // bcftools behaves the same way at a contig start.
+        let refseq: &[u8] = b"AAAAC";
+        let v = del_at(refseq, 3, 1, 2);
+        let aligned = left_align_variants(&[v], refseq);
+
+        assert_eq!(aligned[0].pos, 1, "shifts as far as an anchor base allows");
+        assert_eq!(aligned[0].ref_allele, "AA");
+        assert_eq!(aligned[0].alt_allele, "A");
+    }
+
+    #[test]
+    fn left_align_lets_collapse_merge_equivalent_spellings_and_sum_evidence() {
+        // This is the point of doing alignment before collapsing: the same 1bp
+        // deletion anchored at two different bases of the run is one event with
+        // 7 supporting reads, not two events with 3 and 4.
+        let spelling_a = del_at(HOMOPOLYMER_REF, 5, 1, 3);
+        let spelling_b = del_at(HOMOPOLYMER_REF, 3, 1, 4);
+        let ref_length = HOMOPOLYMER_REF.len();
+
+        let raw = collapse_identical_records(
+            vec![spelling_a.clone(), spelling_b.clone()],
+            ref_length,
+        );
+        assert_eq!(raw.len(), 2, "without alignment they stay separate records");
+
+        let aligned = left_align_variants(&[spelling_a, spelling_b], HOMOPOLYMER_REF);
+        let collapsed = collapse_identical_records(aligned, ref_length);
+
+        assert_eq!(collapsed.len(), 1);
+        assert_eq!(collapsed[0].pos, 2);
+        assert_eq!(collapsed[0].ref_allele, "CA");
+        assert_eq!(collapsed[0].alt_allele, "C");
+        assert_eq!(collapsed[0].allele_count, 7, "evidence from both spellings sums");
+    }
+
+    #[test]
+    fn matrix_keys_follow_the_aligned_variant_not_the_raw_one() {
+        // The read/cover records are keyed by `generate_variant_name` of the
+        // circularized (and, with --left-align, aligned) variant, while the RAW
+        // position still selects the covering bubble. `construct_matrix` looks
+        // rows up by the same name, so the key must be the aligned one or every
+        // matrix lookup misses and the matrix goes all-NaN.
+        let graph = wraparound_test_graph();
+        let dict = get_graph_intervals(&graph, 10);
+
+        // Raw position 11 sits in the wrap-around bubble [8, 12).
+        let raw = vec![Variant { pos: 11, ..del_at(HOMOPOLYMER_REF, 5, 1, 3) }];
+        let aligned = left_align_variants(&[del_at(HOMOPOLYMER_REF, 5, 1, 3)], HOMOPOLYMER_REF);
+
+        let mut read_record = HashMap::new();
+        let mut cover_record = HashMap::new();
+        record_variant_reads(
+            &raw,
+            &aligned,
+            &dict,
+            &graph,
+            &[json!("r4")],
+            &mut read_record,
+            &mut cover_record,
+        );
+
+        let aligned_key = generate_variant_name(&aligned[0]);
+        assert_eq!(aligned_key, "m.2CA>C");
+        assert!(read_record.contains_key(&aligned_key), "keyed by aligned name");
+        assert!(
+            !read_record.contains_key(&generate_variant_name(&raw[0])),
+            "the raw spelling must not appear as a key"
+        );
+        // ...and the raw position still resolved the covering bubble.
+        let mut cover: Vec<String> =
+            cover_record.get(&aligned_key).cloned().unwrap_or_default().into_iter().collect();
+        cover.sort();
+        assert_eq!(cover, vec!["r4".to_string(), "r5".to_string()]);
+    }
+
+    /// One bubble over `TCAAAAGCTT` (k=3) carrying two alt edges that spell the
+    /// SAME 1bp deletion from the A-run at different anchors -- exactly the
+    /// aligner ambiguity left-alignment exists to canonicalize. `E_alt1` deletes
+    /// the last A of the run, `E_alt2` an earlier one; both produce `TCAAAG`.
+    fn homopolymer_bubble_graph() -> GraphicalGenome {
+        let mut anchor = HashMap::new();
+        anchor.insert("A1".to_string(), json!({"pos": 0, "seq": "TCA"}));
+        anchor.insert("A2".to_string(), json!({"pos": 7, "seq": "CTT"}));
+
+        let mut edges = HashMap::new();
+        edges.insert(
+            "E_ref".to_string(),
+            json!({"src": ["A1"], "dst": ["A2"], "seq": "AAAG", "reads": ["chrM_ref"], "variants": "7="}),
+        );
+        edges.insert(
+            "E_alt1".to_string(),
+            json!({"src": ["A1"], "dst": ["A2"], "seq": "AAG", "reads": ["r1", "r2", "r3"], "variants": "5=1D1="}),
+        );
+        edges.insert(
+            "E_alt2".to_string(),
+            json!({"src": ["A1"], "dst": ["A2"], "seq": "AAG", "reads": ["r4", "r5", "r6", "r7"], "variants": "3=1D3="}),
+        );
+
+        let mut outgoing = HashMap::new();
+        outgoing.insert(
+            "A1".to_string(),
+            vec!["E_ref".to_string(), "E_alt1".to_string(), "E_alt2".to_string()],
+        );
+        for e in ["E_ref", "E_alt1", "E_alt2"] {
+            outgoing.insert(e.to_string(), vec!["A2".to_string()]);
+        }
+
+        let mut incoming = HashMap::new();
+        for e in ["E_ref", "E_alt1", "E_alt2"] {
+            incoming.insert(e.to_string(), vec!["A1".to_string()]);
+        }
+        incoming.insert(
+            "A2".to_string(),
+            vec!["E_ref".to_string(), "E_alt1".to_string(), "E_alt2".to_string()],
+        );
+
+        GraphicalGenome { anchor, edges, outgoing, incoming }
+    }
+
+    #[test]
+    fn get_variant_keys_read_records_by_the_left_aligned_name() {
+        // `construct_matrix` looks each row up in `read_record`/`cover_record` by
+        // `generate_variant_name` of the returned variant. So the keys those maps
+        // were built with and the variants returned alongside them must agree --
+        // if alignment were applied after the returned vector was populated, every
+        // lookup would miss and the whole matrix would come out NaN.
+        let mut graph = homopolymer_bubble_graph();
+        let (variants, _coverage, read_record, cover_record) =
+            get_variant(&mut graph, 3, "chrM_ref", HOMOPOLYMER_REF.len(), Some(HOMOPOLYMER_REF));
+
+        let names: HashSet<String> = variants.iter().map(generate_variant_name).collect();
+        assert_eq!(
+            names,
+            HashSet::from(["m.2CA>C".to_string()]),
+            "both spellings must canonicalize to the same aligned name"
+        );
+        for key in read_record.keys() {
+            assert!(names.contains(key), "read_record key {key} has no matching variant");
+        }
+        for key in cover_record.keys() {
+            assert!(names.contains(key), "cover_record key {key} has no matching variant");
+        }
+
+        // Merging the spellings also merges their evidence: all seven alt reads
+        // land under the one canonical key.
+        let mut alt_reads: Vec<String> = read_record["m.2CA>C"]
+            .iter()
+            .filter_map(|r| r.as_str().map(str::to_string))
+            .collect();
+        alt_reads.sort();
+        assert_eq!(alt_reads, vec!["r1", "r2", "r3", "r4", "r5", "r6", "r7"]);
+    }
+
+    #[test]
+    fn get_variant_without_left_align_keeps_both_raw_spellings() {
+        // The flag is opt-in: with `None` the two spellings stay separate records
+        // at their original anchors, exactly as before this feature existed.
+        let mut graph = homopolymer_bubble_graph();
+        let (variants, _coverage, read_record, _cover) =
+            get_variant(&mut graph, 3, "chrM_ref", HOMOPOLYMER_REF.len(), None);
+
+        let mut names: Vec<String> = variants.iter().map(generate_variant_name).collect();
+        names.sort();
+        assert_eq!(names, vec!["m.3AA>A".to_string(), "m.5AA>A".to_string()]);
+        for key in read_record.keys() {
+            assert!(names.contains(key), "read_record key {key} has no matching variant");
+        }
+    }
+
+    /// rCRS 560..=580 (1-based), covering the poly-C run at 568-573. Slice index
+    /// `i` is 1-based reference coordinate `RCRS_OFFSET + i`.
+    const RCRS_560_580: &[u8] = b"CAAAGACACCCCCCACAGTTT";
+    const RCRS_OFFSET: usize = 560;
+
+    #[test]
+    fn left_align_matches_bcftools_norm_on_the_rcrs_poly_c_run() {
+        // Cross-checked against `bcftools norm -f rCRS.fasta`, which turns both
+        // right-anchored spellings below into the calls asserted here:
+        //   chrM 572 CC  > C   ->  chrM 567 AC > A
+        //   chrM 573 C   > CC  ->  chrM 567 A  > AC
+        // 567 AC>A is also exactly what Himito emits from the real test graph, so
+        // this pins the aligned form to both the reference tool and observed output.
+        // A `Variant.pos` is a 0-based index whose value, in genome coordinates,
+        // is also the 1-based coordinate of the indel's anchor base -- which is
+        // what `format_vcf_record` emits as POS. So a slice-local `pos` maps to
+        // the VCF POS it would carry genome-wide by adding the slice's offset and
+        // stepping back over the 0-based/1-based difference.
+        let to_vcf_pos = |slice_pos: usize| slice_pos + RCRS_OFFSET - 1;
+        // Slice index of the last C of the poly-C run (1-based 573).
+        let last_c = 573 - RCRS_OFFSET;
+
+        // Deletion of that last C: emitted as `572 CC>C` before alignment.
+        let del = del_at(RCRS_560_580, last_c, 1, 4);
+        assert_eq!(to_vcf_pos(del.pos), 572, "sanity check on the input spelling");
+        let aligned = left_align_variants(&[del], RCRS_560_580);
+        assert_eq!(to_vcf_pos(aligned[0].pos), 567);
+        assert_eq!(aligned[0].ref_allele, "AC");
+        assert_eq!(aligned[0].alt_allele, "A");
+
+        // Insertion of a further C after that last C: emitted as `573 C>CC`.
+        let ins = ins_at(RCRS_560_580, last_c + 1, "C", 4);
+        assert_eq!(to_vcf_pos(ins.pos), 573, "sanity check on the input spelling");
+        let aligned = left_align_variants(&[ins], RCRS_560_580);
+        assert_eq!(to_vcf_pos(aligned[0].pos), 567);
+        assert_eq!(aligned[0].ref_allele, "A");
+        assert_eq!(aligned[0].alt_allele, "AC");
+    }
+
+    fn write_vcf_to_temp(name: &str, left_align: bool) -> String {
+        let path = std::env::temp_dir().join(name);
+        let variants = vec![del_at(HOMOPOLYMER_REF, 5, 1, 3)];
+        let coverage: HashMap<usize, usize> = [(5, 30)].into_iter().collect();
+        write_vcf(&variants, &coverage, &path, "s1", "chrM", 10, 0.1, left_align).unwrap();
+        std::fs::read_to_string(&path).unwrap()
+    }
+
+    #[test]
+    fn vcf_header_records_that_indels_were_left_aligned() {
+        // Whether a VCF is normalized changes how it may be compared or merged, so
+        // the output has to say so itself rather than relying on the command line
+        // being remembered.
+        let vcf = write_vcf_to_temp("himito_left_align_on.vcf", true);
+        assert!(
+            vcf.contains("##HimitoNormalization=left-aligned"),
+            "header must declare the normalization; got:\n{vcf}"
+        );
+    }
+
+    #[test]
+    fn vcf_header_omits_the_normalization_line_when_not_left_aligning() {
+        let vcf = write_vcf_to_temp("himito_left_align_off.vcf", false);
+        assert!(!vcf.contains("HimitoNormalization"));
     }
 
     #[test]

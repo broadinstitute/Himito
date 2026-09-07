@@ -96,6 +96,22 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ```
 ./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf>
 ```
+
+Add `--left-align` to left-align indels against the reference the way `bcftools norm`
+does, so that equivalent spellings of one event in a homopolymer or tandem repeat
+collapse into a single record with their supporting reads pooled:
+
+```
+./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf> --left-align
+```
+
+This changes the reported POS/REF/ALT, AC and HF of indels, and the variant names used
+as row labels in the output matrix, so it also shifts the coordinates seen by downstream
+lineage analysis. The VCF records it with a `##HimitoNormalization=left-aligned` header
+line. An indel that would shift past the start of the reference stops there rather than
+wrapping around the circular origin. Note that graphs built by `Himito build` already
+carry left-anchored indel CIGARs in practice, so on such graphs the flag is a guarantee
+rather than a transformation and typically changes nothing.
 #### extract major haplotype from graph
 ```
 ./target/release/Himito asm -g <output.gfa>  -o <output.majorhaplotpe.fasta> -s <header string, e.g. "HG002 major haplotype">

@@ -2667,7 +2667,29 @@ mod tests {
         assert_eq!(polished.parent[3], 0);
     }
 
+    /// Corpus-backed regression test, so it is `#[ignore]`d by default.
+    ///
+    /// Unlike the synthetic polish tests above, this one asserts against a real
+    /// simulated ONT-R10 run, which is the whole point of it: the specific
+    /// evidence margins it pins down (see the comment at the end) only arise from
+    /// genuine read-level data, so replacing the corpus with a hand-built matrix
+    /// would turn it into a duplicate of
+    /// `polish_unary_path_order_moves_distal_children_to_new_tip` while still
+    /// claiming to be an integration test. The inputs are generated artifacts of
+    /// `lineage_eval/lineage_sim/run_eval.sh` (which needs read simulators and the
+    /// conda environment in that directory) and are deliberately not committed,
+    /// so an unconditional `#[test]` here made `cargo test` red on every clean
+    /// checkout and masked real regressions.
+    ///
+    /// To run it, point it at a corpus you have generated:
+    ///
+    /// ```text
+    /// HIMITO_TEST_MATRIX=/path/to/sim.matrix.csv \
+    /// HIMITO_TEST_VCF=/path/to/sim.vcf \
+    ///     cargo test --bin Himito -- --ignored polish_fixes_fully_flipped
+    /// ```
     #[test]
+    #[ignore = "needs a generated lineage_eval corpus; set HIMITO_TEST_MATRIX and HIMITO_TEST_VCF"]
     fn polish_fixes_fully_flipped_ont_eval_tree() {
         let mat = std::env::var("HIMITO_TEST_MATRIX").unwrap_or_else(|_| {
             format!("{}/lineage_eval/lineage_sim/tmp/eval_ont_r10/himito/sim.matrix.csv", env!("CARGO_MANIFEST_DIR"))
@@ -2675,6 +2697,16 @@ mod tests {
         let vcf = std::env::var("HIMITO_TEST_VCF").unwrap_or_else(|_| {
             format!("{}/lineage_eval/lineage_sim/tmp/eval_ont_r10/himito/sim.vcf", env!("CARGO_MANIFEST_DIR"))
         });
+        // A raw unwrap here reported only "file not found", which read like a bug
+        // in the code under test rather than a missing input.
+        for (label, path) in [("HIMITO_TEST_VCF", &vcf), ("HIMITO_TEST_MATRIX", &mat)] {
+            assert!(
+                std::path::Path::new(path).exists(),
+                "{label} corpus not found at {path}\n\
+                 Generate it with lineage_eval/lineage_sim/run_eval.sh, or set {label} \
+                 to an existing file. See this test's doc comment."
+            );
+        }
         let hf = lineage::HfFilter::FromVcf(lineage::parse_vcf(&vcf, 0.01, 0.95).unwrap());
         let binary = lineage::load_and_filter_matrix(&mat, &hf, 2, 1).unwrap();
         let n = binary.variants.len();

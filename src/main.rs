@@ -202,6 +202,16 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.10)]
         strand_bias_drop_max_hf: f64,
 
+        /// left-align indels against the reference, as `bcftools norm` does, so that
+        /// equivalent spellings of one event in a homopolymer or tandem repeat
+        /// collapse into a single record with their supporting reads pooled. This
+        /// changes reported POS/REF/ALT, AC and HF for indels, and the variant names
+        /// used as row labels in the output matrix. An indel that would shift past
+        /// the start of the reference stops there rather than wrapping around the
+        /// circular origin.
+        #[clap(long, action)]
+        left_align: bool,
+
     },
 
     /// Filter reads derived from Numts
@@ -658,6 +668,7 @@ fn main() {
             permutation_rounds,
             strand_bias_action,
             strand_bias_drop_max_hf,
+            left_align,
         } => {
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold_) =
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold, permutation_frequency_threshold);
@@ -738,9 +749,7 @@ fn main() {
                 permutation_rounds,
                 strand_bias_action,
                 strand_bias_drop_max_hf,
-                // QuickStart does not expose --left-align, so it keeps the
-                // historical (unaligned) indel representation.
-                false,
+                left_align,
             );
             let annotated_graph_output = output_prefix.with_extension("gfa");
             let methyl_output = output_prefix.with_extension("bed");

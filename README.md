@@ -59,6 +59,9 @@ If GitHub, Docker Hub, or `crates.io` are slow or unreachable, use the **Zenodo 
 ```
 If you are analyzing high coverage samples, remember to set ```--maximal-mt-depth``` to a reasonable number. -d accepts: pacbio (default), ont-r9, ont-r10, ont-denoised
 
+`quick-start` also accepts ```--left-align```, which it forwards to the variant-calling
+step; see [call variants from graph](#call-variants-from-graph-default-for-pacbio) below.
+
 
 ## Details
 

@@ -8,8 +8,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # PVAL default matches run_eval.sh / run_himito.sh, where the choice of 1 over
 # 0.1 is documented: at 0.1 the caller emits an empty VCF for these cells.
 OUTDIR="" PROFILE="ont-r10" PVAL=1
-# SCITE rates forwarded to run_eval.sh / Himito lineage (same defaults as run_eval.sh).
-FP=0.001 FN=0.05
+# SCITE rates forwarded to run_eval.sh only when set. Empty = Himito
+# lineage::resolve_error_rates for the profile (see run_eval.sh).
+FP="" FN=""
 SEEDS="" NMUTS="" DEPTHS=""
 # Forwarded to run_eval.sh when set; empty = use each script's own default.
 MIN_HF="" MAX_HF="" SIM_MIN_HF="" SIM_MAX_HF="" INTERNAL_KEEP=""
@@ -32,6 +33,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 EVAL_ARGS=()
+[[ -n "$FP" ]] && EVAL_ARGS+=(--fp "$FP")
+[[ -n "$FN" ]] && EVAL_ARGS+=(--fn "$FN")
 [[ -n "$MIN_HF" ]] && EVAL_ARGS+=(--min-hf "$MIN_HF")
 [[ -n "$MAX_HF" ]] && EVAL_ARGS+=(--max-hf "$MAX_HF")
 [[ -n "$SIM_MIN_HF" ]] && EVAL_ARGS+=(--sim-min-hf "$SIM_MIN_HF")
@@ -50,7 +53,7 @@ n_s=$(wc -w <<<"$SEEDS")
 n_m=$(wc -w <<<"$NMUTS")
 n_d=$(wc -w <<<"$DEPTHS")
 n_cells=$((n_s * n_m * n_d))
-echo "sweep: ${n_cells} cells (${n_s}×${n_m}×${n_d}), profile=$PROFILE pval=$PVAL fp=$FP fn=$FN" >&2
+echo "sweep: ${n_cells} cells (${n_s}×${n_m}×${n_d}), profile=$PROFILE pval=$PVAL fp=${FP:-<data-type default>} fn=${FN:-<data-type default>}" >&2
 
 i=0
 n_ok=0
@@ -67,8 +70,6 @@ for seed in $SEEDS; do
            --total-depth "$depth" \
            --seed "$seed" \
            --pval "$PVAL" \
-           --fp "$FP" \
-           --fn "$FN" \
            "${EVAL_ARGS[@]+"${EVAL_ARGS[@]}"}"; then
         cell_metrics="$cell/metrics.tsv"
         if [[ ! -f "$cell_metrics" || ! -s "$cell_metrics" ]]; then

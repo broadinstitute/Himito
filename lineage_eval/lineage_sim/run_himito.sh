@@ -6,7 +6,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 REF="${REF:-$REPO/rCRS.fasta}"
-OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05 KMER=21
+OUTDIR="" PROFILE="" SAMPLE="SIM" FP="" FN="" KMER=21
 
 # Call/build-tuning defaults: match `Himito quick-start`'s own defaults, NOT
 # tuned-for-simulated-data overrides, so this harness measures the pipeline
@@ -19,7 +19,10 @@ OUTDIR="" PROFILE="" SAMPLE="SIM" FP=0.001 FN=0.05 KMER=21
 # CALL_DATATYPE here is always "pacbio" or "ont-denoised", so that's the
 # branch that applies for every profile this script supports.
 
-MINIMAL_AC=2 VAF=0.01 PVAL=1 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
+# Call -v tracks lineage --min-hf unless --vaf is passed explicitly, so the
+# VCF that score_lineage.py reads is already cut at the same floor lineage uses.
+# Empty here; filled with MIN_HF after argv parsing.
+MINIMAL_AC=2 VAF="" PVAL=1 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
 STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1
 # denoise's keep threshold, decoupled from the caller's -v. quick-start ties the two
 # together, but they answer different questions: -v is a raw HF cut on a called
@@ -46,9 +49,10 @@ DENOISE_VAF=0.03
 # are recorded as missing rather than ref, which is what starved the lineage matrix.
 MIN_EDGE_READS=2
 
-# HF band forwarded to `Himito lineage` (same band as run_eval.sh / sweep_fpfn.sh).
-# Unrelated to quick-start, which has no lineage/SCITE step of its own, and no longer
-# related to scoring: score_lineage.py counts every PASS/. call regardless of HF.
+# HF band for `Himito lineage` and, unless --vaf is set, for `Himito call -v`.
+# score_lineage.py still counts every PASS/. call (no second HF band): with call
+# already cut at this floor, that is evaluation at the same min-hf.
+# Empty --fp/--fn: Himito lineage -d uses resolve_error_rates (src/lineage.rs).
 
 MIN_HF=0.01 MAX_HF=0.95
 while [[ $# -gt 0 ]]; do
@@ -89,6 +93,9 @@ case "$PROFILE" in
   ont-denoised) MMPRESET="lr:hq";  DTYPE="ont-denoised";;
   *) echo "profile must be hifi or ont-r10 or ont-denoised" >&2; exit 1;;
 esac
+
+# After profile/min-hf are known: call -v follows --min-hf unless --vaf was set.
+VAF="${VAF:-$MIN_HF}"
 
 HDIR="$OUTDIR/himito"; mkdir -p "$HDIR"
 FQ="$OUTDIR/reads/reads.fastq.gz"
@@ -158,9 +165,17 @@ fi
 # produce artifacts (fasta, methylation bed) this harness doesn't score, so
 # they're intentionally not reproduced here.
 
-# Lineage: SCITE mutation-tree reconstruction.
-"$HIMITO" lineage -m "$HDIR/sim.matrix.csv" -v "$HDIR/sim.vcf" \
-  --fp-rate "$FP" --fn-rate "$FN" --min-hf "$MIN_HF" --max-hf "$MAX_HF" \
+# Lineage: SCITE mutation-tree reconstruction. -d selects resolve_error_rates
+# presets (pacbio 0.005/0.05, ont-r10 0.001/0.05, ont-denoised 0.0001/0.01)
+# unless --fp/--fn were passed.
+LINEAGE_ARGS=(
+  -m "$HDIR/sim.matrix.csv" -v "$HDIR/sim.vcf"
+  --min-hf "$MIN_HF" --max-hf "$MAX_HF"
+  -d "$DTYPE"
   -o "$HDIR/sim_lineage"
+)
+[[ -n "$FP" ]] && LINEAGE_ARGS+=(--fp-rate "$FP")
+[[ -n "$FN" ]] && LINEAGE_ARGS+=(--fn-rate "$FN")
+"$HIMITO" lineage "${LINEAGE_ARGS[@]}"
 
 echo "himito done: $HDIR/sim_lineage.mutation_tree.tsv"

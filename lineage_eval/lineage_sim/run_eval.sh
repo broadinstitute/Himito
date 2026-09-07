@@ -9,16 +9,19 @@ REPO="$(cd "$HERE/../.." && pwd)"
 export REF="${REF:-$REPO/rCRS.fasta}"
 export HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 
-OUTDIR="" PROFILE="ont-r10" NMUT=12 DEPTH=300 SEED=1 FP=0.001 FN=0.05
+OUTDIR="" PROFILE="ont-r10" NMUT=12 DEPTH=300 SEED=1 FP="" FN=""
 # Call p-value forwarded to run_himito.sh (Himito call -p); default matches that
 # script, where the reason for 1 rather than 0.1 is documented: at 0.1 the caller
 # emits an empty VCF for these simulated cells and every metric collapses to zero.
 PVAL=1
-# HF band for `Himito lineage` only (forwarded via run_himito.sh). score_lineage.py
-# no longer bands its detected-variant set -- var_precision counts every PASS/. call.
+# Shared HF floor for `Himito call -v` and `Himito lineage --min-hf` (forwarded
+# via run_himito.sh). score_lineage.py does not re-band: it counts every PASS/.
+# call, which is evaluation at this floor once the caller already cut there.
 # 0.01 matches the committed benchmarks, whose truth SNVs are *observed* at
 # HF 0.06-0.21 and would be mostly filtered away by a 0.1 floor.
-MIN_HF=0.01 MAX_HF=0.99
+# max-hf 0.95 matches the Himito lineage CLI (excludes near-fixed sites).
+# Empty --fp/--fn: run_himito.sh passes -d so lineage::resolve_error_rates applies.
+MIN_HF=0.01 MAX_HF=0.95
 # Band for simulate_tree.py's *truth* frequencies. This is a different constraint
 # from the lineage filter above -- one is what we simulate, the other is how we
 # filter what got called -- and the two used to share a single flag, which made
@@ -62,14 +65,30 @@ if [[ -z "${PBSIM_MODEL_DIR:-}" || ! -d "${PBSIM_MODEL_DIR:-}" ]]; then
 fi
 [[ -f "$REF" ]] || { echo "missing reference FASTA: $REF" >&2; exit 1; }
 
+# Mirrors lineage::resolve_error_rates (src/lineage.rs) so metrics.tsv records
+# the rates Himito lineage actually uses when --fp/--fn are left unset.
+resolve_scite_rates() {
+  case "$1" in
+    hifi) echo "0.005 0.05";;
+    ont-denoised) echo "0.0001 0.01";;
+    *) echo "0.001 0.05";;  # ont-r10, ont-r9, fallback
+  esac
+}
+
 mkdir -p "$OUTDIR"
 echo "$OUTDIR"
 SIM_TREE_ARGS=()
 [[ -n "$INTERNAL_KEEP" ]] && SIM_TREE_ARGS+=(--internal-keep "$INTERNAL_KEEP")
 python "$HERE/simulate_tree.py" --reference "$REF" --n-mutations "$NMUT" --seed "$SEED" --outdir "$OUTDIR" --min-hf "$SIM_MIN_HF" --max-hf "$SIM_MAX_HF" "${SIM_TREE_ARGS[@]+"${SIM_TREE_ARGS[@]}"}"
 "$HERE/simulate_reads.sh" --outdir "$OUTDIR" --profile "$PROFILE" --total-depth "$DEPTH" --seed "$SEED"
-"$HERE/run_himito.sh" --outdir "$OUTDIR" --profile "$PROFILE" --sample SIM \
-  --fp "$FP" --fn "$FN" --pval "$PVAL" --min-hf "$MIN_HF" --max-hf "$MAX_HF"
+HIMITO_ARGS=(
+  --outdir "$OUTDIR" --profile "$PROFILE" --sample SIM
+  --pval "$PVAL" --vaf "$MIN_HF" --min-hf "$MIN_HF" --max-hf "$MAX_HF"
+)
+[[ -n "$FP" ]] && HIMITO_ARGS+=(--fp "$FP")
+[[ -n "$FN" ]] && HIMITO_ARGS+=(--fn "$FN")
+"$HERE/run_himito.sh" "${HIMITO_ARGS[@]}"
+read -r DEFAULT_FP DEFAULT_FN < <(resolve_scite_rates "$PROFILE")
 python "$HERE/score_lineage.py" \
   --truth-tree "$OUTDIR/truth/truth_mutation_tree.tsv" \
   --recon-tree "$OUTDIR/himito/sim_lineage.mutation_tree.tsv" \
@@ -77,7 +96,7 @@ python "$HERE/score_lineage.py" \
   --vcf "$OUTDIR/himito/sim.vcf" \
   --recon-matrix "$OUTDIR/himito/sim_lineage.cleaned_matrix.csv" \
   --truth-clones "$OUTDIR/truth/clones.tsv" \
-  --profile "$PROFILE" --fp "$FP" --fn "$FN" \
+  --profile "$PROFILE" --fp "${FP:-$DEFAULT_FP}" --fn "${FN:-$DEFAULT_FN}" \
   --metrics-out "$OUTDIR/metrics.tsv"
 
 echo "=== metrics ($OUTDIR/metrics.tsv) ==="

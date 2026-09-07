@@ -11,17 +11,22 @@ workflow HimitoLineageSim {
         Array[Int] n_mutations
         Array[Int] depths
 
-        String profile = "ont-r10"          # hifi | ont-r10 (hifi needs ccs -> linux/amd64)
+        String profile = "ont-r10"          # hifi | ont-r10 | ont-denoised (hifi needs ccs -> linux/amd64)
         Float pval = 1                       # Himito call -p forwarded to run_eval.sh
-        Float fp = 0.001                     # SCITE false-positive rate
-        Float fn = 0.05                      # SCITE false-negative rate
+        # Optional SCITE overrides. Unset = Himito lineage::resolve_error_rates
+        # for the profile (hifi/pacbio 0.005/0.05, ont-r10 0.001/0.05,
+        # ont-denoised 0.0001/0.01). Converted to argv strings below so a
+        # no-default optional is never threaded through the nested scatter.
+        Float? fp
+        Float? fn
 
-        # Tuning knobs. Defaults match run_eval.sh's own defaults, so leaving them
-        # unset reproduces a plain `run_eval.sh` invocation. They carry concrete
-        # defaults (rather than being bare optionals) because Cromwell fails to
-        # look up a no-default optional threaded through nested scatter into a task.
+        # Tuning knobs. Defaults match run_eval.sh / Himito lineage CLI.
+        # min_hf is the shared floor for Himito call -v and lineage --min-hf.
+        # They carry concrete defaults (rather than being bare optionals) because
+        # Cromwell fails to look up a no-default optional threaded through nested
+        # scatter into a task.
         Float min_hf = 0.01
-        Float max_hf = 0.99
+        Float max_hf = 0.95
         Float sim_min_hf = 0.05
         Float sim_max_hf = 0.99
         Float internal_keep = 0.20
@@ -33,6 +38,9 @@ workflow HimitoLineageSim {
         RuntimeAttr? runtime_attr_override
     }
 
+    String fp_arg = if defined(fp) then "--fp " + select_first([fp]) else ""
+    String fn_arg = if defined(fn) then "--fn " + select_first([fn]) else ""
+
     scatter (seed in seeds) {
         scatter (nmut in n_mutations) {
             scatter (depth in depths) {
@@ -43,8 +51,8 @@ workflow HimitoLineageSim {
                         total_depth = depth,
                         profile = profile,
                         pval = pval,
-                        fp = fp,
-                        fn = fn,
+                        fp_arg = fp_arg,
+                        fn_arg = fn_arg,
                         min_hf = min_hf,
                         max_hf = max_hf,
                         sim_min_hf = sim_min_hf,
@@ -94,7 +102,10 @@ task RunEvalCell {
         seed:          "RNG seed for simulate_tree.py / simulate_reads.sh"
         n_mutations:   "number of heteroplasmic SNVs in the truth tree"
         total_depth:   "total simulated read depth across all clones"
-        profile:       "read profile: hifi or ont-r10"
+        profile:       "read profile: hifi, ont-r10, or ont-denoised"
+        fp_arg:        "optional '--fp <rate>' override; empty uses the profile's Himito default"
+        fn_arg:        "optional '--fn <rate>' override; empty uses the profile's Himito default"
+        min_hf:        "shared HF floor for Himito call -v and lineage --min-hf"
         reference_fa:  "optional reference FASTA; default is rCRS.fasta baked into the image"
     }
 
@@ -105,8 +116,8 @@ task RunEvalCell {
 
         String profile
         Float pval
-        Float fp
-        Float fn
+        String fp_arg
+        String fn_arg
 
         Float min_hf
         Float max_hf
@@ -139,14 +150,14 @@ task RunEvalCell {
             --total-depth ~{total_depth} \
             --seed ~{seed} \
             --pval ~{pval} \
-            --fp ~{fp} \
-            --fn ~{fn} \
             --ref "$REF" \
             --min-hf ~{min_hf} \
             --max-hf ~{max_hf} \
             --sim-min-hf ~{sim_min_hf} \
             --sim-max-hf ~{sim_max_hf} \
-            --internal-keep ~{internal_keep}
+            --internal-keep ~{internal_keep} \
+            ~{fp_arg} \
+            ~{fn_arg}
 
         # Prepend the identifying columns run_simulation.sh adds to the combined table.
         metrics="~{cell}/metrics.tsv"

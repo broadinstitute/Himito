@@ -2,22 +2,26 @@
 #
 # Bakes in everything run_eval.sh -> {simulate_tree.py, simulate_reads.sh,
 # run_himito.sh, score_lineage.py} needs:
-#   - the Himito release binary (built from source)
+#   - the Himito release binary
 #   - the read-simulation toolchain (pbsim3, pbccs, minimap2, samtools)
 #   - Python + numpy/dendropy
 #   - the pbsim3 error models
 #   - the lineage_sim scripts and rCRS.fasta
 #
-# ccs (pbccs) has no macOS-ARM64 build, so the HiFi profile needs linux/amd64.
-# The stage below is pinned to linux/amd64 so `docker build` works on Apple Silicon.
+# pbccs is linux/amd64-only, so the runtime is always amd64. Do NOT compile
+# Rust under QEMU on Apple Silicon: `rustc -vV` SIGSEGVs there. Default is to
+# copy a prebuilt linux/amd64 Himito binary. Compile from source only on a
+# real amd64 host (--build-arg HIMITO_SOURCE=from-source).
 #
 # Build context is this directory (lineage_sim/):
-#   docker build --platform=linux/amd64 \
+#   docker build \
 #     -t us.gcr.io/broad-dsp-lrma/hangsuunc/himito-lineage-sim:dev \
 #     -f Dockerfile .
+# Override the prebuilt binary source if needed:
+#   --build-arg HIMITO_IMAGE=us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev
 
-# ---- Stage 1: build the Himito release binary --------------------------------
-FROM --platform=linux/amd64 rust:1.84.0 AS himito-build
+# ---- optional: compile Himito (linux/amd64 host only; skipped by default) ----
+FROM rust:1.84.0 AS himito-from-source
 ARG DEBIAN_FRONTEND=noninteractive
 ARG HIMITO_REPO=https://github.com/broadinstitute/Himito.git
 ARG HIMITO_REF=hs_lineage_
@@ -30,7 +34,14 @@ RUN git config --global http.sslverify false \
     && cd /Himito \
     && cargo build --release
 
-# ---- Stage 2: runtime image --------------------------------------------------
+# ---- default: reuse a published linux/amd64 Himito (no rustc, QEMU-safe) -----
+ARG HIMITO_IMAGE=docker.io/hangsuunc/himito:dev
+FROM --platform=linux/amd64 ${HIMITO_IMAGE} AS himito-prebuilt
+
+ARG HIMITO_SOURCE=prebuilt
+FROM himito-${HIMITO_SOURCE} AS himito-build
+
+# ---- runtime ----------------------------------------------------------------
 FROM --platform=linux/amd64 mambaorg/micromamba:1.5.8 AS runtime
 USER root
 ENV MAMBA_ROOT_PREFIX=/opt/conda

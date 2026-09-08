@@ -10,36 +10,28 @@ workflow HimitoLineageSim {
         Array[Int] seeds
         Array[Int] n_mutations
         Array[Int] depths
+        File reference_fa
 
         String profile = "ont-r10"          # hifi | ont-r10 | ont-denoised (hifi needs ccs -> linux/amd64)
         Float pval = 1                       # Himito call -p forwarded to run_eval.sh
-        # Optional SCITE overrides. Unset = Himito lineage::resolve_error_rates
-        # for the profile (hifi/pacbio 0.005/0.05, ont-r10 0.001/0.05,
-        # ont-denoised 0.0001/0.01). Converted to argv strings below so a
-        # no-default optional is never threaded through the nested scatter.
+
         Float? fp
         Float? fn
 
-        # Tuning knobs. Defaults match run_eval.sh / Himito lineage CLI.
-        # min_hf is the shared floor for Himito call -v and lineage --min-hf.
-        # They carry concrete defaults (rather than being bare optionals) because
-        # Cromwell fails to look up a no-default optional threaded through nested
-        # scatter into a task.
         Float min_hf = 0.01
         Float max_hf = 0.95
-        Float sim_min_hf = 0.05
-        Float sim_max_hf = 0.99
+        Float sim_min_hf = 0.01
+        Float sim_max_hf = 0.95
         Float internal_keep = 0.20
+        
 
-        # Optional reference override; default = rCRS.fasta baked into the image.
-        File? reference_fa
-
-        String docker = "us.gcr.io/broad-dsp-lrma/hangsuunc/himito_eval:dev"
+        String docker = "us.gcr.io/broad-dsp-lrma/hangsuunc/himito-lineage-sim:dev"
         RuntimeAttr? runtime_attr_override
     }
 
     String fp_arg = if defined(fp) then "--fp " + select_first([fp]) else ""
     String fn_arg = if defined(fn) then "--fn " + select_first([fn]) else ""
+    RuntimeAttr runtime_attr = select_first([runtime_attr_override, object {}])
 
     scatter (seed in seeds) {
         scatter (nmut in n_mutations) {
@@ -60,7 +52,7 @@ workflow HimitoLineageSim {
                         internal_keep = internal_keep,
                         reference_fa = reference_fa,
                         docker = docker,
-                        runtime_attr_override = runtime_attr_override
+                        runtime_attr_override = runtime_attr
                 }
             }
         }
@@ -106,10 +98,11 @@ task RunEvalCell {
         fp_arg:        "optional '--fp <rate>' override; empty uses the profile's Himito default"
         fn_arg:        "optional '--fn <rate>' override; empty uses the profile's Himito default"
         min_hf:        "shared HF floor for Himito call -v and lineage --min-hf"
-        reference_fa:  "optional reference FASTA; default is rCRS.fasta baked into the image"
+        reference_fa:  "mitochondrial reference FASTA (required)"
     }
 
     input {
+        File reference_fa
         Int seed
         Int n_mutations
         Int total_depth
@@ -125,23 +118,19 @@ task RunEvalCell {
         Float sim_max_hf
         Float internal_keep
 
-        File? reference_fa
-
         String docker
         RuntimeAttr? runtime_attr_override
     }
 
     String cell = "seed~{seed}_mut~{n_mutations}_depth~{total_depth}"
-    String ref_arg = if defined(reference_fa) then "~{select_first([reference_fa])}" else "/opt/lineage_sim/rCRS.fasta"
-
     command <<<
         set -euxo pipefail
 
-        # Tools + scripts + models + Himito binary + rCRS.fasta are baked into the
-        # image; export the paths the shell scripts look for so they run standalone.
+        # Tools + scripts + models + Himito binary are baked into the image;
+        # export the paths the shell scripts look for so they run standalone.
         export HIMITO="/Himito/target/release/Himito"
         export PBSIM_MODEL_DIR="/opt/lineage_sim/pbsim3_models"
-        export REF="~{ref_arg}"
+        export REF="~{reference_fa}"
 
         /opt/lineage_sim/run_eval.sh \
             --outdir "~{cell}" \
@@ -176,8 +165,8 @@ task RunEvalCell {
     }
 
     RuntimeAttr default_attr = object {
-        cpu_cores:          4,
-        mem_gb:             8,
+        cpu_cores:          1,
+        mem_gb:             4,
         disk_gb:            50,
         boot_disk_gb:       10,
         preemptible_tries:  2,

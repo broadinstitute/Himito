@@ -13,12 +13,13 @@
 # copy a prebuilt linux/amd64 Himito binary. Compile from source only on a
 # real amd64 host (--build-arg HIMITO_SOURCE=from-source).
 #
-# Build context is this directory (lineage_sim/):
-#   docker build \
+# Build context is this directory (lineage_sim/). Must be linux/amd64 (pbccs)
+# and a single-platform image (no buildx attestation index): Docker Desktop
+# otherwise publishes linux/arm64+unknown, which Terra cannot pull.
+#   docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+#     --build-arg HIMITO_IMAGE=us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev \
 #     -t us.gcr.io/broad-dsp-lrma/hangsuunc/himito-lineage-sim:dev \
-#     -f Dockerfile .
-# Override the prebuilt binary source if needed:
-#   --build-arg HIMITO_IMAGE=us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev
+#     -f Dockerfile . --push
 
 # ---- optional: compile Himito (linux/amd64 host only; skipped by default) ----
 FROM rust:1.84.0 AS himito-from-source

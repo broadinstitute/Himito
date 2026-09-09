@@ -14,15 +14,15 @@ OUTDIR="" PROFILE="" SAMPLE="SIM" FP="" FN="" KMER=21
 # QuickStart: minimal_ac=2, vaf_threshold=0.01, strand_bias_threshold=0.05,
 # indel_false_threshold=0.1, build's min_edge_reads hardcoded to 2) or, where
 # quick-start leaves a threshold as Option<None>, the same
-# call::resolve_thresholds(data_type, None, None, None) fallback quick-start
-# gets for a data_type other than ont-r9/ont-r10 (p=0.01, f=0.2, perm=0.7) --
-# CALL_DATATYPE here is always "pacbio" or "ont-denoised", so that's the
-# branch that applies for every profile this script supports.
+# call::resolve_thresholds(data_type, None, None, None) fallback (p=0.01,
+# f=0.2, perm=0.7 for every profile this script supports). `--p-value-threshold`
+# is deliberately omitted so that data-type default runs; pass
+# --frequency-threshold to override `-f` without touching `-p`.
 
 # Call -v tracks lineage --min-hf unless --vaf is passed explicitly, so the
 # VCF that score_lineage.py reads is already cut at the same floor lineage uses.
 # Empty here; filled with MIN_HF after argv parsing.
-MINIMAL_AC=2 VAF="" PVAL=1 FREQ_THRESHOLD=0.2 PERM_FREQ_THRESHOLD=0.7
+MINIMAL_AC=2 VAF="" FREQ_THRESHOLD="" PERM_FREQ_THRESHOLD=0.7
 STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1
 # denoise's keep threshold, decoupled from the caller's -v. quick-start ties the two
 # together, but they answer different questions: -v is a raw HF cut on a called
@@ -35,14 +35,6 @@ STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1
 # and DENOISE_KEEP_VAF in src/main.rs): variant precision 0.837 -> 0.967 with recall
 # held at 1.000 and ad_f1 within 0.003 of best. Empty = follow --vaf.
 DENOISE_VAF=0.03
-# PVAL=1 (permutation test effectively disabled) is required for this harness to
-# call anything at all. At PVAL=0.1 the simulated ont-r10 n=10 cells produce an
-# EMPTY VCF -- not a single one of the ten truth SNVs survives, even though the
-# reads plainly carry them at 4-17% HF and `-p 1` calls all ten as PASS. That
-# makes every downstream lineage metric zero, and it is why the committed
-# benchmarks under lineage_eval/benchmark_results (which have var_f1 ~ 1.0)
-# cannot be reproduced with a 0.1 default. Lower this only alongside a check
-# that truth SNVs are still called.
 # MIN_EDGE_READS deliberately diverges from quick-start's hardcoded 2: the gate is
 # now inclusive (>= N reads), and 1 CIGARs every read-supported edge. At 2, ~98% of
 # edges on this ONT graph go un-CIGARed and the reads reaching a bubble through them
@@ -67,7 +59,6 @@ while [[ $# -gt 0 ]]; do
     --minimal-ac) MINIMAL_AC="$2"; shift 2;;
     --vaf) VAF="$2"; shift 2;;
     --denoise-vaf) DENOISE_VAF="$2"; shift 2;;
-    --pval) PVAL="$2"; shift 2;;
     --frequency-threshold) FREQ_THRESHOLD="$2"; shift 2;;
     --permutation-frequency-threshold) PERM_FREQ_THRESHOLD="$2"; shift 2;;
     --strand-bias-threshold) STRAND_BIAS_THRESHOLD="$2"; shift 2;;
@@ -81,7 +72,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$OUTDIR" && -n "$PROFILE" ]] || {
   echo "usage: --outdir DIR --profile {hifi,ont-r10} [--sample S] [--fp F] [--fn F]" >&2
-  echo "  [--minimal-ac N] [--vaf V] [--denoise-vaf V] [--pval P] [--frequency-threshold F]" >&2
+  echo "  [--minimal-ac N] [--vaf V] [--denoise-vaf V] [--frequency-threshold F]" >&2
   echo "  [--permutation-frequency-threshold F] [--strand-bias-threshold F]" >&2
   echo "  [--indel-false-threshold F] [--min-edge-reads N] [--min-hf F] [--max-hf F]" >&2
   exit 1
@@ -152,12 +143,20 @@ fi
   --min-edge-reads "$MIN_EDGE_READS"
 
 # Call variants: -o is the VCF; matrix.csv is derived as <o>.matrix.csv.
-"$HIMITO" call -g "$HDIR/sim.gfa" -r "$REF" -s "$SAMPLE" -d "$CALL_DATATYPE" \
-  -o "$HDIR/sim.vcf" -k "$KMER" --input-bam "$BUILD_BAM" \
-  -m "$MINIMAL_AC" -v "$VAF" -p "$PVAL" -f "$FREQ_THRESHOLD" \
-  --permutation-frequency-threshold "$PERM_FREQ_THRESHOLD" \
-  --strand-bias-threshold "$STRAND_BIAS_THRESHOLD" \
+# `-p` / `--p-value-threshold` is omitted so call::resolve_thresholds applies
+# the data-type default (0.01 for every profile this script supports). `-f` is
+# only forwarded when --frequency-threshold was set; otherwise that default
+# (0.2 here) applies too.
+CALL_ARGS=(
+  -g "$HDIR/sim.gfa" -r "$REF" -s "$SAMPLE" -d "$CALL_DATATYPE"
+  -o "$HDIR/sim.vcf" -k "$KMER" --input-bam "$BUILD_BAM"
+  -m "$MINIMAL_AC" -v "$VAF"
+  --permutation-frequency-threshold "$PERM_FREQ_THRESHOLD"
+  --strand-bias-threshold "$STRAND_BIAS_THRESHOLD"
   --indel-false-threshold "$INDEL_FALSE_THRESHOLD"
+)
+[[ -n "$FREQ_THRESHOLD" ]] && CALL_ARGS+=(-f "$FREQ_THRESHOLD")
+"$HIMITO" call "${CALL_ARGS[@]}"
 
 # quick-start also runs a NUMT/methylation filter before build and asm/methyl
 # steps after call; both are no-ops for this harness's simulated reads (no

@@ -171,7 +171,7 @@ task Himito_quickstart {
         String sample_id
         String data_type
         String chromo = "chrM"
-        String? extra_args
+        String extra_args = "--left-align"
 
         RuntimeAttr? runtime_attr_override
     }
@@ -207,7 +207,7 @@ task Himito_quickstart {
         boot_disk_gb:       10,
         preemptible_tries:  2,
         max_retries:        1,
-        docker:             "docker.io/hangsuunc/himito:dev"
+        docker:             "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
     }
     RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])
     runtime {
@@ -286,6 +286,7 @@ task Himito_lineage {
         String prefix
         Float min_hf
         Float max_hf
+        String data_type = "pacbio"
         String? extra_args
 
         RuntimeAttr? runtime_attr_override
@@ -297,7 +298,7 @@ task Himito_lineage {
                                               -v ~{shared_vcf} \
                                               --min-hf ~{min_hf} \
                                               --max-hf ~{max_hf} \
-                                              -d "pacbio" \
+                                              -d ~{data_type} \
                                               -o ~{prefix}.pb \
                                               ~{extra_args}
 
@@ -320,7 +321,7 @@ task Himito_lineage {
         boot_disk_gb:       10,
         preemptible_tries:  2,
         max_retries:        1,
-        docker:             "docker.io/hangsuunc/himito:dev"
+        docker:             "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
     }
 
     RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])

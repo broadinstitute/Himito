@@ -13,7 +13,7 @@ workflow HimitoLineageSim {
         File reference_fa
 
         String profile = "ont-r10"          # hifi | ont-r10 | ont-denoised (hifi needs ccs -> linux/amd64)
-        Float pval = 1                       # Himito call -p forwarded to run_eval.sh
+        Float? frequency_threshold           # Himito call -f; unset = data-type default (0.2)
 
         Float? fp
         Float? fn
@@ -31,6 +31,7 @@ workflow HimitoLineageSim {
 
     String fp_arg = if defined(fp) then "--fp " + select_first([fp]) else ""
     String fn_arg = if defined(fn) then "--fn " + select_first([fn]) else ""
+    String frequency_threshold_arg = if defined(frequency_threshold) then "--frequency-threshold " + select_first([frequency_threshold]) else ""
     RuntimeAttr runtime_attr = select_first([runtime_attr_override, object {}])
 
     scatter (seed in seeds) {
@@ -42,9 +43,9 @@ workflow HimitoLineageSim {
                         n_mutations = nmut,
                         total_depth = depth,
                         profile = profile,
-                        pval = pval,
                         fp_arg = fp_arg,
                         fn_arg = fn_arg,
+                        frequency_threshold_arg = frequency_threshold_arg,
                         min_hf = min_hf,
                         max_hf = max_hf,
                         sim_min_hf = sim_min_hf,
@@ -97,6 +98,7 @@ task RunEvalCell {
         profile:       "read profile: hifi, ont-r10, or ont-denoised"
         fp_arg:        "optional '--fp <rate>' override; empty uses the profile's Himito default"
         fn_arg:        "optional '--fn <rate>' override; empty uses the profile's Himito default"
+        frequency_threshold_arg: "optional '--frequency-threshold <F>' override; empty uses Himito call's data-type default"
         min_hf:        "shared HF floor for Himito call -v and lineage --min-hf"
         reference_fa:  "mitochondrial reference FASTA (required)"
     }
@@ -108,9 +110,9 @@ task RunEvalCell {
         Int total_depth
 
         String profile
-        Float pval
         String fp_arg
         String fn_arg
+        String frequency_threshold_arg
 
         Float min_hf
         Float max_hf
@@ -138,7 +140,6 @@ task RunEvalCell {
             --n-mutations ~{n_mutations} \
             --total-depth ~{total_depth} \
             --seed ~{seed} \
-            --pval ~{pval} \
             --ref "$REF" \
             --min-hf ~{min_hf} \
             --max-hf ~{max_hf} \
@@ -146,7 +147,8 @@ task RunEvalCell {
             --sim-max-hf ~{sim_max_hf} \
             --internal-keep ~{internal_keep} \
             ~{fp_arg} \
-            ~{fn_arg}
+            ~{fn_arg} \
+            ~{frequency_threshold_arg}
 
         # Prepend the identifying columns run_simulation.sh adds to the combined table.
         metrics="~{cell}/metrics.tsv"

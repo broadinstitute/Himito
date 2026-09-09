@@ -148,6 +148,10 @@ task MergeVcfs {
     command {
         set -euox pipefail
 
+        # Avoid /tmp space issues on some workers (bcftools spills FILTER/merge temps there).
+        export TMPDIR="$PWD/bcftools_tmp"
+        mkdir -p "$TMPDIR"
+
         # Create a zero-size monitoring log file so it exists even if we don't pass a monitoring script
         touch monitoring.log
         if [ -s ~{monitoring_script} ]; then
@@ -155,21 +159,24 @@ task MergeVcfs {
         fi
 
         if [ "~{if defined(vcf_gz_tbis) then "1" else "0"}" = "0" ]; then
+            : > filelist.txt
+            i=0
             for vcf in ~{sep=' ' vcf_gzs}; do
-                # Get basename of VCF file (remove directory path)
-                vcf_basename=$(basename "$vcf")
-                # Recompress and index the VCF file, excluding 1bp indels with HF < 0.1
+                i=$((i + 1))
+                # Unique names: basename collisions (or a retry leftover .tbi) must not
+                # overwrite another sample or fail bcftools index.
+                out="input_$i.vcf.gz"
                 bcftools view "$vcf" \
                     -i 'FILTER="PASS"' \
-                    -Oz -o "$vcf_basename.vcf.gz"
-                bcftools index -t "$vcf_basename.vcf.gz"
+                    -Oz -o "$out"
+                bcftools index -f -t "$out"
+                echo "$out" >> filelist.txt
             done
-            ls *.vcf.gz > filelist.txt
             bcftools merge \
                 -l filelist.txt \
                 ~{extra_args} \
                 -Oz -o ~{output_prefix}.vcf.gz
-            bcftools index -t ~{output_prefix}.vcf.gz
+            bcftools index -f -t ~{output_prefix}.vcf.gz
         fi
 
         if [ "~{if defined(vcf_gz_tbis) then "1" else "0"}" = "1" ]; then
@@ -177,7 +184,7 @@ task MergeVcfs {
                 -l ~{write_lines(vcf_gzs)} \
                 ~{extra_args} \
                 -Oz -o ~{output_prefix}.vcf.gz
-            bcftools index -t ~{output_prefix}.vcf.gz
+            bcftools index -f -t ~{output_prefix}.vcf.gz
         fi
     }
 
@@ -216,6 +223,10 @@ task Ivcfmerge {
     command {
         set -euox pipefail
 
+        # Avoid /tmp space issues on some workers.
+        export TMPDIR="$PWD/bcftools_tmp"
+        mkdir -p "$TMPDIR"
+
         # Create a zero-size monitoring log file so it exists even if we don't pass a monitoring script
         touch monitoring.log
         if [ -s ~{monitoring_script} ]; then
@@ -229,7 +240,7 @@ task Ivcfmerge {
         cat ~{write_lines(vcf_gzs)} | xargs -I % sh -c 'bcftools annotate --no-version ~{region_args} -x INFO % -Ov -o decompressed/$(basename % .gz)'
         time python ivcfmerge-1.0.0/ivcfmerge.py <(ls decompressed/*.vcf) ~{output_prefix}.vcf
         bcftools annotate --no-version -S ~{write_lines(sample_names)} -x FORMAT/FT ~{output_prefix}.vcf -Oz -o ~{output_prefix}.vcf.gz
-        bcftools index -t ~{output_prefix}.vcf.gz
+        bcftools index -f -t ~{output_prefix}.vcf.gz
     }
 
     output {
@@ -265,6 +276,10 @@ task ConcatVcfs {
     command {
         set -euox pipefail
 
+        # Avoid /tmp space issues on some workers.
+        export TMPDIR="$PWD/bcftools_tmp"
+        mkdir -p "$TMPDIR"
+
         # Create a zero-size monitoring log file so it exists even if we don't pass a monitoring script
         touch monitoring.log
         if [ -s ~{monitoring_script} ]; then
@@ -275,7 +290,7 @@ task ConcatVcfs {
             -f ~{write_lines(vcf_gzs)} \
             ~{extra_args} \
             -Oz -o ~{output_prefix}.vcf.gz
-        bcftools index -t --threads $(nproc) ~{output_prefix}.vcf.gz
+        bcftools index -f -t --threads $(nproc) ~{output_prefix}.vcf.gz
     }
 
     output {

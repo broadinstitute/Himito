@@ -10,10 +10,10 @@ export REF="${REF:-$REPO/rCRS.fasta}"
 export HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 
 OUTDIR="" PROFILE="ont-r10" NMUT=12 DEPTH=300 SEED=1 FP="" FN=""
-# Call p-value forwarded to run_himito.sh (Himito call -p); default matches that
-# script, where the reason for 1 rather than 0.1 is documented: at 0.1 the caller
-# emits an empty VCF for these simulated cells and every metric collapses to zero.
-PVAL=1
+# Himito call -f override forwarded to run_himito.sh. Empty = omit `-f` so
+# call::resolve_thresholds applies the data-type default (0.2 here). `-p` is
+# never forwarded: run_himito.sh lets the same resolver pick the p-value.
+FREQ_THRESHOLD=""
 # Shared HF floor for `Himito call -v` and `Himito lineage --min-hf` (forwarded
 # via run_himito.sh). score_lineage.py does not re-band: it counts every PASS/.
 # call, which is evaluation at this floor once the caller already cut there.
@@ -45,7 +45,7 @@ while [[ $# -gt 0 ]]; do
     --seed) SEED="$2"; shift 2;;
     --fp) FP="$2"; shift 2;;
     --fn) FN="$2"; shift 2;;
-    --pval) PVAL="$2"; shift 2;;
+    --frequency-threshold) FREQ_THRESHOLD="$2"; shift 2;;
     --min-hf) MIN_HF="$2"; shift 2;;
     --max-hf) MAX_HF="$2"; shift 2;;
     --sim-min-hf) SIM_MIN_HF="$2"; shift 2;;
@@ -56,7 +56,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--pval P] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--ref FASTA]" >&2
+  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--ref FASTA]" >&2
   exit 1
 }
 # Resolve in simulate_reads.sh; export a sane default here for visibility.
@@ -83,10 +83,11 @@ python "$HERE/simulate_tree.py" --reference "$REF" --n-mutations "$NMUT" --seed 
 "$HERE/simulate_reads.sh" --outdir "$OUTDIR" --profile "$PROFILE" --total-depth "$DEPTH" --seed "$SEED"
 HIMITO_ARGS=(
   --outdir "$OUTDIR" --profile "$PROFILE" --sample SIM
-  --pval "$PVAL" --vaf "$MIN_HF" --min-hf "$MIN_HF" --max-hf "$MAX_HF"
+  --vaf "$MIN_HF" --min-hf "$MIN_HF" --max-hf "$MAX_HF"
 )
 [[ -n "$FP" ]] && HIMITO_ARGS+=(--fp "$FP")
 [[ -n "$FN" ]] && HIMITO_ARGS+=(--fn "$FN")
+[[ -n "$FREQ_THRESHOLD" ]] && HIMITO_ARGS+=(--frequency-threshold "$FREQ_THRESHOLD")
 "$HERE/run_himito.sh" "${HIMITO_ARGS[@]}"
 read -r DEFAULT_FP DEFAULT_FN < <(resolve_scite_rates "$PROFILE")
 python "$HERE/score_lineage.py" \

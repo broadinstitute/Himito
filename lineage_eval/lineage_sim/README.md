@@ -81,14 +81,14 @@ The wrapper passes sim-appropriate `Himito call` flags by default:
 
 | Flag | Default | Why |
 |------|---------|-----|
-| `--minimal-ac 0` | 0 | Matrix construction keeps only reads whose alt-count exceeds `minimal-ac`. Simulated reads carry few alts each; the clinical default (1) empties the matrix so `Himito lineage` has nothing to work with. |
-| `--vaf 0.005` | 0.005 | Captures low-frequency clones (~0.5%). The clinical default (0.01) drops sub-1% clones. |
-| `--pval 1.0` | 1.0 | Disables the permutation test. Clean simulated variants have balanced strand coverage; the test rejects them at clinical thresholds. |
+| `--minimal-ac` | 2 | Same as Himito `call` / quick-start. |
+| `--vaf` | lineage `--min-hf` (0.01) | Call floor tracks the lineage HF band unless `--vaf` is set. |
+| `--frequency-threshold` | unset (Himito 0.2) | Permutation-test heteroplasmy gate (`call -f`). Omit to use the data-type default; pass to override. `--p-value-threshold` is never set, so `call::resolve_thresholds` supplies the data-type p-value (0.01). |
 
 These can be overridden when calling `run_himito.sh` directly:
 ```bash
 ./run_himito.sh --outdir /tmp/eval_ont --profile ont-r10 \
-  --minimal-ac 0 --vaf 0.005 --pval 1.0
+  --frequency-threshold 0.2
 ```
 
 ## Sweep fp/fn

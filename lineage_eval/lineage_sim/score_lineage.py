@@ -199,11 +199,11 @@ def detected_variants_with_hf_from_vcf(path: str) -> dict[str, float | None]:
     error-driven calls sat below the band's floor and near-homoplasmic artifacts above
     its ceiling, so neither reached the metric. Indels are likewise counted now.
     ``simulate_tree.py`` emits substitutions only, so every indel call is a false
-    positive by construction -- expect ONT ``var_precision`` to read low, since indel
-    artifacts outnumber SNV calls by ~50x there and are suppressed solely by the
-    permutation test, which this harness disables (``call -p 1``). That is a property
-    of the caller output, not of lineage reconstruction; read ``ad_*``/``pc_recall``
-    for tree accuracy.
+    positive by construction -- expect ONT ``var_precision`` to read low whenever
+    the permutation test lets indel artifacts through. ``run_himito.sh`` leaves
+    ``call -p`` at the data-type default (does not pass ``-p 1``). That is a
+    property of the caller output, not of lineage reconstruction; read
+    ``ad_*`` for tree accuracy.
     """
     out: dict[str, float | None] = {}
     with open(path) as fh:

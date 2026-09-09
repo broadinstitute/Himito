@@ -5,15 +5,14 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# PVAL default matches run_eval.sh / run_himito.sh, where the choice of 1 over
-# 0.1 is documented: at 0.1 the caller emits an empty VCF for these cells.
-OUTDIR="" PROFILE="ont-r10" PVAL=1
+OUTDIR="" PROFILE="ont-r10"
 # SCITE rates forwarded to run_eval.sh only when set. Empty = Himito
 # lineage::resolve_error_rates for the profile (see run_eval.sh).
 FP="" FN=""
 SEEDS="" NMUTS="" DEPTHS=""
 # Forwarded to run_eval.sh when set; empty = use each script's own default.
-MIN_HF="" MAX_HF="" SIM_MIN_HF="" SIM_MAX_HF="" INTERNAL_KEEP=""
+# FREQ_THRESHOLD is Himito call -f; empty = data-type default via run_himito.sh.
+MIN_HF="" MAX_HF="" SIM_MIN_HF="" SIM_MAX_HF="" INTERNAL_KEEP="" FREQ_THRESHOLD=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -21,7 +20,7 @@ while [[ $# -gt 0 ]]; do
     --seeds) SEEDS="$2"; shift 2;;
     --n-mutations) NMUTS="$2"; shift 2;;
     --depths) DEPTHS="$2"; shift 2;;
-    --pval) PVAL="$2"; shift 2;;
+    --frequency-threshold) FREQ_THRESHOLD="$2"; shift 2;;
     --fp) FP="$2"; shift 2;;
     --fn) FN="$2"; shift 2;;
     --min-hf) MIN_HF="$2"; shift 2;;
@@ -40,8 +39,9 @@ EVAL_ARGS=()
 [[ -n "$SIM_MIN_HF" ]] && EVAL_ARGS+=(--sim-min-hf "$SIM_MIN_HF")
 [[ -n "$SIM_MAX_HF" ]] && EVAL_ARGS+=(--sim-max-hf "$SIM_MAX_HF")
 [[ -n "$INTERNAL_KEEP" ]] && EVAL_ARGS+=(--internal-keep "$INTERNAL_KEEP")
+[[ -n "$FREQ_THRESHOLD" ]] && EVAL_ARGS+=(--frequency-threshold "$FREQ_THRESHOLD")
 [[ -n "$OUTDIR" && -n "$SEEDS" && -n "$NMUTS" && -n "$DEPTHS" ]] || {
-  echo "usage: --outdir DIR --seeds \"...\" --n-mutations \"...\" --depths \"...\" [--profile P] [--pval P] [--fp F] [--fn F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F]" >&2
+  echo "usage: --outdir DIR --seeds \"...\" --n-mutations \"...\" --depths \"...\" [--profile P] [--frequency-threshold F] [--fp F] [--fn F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F]" >&2
   exit 1
 }
 
@@ -53,7 +53,7 @@ n_s=$(wc -w <<<"$SEEDS")
 n_m=$(wc -w <<<"$NMUTS")
 n_d=$(wc -w <<<"$DEPTHS")
 n_cells=$((n_s * n_m * n_d))
-echo "sweep: ${n_cells} cells (${n_s}×${n_m}×${n_d}), profile=$PROFILE pval=$PVAL fp=${FP:-<data-type default>} fn=${FN:-<data-type default>}" >&2
+echo "sweep: ${n_cells} cells (${n_s}×${n_m}×${n_d}), profile=$PROFILE frequency-threshold=${FREQ_THRESHOLD:-<data-type default>} fp=${FP:-<data-type default>} fn=${FN:-<data-type default>}" >&2
 
 i=0
 n_ok=0
@@ -69,7 +69,6 @@ for seed in $SEEDS; do
            --n-mutations "$nmut" \
            --total-depth "$depth" \
            --seed "$seed" \
-           --pval "$PVAL" \
            "${EVAL_ARGS[@]+"${EVAL_ARGS[@]}"}"; then
         cell_metrics="$cell/metrics.tsv"
         if [[ ! -f "$cell_metrics" || ! -s "$cell_metrics" ]]; then

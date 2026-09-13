@@ -229,6 +229,157 @@ pub fn best_attachment(
     (best_node, best_ll)
 }
 
+/// Error rates are clamped into `[RATE_FLOOR, 1 - RATE_FLOOR]` before any
+/// logarithm is taken.
+///
+/// This is load-bearing, not defensive. `--fp-rate 0` is a supported input
+/// (see `lineage::resolve_error_rates`, which passes `Some(0.0)` through
+/// verbatim). The reference `attachment_log_likelihood` sums `ln(0) = -inf`
+/// directly and stays at `-inf`, but incremental scoring stores the *difference*
+/// between the mutated and unmutated log-probabilities, and `ln(1 - fn) - ln(0)`
+/// is `+inf`. Adding that to a `-inf` base gives `NaN`, which compares false
+/// against every threshold and would silently pin every read to node 0.
+///
+/// Clamping is also the more useful behaviour. At `fp = 0` the reference
+/// implementation scores every node that fails to explain some alt call at
+/// exactly `-inf`, so they all tie and the parsimony tie-break returns the root
+/// regardless of what the data says. The clamped version keeps them ordered.
+pub const RATE_FLOOR: f64 = 1e-12;
+
+/// Node visit order and mutation depth for one tree, computed once and reused
+/// across every read.
+///
+/// `preorder` lists every node exactly once with each parent before all of its
+/// children, which is what lets a read's score at a node be computed from its
+/// parent's in a single forward pass. `depth[node]` is the number of mutations
+/// on the root→node path — identical to `tree.ancestor_mask(node).count_ones()`,
+/// but O(1) to read instead of O(depth) to recompute.
+pub struct TreeLayout {
+    preorder: Vec<usize>,
+    depth: Vec<usize>,
+}
+
+impl TreeLayout {
+    pub fn new(tree: &MutationTree) -> Self {
+        let children = tree.children_of();
+        let root = tree.root();
+        let mut preorder = Vec::with_capacity(tree.n_mutations + 1);
+        let mut depth = vec![0usize; tree.n_mutations + 1];
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            preorder.push(node);
+            for &c in &children[node] {
+                depth[c] = depth[node] + 1;
+                stack.push(c);
+            }
+        }
+        TreeLayout { preorder, depth }
+    }
+}
+
+/// Per-read log-likelihood terms, precomputed so that scoring a read against a
+/// tree node costs O(1) per node rather than O(n_variants).
+///
+/// A SCITE mutation tree is a perfect phylogeny: `genotype(child)` is
+/// `genotype(parent)` plus exactly one mutation. So the log-likelihood of a read
+/// at a child differs from its value at the parent by a single term — the one
+/// for the child's own mutation. `delta[read][m]` holds that term and
+/// `base[read]` holds the score at the root (nothing mutated); every node's
+/// score is the root's plus the deltas along its path, which one forward pass
+/// over `TreeLayout::preorder` accumulates.
+///
+/// `delta` is indexed `[read][variant]` rather than `[variant][read]` so the
+/// scoring pass, which walks variants for a fixed read, reads contiguous memory.
+pub struct AttachmentScorer {
+    /// `base[r]` = log P(read r's calls | genotype is all-reference).
+    base: Vec<f64>,
+    /// `delta[r][m]` = log P(call | m mutated) − log P(call | m not mutated).
+    delta: Vec<Vec<f64>>,
+}
+
+impl AttachmentScorer {
+    pub fn new(matrix: &BinaryMatrix, rates: &ErrorRates) -> Self {
+        let fp = rates.fp_rate.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR);
+        let fnr = rates.fn_rate.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR);
+        let ln_fp = fp.ln();
+        let ln_1mfp = (1.0 - fp).ln();
+        let ln_fn = fnr.ln();
+        let ln_1mfn = (1.0 - fnr).ln();
+
+        let n_variants = matrix.variants.len();
+        let n_reads = matrix.reads.len();
+        let mut base = vec![0.0f64; n_reads];
+        let mut delta = vec![vec![0.0f64; n_variants]; n_reads];
+
+        for m in 0..n_variants {
+            for r in 0..n_reads {
+                match matrix.data[m][r] {
+                    Some(1) => {
+                        base[r] += ln_fp;
+                        delta[r][m] = ln_1mfn - ln_fp;
+                    }
+                    Some(0) => {
+                        base[r] += ln_1mfp;
+                        delta[r][m] = ln_fn - ln_1mfp;
+                    }
+                    // Uncovered: contributes nothing at any node.
+                    _ => {}
+                }
+            }
+        }
+
+        AttachmentScorer { base, delta }
+    }
+
+    /// The best-fitting node for read `read` and its log-likelihood.
+    ///
+    /// Identical in result to the reference [`best_attachment`], including its
+    /// parsimony tie-break and its first-wins behaviour among nodes tied on both
+    /// likelihood and mutation count — which is why the selection loop below runs
+    /// in node-index order over a precomputed array rather than folding the
+    /// comparison into the forward pass, whose order is the tree's, not the
+    /// index's.
+    ///
+    /// `scratch` is caller-owned so a loop over reads allocates once, not once
+    /// per read. Its contents on entry are irrelevant; it is resized and
+    /// overwritten for every node before anything reads it.
+    pub fn best_attachment(
+        &self,
+        read: usize,
+        tree: &MutationTree,
+        layout: &TreeLayout,
+        scratch: &mut Vec<f64>,
+    ) -> (usize, f64) {
+        let root = tree.root();
+        scratch.clear();
+        scratch.resize(tree.n_mutations + 1, 0.0);
+        scratch[root] = self.base[read];
+
+        let deltas = &self.delta[read];
+        for &node in &layout.preorder {
+            if node != root {
+                scratch[node] = scratch[tree.parent[node]] + deltas[node];
+            }
+        }
+
+        let mut best_node = root;
+        let mut best_ll = f64::NEG_INFINITY;
+        let mut best_muts = usize::MAX;
+        for node in 0..=tree.n_mutations {
+            let ll = scratch[node];
+            let n_muts = layout.depth[node];
+            let strictly_better = ll > best_ll + LL_TIE_EPS;
+            let tied_and_simpler = (ll - best_ll).abs() <= LL_TIE_EPS && n_muts < best_muts;
+            if strictly_better || tied_and_simpler {
+                best_ll = best_ll.max(ll);
+                best_node = node;
+                best_muts = n_muts;
+            }
+        }
+        (best_node, best_ll)
+    }
+}
+
 /// Total log-likelihood of `matrix` under `tree`: sum, over every read, of
 /// that read's best-attachment log-likelihood.
 pub fn tree_log_likelihood(matrix: &BinaryMatrix, tree: &MutationTree, rates: &ErrorRates) -> f64 {
@@ -2769,5 +2920,141 @@ mod tests {
         );
 
         assert!(ll1 > ll0 + 1.0, "expected large LL gain from fixing flipped lineages");
+    }
+
+    #[test]
+    fn incremental_scorer_matches_reference_best_attachment_on_random_trees() {
+        let mut rng = StdRng::seed_from_u64(0xC0FFEE);
+        let rates = ErrorRates { fp_rate: 0.005, fn_rate: 0.05 };
+
+        for trial in 0..300usize {
+            let n_variants = 1 + trial % 9;
+            let n_reads = 1 + trial % 7;
+
+            let data: Vec<Vec<Option<u8>>> = (0..n_variants)
+                .map(|_| {
+                    (0..n_reads)
+                        .map(|_| match rng.random_range(0..3u8) {
+                            0 => None,
+                            1 => Some(0),
+                            _ => Some(1),
+                        })
+                        .collect()
+                })
+                .collect();
+            let matrix = BinaryMatrix {
+                variants: (0..n_variants).map(|i| format!("m.{}A>G", 100 + i)).collect(),
+                reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
+                data,
+            };
+
+            let tree = MutationTree::random(n_variants, &mut rng);
+            let scorer = AttachmentScorer::new(&matrix, &rates);
+            let layout = TreeLayout::new(&tree);
+            let mut scratch = Vec::new();
+
+            for r in 0..n_reads {
+                let profile: Vec<Option<u8>> = matrix.data.iter().map(|row| row[r]).collect();
+                let (want_node, want_ll) = best_attachment(&profile, &tree, &rates);
+                let (got_node, got_ll) = scorer.best_attachment(r, &tree, &layout, &mut scratch);
+                assert_eq!(got_node, want_node, "node mismatch (trial {trial}, read {r})");
+                assert!(
+                    (got_ll - want_ll).abs() < 1e-9,
+                    "ll mismatch (trial {trial}, read {r}): {got_ll} vs {want_ll}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tree_layout_depth_equals_ancestor_mask_popcount() {
+        let mut rng = StdRng::seed_from_u64(7);
+        for n in 1..12usize {
+            let tree = MutationTree::random(n, &mut rng);
+            let layout = TreeLayout::new(&tree);
+            assert_eq!(layout.preorder.len(), n + 1, "every node must appear exactly once");
+            for node in 0..=n {
+                assert_eq!(
+                    layout.depth[node],
+                    tree.ancestor_mask(node).count_ones(),
+                    "depth mismatch at node {node}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tree_layout_preorder_visits_every_parent_before_its_children() {
+        // The forward scoring pass depends on this: scratch[parent] must already be
+        // final when scratch[node] is computed from it.
+        let mut rng = StdRng::seed_from_u64(19);
+        for n in 1..12usize {
+            let tree = MutationTree::random(n, &mut rng);
+            let layout = TreeLayout::new(&tree);
+            let mut seen = vec![false; n + 1];
+            for &node in &layout.preorder {
+                if node != tree.root() {
+                    assert!(
+                        seen[tree.parent[node]],
+                        "node {node} visited before its parent {}",
+                        tree.parent[node]
+                    );
+                }
+                seen[node] = true;
+            }
+        }
+    }
+
+    #[test]
+    fn attachment_scorer_clamps_zero_rates_instead_of_producing_nan() {
+        // fp = 0 is a supported CLI input (`--fp-rate 0`, passed through verbatim by
+        // lineage::resolve_error_rates). The reference implementation yields -inf for
+        // any node that cannot explain an alt call; naive incremental scoring would
+        // compute (-inf) + (+inf) = NaN, which compares false against everything and
+        // would silently pin every read to node 0. The clamp keeps scores finite.
+        let matrix = BinaryMatrix {
+            variants: vec!["m.100A>G".to_string(), "m.200C>T".to_string()],
+            reads: vec!["r0".to_string()],
+            data: vec![vec![Some(1)], vec![Some(0)]],
+        };
+        let rates = ErrorRates { fp_rate: 0.0, fn_rate: 0.0 };
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        let scorer = AttachmentScorer::new(&matrix, &rates);
+        let layout = TreeLayout::new(&tree);
+        let mut scratch = Vec::new();
+        let (node, ll) = scorer.best_attachment(0, &tree, &layout, &mut scratch);
+        assert!(ll.is_finite(), "score must stay finite with zero rates, got {ll}");
+        // Node 0 carries m.100A>G (observed alt) and not m.200C>T (observed ref):
+        // the only genotype that explains both calls.
+        assert_eq!(node, 0);
+    }
+
+    #[test]
+    fn attachment_scorer_scratch_is_reusable_across_reads_and_trees() {
+        // The scratch buffer is caller-owned so a loop over reads allocates once.
+        // A stale buffer from a larger tree must not leak into a smaller one.
+        let matrix = BinaryMatrix {
+            variants: vec!["m.100A>G".into(), "m.200C>T".into(), "m.300G>A".into()],
+            reads: vec!["r0".into(), "r1".into()],
+            data: vec![
+                vec![Some(1), Some(0)],
+                vec![Some(1), Some(0)],
+                vec![Some(0), Some(1)],
+            ],
+        };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let scorer = AttachmentScorer::new(&matrix, &rates);
+        let mut scratch = Vec::new();
+
+        let big = MutationTree { n_mutations: 3, parent: vec![1, 2, 3, 3] };
+        let big_layout = TreeLayout::new(&big);
+        let _ = scorer.best_attachment(0, &big, &big_layout, &mut scratch);
+
+        // Different tree, same buffer.
+        let small = MutationTree { n_mutations: 3, parent: vec![3, 3, 3, 3] };
+        let small_layout = TreeLayout::new(&small);
+        let reused = scorer.best_attachment(1, &small, &small_layout, &mut scratch);
+        let fresh = scorer.best_attachment(1, &small, &small_layout, &mut Vec::new());
+        assert_eq!(reused, fresh);
     }
 }

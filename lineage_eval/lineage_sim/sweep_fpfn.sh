@@ -55,11 +55,20 @@ for fp in $FP_GRID; do
          --fp-rate "$fp" --fn-rate "$fn" --min-hf "$MIN_HF" --max-hf "$MAX_HF" \
          --mcmc-iterations "$MCMC_ITERS" --mcmc-chains "$MCMC_CHAINS" \
          -o "$pfx" >/dev/null 2>&1; then
+      # Score the clone (hap_*) metrics too, from this cell's own cleaned matrix.
+      # Without these the sweep reported hap_* as NA in every row, so a cell that
+      # split reads into the wrong clones looked identical to one that did not.
+      HAP_ARGS=()
+      if [[ -s "${pfx}.cleaned_matrix.csv" && -s "$OUTDIR/truth/clones.tsv" ]]; then
+        HAP_ARGS=(--recon-matrix "${pfx}.cleaned_matrix.csv"
+                  --truth-clones "$OUTDIR/truth/clones.tsv")
+      fi
       python "$HERE/score_lineage.py" \
         --truth-tree "$OUTDIR/truth/truth_mutation_tree.tsv" \
         --recon-tree "${pfx}.mutation_tree.tsv" \
         --truth-variants "$OUTDIR/truth/truth_variants.txt" \
         --vcf "$VCF" --profile "$PROFILE" --fp "$fp" --fn "$fn" \
+        "${HAP_ARGS[@]+"${HAP_ARGS[@]}"}" \
         --metrics-out "$SWEEP" >/dev/null
     else
       echo "lineage failed at fp=$fp fn=$fn (skipped)" >&2
@@ -71,6 +80,12 @@ echo "=== sweep results ($SWEEP) ==="
 column -t "$SWEEP"
 echo "=== best cell by ad_f1 (tie-break var_f1) ==="
 [[ $(wc -l < "$SWEEP") -gt 1 ]] || { echo "no successful sweep cells (all lineage runs failed?)" >&2; exit 1; }
-# columns: 1=profile 2=fp 3=fn ... 9=var_f1 ... 12=ad_f1
-tail -n +2 "$SWEEP" | sort -t$'\t' -k12,12gr -k9,9gr | head -1 \
-  | awk -F'\t' '{printf "profile=%s fp=%s fn=%s  ad_f1=%s var_f1=%s\n",$1,$2,$3,$12,$9}'
+# Resolve the ranking columns by header name. This used to hardcode $12/$9, which
+# silently ranks on whatever happens to sit there after score_lineage.py's FIELDS
+# list changes.
+col() { head -1 "$SWEEP" | tr '\t' '\n' | grep -nxF "$1" | cut -d: -f1; }
+AD_COL=$(col ad_f1); VAR_COL=$(col var_f1)
+[[ -n "$AD_COL" && -n "$VAR_COL" ]] || { echo "ad_f1/var_f1 missing from $SWEEP header" >&2; exit 1; }
+tail -n +2 "$SWEEP" | sort -t$'\t' -k"$AD_COL","$AD_COL"gr -k"$VAR_COL","$VAR_COL"gr | head -1 \
+  | awk -F'\t' -v a="$AD_COL" -v v="$VAR_COL" \
+      '{printf "profile=%s fp=%s fn=%s  ad_f1=%s var_f1=%s\n",$1,$2,$3,$a,$v}'

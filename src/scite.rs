@@ -311,11 +311,36 @@ impl TreeLayout {
 ///
 /// `delta` is indexed `[read][variant]` rather than `[variant][read]` so the
 /// scoring pass, which walks variants for a fixed read, reads contiguous memory.
+/// A cell the read does not cover: it costs nothing at any node.
+const CODE_UNCOVERED: u8 = 0;
+/// An explicit reference call.
+const CODE_REF: u8 = 1;
+/// An explicit alternate call.
+const CODE_ALT: u8 = 2;
+
 pub struct AttachmentScorer {
     /// `base[r]` = log P(read r's calls | genotype is all-reference).
     base: Vec<f64>,
-    /// `delta[r][m]` = log P(call | m mutated) − log P(call | m not mutated).
-    delta: Vec<Vec<f64>>,
+    /// `code[r * n_variants + m]` — one of the three `CODE_*` values, naming
+    /// which entry of `delta_by_code` cell `(r, m)` contributes.
+    ///
+    /// Stored as one byte per cell rather than the `f64` it selects, because
+    /// the per-cell term takes exactly three values across the whole matrix:
+    /// an `f64` per cell spends 64 bits carrying 2 bits of information. At
+    /// 100k reads x 200 variants that is ~20MB instead of ~160MB. Flat rather
+    /// than `Vec<Vec<u8>>` for the same reason — a row-per-read layout adds a
+    /// 24-byte header and a separate allocation per read, which at 100k reads
+    /// is another ~2.4MB and scatters the rows across the heap.
+    ///
+    /// Row-major by read, so the scoring pass — which walks every variant for
+    /// one fixed read — reads a contiguous slice.
+    code: Vec<u8>,
+    /// Row stride of `code`.
+    n_variants: usize,
+    /// Indexed by a `CODE_*` value: log P(call | m mutated) − log P(call | m
+    /// not mutated), which depends only on the call, never on which variant it
+    /// was.
+    delta_by_code: [f64; 3],
 }
 
 impl AttachmentScorer {
@@ -329,26 +354,31 @@ impl AttachmentScorer {
         let n_variants = matrix.variants.len();
         let n_reads = matrix.reads.len();
         let mut base = vec![0.0f64; n_reads];
-        let mut delta = vec![vec![0.0f64; n_variants]; n_reads];
+        let mut code = vec![CODE_UNCOVERED; n_reads * n_variants];
 
         for m in 0..n_variants {
             for r in 0..n_reads {
                 match matrix.data[m][r] {
                     Some(1) => {
                         base[r] += ln_fp;
-                        delta[r][m] = ln_1mfn - ln_fp;
+                        code[r * n_variants + m] = CODE_ALT;
                     }
                     Some(0) => {
                         base[r] += ln_1mfp;
-                        delta[r][m] = ln_fn - ln_1mfp;
+                        code[r * n_variants + m] = CODE_REF;
                     }
-                    // Uncovered: contributes nothing at any node.
+                    // Uncovered: contributes nothing at any node, and the
+                    // buffer is already CODE_UNCOVERED.
                     _ => {}
                 }
             }
         }
 
-        AttachmentScorer { base, delta }
+        let mut delta_by_code = [0.0f64; 3];
+        delta_by_code[CODE_REF as usize] = ln_fn - ln_1mfp;
+        delta_by_code[CODE_ALT as usize] = ln_1mfn - ln_fp;
+
+        AttachmentScorer { base, code, n_variants, delta_by_code }
     }
 
     /// How many reads this scorer was built over.
@@ -383,10 +413,12 @@ impl AttachmentScorer {
         scratch.resize(tree.n_mutations + 1, 0.0);
         scratch[root] = self.base[read];
 
-        let deltas = &self.delta[read];
+        // One contiguous row: this read's call code for every variant.
+        let codes = &self.code[read * self.n_variants..(read + 1) * self.n_variants];
         for &node in &layout.preorder {
             if node != root {
-                scratch[node] = scratch[tree.parent[node]] + deltas[node];
+                let delta = self.delta_by_code[codes[node] as usize];
+                scratch[node] = scratch[tree.parent[node]] + delta;
             }
         }
 
@@ -3451,6 +3483,32 @@ mod tests {
         // Node 0 carries m.100A>G (observed alt) and not m.200C>T (observed ref):
         // the only genotype that explains both calls.
         assert_eq!(node, 0);
+    }
+
+    #[test]
+    fn attachment_scorer_stores_one_byte_per_cell_in_a_single_allocation() {
+        // The per-cell term takes exactly three values across the whole matrix,
+        // so it is stored as a byte code into a 3-entry table rather than as an
+        // f64 per cell. Pinned because nothing else would notice the day someone
+        // "simplifies" this back to a Vec<Vec<f64>>: every other test would still
+        // pass, and the cost — ~160MB instead of ~20MB at 100k reads x 200
+        // variants, plus 100k separate allocations — is invisible at test sizes.
+        let (n_variants, n_reads) = (64usize, 256usize);
+        let matrix = BinaryMatrix {
+            variants: (0..n_variants).map(|i| format!("m.{}A>G", 100 + i)).collect(),
+            reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
+            data: vec![vec![Some(1); n_reads]; n_variants],
+        };
+        let scorer =
+            AttachmentScorer::new(&matrix, &ErrorRates { fp_rate: 0.005, fn_rate: 0.05 });
+
+        assert_eq!(std::mem::size_of_val(&scorer.code[0]), 1, "one byte per cell");
+        assert_eq!(scorer.code.len(), n_reads * n_variants, "flat, not nested");
+        assert_eq!(scorer.n_variants, n_variants, "row stride is the variant count");
+        // Three distinct deltas is the whole premise; uncovered must cost zero.
+        assert_eq!(scorer.delta_by_code[CODE_UNCOVERED as usize], 0.0);
+        assert!(scorer.delta_by_code[CODE_REF as usize] < 0.0, "a ref call argues against");
+        assert!(scorer.delta_by_code[CODE_ALT as usize] > 0.0, "an alt call argues for");
     }
 
     #[test]

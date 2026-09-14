@@ -351,6 +351,14 @@ impl AttachmentScorer {
         AttachmentScorer { base, delta }
     }
 
+    /// How many reads this scorer was built over.
+    ///
+    /// This is the authority on that count, not any `BinaryMatrix` a caller
+    /// happens to have in hand — see [`tree_log_likelihood_with`].
+    fn n_reads(&self) -> usize {
+        self.base.len()
+    }
+
     /// The best-fitting node for read `read` and its log-likelihood.
     ///
     /// Identical in result to the reference [`best_attachment`], including its
@@ -405,14 +413,10 @@ impl AttachmentScorer {
 /// Prefer this inside any loop that scores many trees against one matrix — the
 /// scorer's precompute is O(reads * variants) and does not depend on the tree,
 /// so hoisting it out of the loop is the whole point of it existing.
-pub fn tree_log_likelihood_with(
-    matrix: &BinaryMatrix,
-    tree: &MutationTree,
-    scorer: &AttachmentScorer,
-) -> f64 {
+pub fn tree_log_likelihood_with(tree: &MutationTree, scorer: &AttachmentScorer) -> f64 {
     let layout = TreeLayout::new(tree);
     let mut scratch = Vec::new();
-    (0..matrix.reads.len())
+    (0..scorer.n_reads())
         .map(|r| scorer.best_attachment(r, tree, &layout, &mut scratch).1)
         .sum()
 }
@@ -425,7 +429,7 @@ pub fn tree_log_likelihood_with(
 /// [`tree_log_likelihood_with`] instead.
 pub fn tree_log_likelihood(matrix: &BinaryMatrix, tree: &MutationTree, rates: &ErrorRates) -> f64 {
     let scorer = AttachmentScorer::new(matrix, rates);
-    tree_log_likelihood_with(matrix, tree, &scorer)
+    tree_log_likelihood_with(tree, &scorer)
 }
 
 fn subtree_all_carry(tree: &lineage::Tree, hap_matrix: &HaplotypeMatrix, node_id: usize, mutation: usize) -> bool {
@@ -768,7 +772,7 @@ pub fn run_mcmc(
     let mut current = initial_tree.cloned().unwrap_or_else(|| MutationTree::random(n, rng));
     current = enforce_position_exclusivity(&current, &spans);
     let scorer = AttachmentScorer::new(matrix, rates);
-    let mut current_ll = tree_log_likelihood_with(matrix, &current, &scorer);
+    let mut current_ll = tree_log_likelihood_with(&current, &scorer);
     let mut best = current.clone();
     let mut best_ll = current_ll;
 
@@ -786,7 +790,7 @@ pub fn run_mcmc(
         if violates_position_exclusivity(&proposal, &spans) {
             continue;
         }
-        let proposal_ll = tree_log_likelihood_with(matrix, &proposal, &scorer);
+        let proposal_ll = tree_log_likelihood_with(&proposal, &scorer);
 
         // Record the running best BEFORE the Metropolis-Hastings test, not
         // after. `propose_swap_subtrees` returns a neighbourhood correction
@@ -1115,6 +1119,15 @@ fn sign_test_p(a: usize, b: usize) -> f64 {
 /// This is the same quantity the unary-path hill climb maximises, reported so a
 /// reader can tell an order the data insists on from one that was picked
 /// arbitrarily off a flat likelihood.
+///
+/// Retained with no production caller on purpose. [`edge_evidence`] used to
+/// drive this function once per node and now shares one scorer via
+/// [`edge_order_support_with`], which leaves this as the from-scratch
+/// implementation that
+/// `edge_evidence_matches_per_node_edge_order_support_on_random_trees` checks
+/// the hoisted one against. Deleting it would delete that cross-check, and the
+/// hoist would have nothing independent holding it honest.
+#[allow(dead_code)]
 pub fn edge_order_support(
     tree: &MutationTree,
     matrix: &BinaryMatrix,
@@ -1125,8 +1138,8 @@ pub fn edge_order_support(
     // stays free, as it was when this function scored from scratch.
     orderable_parent(tree, node)?;
     let scorer = AttachmentScorer::new(matrix, rates);
-    let tree_ll = tree_log_likelihood_with(matrix, tree, &scorer);
-    edge_order_support_with(tree, matrix, &scorer, tree_ll, node)
+    let tree_ll = tree_log_likelihood_with(tree, &scorer);
+    edge_order_support_with(tree, &scorer, tree_ll, node)
 }
 
 /// The parent of `node`, when this edge has an order to support at all — that
@@ -1147,14 +1160,13 @@ fn orderable_parent(tree: &MutationTree, node: usize) -> Option<usize> {
 /// alone and recomputes one identical number `n_mutations` times.
 fn edge_order_support_with(
     tree: &MutationTree,
-    matrix: &BinaryMatrix,
     scorer: &AttachmentScorer,
     tree_ll: f64,
     node: usize,
 ) -> Option<f64> {
     let parent = orderable_parent(tree, node)?;
     let swapped = swap_labels(tree, node, parent);
-    Some(tree_ll - tree_log_likelihood_with(matrix, &swapped, scorer))
+    Some(tree_ll - tree_log_likelihood_with(&swapped, scorer))
 }
 
 /// [`EdgeEvidence`] for every mutation node, indexed by mutation id.
@@ -1166,13 +1178,13 @@ pub fn edge_evidence(
     // Hoisted out of the per-node loop: neither the scorer nor the unswapped
     // tree's likelihood depends on which edge is being scored.
     let scorer = AttachmentScorer::new(matrix, rates);
-    let tree_ll = tree_log_likelihood_with(matrix, tree, &scorer);
+    let tree_ll = tree_log_likelihood_with(tree, &scorer);
 
     (0..tree.n_mutations)
         .map(|node| match orderable_parent(tree, node) {
             None => EdgeEvidence { support_ll: None, counts: None },
             Some(parent) => EdgeEvidence {
-                support_ll: edge_order_support_with(tree, matrix, &scorer, tree_ll, node),
+                support_ll: edge_order_support_with(tree, &scorer, tree_ll, node),
                 counts: Some(orientation_counts(matrix, node, parent)),
             },
         })
@@ -1387,7 +1399,7 @@ pub fn polish_unary_path_order(
                 .join(" → ")
         };
         let start_names = names(&path);
-        let ll_start = tree_log_likelihood_with(matrix, &current, &scorer);
+        let ll_start = tree_log_likelihood_with(&current, &scorer);
 
         // Rank preferred by the data-driven orientation statistic; used to seed
         // the climb and to break exact likelihood ties in a fixed direction.
@@ -1403,7 +1415,7 @@ pub fn polish_unary_path_order(
         // Seed with the full orientation ordering when it does not cost likelihood.
         if preferred != order {
             let candidate = apply_path_reorder(&current, &order, &preferred);
-            let ll_candidate = tree_log_likelihood_with(matrix, &candidate, &scorer);
+            let ll_candidate = tree_log_likelihood_with(&candidate, &scorer);
             if ll_candidate >= ll - 1e-6 {
                 current = candidate;
                 order = preferred.clone();
@@ -1423,7 +1435,7 @@ pub fn polish_unary_path_order(
                 let mut trial_order = order.clone();
                 trial_order.swap(i, i + 1);
                 let trial = apply_path_reorder(&current, &order, &trial_order);
-                let trial_ll = tree_log_likelihood_with(matrix, &trial, &scorer);
+                let trial_ll = tree_log_likelihood_with(&trial, &scorer);
                 let strictly_better = trial_ll > ll + LL_TIE_EPS;
                 let tied_and_preferred = (trial_ll - ll).abs() <= LL_TIE_EPS
                     && rank[&trial_order[i]] < rank[&order[i]];
@@ -1960,7 +1972,7 @@ mod tests {
                 .sum();
 
             let scorer = AttachmentScorer::new(&matrix, &rates);
-            let got = tree_log_likelihood_with(&matrix, &tree, &scorer);
+            let got = tree_log_likelihood_with(&tree, &scorer);
             assert!((got - want).abs() < 1e-9, "trial {trial}: {got} vs {want}");
 
             // The public wrapper must agree with both.

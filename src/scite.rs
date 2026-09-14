@@ -173,6 +173,26 @@ pub struct ErrorRates {
     pub fn_rate: f64,
 }
 
+impl ErrorRates {
+    /// The rates as every likelihood computation must use them: clamped into
+    /// `[RATE_FLOOR, 1 - RATE_FLOOR]` so no logarithm is infinite.
+    ///
+    /// Both scoring paths go through here, which is load-bearing rather than
+    /// tidiness. `attach_all_reads` scores reads through [`AttachmentScorer`]
+    /// while `write_read_lineage_newick` scores haplotype profiles through
+    /// [`best_attachment`]. If one clamped and the other did not, then at
+    /// `--fp-rate 0` — a supported input — the unclamped path would score every
+    /// node that fails to explain an alt call at exactly `-inf`, fall through
+    /// its tie-break to the root, and place a haplotype tip on a different node
+    /// than the reads that compose it.
+    fn clamped(&self) -> (f64, f64) {
+        (
+            self.fp_rate.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR),
+            self.fn_rate.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR),
+        )
+    }
+}
+
 /// Log-likelihood of `profile` (one read's observed calls, one per variant,
 /// `None` = missing/uncovered and contributes nothing) given that
 /// `ancestor_mask` bit `i` set means variant `i` is present under the
@@ -182,15 +202,16 @@ pub fn attachment_log_likelihood(
     ancestor_mask: &Mask,
     rates: &ErrorRates,
 ) -> f64 {
+    let (fp, fn_rate) = rates.clamped();
     let mut ll = 0.0;
     for (i, call) in profile.iter().enumerate() {
         let Some(observed) = call else { continue };
         let expected_mutated = ancestor_mask.get(i);
         let p = match (*observed, expected_mutated) {
-            (1, false) => rates.fp_rate,
-            (0, false) => 1.0 - rates.fp_rate,
-            (0, true) => rates.fn_rate,
-            (1, true) => 1.0 - rates.fn_rate,
+            (1, false) => fp,
+            (0, false) => 1.0 - fp,
+            (0, true) => fn_rate,
+            (1, true) => 1.0 - fn_rate,
             _ => unreachable!("observed genotype must be 0 or 1"),
         };
         ll += p.ln();
@@ -299,8 +320,7 @@ pub struct AttachmentScorer {
 
 impl AttachmentScorer {
     pub fn new(matrix: &BinaryMatrix, rates: &ErrorRates) -> Self {
-        let fp = rates.fp_rate.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR);
-        let fnr = rates.fn_rate.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR);
+        let (fp, fnr) = rates.clamped();
         let ln_fp = fp.ln();
         let ln_1mfp = (1.0 - fp).ln();
         let ln_fn = fnr.ln();
@@ -3215,7 +3235,23 @@ mod tests {
     #[test]
     fn incremental_scorer_matches_reference_best_attachment_on_random_trees() {
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-        let rates = ErrorRates { fp_rate: 0.005, fn_rate: 0.05 };
+        // Swept across rate regimes, not just the pacbio default. The degenerate
+        // rows are the ones that matter: at 0.0 and 1.0 an unclamped path scores
+        // whole classes of nodes at -inf and its tie-break stops discriminating,
+        // so these rows are what hold the reference and the scorer to the same
+        // `ErrorRates::clamped` view of the model.
+        let rate_settings = [
+            (0.005, 0.05), // pacbio default
+            (0.0001, 0.01), // ont-denoised default
+            (0.0, 0.0),    // both at the floor
+            (0.0, 0.05),   // fp only at the floor
+            (0.005, 0.0),  // fn only at the floor
+            (1.0, 1.0),    // both at the ceiling
+            (0.5, 0.5),    // uninformative
+        ];
+
+        for (fp_rate, fn_rate) in rate_settings {
+        let rates = ErrorRates { fp_rate, fn_rate };
 
         for trial in 0..300usize {
             let n_variants = 1 + trial % 9;
@@ -3253,6 +3289,7 @@ mod tests {
                     "ll mismatch (trial {trial}, read {r}): {got_ll} vs {want_ll}"
                 );
             }
+        }
         }
     }
 
@@ -3317,6 +3354,53 @@ mod tests {
         // Node 0 carries m.100A>G (observed alt) and not m.200C>T (observed ref):
         // the only genotype that explains both calls.
         assert_eq!(node, 0);
+    }
+
+    #[test]
+    fn reference_and_scorer_agree_when_no_node_can_explain_the_read() {
+        // `attach_all_reads` scores through `AttachmentScorer` (rates clamped),
+        // while `write_read_lineage_newick` scores haplotype profiles through the
+        // reference `best_attachment`. If those two disagree, a haplotype tip in
+        // `read_lineage.nwk` lands on a different node than the reads that
+        // compose it in `cleaned_matrix.csv`.
+        //
+        // They diverge exactly when no node explains the read and `fp` is 0 (a
+        // supported CLI input): unclamped, every node scores exactly -inf, all
+        // comparisons against -inf are false or NaN, and `best_attachment` falls
+        // through to its initial value, the root. Clamped, the nodes stay ordered
+        // by how badly they fit and the least-bad one wins.
+        //
+        // Here root(2) has 0 and 1 as siblings and the read claims BOTH variants,
+        // which no single node's genotype can satisfy.
+        let matrix = BinaryMatrix {
+            variants: vec!["m.100A>G".to_string(), "m.200C>T".to_string()],
+            reads: vec!["r0".to_string()],
+            data: vec![vec![Some(1)], vec![Some(1)]],
+        };
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 2, 2] };
+        let rates = ErrorRates { fp_rate: 0.0, fn_rate: 0.0 };
+
+        let profile: Vec<Option<u8>> = matrix.data.iter().map(|row| row[0]).collect();
+        let (ref_node, ref_ll) = best_attachment(&profile, &tree, &rates);
+
+        let scorer = AttachmentScorer::new(&matrix, &rates);
+        let layout = TreeLayout::new(&tree);
+        let (scorer_node, scorer_ll) =
+            scorer.best_attachment(0, &tree, &layout, &mut Vec::new());
+
+        assert!(
+            ref_ll.is_finite(),
+            "the reference path must not collapse to -inf either, got {ref_ll}"
+        );
+        assert_eq!(
+            ref_node, scorer_node,
+            "reference picked node {ref_node}, scorer picked {scorer_node} — \
+             a haplotype tip would disagree with its own reads"
+        );
+        assert!(
+            (ref_ll - scorer_ll).abs() < 1e-9,
+            "reference {ref_ll}, scorer {scorer_ll}"
+        );
     }
 
     #[test]

@@ -14,6 +14,13 @@ OUTDIR="" PROFILE="ont-r10" NMUT=12 DEPTH=300 SEED=1 FP="" FN=""
 # call::resolve_thresholds applies the data-type default (0.2 here). `-p` is
 # never forwarded: run_himito.sh lets the same resolver pick the p-value.
 FREQ_THRESHOLD=""
+# denoise's keep threshold, forwarded to run_himito.sh (which defaults it to 0.03).
+# That default was swept on n=10 cells whose rarest truth variant sits at HF ~0.05.
+# It is a *frequency* floor, not a coverage floor, so depth cannot compensate: at
+# --n-mutations 15 --sim-min-hf 0.03 the six variants at HF 0.033-0.045 never reach
+# raw_matrix.csv and var_recall caps at 0.53 even at --total-depth 3000. Lowering it
+# to 0.01 restores them (0.53 -> 0.87). Keep this below --sim-min-hf.
+DENOISE_VAF=""
 # Shared HF floor for `Himito call -v` and `Himito lineage --min-hf` (forwarded
 # via run_himito.sh). score_lineage.py does not re-band: it counts every PASS/.
 # call, which is evaluation at this floor once the caller already cut there.
@@ -36,6 +43,11 @@ SIM_MIN_HF=0.05 SIM_MAX_HF=0.99
 # Internal-clone mass held back by simulate_tree.py; controls whether mutation
 # order along a chain is identifiable at all. Empty = use the simulator default.
 INTERNAL_KEEP=""
+# Tree shape, forwarded to simulate_tree.py. 'chain' is the one knob that raises
+# mutation-ordering difficulty WITHOUT costing variant recall: a unary path never
+# splits mass between siblings, so the minimum clone frequency is higher than a
+# random tree of the same --n-mutations. Empty = simulator default (random).
+TOPOLOGY=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -46,17 +58,19 @@ while [[ $# -gt 0 ]]; do
     --fp) FP="$2"; shift 2;;
     --fn) FN="$2"; shift 2;;
     --frequency-threshold) FREQ_THRESHOLD="$2"; shift 2;;
+    --denoise-vaf) DENOISE_VAF="$2"; shift 2;;
     --min-hf) MIN_HF="$2"; shift 2;;
     --max-hf) MAX_HF="$2"; shift 2;;
     --sim-min-hf) SIM_MIN_HF="$2"; shift 2;;
     --sim-max-hf) SIM_MAX_HF="$2"; shift 2;;
     --internal-keep) INTERNAL_KEEP="$2"; shift 2;;
+    --topology) TOPOLOGY="$2"; shift 2;;
     --ref) export REF="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--ref FASTA]" >&2
+  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA]" >&2
   exit 1
 }
 # Resolve in simulate_reads.sh; export a sane default here for visibility.
@@ -79,6 +93,7 @@ mkdir -p "$OUTDIR"
 echo "$OUTDIR"
 SIM_TREE_ARGS=()
 [[ -n "$INTERNAL_KEEP" ]] && SIM_TREE_ARGS+=(--internal-keep "$INTERNAL_KEEP")
+[[ -n "$TOPOLOGY" ]] && SIM_TREE_ARGS+=(--topology "$TOPOLOGY")
 python "$HERE/simulate_tree.py" --reference "$REF" --n-mutations "$NMUT" --seed "$SEED" --outdir "$OUTDIR" --min-hf "$SIM_MIN_HF" --max-hf "$SIM_MAX_HF" "${SIM_TREE_ARGS[@]+"${SIM_TREE_ARGS[@]}"}"
 "$HERE/simulate_reads.sh" --outdir "$OUTDIR" --profile "$PROFILE" --total-depth "$DEPTH" --seed "$SEED"
 HIMITO_ARGS=(
@@ -88,6 +103,7 @@ HIMITO_ARGS=(
 [[ -n "$FP" ]] && HIMITO_ARGS+=(--fp "$FP")
 [[ -n "$FN" ]] && HIMITO_ARGS+=(--fn "$FN")
 [[ -n "$FREQ_THRESHOLD" ]] && HIMITO_ARGS+=(--frequency-threshold "$FREQ_THRESHOLD")
+[[ -n "$DENOISE_VAF" ]] && HIMITO_ARGS+=(--denoise-vaf "$DENOISE_VAF")
 "$HERE/run_himito.sh" "${HIMITO_ARGS[@]}"
 read -r DEFAULT_FP DEFAULT_FN < <(resolve_scite_rates "$PROFILE")
 python "$HERE/score_lineage.py" \

@@ -96,15 +96,47 @@ def _sample_position(seq: str, used: set[int], rng: random.Random) -> int:
         return pos
 
 
-def build_tree(seq: str, n_mutations: int, rng: random.Random) -> Tree:
-    """Random rooted tree: each new mutation attaches to a uniformly chosen
-    existing node (root or a prior mutation), giving a mix of chains and
-    branch points."""
+TOPOLOGIES = ("random", "chain", "star")
+
+
+def build_tree(seq: str, n_mutations: int, rng: random.Random,
+               topology: str = "random") -> Tree:
+    """Rooted mutation tree in one of three shapes.
+
+    ``random`` (default) attaches each new mutation to a uniformly chosen existing
+    node, giving a mix of chains and branch points. ``chain`` makes one unary path
+    (every mutation is the child of the previous one); ``star`` hangs every
+    mutation directly off ROOT.
+
+    Shape is the knob that varies *ordering* difficulty independently of
+    *detection* difficulty, which `--n-mutations` cannot do -- raising the mutation
+    count shrinks every clone, drops the minimum HF and just costs variant recall.
+    Ordering is only ever hard along a unary path, because that is where the
+    evidence is a handful of "parent without child" reads (see
+    `DEFAULT_INTERNAL_KEEP`); a star has no ancestral pairs to get wrong at all.
+
+    A chain is also the *gentlest* shape on frequency: with one child per node no
+    mass is split between siblings, so cum_freq decays only by `internal_keep` per
+    level. At n=10 the deepest chain clone sits at 0.85 * 0.8^10 = 0.091, above the
+    0.077 a random tree produced at the same settings. So `--topology chain` raises
+    ordering difficulty while *improving* detectability -- the decoupling that
+    raising --n-mutations failed to deliver.
+
+    Only the ``random`` branch draws from `rng` for parent choice, so existing
+    seeds reproduce byte-identically.
+    """
+    if topology not in TOPOLOGIES:
+        raise ValueError(f"unknown topology {topology!r}; expected one of {TOPOLOGIES}")
     root = Node(id=0, variant=None, pos=None, ref=None, alt=None, parent=0)
     nodes = [root]
     used: set[int] = set()
     for i in range(1, n_mutations + 1):
-        parent = rng.randrange(len(nodes))
+        if topology == "chain":
+            parent = i - 1          # extend the single path
+        elif topology == "star":
+            parent = 0              # every mutation hangs off ROOT
+        else:
+            parent = rng.randrange(len(nodes))
         pos = _sample_position(seq, used, rng)
         used.add(pos)
         ref, alt = pick_snv(seq, pos, rng)
@@ -113,6 +145,17 @@ def build_tree(seq: str, n_mutations: int, rng: random.Random) -> Tree:
         nodes.append(node)
         nodes[parent].children.append(i)
     return Tree(nodes=nodes)
+
+
+def deepest_chain_freq(n_mutations: int, ref_fraction: float,
+                       internal_keep: float) -> float:
+    """cum_freq of the last node of a `--topology chain` tree.
+
+    Closed form: a unary path never splits mass between siblings, so each level
+    just multiplies by (1 - internal_keep). Used to fail fast, because chain
+    frequencies are fully deterministic -- retrying with another seed cannot help.
+    """
+    return (1.0 - ref_fraction) * (1.0 - internal_keep) ** n_mutations
 
 
 def assign_frequencies(
@@ -242,6 +285,15 @@ def main() -> None:
         "clone; controls whether mutation order along a chain is recoverable "
         f"under sequencing dropout (default {DEFAULT_INTERNAL_KEEP})",
     )
+    ap.add_argument(
+        "--topology",
+        choices=TOPOLOGIES,
+        default="random",
+        help="tree shape. 'random' (default) mixes chains and branch points; "
+        "'chain' makes one unary path, the hardest shape for mutation *ordering* "
+        "and the gentlest on clone frequency; 'star' hangs every mutation off ROOT, "
+        "which has no ancestral pairs at all (a control, not a difficulty setting)",
+    )
     ap.add_argument("--min-hf", type=float, default=0.01)
     ap.add_argument("--max-hf", type=float, default=0.99)
     ap.add_argument("--seed", type=int, default=42)
@@ -249,10 +301,32 @@ def main() -> None:
     args = ap.parse_args()
 
     _, seq = load_reference(args.reference)
+    # A chain's frequencies are deterministic (no sibling split, so no rng in the
+    # mass assignment), which makes the retry loop below pointless for it: 100
+    # reseeds all produce the same cum_freq. Check the closed form up front and
+    # say what would actually help.
+    if args.topology == "chain":
+        deepest = deepest_chain_freq(args.n_mutations, args.ref_fraction,
+                                     args.internal_keep)
+        if not deepest > args.min_hf:
+            import math
+            feasible = math.floor(
+                math.log(args.min_hf / (1.0 - args.ref_fraction))
+                / math.log(1.0 - args.internal_keep)
+            )
+            raise SystemExit(
+                f"--topology chain with --n-mutations {args.n_mutations} puts the "
+                f"deepest clone at cum_freq={deepest:.6f}, at or below --min-hf "
+                f"{args.min_hf}. Chain frequencies are deterministic, so a different "
+                f"--seed cannot help. At these --ref-fraction/--internal-keep the "
+                f"limit is --n-mutations {feasible}; otherwise lower --min-hf or "
+                f"--internal-keep."
+            )
+
     max_attempts = 100
     for attempt in range(max_attempts):
         rng = random.Random(args.seed + attempt)
-        tree = build_tree(seq, args.n_mutations, rng)
+        tree = build_tree(seq, args.n_mutations, rng, topology=args.topology)
         try:
             assign_frequencies(
                 tree,
@@ -270,7 +344,8 @@ def main() -> None:
                     "Try a smaller --n-mutations or a different --seed."
                 ) from exc
     write_truth(tree, seq, args.outdir)
-    print(f"wrote truth for {args.n_mutations} mutations to {args.outdir}/truth")
+    print(f"wrote truth for {args.n_mutations} mutations "
+          f"(topology={args.topology}) to {args.outdir}/truth")
 
 
 if __name__ == "__main__":

@@ -380,16 +380,32 @@ impl AttachmentScorer {
     }
 }
 
+/// Total log-likelihood of `matrix` under `tree` using a prebuilt scorer.
+///
+/// Prefer this inside any loop that scores many trees against one matrix — the
+/// scorer's precompute is O(reads * variants) and does not depend on the tree,
+/// so hoisting it out of the loop is the whole point of it existing.
+pub fn tree_log_likelihood_with(
+    matrix: &BinaryMatrix,
+    tree: &MutationTree,
+    scorer: &AttachmentScorer,
+) -> f64 {
+    let layout = TreeLayout::new(tree);
+    let mut scratch = Vec::new();
+    (0..matrix.reads.len())
+        .map(|r| scorer.best_attachment(r, tree, &layout, &mut scratch).1)
+        .sum()
+}
+
 /// Total log-likelihood of `matrix` under `tree`: sum, over every read, of
 /// that read's best-attachment log-likelihood.
+///
+/// Builds a fresh [`AttachmentScorer`] on every call. Callers scoring more than
+/// one tree against the same matrix should build the scorer once and use
+/// [`tree_log_likelihood_with`] instead.
 pub fn tree_log_likelihood(matrix: &BinaryMatrix, tree: &MutationTree, rates: &ErrorRates) -> f64 {
-    let n_reads = matrix.reads.len();
-    (0..n_reads)
-        .map(|r| {
-            let profile: Vec<Option<u8>> = matrix.data.iter().map(|row| row[r]).collect();
-            best_attachment(&profile, tree, rates).1
-        })
-        .sum()
+    let scorer = AttachmentScorer::new(matrix, rates);
+    tree_log_likelihood_with(matrix, tree, &scorer)
 }
 
 fn subtree_all_carry(tree: &lineage::Tree, hap_matrix: &HaplotypeMatrix, node_id: usize, mutation: usize) -> bool {
@@ -731,7 +747,8 @@ pub fn run_mcmc(
     let spans = variant_spans(&matrix.variants);
     let mut current = initial_tree.cloned().unwrap_or_else(|| MutationTree::random(n, rng));
     current = enforce_position_exclusivity(&current, &spans);
-    let mut current_ll = tree_log_likelihood(matrix, &current, rates);
+    let scorer = AttachmentScorer::new(matrix, rates);
+    let mut current_ll = tree_log_likelihood_with(matrix, &current, &scorer);
     let mut best = current.clone();
     let mut best_ll = current_ll;
 
@@ -749,7 +766,7 @@ pub fn run_mcmc(
         if violates_position_exclusivity(&proposal, &spans) {
             continue;
         }
-        let proposal_ll = tree_log_likelihood(matrix, &proposal, rates);
+        let proposal_ll = tree_log_likelihood_with(matrix, &proposal, &scorer);
 
         let acceptance = nbh_correction * (proposal_ll - current_ll).exp();
         if rng.random::<f64>() < acceptance {
@@ -807,13 +824,19 @@ pub fn attach_all_reads(matrix: &BinaryMatrix, tree: &MutationTree, rates: &Erro
     let mut data = vec![vec![0u8; n_reads]; n_variants];
     let mut attachment = vec![0usize; n_reads];
 
+    let scorer = AttachmentScorer::new(matrix, rates);
+    let layout = TreeLayout::new(tree);
+    let mut scratch = Vec::new();
+
+    // Ancestor masks depend only on the tree, so build them once rather than
+    // re-walking the parent chain for every read.
+    let masks: Vec<Mask> = (0..=tree.n_mutations).map(|n| tree.ancestor_mask(n)).collect();
+
     for r in 0..n_reads {
-        let profile: Vec<Option<u8>> = matrix.data.iter().map(|row| row[r]).collect();
-        let (node, _ll) = best_attachment(&profile, tree, rates);
-        let mask = tree.ancestor_mask(node);
+        let (node, _ll) = scorer.best_attachment(r, tree, &layout, &mut scratch);
         attachment[r] = node;
         for v in 0..n_variants {
-            data[v][r] = u8::from(mask.get(v));
+            data[v][r] = u8::from(masks[node].get(v));
         }
     }
 
@@ -1290,6 +1313,7 @@ pub fn polish_unary_path_order(
     rates: &ErrorRates,
 ) -> MutationTree {
     let mut current = tree.clone();
+    let scorer = AttachmentScorer::new(matrix, rates);
     let paths = maximal_unary_paths(&current);
     info!(
         "[SCITE] Unary-path polish: {} maximal unary path(s) (len≥2) over {} variants",
@@ -1308,7 +1332,7 @@ pub fn polish_unary_path_order(
                 .join(" → ")
         };
         let start_names = names(&path);
-        let ll_start = tree_log_likelihood(matrix, &current, rates);
+        let ll_start = tree_log_likelihood_with(matrix, &current, &scorer);
 
         // Rank preferred by the data-driven orientation statistic; used to seed
         // the climb and to break exact likelihood ties in a fixed direction.
@@ -1324,7 +1348,7 @@ pub fn polish_unary_path_order(
         // Seed with the full orientation ordering when it does not cost likelihood.
         if preferred != order {
             let candidate = apply_path_reorder(&current, &order, &preferred);
-            let ll_candidate = tree_log_likelihood(matrix, &candidate, rates);
+            let ll_candidate = tree_log_likelihood_with(matrix, &candidate, &scorer);
             if ll_candidate >= ll - 1e-6 {
                 current = candidate;
                 order = preferred.clone();
@@ -1344,7 +1368,7 @@ pub fn polish_unary_path_order(
                 let mut trial_order = order.clone();
                 trial_order.swap(i, i + 1);
                 let trial = apply_path_reorder(&current, &order, &trial_order);
-                let trial_ll = tree_log_likelihood(matrix, &trial, rates);
+                let trial_ll = tree_log_likelihood_with(matrix, &trial, &scorer);
                 let strictly_better = trial_ll > ll + LL_TIE_EPS;
                 let tied_and_preferred = (trial_ll - ll).abs() <= LL_TIE_EPS
                     && rank[&trial_order[i]] < rank[&order[i]];
@@ -1844,6 +1868,81 @@ mod tests {
         let expected = 2.0 * per_read_ll;
         let actual = tree_log_likelihood(&matrix, &tree, &rates);
         assert!((actual - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn tree_log_likelihood_with_scorer_matches_the_reference_implementation() {
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
+        let rates = ErrorRates { fp_rate: 0.005, fn_rate: 0.05 };
+
+        for trial in 0..100usize {
+            let n_variants = 1 + trial % 8;
+            let n_reads = 1 + trial % 11;
+            let data: Vec<Vec<Option<u8>>> = (0..n_variants)
+                .map(|_| {
+                    (0..n_reads)
+                        .map(|_| match rng.random_range(0..3u8) {
+                            0 => None,
+                            1 => Some(0),
+                            _ => Some(1),
+                        })
+                        .collect()
+                })
+                .collect();
+            let matrix = BinaryMatrix {
+                variants: (0..n_variants).map(|i| format!("m.{}A>G", 100 + i)).collect(),
+                reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
+                data,
+            };
+            let tree = MutationTree::random(n_variants, &mut rng);
+
+            // Reference: recompute ancestor masks per read per node.
+            let want: f64 = (0..n_reads)
+                .map(|r| {
+                    let profile: Vec<Option<u8>> = matrix.data.iter().map(|row| row[r]).collect();
+                    best_attachment(&profile, &tree, &rates).1
+                })
+                .sum();
+
+            let scorer = AttachmentScorer::new(&matrix, &rates);
+            let got = tree_log_likelihood_with(&matrix, &tree, &scorer);
+            assert!((got - want).abs() < 1e-9, "trial {trial}: {got} vs {want}");
+
+            // The public wrapper must agree with both.
+            let wrapped = tree_log_likelihood(&matrix, &tree, &rates);
+            assert!((wrapped - want).abs() < 1e-9, "trial {trial}: wrapper {wrapped} vs {want}");
+        }
+    }
+
+    #[test]
+    fn attach_all_reads_is_unchanged_by_the_incremental_scorer() {
+        // Pins the cleaned-matrix output, which every downstream file is derived
+        // from. Chain root(3) -> 2 -> 1 -> 0 with a mix of covered, uncovered, and
+        // contradictory calls.
+        let matrix = BinaryMatrix {
+            variants: vec!["m.100A>G".into(), "m.200C>T".into(), "m.300G>A".into()],
+            reads: vec!["r0".into(), "r1".into(), "r2".into(), "r3".into()],
+            data: vec![
+                vec![Some(1), Some(0), None, Some(1)],
+                vec![Some(1), Some(1), None, Some(0)],
+                vec![Some(1), Some(1), Some(1), Some(0)],
+            ],
+        };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let tree = MutationTree { n_mutations: 3, parent: vec![1, 2, 3, 3] };
+
+        let cleaned = attach_all_reads(&matrix, &tree, &rates);
+
+        // Independently recompute with the reference scorer.
+        for r in 0..matrix.reads.len() {
+            let profile: Vec<Option<u8>> = matrix.data.iter().map(|row| row[r]).collect();
+            let (want_node, _) = best_attachment(&profile, &tree, &rates);
+            assert_eq!(cleaned.attachment[r], want_node, "read {r}");
+            let mask = tree.ancestor_mask(want_node);
+            for v in 0..matrix.variants.len() {
+                assert_eq!(cleaned.data[v][r], u8::from(mask.get(v)), "cell ({v}, {r})");
+            }
+        }
     }
 
     #[test]

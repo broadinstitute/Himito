@@ -1121,12 +1121,40 @@ pub fn edge_order_support(
     rates: &ErrorRates,
     node: usize,
 ) -> Option<f64> {
+    // Checked before the scorer is built so a node with no order to support
+    // stays free, as it was when this function scored from scratch.
+    orderable_parent(tree, node)?;
+    let scorer = AttachmentScorer::new(matrix, rates);
+    let tree_ll = tree_log_likelihood_with(matrix, tree, &scorer);
+    edge_order_support_with(tree, matrix, &scorer, tree_ll, node)
+}
+
+/// The parent of `node`, when this edge has an order to support at all — that
+/// is, when `node` is a mutation node whose parent is not the root. A mutation
+/// hanging directly off the root has nothing above it to be swapped with.
+fn orderable_parent(tree: &MutationTree, node: usize) -> Option<usize> {
     let parent = tree.parent[node];
-    if parent == tree.root() || node == tree.root() {
-        return None;
-    }
+    (parent != tree.root() && node != tree.root()).then_some(parent)
+}
+
+/// [`edge_order_support`] against a prebuilt scorer and the already-computed
+/// log-likelihood of the unswapped `tree`.
+///
+/// Both of those are invariant across nodes, which is the whole point: the
+/// public wrapper builds an `AttachmentScorer` — O(reads * variants) — and
+/// rescores the unswapped tree on every call, so driving it once per mutation
+/// node, as [`edge_evidence`] must, spends O(reads * variants^2) on precompute
+/// alone and recomputes one identical number `n_mutations` times.
+fn edge_order_support_with(
+    tree: &MutationTree,
+    matrix: &BinaryMatrix,
+    scorer: &AttachmentScorer,
+    tree_ll: f64,
+    node: usize,
+) -> Option<f64> {
+    let parent = orderable_parent(tree, node)?;
     let swapped = swap_labels(tree, node, parent);
-    Some(tree_log_likelihood(matrix, tree, rates) - tree_log_likelihood(matrix, &swapped, rates))
+    Some(tree_ll - tree_log_likelihood_with(matrix, &swapped, scorer))
 }
 
 /// [`EdgeEvidence`] for every mutation node, indexed by mutation id.
@@ -1135,17 +1163,18 @@ pub fn edge_evidence(
     matrix: &BinaryMatrix,
     rates: &ErrorRates,
 ) -> Vec<EdgeEvidence> {
+    // Hoisted out of the per-node loop: neither the scorer nor the unswapped
+    // tree's likelihood depends on which edge is being scored.
+    let scorer = AttachmentScorer::new(matrix, rates);
+    let tree_ll = tree_log_likelihood_with(matrix, tree, &scorer);
+
     (0..tree.n_mutations)
-        .map(|node| {
-            let parent = tree.parent[node];
-            if parent == tree.root() {
-                EdgeEvidence { support_ll: None, counts: None }
-            } else {
-                EdgeEvidence {
-                    support_ll: edge_order_support(tree, matrix, rates, node),
-                    counts: Some(orientation_counts(matrix, node, parent)),
-                }
-            }
+        .map(|node| match orderable_parent(tree, node) {
+            None => EdgeEvidence { support_ll: None, counts: None },
+            Some(parent) => EdgeEvidence {
+                support_ll: edge_order_support_with(tree, matrix, &scorer, tree_ll, node),
+                counts: Some(orientation_counts(matrix, node, parent)),
+            },
         })
         .collect()
 }
@@ -3103,6 +3132,62 @@ mod tests {
     }
 
     #[test]
+    fn edge_evidence_matches_per_node_edge_order_support_on_random_trees() {
+        // Pins the invariant that `edge_evidence`'s hoisting must preserve: what
+        // it computes in bulk — one scorer and one unswapped-tree likelihood
+        // shared across every node — must equal what `edge_order_support`
+        // computes node by node, rebuilding both each time.
+        let mut rng = StdRng::seed_from_u64(0xED6E);
+        let rates = ErrorRates { fp_rate: 0.005, fn_rate: 0.05 };
+
+        for trial in 0..100usize {
+            let n_variants = 2 + trial % 7;
+            let n_reads = 1 + trial % 9;
+            let data: Vec<Vec<Option<u8>>> = (0..n_variants)
+                .map(|_| {
+                    (0..n_reads)
+                        .map(|_| match rng.random_range(0..3u8) {
+                            0 => None,
+                            1 => Some(0),
+                            _ => Some(1),
+                        })
+                        .collect()
+                })
+                .collect();
+            let matrix = BinaryMatrix {
+                variants: (0..n_variants).map(|i| format!("m.{}A>G", 100 + i)).collect(),
+                reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
+                data,
+            };
+            let tree = MutationTree::random(n_variants, &mut rng);
+
+            let evidence = edge_evidence(&tree, &matrix, &rates);
+            assert_eq!(evidence.len(), n_variants, "one entry per mutation node");
+
+            for node in 0..n_variants {
+                match (evidence[node].support_ll, edge_order_support(&tree, &matrix, &rates, node)) {
+                    (None, None) => {}
+                    (Some(got), Some(want)) => assert!(
+                        (got - want).abs() < 1e-9,
+                        "trial {trial} node {node}: bulk {got} vs per-node {want}"
+                    ),
+                    (got, want) => {
+                        panic!("trial {trial} node {node}: bulk {got:?} vs per-node {want:?}")
+                    }
+                }
+
+                let parent = tree.parent[node];
+                let want_counts = (parent != tree.root())
+                    .then(|| orientation_counts(&matrix, node, parent));
+                assert_eq!(
+                    evidence[node].counts, want_counts,
+                    "trial {trial} node {node}: counts diverged"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn polish_unary_path_order_moves_distal_children_to_new_tip() {
         // Path ROOT→0→1 with distal children 2,3 under tip 1. AF prefers 1 ancestral to 0.
         let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
@@ -3432,3 +3517,4 @@ mod tests {
         assert_eq!(reused, fresh);
     }
 }
+

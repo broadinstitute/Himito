@@ -768,14 +768,20 @@ pub fn run_mcmc(
         }
         let proposal_ll = tree_log_likelihood_with(matrix, &proposal, &scorer);
 
+        // Record the running best BEFORE the Metropolis-Hastings test, not
+        // after. `propose_swap_subtrees` returns a neighbourhood correction
+        // below 1, so a proposal that beats every tree seen so far can still be
+        // rejected — and this function returns the running best, not a posterior
+        // sample, so a rejected-but-better tree would otherwise be lost.
+        if proposal_ll > best_ll {
+            best = proposal.clone();
+            best_ll = proposal_ll;
+        }
+
         let acceptance = nbh_correction * (proposal_ll - current_ll).exp();
         if rng.random::<f64>() < acceptance {
             current = proposal;
             current_ll = proposal_ll;
-            if current_ll > best_ll {
-                best = current.clone();
-                best_ll = current_ll;
-            }
         }
     }
 
@@ -2171,6 +2177,82 @@ mod tests {
             !violates_position_exclusivity(&tree, &spans),
             "the two position-310 alleles must never lie on one root-to-leaf path"
         );
+    }
+
+    #[test]
+    fn run_mcmc_returns_a_tree_at_least_as_good_as_its_own_starting_point() {
+        let matrix = BinaryMatrix {
+            variants: vec!["m.100A>G".into(), "m.200C>T".into(), "m.300G>A".into(), "m.400T>C".into()],
+            reads: (0..12).map(|i| format!("r{i}")).collect(),
+            data: vec![
+                vec![Some(1); 12],
+                vec![Some(1), Some(1), Some(1), Some(1), Some(1), Some(1), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)],
+                vec![Some(1), Some(1), Some(1), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)],
+                vec![Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(1), Some(1), Some(1), Some(0), Some(0), Some(0)],
+            ],
+        };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+        let start = MutationTree { n_mutations: 4, parent: vec![4, 4, 4, 4, 4] };
+        let start_ll = tree_log_likelihood(&matrix, &start, &rates);
+
+        let mut rng = StdRng::seed_from_u64(11);
+        let (best, best_ll) = run_mcmc(&matrix, &rates, 500, Some(&start), &mut rng);
+
+        assert!(best_ll >= start_ll - 1e-9, "returned {best_ll}, started at {start_ll}");
+        // The reported score must be the score of the returned tree, not a stale value.
+        let recomputed = tree_log_likelihood(&matrix, &best, &rates);
+        assert!((recomputed - best_ll).abs() < 1e-9, "reported {best_ll}, actual {recomputed}");
+    }
+
+    #[test]
+    fn run_mcmc_reaches_the_optimum_on_an_exhaustively_searchable_space() {
+        // A swap-subtrees proposal carries nbh_correction < 1, so a proposal that
+        // beats every tree seen so far can still be rejected by the MH test. If the
+        // running best is only updated on acceptance, that tree is lost. Over a
+        // 3-mutation space small enough to brute-force, thousands of iterations must
+        // reach the true optimum.
+        let matrix = BinaryMatrix {
+            variants: vec!["m.100A>G".into(), "m.200C>T".into(), "m.300G>A".into()],
+            reads: (0..9).map(|i| format!("r{i}")).collect(),
+            data: vec![
+                vec![Some(1), Some(1), Some(1), Some(1), Some(1), Some(1), Some(0), Some(0), Some(0)],
+                vec![Some(1), Some(1), Some(1), Some(0), Some(0), Some(0), Some(0), Some(0), Some(0)],
+                vec![Some(0), Some(0), Some(0), Some(1), Some(1), Some(1), Some(0), Some(0), Some(0)],
+            ],
+        };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+
+        // Brute-force every acyclic parent vector on 3 mutations.
+        let mut optimum = f64::NEG_INFINITY;
+        for p0 in 0..=3usize {
+            for p1 in 0..=3usize {
+                for p2 in 0..=3usize {
+                    let t = MutationTree { n_mutations: 3, parent: vec![p0, p1, p2, 3] };
+                    let acyclic = (0..3).all(|s| {
+                        let (mut cur, mut steps) = (s, 0);
+                        while cur != 3 && steps <= 3 {
+                            cur = t.parent[cur];
+                            steps += 1;
+                        }
+                        cur == 3
+                    });
+                    if !acyclic {
+                        continue;
+                    }
+                    optimum = optimum.max(tree_log_likelihood(&matrix, &t, &rates));
+                }
+            }
+        }
+
+        for seed in [3u64, 17, 101, 2024] {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (_best, best_ll) = run_mcmc(&matrix, &rates, 3000, None, &mut rng);
+            assert!(
+                best_ll >= optimum - 1e-9,
+                "seed {seed}: 3000 iterations over a 3-mutation space must reach the \
+                 optimum, got {best_ll} vs {optimum}"
+            );
+        }
     }
 
     #[test]

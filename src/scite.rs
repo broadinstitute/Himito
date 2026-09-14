@@ -2179,6 +2179,88 @@ mod tests {
         );
     }
 
+    /// Test-only RNG that replays a fixed sequence of `u64` words, cycling
+    /// once exhausted. `Rng` is blanket-implemented for any `RngCore`, so this
+    /// drops straight into any `&mut impl Rng` parameter — used below to drive
+    /// `run_mcmc` through one exact, pre-scripted sequence of proposal and
+    /// accept/reject draws, rather than relying on a seed to happen to
+    /// exercise a specific code path.
+    struct ScriptedRng { words: Vec<u64>, idx: usize }
+    impl rand::RngCore for ScriptedRng {
+        fn next_u32(&mut self) -> u32 { (self.next_u64() >> 32) as u32 }
+        fn next_u64(&mut self) -> u64 {
+            let v = self.words[self.idx % self.words.len()];
+            self.idx += 1;
+            v
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for chunk in dest.chunks_mut(8) {
+                let v = self.next_u64().to_le_bytes();
+                chunk.copy_from_slice(&v[..chunk.len()]);
+            }
+        }
+    }
+
+    #[test]
+    fn run_mcmc_records_a_rejected_but_superior_swap_subtrees_proposal() {
+        // Forces the exact defect path deterministically, rather than hoping a
+        // seed happens to hit it (the seed-based test above didn't, on any of
+        // its four seeds). Word-to-outcome mapping below was verified
+        // empirically against rand 0.9.3's `random::<f64>()` (top 53 bits of
+        // the word, scaled by 2^-53) and `random_range(0..n)` for a
+        // power-of-two `n` (top bits of the word, exact — no rejection
+        // sampling) via a throwaway probe test before being hardcoded here.
+        //
+        // Starting tree (parent = [2, 2, 4, 4, 4]): root(4) has children 2, 3;
+        // node 2 has children 0, 1. `propose_swap_subtrees` is scripted to
+        // pick the pair (1, 2) — 1 is a descendant of 2 (same lineage) — which
+        // reinserts node 2 under node 1, giving proposal parent
+        // [2, 4, 1, 4, 4] with `nbh_correction == 0.5` (< 1, the condition
+        // that lets a superior proposal be rejected). The single read is
+        // scored so that the proposal's tree strictly beats the start tree,
+        // and the final scripted draw (~1.0) forces the MH test to reject it
+        // anyway.
+        let matrix = BinaryMatrix {
+            variants: vec!["m.100A>G".into(), "m.200C>T".into(), "m.300G>A".into(), "m.400T>C".into()],
+            reads: vec!["r0".into()],
+            data: vec![vec![Some(0)], vec![Some(1)], vec![Some(0)], vec![Some(0)]],
+        };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.6 };
+        let start = MutationTree { n_mutations: 4, parent: vec![2, 2, 4, 4, 4] };
+        let start_ll = tree_log_likelihood(&matrix, &start, &rates);
+
+        let words = vec![
+            u64::MAX,   // propose_move: random::<f64>() ~= 0.9999999999999999 >= 0.95 -> swap-subtrees.
+            1u64 << 62, // sample_two_distinct: random_range(0..4) == 1 -> first = 1.
+            1u64 << 63, // sample_two_distinct: random_range(0..4) == 2 -> second = 2 (!= first, no retry).
+            0u64,       // swap_subtrees's only same-lineage candidate: random_range(0..1) == 0 regardless.
+            u64::MAX,   // MH accept test: random::<f64>() ~= 0.9999999999999999 >= acceptance -> reject.
+        ];
+        let mut rng = ScriptedRng { words, idx: 0 };
+
+        let (best, best_ll) = run_mcmc(&matrix, &rates, 1, Some(&start), &mut rng);
+
+        let proposal = MutationTree { n_mutations: 4, parent: vec![2, 4, 1, 4, 4] };
+        let proposal_ll = tree_log_likelihood(&matrix, &proposal, &rates);
+        assert!(
+            proposal_ll > start_ll,
+            "test setup bug: the scripted proposal must beat the start tree \
+             ({proposal_ll} vs {start_ll})"
+        );
+
+        // The MH draw above was rigged to reject the proposal, yet it is
+        // strictly better than the start tree -- a correct implementation
+        // must have recorded it as the running best before that rejection.
+        assert_eq!(
+            best.parent, proposal.parent,
+            "a rejected-but-superior swap-subtrees proposal must still be returned as best"
+        );
+        assert!(
+            (best_ll - proposal_ll).abs() < 1e-9,
+            "reported {best_ll}, actual {proposal_ll}"
+        );
+    }
+
     #[test]
     fn run_mcmc_returns_a_tree_at_least_as_good_as_its_own_starting_point() {
         let matrix = BinaryMatrix {
@@ -2206,11 +2288,16 @@ mod tests {
 
     #[test]
     fn run_mcmc_reaches_the_optimum_on_an_exhaustively_searchable_space() {
-        // A swap-subtrees proposal carries nbh_correction < 1, so a proposal that
-        // beats every tree seen so far can still be rejected by the MH test. If the
-        // running best is only updated on acceptance, that tree is lost. Over a
-        // 3-mutation space small enough to brute-force, thousands of iterations must
-        // reach the true optimum.
+        // General sanity check, not a defect-specific regression test: over a
+        // 3-mutation space small enough to brute-force, thousands of
+        // iterations of MCMC must reach the true optimum, for any seed. (It
+        // does not specifically exercise the rejected-but-superior
+        // swap-subtrees case — with propose_move's move weights and a space
+        // this thoroughly explored, the optimum is overwhelmingly likely to
+        // be reached via a prune-reattach or swap-labels acceptance, where
+        // nbh_correction == 1 and the pre-fix code recorded `best` correctly
+        // too. See `run_mcmc_records_a_rejected_but_superior_swap_subtrees_proposal`
+        // for a test that deterministically forces that specific path.)
         let matrix = BinaryMatrix {
             variants: vec!["m.100A>G".into(), "m.200C>T".into(), "m.300G>A".into()],
             reads: (0..9).map(|i| format!("r{i}")).collect(),

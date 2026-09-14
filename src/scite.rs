@@ -2248,6 +2248,28 @@ mod tests {
              ({proposal_ll} vs {start_ll})"
         );
 
+        // Guard that the proposal is actually REJECTED, which is the only
+        // reason this test distinguishes the fixed code from the broken code.
+        // The pre-fix implementation also recorded `best` on acceptance, so if
+        // the scripted draw ever started accepting this proposal, every
+        // assertion below would still pass — against the broken code too.
+        //
+        // The draw is derived through rand's own `f64` mapping rather than
+        // hardcoded, so a future change to that mapping moves this guard with
+        // it instead of silently invalidating the test.
+        let mh_draw: f64 = ScriptedRng { words: vec![u64::MAX], idx: 0 }.random();
+        // Mirrors `run_mcmc`: acceptance = nbh_correction * exp(proposal - current),
+        // with 0.5 the correction `swap_subtrees` returns for this scripted pair,
+        // and `current_ll == start_ll` on the single iteration this test runs.
+        let acceptance = 0.5 * (proposal_ll - start_ll).exp();
+        assert!(
+            acceptance <= mh_draw,
+            "this test no longer exercises the rejection path: acceptance \
+             {acceptance} would be accepted by the scripted draw {mh_draw}, and \
+             the pre-fix code recorded best on acceptance too — so the \
+             assertions below would pass for the wrong reason"
+        );
+
         // The MH draw above was rigged to reject the proposal, yet it is
         // strictly better than the start tree -- a correct implementation
         // must have recorded it as the running best before that rejection.

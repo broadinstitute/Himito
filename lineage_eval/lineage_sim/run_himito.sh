@@ -31,10 +31,19 @@ STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1
 # sharper filter on noise sites whose raw HF overlaps real low-frequency
 # heteroplasmies.
 #
-# 0.03 is the sweep optimum over the n=10 depth>=300 cells (see sweep_denoise_vaf.sh
-# and DENOISE_KEEP_VAF in src/main.rs): variant precision 0.837 -> 0.967 with recall
-# held at 1.000 and ad_f1 within 0.003 of best. Empty = follow --vaf.
-DENOISE_VAF=0.03
+# NOT hardcoded any more. This used to default to 0.03 -- the sweep optimum over
+# the n=10 depth>=300 cells (variant precision 0.837 -> 0.967 at recall 1.000).
+# That number is only valid where the simulated truth has headroom above it, and
+# it is a *frequency* floor applied before the graph is built, so when it does not
+# it silently deletes truth variants and no amount of depth recovers them: at
+# --n-mutations 15 --sim-min-hf 0.03 (min truth HF 0.0330) the 0.03 default cut
+# var_recall to 0.533, and 0.01 restored it to 0.867 on the same reads.
+#
+# Unset now follows --vaf, which is what `Himito quick-start` does (main.rs passes
+# the same vaf_threshold to both). The resolved value is echoed below so it is
+# never silent. Pass --denoise-vaf explicitly to override, and keep it below the
+# lowest heteroplasmy you expect to recover.
+DENOISE_VAF=""
 # MIN_EDGE_READS deliberately diverges from quick-start's hardcoded 2: the gate is
 # now inclusive (>= N reads), and 1 CIGARs every read-supported edge. At 2, ~98% of
 # edges on this ONT graph go un-CIGARed and the reads reaching a bubble through them
@@ -126,7 +135,16 @@ BUILD_BAM="$BAM"
 CALL_DATATYPE="$DTYPE"
 if [[ "$DTYPE" == ont-denoised ]]; then
   DENOISED="$HDIR/aln.denoised.bam"
-  DENOISE_ARGS=(--vaf "${DENOISE_VAF:-$VAF}" --stats "$HDIR/denoise_stats.json")
+  # Announce the resolved threshold and where it came from. This gate silently
+  # deletes truth variants below it, so a run must never have to guess which
+  # value was in effect.
+  if [[ -n "$DENOISE_VAF" ]]; then
+    RESOLVED_DENOISE_VAF="$DENOISE_VAF"; DENOISE_VAF_SRC="--denoise-vaf"
+  else
+    RESOLVED_DENOISE_VAF="$VAF"; DENOISE_VAF_SRC="follows --vaf"
+  fi
+  echo "denoise --vaf ${RESOLVED_DENOISE_VAF} (${DENOISE_VAF_SRC}); truth variants below this are removed before the graph" >&2
+  DENOISE_ARGS=(--vaf "$RESOLVED_DENOISE_VAF" --stats "$HDIR/denoise_stats.json")
   if [[ "$DENOISE_INDELS" == "1" ]]; then
     DENOISE_ARGS+=(--indels)
   fi

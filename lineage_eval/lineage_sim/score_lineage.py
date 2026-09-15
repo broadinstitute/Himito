@@ -196,15 +196,31 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars,
     # and 0.00 with it out. ROOT was originally kept so that two identical star
     # topologies would not score 0 on empty pair sets; the both-empty branch below
     # handles that case directly, without inflating everything else.
-    tp_pairs = _anc_pairs(truth_anc, shared)
+    #
+    # ad_recall is measured against EVERY truth ancestral pair, not only pairs
+    # among `shared`. Restricting the denominator to `shared` meant a run that
+    # detected fewer variants scored HIGHER, because the pairs it had no chance of
+    # recovering simply left the denominator: over 100 runs corr(var_recall,
+    # ad_f1) ran -0.40 to -0.63 within a config, so improving detection lowered the
+    # tree score. The extreme case was --n-mutations 15 with denoise --vaf
+    # destroying 40% of the truth set, which scored a perfect ad_f1 = 1.000 on all
+    # 10 seeds; against all truth pairs it scores 0.374. With this denominator the
+    # same correlations run +0.27 to +0.98.
+    #
+    # ad_precision stays restricted to `shared`. A pair built from a
+    # false-positive variant is a *detection* error and var_precision already
+    # reports it; charging it here too would double-count one mistake.
+    tp_all = _anc_pairs(truth_anc, truth_tree_vars)
+    tp_shared = _anc_pairs(truth_anc, shared)
     rp_pairs = _anc_pairs(recon_anc, shared)
-    inter = tp_pairs & rp_pairs
-    if not tp_pairs and not rp_pairs:
-        # Both trees are flat over `shared`: they agree, there is simply nothing
-        # to count. Distinct from "one side is flat", which scores 0 below.
+    inter = tp_shared & rp_pairs
+    if not tp_all and not rp_pairs:
+        # Truth has no ancestral pairs at all and neither does the reconstruction:
+        # they agree, there is simply nothing to count. Distinct from "one side is
+        # flat", which scores 0 below.
         ad_precision = ad_recall = 1.0
     else:
-        ad_recall = len(inter) / len(tp_pairs) if tp_pairs else 0.0
+        ad_recall = len(inter) / len(tp_all) if tp_all else 0.0
         ad_precision = len(inter) / len(rp_pairs) if rp_pairs else 0.0
 
     # --- haplotype (clone) recovery ---
@@ -217,6 +233,9 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars,
         "n_truth_vars": len(truth_vars),
         "n_detected_vars": len(detected_vars),
         "n_shared": len(shared),
+        # Denominator of ad_recall. With recall scored against all truth pairs,
+        # n_shared alone no longer says what ad_* was measured over.
+        "n_truth_pairs": len(tp_all),
         "var_precision": var_precision,
         "var_recall": var_recall,
         "var_f1": _f1(var_precision, var_recall),
@@ -236,6 +255,7 @@ HAP_FIELDS = ["n_truth_clones", "n_recon_haps",
 # ancestor-descendant tree accuracy, and clone (haplotype) recovery. Consumers
 # look columns up by header name, not by position -- see sweep_fpfn.sh.
 FIELDS = ["profile", "fp", "fn", "n_truth_vars", "n_detected_vars", "n_shared",
+          "n_truth_pairs",
           "var_precision", "var_recall", "var_f1",
           "ad_precision", "ad_recall", "ad_f1"] + HAP_FIELDS
 

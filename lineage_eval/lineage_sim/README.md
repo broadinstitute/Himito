@@ -6,8 +6,8 @@ lineage`, and score reconstruction accuracy across replicate seeds.
 
 **Start here:** [The three frequency gates](#the-three-frequency-gates-read-this-first)
 — the defaults silently empty the VCF on simulated data — and
-[`ad_*` is anti-correlated with detection](#ad_-is-anti-correlated-with-detection),
-which governs how the tree metrics may be compared.
+[Why `ad_recall` is scored against *all* truth pairs](#why-ad_recall-is-scored-against-all-truth-pairs),
+which governs how the tree metrics may be compared across runs.
 
 ## Truth model
 
@@ -59,7 +59,7 @@ that is roughly 0.06–0.23, and it falls as `--n-mutations` rises.
 
 | gate | default | set with | stage |
 |------|---------|----------|-------|
-| `denoise --vaf` | **0.03** (hardcoded in `run_himito.sh`) | `--denoise-vaf` | before the graph |
+| `denoise --vaf` | follows `--vaf` (0.01) unless set | `--denoise-vaf` | before the graph |
 | `call -v` | tracks `--min-hf` (0.01) | `--min-hf` / `--vaf` | caller |
 | `call -f` | **0.2** (`call::resolve_thresholds`) | `--frequency-threshold` | permutation test |
 
@@ -89,9 +89,11 @@ empty VCF, then `Himito lineage` aborting with:
 Error running lineage analysis: No informative variants remain after filtering.
 ```
 
-**`denoise --vaf` = 0.03.** `run_himito.sh:37` documents this as "the sweep
-optimum over the n=10 depth>=300 cells". It bites whenever clones are rarer than
-that. Measured at `--n-mutations 15 --sim-min-hf 0.03` (min truth HF 0.0330),
+**`denoise --vaf`.** This used to be hardcoded to 0.03 in `run_himito.sh` — the
+sweep optimum over the n=10 depth>=300 cells, valid only where the truth has
+headroom above it. It is now unset by default and follows `--vaf`, and the
+resolved value is echoed to stderr at run time so it is never silent. The
+measurement that motivated the change, with the old 0.03 in force: Measured at `--n-mutations 15 --sim-min-hf 0.03` (min truth HF 0.0330),
 one seed, `-f 0.02` so the permutation gate is not the constraint:
 
 | `--denoise-vaf` | truth recovered | var_recall |
@@ -137,8 +139,8 @@ Still true, and independent of the gates: clone frequency falls as
 `n_shared = 3`, and a degenerate tree.
 
 - Check `var_recall` and `n_shared` **first**. If `n_shared` is well under
-  `n_truth_vars`, fix that before reading any tree metric — see
-  [`ad_*` is anti-correlated with detection](#ad_-is-anti-correlated-with-detection).
+  `n_truth_vars`, fix that first: `ad_recall` is scored against all truth pairs,
+  so undetected variants cap it directly.
 - Verify each gate sits below `--sim-min-hf` before blaming depth.
 - Raise `--total-depth` for genuine coverage limits — but note it cannot fix a
   frequency gate.
@@ -155,13 +157,13 @@ Measured at depth 1000, 10 seeds each:
 
 | config | var_recall | truth pairs | ad_f1 | imperfect |
 |--------|-----------|-------------|-------|-----------|
-| n=10 random | 0.920 | 6.4 | 0.975 | 2/10 |
-| n=12 random | 0.858 | 10.3 | 0.915 | 3/10 |
-| n=15 random, gates cleared | 0.933 | — | 0.978 | 3/10 |
-| n=15 random, depth 3000 | 0.987 | — | **1.000** | **0/10** |
+| n=10 random | 0.920 | 7.3 | 0.867 | 7/10 |
+| n=12 random | 0.858 | 7.0 | 0.766 | 9/10 |
+| n=15 random, gates cleared | 0.933 | 12.0 | 0.903 | 9/10 |
+| n=15 random, depth 3000 | 0.987 | 12.0 | **0.996** | **1/10** |
 
-The last row is the trap: give n=15 enough depth and the tree is reconstructed
-perfectly every time. **Bigger trees are not harder trees.**
+The last row is the trap: give n=15 enough depth and the tree is essentially
+always reconstructed correctly. **Bigger trees are not harder trees.**
 
 Two knobs vary tree difficulty at fixed detection:
 
@@ -182,13 +184,14 @@ Measured, n=10 / depth 1000 / 10 seeds:
 
 | config | var_prec | var_recall | truth pairs | ad_f1 | ad range | imperfect |
 |--------|----------|-----------|-------------|-------|----------|-----------|
-| `random`, keep .20 | 1.000 | 0.920 | 6.4 | 0.975 | 0.875–1.000 | 2/10 |
-| `chain`, keep .20 | 0.982 | **0.990** | **44.1** | 0.998 | 0.978–1.000 | 1/10 |
-| `chain`, keep .10 | 0.982 | **0.990** | **44.1** | 0.991 | 0.956–1.000 | **3/10** |
+| `random`, keep .20 | 1.000 | 0.920 | 7.3 | 0.867 | 0.500–1.000 | 7/10 |
+| `chain`, keep .20 | 0.982 | **0.990** | **45.0** | 0.987 | 0.889–1.000 | 2/10 |
+| `chain`, keep .10 | 0.982 | **0.990** | **45.0** | 0.980 | 0.889–1.000 | **4/10** |
 
 `chain` multiplies ancestral pairs 6.9× *and* improves `var_recall` — the
 decoupling `--n-mutations` cannot deliver. But shape alone made `ad_f1` go **up**
-(0.975 → 0.998), because a chain has no starved intermediate clones. Combine it
+(0.867 → 0.987) — partly because a chain has no starved intermediate clones, and
+partly because its near-complete detection is now rewarded rather than punished. Combine it
 with `--internal-keep 0.10` for headroom at clean detection.
 
 Two caveats. With ~44 pairs a single order flip costs ~2% of `ad_f1` instead of
@@ -223,7 +226,7 @@ reference lives elsewhere (e.g. `--ref ../../test_data/rCRS.fasta`).
 | `--profile` | `ont-r10` | use `ont-denoised`; `ont-r10` skips denoise and empties the VCF |
 | `--n-mutations` / `--total-depth` / `--seed` | 12 / 300 / 1 | simulation size. Not a difficulty knob — see [Difficulty knobs](#difficulty-knobs) |
 | `--frequency-threshold F` | unset (Himito 0.2) | `call -f`. **Must be below `--sim-min-hf`** |
-| `--denoise-vaf F` | unset (`run_himito.sh` 0.03) | denoise keep threshold. **Must be below `--sim-min-hf`** |
+| `--denoise-vaf F` | unset (follows `--vaf`) | denoise keep threshold. **Must be below `--sim-min-hf`**; sweep it with `sweep_denoise_vaf.sh` |
 | `--sim-min-hf F` / `--sim-max-hf F` | 0.05 / 0.99 | band for *simulated truth* frequencies (distinct from `--min-hf`) |
 | `--min-hf F` / `--max-hf F` | 0.01 / 0.95 | band for `call -v` and `lineage`; **not** the truth band |
 | `--topology random\|chain\|star` | `random` | tree shape; `chain` for ordering difficulty |
@@ -250,6 +253,64 @@ These can be overridden when calling `run_himito.sh` directly:
   --frequency-threshold 0.05
 ```
 
+## The standard benchmark (`bench_standard.sh`)
+
+**Use this to produce a number anyone can compare against.** It runs a frozen
+configuration and scores the result against a committed baseline.
+
+```bash
+./bench_standard.sh --outdir /tmp/std --ref ../../test_data/rCRS.fasta
+```
+
+It prints each focus metric next to `baseline_standard.tsv`, with a `±2 SE` noise
+band, and labels every metric `same` / `IMPROVED` / `REGRESSED`. A delta inside
+the band is seed scatter, not a result. To re-score an existing run without
+re-running the pipeline: `--compare path/to/seed_metrics.tsv`. To move the
+baseline after an intentional change: `--update-baseline`.
+
+### The frozen parameters, and why each one
+
+| parameter | value | why not something else |
+|-----------|-------|------------------------|
+| `--profile` | `ont-denoised` | `ont-r10` skips denoise and yields an empty VCF; `hifi` is untested here |
+| `--n-mutations` | 10 | **not** a difficulty knob — raising it only costs variant recall. 10 keeps min truth HF at 0.091, clear of every gate |
+| `--total-depth` | 1000 | 3000 removes nearly all headroom (`ad_f1` 0.996, 1/10 imperfect); 300 wrecks detection (`var_recall` 0.750) |
+| `--topology` | `chain` | 45 truth ancestral pairs instead of ~7, **and** better detection (0.990 vs 0.920) — a chain never splits clone mass between siblings |
+| `--internal-keep` | 0.10 | the real ordering-difficulty knob. Chain shape alone gives no headroom (`ad_f1` 0.987) |
+| `--frequency-threshold` | 0.05 | `call -f` defaults to 0.2, above every truth variant here. Must stay under min truth HF (0.296) |
+| `--denoise-vaf` | 0.03 | pinned, not inherited: `run_himito.sh` no longer hardcodes it, so the benchmark states it or the result drifts with an unrelated default. ~10× headroom here, so it truncates nothing |
+| seeds | 1–30 | 10 seeds cannot separate a real effect from one coin-flip edge |
+
+Changing any of these makes the result incomparable to the baseline — that is
+the point of freezing them. For exploration, call `sweep_seeds.sh` directly.
+
+### Committed baseline
+
+`baseline_standard.tsv`, 30/30 seeds, no failures. Mean `n_truth_pairs` = 45.0,
+mean `n_shared` = 9.8 of 10.
+
+| metric | mean | sd | min | max |
+|--------|------|----|-----|-----|
+| `var_precision` | 0.9909 | 0.0277 | 0.9091 | 1.000 |
+| `var_recall` | 0.9833 | 0.0461 | 0.8000 | 1.000 |
+| `var_f1` | 0.9863 | 0.0274 | 0.8889 | 1.000 |
+| `ad_precision` | 0.9932 | 0.0122 | 0.9556 | 1.000 |
+| `ad_recall` | 0.9607 | 0.0892 | 0.6222 | 1.000 |
+| `ad_f1` | **0.9744** | 0.0534 | 0.7671 | 1.000 |
+| `hap_precision` | 0.9215 | 0.1399 | 0.3750 | 1.000 |
+| `hap_recall` | 0.9200 | 0.1584 | 0.3000 | 1.000 |
+| `hap_f1` | **0.9202** | 0.1489 | 0.3333 | 1.000 |
+
+Headroom: 11/30 seeds imperfect on `ad_f1`, 13/30 on `hap_f1`, 7/30 on `var_f1`.
+Detection is clean (`var_precision` 0.991) without being saturated, so all three
+families can still move in either direction.
+
+**Resolution.** The `2*SE` band is what a run has to beat to count as a change:
+roughly **±0.028 on `ad_f1`** and **±0.077 on `hap_f1`** at 30 seeds. `hap_*` is
+much noisier because a single mis-grouped clone moves it by ~0.1; treat small
+`hap_*` deltas with suspicion and raise the seed count if you need to resolve
+them.
+
 ## Multi-seed baselines (`sweep_seeds.sh`)
 
 A single seed cannot separate "the method has a systematic weakness" from "this
@@ -269,12 +330,15 @@ unless `--keep-intermediate` is passed (~30 MB/seed otherwise).
 
 Measured baselines, `ont-denoised`, `-f 0.05`:
 
-| config | seeds | var_prec | var_recall | ad_f1 | hap_f1 | imperfect `ad` |
-|--------|-------|----------|-----------|-------|--------|----------------|
-| n=10, depth 1000 | 10 | 1.000 | 0.920 | 0.975 | 0.936 | 2/10 |
-| n=10, depth 300 | 30 | 0.749 | 0.750 | 0.848 | 0.621 | 16/30 |
-| n=12, depth 1000 | 10 | 0.991 | 0.858 | 0.915 | 0.854 | 3/10 |
-| n=10, depth 1000, `chain` keep .10 | 10 | 0.982 | 0.990 | 0.991 | 0.935 | 3/10 |
+| config | seeds | var_prec | var_recall | ad_f1 | ad range | hap_f1 | imperfect `ad` |
+|--------|-------|----------|-----------|-------|----------|--------|----------------|
+| n=10, depth 1000 | 10 | 1.000 | 0.920 | 0.867 | 0.500–1.000 | 0.936 | 7/10 |
+| n=10, depth 300 | 30 | 0.749 | 0.750 | 0.615 | 0.286–0.857 | 0.621 | 30/30 |
+| n=12, depth 1000 | 10 | 0.991 | 0.858 | 0.766 | 0.500–1.000 | 0.854 | 9/10 |
+| n=10, depth 1000, `chain` keep .10 | 10 | 0.982 | 0.990 | **0.980** | 0.889–1.000 | 0.935 | 4/10 |
+
+Scored with the corrected `ad_recall` denominator; see
+[Why `ad_recall` is scored against *all* truth pairs](#why-ad_recall-is-scored-against-all-truth-pairs).
 
 Outputs land under `<outdir>/`: `truth/`, `reads/`, `himito/`, and
 `metrics.tsv`.
@@ -310,54 +374,74 @@ recovered".
 | Column | Meaning |
 |--------|---------|
 | `var_precision` / `recall` / `f1` | Variant *detection*: PASS SNVs in `sim.vcf` vs the truth SNV set. Independent of the tree. |
-| `ad_precision` / `recall` / `f1` | **Ancestor–descendant** accuracy: over shared variants, are truth ancestral pairs preserved in the reconstruction? The primary tree-topology metric. |
+| `ad_precision` / `recall` / `f1` | **Ancestor–descendant** accuracy: are truth ancestral pairs preserved in the reconstruction? `ad_recall` is scored against *every* truth pair, `ad_precision` only over shared variants — see [below](#why-ad_recall-is-scored-against-all-truth-pairs). The primary tree-topology metric. |
 | `hap_precision` / `recall` / `f1` | **Clone recovery**: a reconstructed haplotype matches a truth clone when their full variant sets are equal. Needs `--recon-matrix` + `--truth-clones`; reads `NA` otherwise. |
 | `n_truth_vars` / `n_detected_vars` | Denominators for `var_recall` / `var_precision`. |
-| `n_shared` | Variants present in both the truth tree and the reconstructed tree (the `ad_*` taxon set). |
+| `n_shared` | Variants present in both the truth tree and the reconstructed tree (the `ad_precision` taxon set). |
+| `n_truth_pairs` | Ancestral pairs in the truth tree — the `ad_recall` denominator. Read `ad_*` next to this. |
 | `n_truth_clones` / `n_recon_haps` | Denominators for `hap_recall` / `hap_precision`. Excludes the mutation-free bin. |
 
-`ad_*` counts ordered (ancestor, descendant) pairs over `n_shared` variants,
-with ROOT excluded — ROOT is an ancestor of everything in both trees, so
+`ad_*` counts ordered (ancestor, descendant) pairs with ROOT excluded — ROOT is an ancestor of everything in both trees, so
 counting it would hand every run |n_shared| free true positives. When both trees
 are flat over the shared set they agree, and `ad_*` reads 1.0; when only one is
 flat it reads 0.0.
 
 Column order in the TSV: `profile`, `fp`, `fn`, `n_truth_vars`,
-`n_detected_vars`, `n_shared`, `var_precision`, `var_recall`, `var_f1`,
+`n_detected_vars`, `n_shared`, `n_truth_pairs`, `var_precision`, `var_recall`,
+`var_f1`,
 `ad_precision`, `ad_recall`, `ad_f1`, `n_truth_clones`, `n_recon_haps`,
 `hap_precision`, `hap_recall`, `hap_f1`. Read columns by header name, not
 position.
 
-### `ad_*` is anti-correlated with detection
+### Why `ad_recall` is scored against *all* truth pairs
 
-`ad_*` is restricted to `shared` (variants in *both* trees), so a variant the
-caller misses leaves the denominator entirely and the reconstruction is never
-charged for it. Missing variants therefore produce a smaller, easier tree and a
-**higher** `ad_f1`. Correlation with `var_recall` over 60 runs:
+`ad_recall`'s denominator is every ancestral pair in the truth tree
+(`n_truth_pairs`), **not** only pairs among `shared`. `ad_precision` stays
+restricted to `shared`.
 
-| metric | depth 300 (n=30) | depth 1000 (n=10) | pooled (n=60) |
-|--------|------------------|-------------------|---------------|
-| `ad_f1` | **−0.403** | **−0.459** | **−0.228** |
-| `hap_f1` | +0.315 | +0.641 | +0.579 |
+This asymmetry is deliberate and load-bearing. When both were restricted to
+`shared`, a variant the caller missed left the denominator entirely, so a run
+that detected *less* scored *higher* — the reconstruction was never charged for
+ancestry it had no chance to recover. Correlation of `ad_f1` with `var_recall`,
+before and after, over 100 runs:
 
-At depth 300 the 14 seeds scoring a perfect `ad_f1` had *worse* detection than
-the 16 imperfect ones (mean `var_recall` 0.686 vs 0.806). The extreme case:
-`--n-mutations 15` with `denoise --vaf` blocking 40% of truth variants scored
-`ad_f1 = 1.000` on **all 10 seeds**.
+| config | before | after |
+|--------|--------|-------|
+| n=10 depth 1000 | −0.459 | **+0.679** |
+| n=10 depth 300 | −0.403 | **+0.271** |
+| n=15 gates clear | −0.625 | **+0.723** |
+| n=10 chain keep .20 | −0.111 | **+0.980** |
+| **pooled (n=100)** | +0.049 | **+0.863** |
 
-Consequences:
+The clearest case: `--n-mutations 15` with `denoise --vaf` destroying 40% of the
+truth set scored a **perfect `ad_f1` = 1.000 on all 10 seeds** under the old
+definition — the best score in the whole benchmark, from the worst-detecting
+config. It now scores 0.374, the worst.
 
-- **A genuine improvement to variant detection will lower `ad_f1`.** Do not
-  compare `ad_*` across runs with different `n_shared`.
-- Always read `ad_*` next to `n_shared`. Five of the 30 depth-300 seeds scored
-  `ad` on ≤2 truth pairs.
-- `hap_*` is correctly signed at every depth and is the better headline metric
-  when detection is incomplete.
+A perfectly correct tree built from fewer detected variants now degrades as it
+should (4-mutation chain truth, reconstruction correct on everything it saw):
+
+| variants detected | `ad_precision` | `ad_recall` | `ad_f1` |
+|-------------------|----------------|-------------|---------|
+| 4 / 4 | 1.000 | 1.000 | 1.000 |
+| 3 / 4 | 1.000 | 0.500 | 0.667 |
+| 2 / 4 | 1.000 | 0.167 | 0.286 |
+
+All four rows scored 1.000 before. Precision stays 1.000 throughout because the
+tree really is correct — a *false-positive* variant is a detection error that
+`var_precision` already reports, so charging it here too would double-count one
+mistake.
+
+**`ad_*` from before this change is not comparable to `ad_*` after it.** Earlier
+numbers were inflated by however much detection was incomplete: near-perfect
+detection barely moves (n=15 depth 3000, `var_recall` 0.987: 1.000 → 0.996),
+poor detection moves a lot (n=10 depth 300, `var_recall` 0.750: 0.848 → 0.615).
 
 ## Suggested experiments
 
-- **Replicates first.** Always use `sweep_seeds.sh` (10+ seeds) before drawing a
-  conclusion; single-seed differences of 0.1 in `ad_f1` are one coin-flip edge.
+- **Run `bench_standard.sh` first.** It is the frozen config and it reports
+  against the committed baseline with a noise band. Only reach for
+  `sweep_seeds.sh` when you are deliberately exploring off-config.
 - **Ordering difficulty:** vary `--internal-keep` (0.20/0.15/0.10) under
   `--topology chain`. This is the axis that isolates tree inference.
 - **Depth titration:** vary `--total-depth` (300/1000/3000) — but confirm every
@@ -386,8 +470,9 @@ Two things that did **not** work, so you can skip them:
   `denoise --vaf` (0.03) and `call -v`. The first two defaults were tuned for
   `--n-mutations 10` and break silently otherwise; no amount of depth
   compensates. See [The three frequency gates](#the-three-frequency-gates-read-this-first).
-- **`ad_*` rises when detection falls.** Never compare it across runs with
-  different `n_shared`; see [`ad_*` is anti-correlated with detection](#ad_-is-anti-correlated-with-detection).
+- **`ad_*` changed definition.** `ad_recall` is now scored against all truth
+  pairs, so numbers from before that change are inflated and not comparable; see
+  [Why `ad_recall` is scored against *all* truth pairs](#why-ad_recall-is-scored-against-all-truth-pairs).
 - **SNV-only truth (no indels).** rCRS homopolymer/control-region positions are
   excluded (see `AVOID_RANGES` in `simulate_tree.py`) to keep the benchmark on
   cleanly callable sites.

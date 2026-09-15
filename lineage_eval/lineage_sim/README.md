@@ -344,6 +344,38 @@ Outputs land under `<outdir>/`: `truth/`, `reads/`, `himito/`, and
 `metrics.tsv`.
 
 
+## Sweep denoise --vaf
+
+```bash
+./sweep_denoise_vaf.sh --outdir /tmp/dv --ref ../../test_data/rCRS.fasta \
+  --vafs "0.005 0.01 0.03 0.05" --seeds "1 2 3 4 5 6 7 8 9 10"
+```
+
+Defaults to the standard config and forwards `--topology` / `--internal-keep` /
+`--sim-min-hf`, so a cell differs from the frozen benchmark only in `--vaf`.
+
+Measured on the standard config (10 seeds/cell, min truth HF **0.296**, so a
+~10x margin over the gate):
+
+| `--vaf` | var_precision | var_recall | ad_f1 | hap_f1 |
+|---------|---------------|------------|-------|--------|
+| 0.005 | 0.8957 | **0.9900** | 0.9800 | 0.8912 |
+| 0.01 | 0.9496 | **0.9900** | 0.9800 | 0.9174 |
+| **0.03** | **0.9818** | **0.9900** | 0.9800 | **0.9352** |
+| 0.05 | 0.9818 | **0.9900** | 0.9800 | 0.9352 |
+
+`var_recall` is flat: with that much headroom the gate truncates nothing, and the
+precision gain up to 0.03 is free. `ad_f1` does not move at all — the threshold
+changes which noise reaches the matrix, not the tree. 0.03 is the optimum here
+and is what `bench_standard.sh` pins.
+
+**This is also why 0.03 cannot be a default.** The same value in a low-margin
+config destroys the truth set: at `--n-mutations 15 --sim-min-hf 0.03` (min truth
+HF 0.033, ~1.1x margin) it cut `var_recall` to 0.533, and 0.01 restored it to
+0.867 on identical reads. The optimum is a property of the config, not of the
+tool — sweep the regime you are actually in, and check `var_recall` before
+reading any precision gain.
+
 ## Sweep fp/fn
 
 After `run_eval.sh` completes (matrix and VCF are fixed), sweep SCITE error

@@ -20,6 +20,13 @@
 #     --build-arg HIMITO_IMAGE=us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev \
 #     -t us.gcr.io/broad-dsp-lrma/hangsuunc/himito-lineage-sim:dev \
 #     -f Dockerfile . --push
+#
+# ARGs consumed by FROM must be declared before the first FROM. An ARG sitting
+# between stages is scoped to the preceding stage, so FROM ${HIMITO_IMAGE}
+# used to expand to a blank name:
+#   ERROR: failed to solve: base name (${HIMITO_IMAGE}) should not be blank
+ARG HIMITO_IMAGE=docker.io/hangsuunc/himito:dev
+ARG HIMITO_SOURCE=prebuilt
 
 # ---- optional: compile Himito (linux/amd64 host only; skipped by default) ----
 FROM rust:1.84.0 AS himito-from-source
@@ -36,10 +43,8 @@ RUN git config --global http.sslverify false \
     && cargo build --release
 
 # ---- default: reuse a published linux/amd64 Himito (no rustc, QEMU-safe) -----
-ARG HIMITO_IMAGE=docker.io/hangsuunc/himito:dev
 FROM --platform=linux/amd64 ${HIMITO_IMAGE} AS himito-prebuilt
 
-ARG HIMITO_SOURCE=prebuilt
 FROM himito-${HIMITO_SOURCE} AS himito-build
 
 # ---- runtime ----------------------------------------------------------------
@@ -60,9 +65,10 @@ RUN git clone --depth 1 https://github.com/yukiteruono/pbsim3.git /tmp/pbsim3_sr
     && cp /tmp/pbsim3_src/data/*.model /opt/lineage_sim/pbsim3_models/ \
     && rm -rf /tmp/pbsim3_src
 
-# Himito binary + rCRS.fasta from the build stage.
+# Himito binary + rCRS.fasta from the Himito image (not the build context:
+# lineage_sim/ has no rCRS.fasta; it lives in test_data/).
 COPY --from=himito-build /Himito/target/release/Himito /Himito/target/release/Himito
-COPY rCRS.fasta /opt/lineage_sim/rCRS.fasta
+COPY --from=himito-build /Himito/test_data/rCRS.fasta /opt/lineage_sim/rCRS.fasta
 
 # The lineage_sim scripts (build context = this directory).
 COPY run_eval.sh run_himito.sh simulate_reads.sh simulate_tree.py score_lineage.py \

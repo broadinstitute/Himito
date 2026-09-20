@@ -1254,20 +1254,25 @@ pub fn write_root_block_table(
     path: &str,
 ) -> Result<()> {
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
-    writeln!(w, "variant\thf\tn_absent\tmin_q\tpartner_variant\tin_block")?;
+    writeln!(w, "variant\thf\tn_absent\tmin_q\tpartner_variant\tin_block\treason")?;
     for a in audit {
         let min_q = match a.min_q {
             Some(q) => format!("{q:.6e}"),
             None => "NA".to_string(),
         };
-        let partner = match a.partner {
-            Some(u) => variants[u].clone(),
-            None => "NA".to_string(),
+        // A saturated tie (min_q >= 1.0) means no partner was ever strictly
+        // better than any other, so whichever `u` happens to sit lowest in
+        // variant order "wins" the incumbent slot in `partition`'s pass 3 —
+        // that index had nothing to do with the decision. Report NA rather
+        // than a partner that reads as "the best-discriminating partner".
+        let partner = match (a.partner, a.min_q) {
+            (Some(u), Some(q)) if q < 1.0 => variants[u].clone(),
+            _ => "NA".to_string(),
         };
         writeln!(
             w,
-            "{}\t{:.6}\t{}\t{min_q}\t{partner}\t{}",
-            variants[a.variant], a.hf, a.n_absent, a.in_block
+            "{}\t{:.6}\t{}\t{min_q}\t{partner}\t{}\t{}",
+            variants[a.variant], a.hf, a.n_absent, a.in_block, a.reason.as_str()
         )?;
     }
     Ok(())
@@ -1422,6 +1427,20 @@ pub fn write_read_lineage_newick(
     let children = tree.children_of();
     let mut haps_by_node: Vec<Vec<(String, usize)>> = vec![Vec::new(); tree.n_mutations + 1];
     for hap in &hap_matrix.haplotypes {
+        // `hap.profile` has one entry per column of the CLEANED matrix —
+        // `n_informative + n_block` entries, since `append_block_to_cleaned`
+        // appended the block columns — while `tree.n_mutations ==
+        // n_informative`. That length mismatch is correct, but only by
+        // construction: every block column is `1` on every read, and
+        // `ancestor_mask(node)` never sets a bit past `n_mutations` for any
+        // node, so `attachment_log_likelihood` scores every block column as
+        // "observed=1, expected_mutated=false" -> `ln(fp)`, identically at
+        // every candidate node. That is a constant additive offset per read,
+        // which cancels under `argmax` and does not move the `LL_TIE_EPS`
+        // tie-break; only the returned `_ll` (discarded here) is off by it.
+        // Do not "fix" this by truncating `hap.profile` to `tree.n_mutations`
+        // — that would remove the offset, not change which node wins, so it
+        // would look like a cleanup while being a no-op at best.
         let (node, _ll) = best_attachment(&hap.profile, tree, rates);
         haps_by_node[node].push((hap.id.clone(), hap.count));
     }
@@ -1442,6 +1461,14 @@ pub fn write_read_lineage_newick(
     let body = if block_names.is_empty() {
         body
     } else {
+        // Safe today because `emit_lineage_node` emits the literal `)ROOT`
+        // exactly once (line ~1385) — but `replace` is a blind substring
+        // rewrite, and a future format change (e.g. a second string that
+        // happens to contain `)ROOT`) would silently annotate the wrong
+        // token, or none, instead of failing loudly. Assert the invariant
+        // this relies on rather than trusting it silently.
+        let n = body.matches(")ROOT").count();
+        assert_eq!(n, 1, "expected exactly one )ROOT token in the Newick body, found {n}");
         body.replace(")ROOT", &format!(")ROOT[&&NHX:root_block={}]", block_names.join(",")))
     };
 
@@ -1786,6 +1813,11 @@ fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> 
     for a in rb.audit.iter_mut() {
         if pulled_back.contains(&a.variant) {
             a.in_block = false;
+            // Overwrite whatever `partition` recorded (untested/unstructured):
+            // the span conflict is why this variant is NOT in the block, and
+            // that reason must win over the one that would have applied had
+            // the conflict not existed.
+            a.reason = rootblock::BlockReason::SpanConflict;
         }
     }
 
@@ -3915,14 +3947,18 @@ mod tests {
             informative: vec![1],
             audit: vec![rootblock::RootBlockAudit {
                 variant: 0, hf: 0.92, n_absent: 12, min_q: None, partner: None, in_block: true,
+                reason: rootblock::BlockReason::UntestedFewAbsences,
             }],
         };
         let rb = resolve_span_conflicts(rb, &variants);
         assert!(rb.block.is_empty(), "the overlapping block member must be pulled back");
         assert_eq!(rb.informative, vec![0, 1]);
-        assert!(
-            !rb.audit.iter().find(|a| a.variant == 0).unwrap().in_block,
-            "the audit row must reflect the reversal"
+        let a = rb.audit.iter().find(|a| a.variant == 0).unwrap();
+        assert!(!a.in_block, "the audit row must reflect the reversal");
+        assert_eq!(
+            a.reason,
+            rootblock::BlockReason::SpanConflict,
+            "the reason must be overwritten to span_conflict, not left at its pre-conflict value"
         );
     }
 
@@ -3946,9 +3982,11 @@ mod tests {
             audit: vec![
                 rootblock::RootBlockAudit {
                     variant: 1, hf: 0.85, n_absent: 15, min_q: None, partner: None, in_block: true,
+                    reason: rootblock::BlockReason::UntestedFewAbsences,
                 },
                 rootblock::RootBlockAudit {
                     variant: 2, hf: 0.88, n_absent: 20, min_q: None, partner: None, in_block: true,
+                    reason: rootblock::BlockReason::UntestedFewAbsences,
                 },
             ],
         };
@@ -3956,6 +3994,10 @@ mod tests {
         assert!(rb.block.is_empty(), "the whole overlapping chain must drain out of the block");
         assert_eq!(rb.informative, vec![0, 1, 2]);
         assert!(rb.audit.iter().all(|a| !a.in_block));
+        assert!(
+            rb.audit.iter().all(|a| a.reason == rootblock::BlockReason::SpanConflict),
+            "every pulled-back variant in the chain must be re-tagged span_conflict"
+        );
     }
 
     #[test]
@@ -3972,9 +4014,11 @@ mod tests {
             audit: vec![
                 rootblock::RootBlockAudit {
                     variant: 0, hf: 0.90, n_absent: 30, min_q: None, partner: None, in_block: true,
+                    reason: rootblock::BlockReason::UntestedFewAbsences,
                 },
                 rootblock::RootBlockAudit {
                     variant: 1, hf: 0.60, n_absent: 25, min_q: None, partner: None, in_block: true,
+                    reason: rootblock::BlockReason::UntestedFewAbsences,
                 },
             ],
         };
@@ -3982,6 +4026,7 @@ mod tests {
         assert!(rb.block.is_empty(), "a mutually-overlapping block cluster must empty entirely");
         assert_eq!(rb.informative, vec![0, 1]);
         assert!(rb.audit.iter().all(|a| !a.in_block));
+        assert!(rb.audit.iter().all(|a| a.reason == rootblock::BlockReason::SpanConflict));
     }
 
     #[test]
@@ -4017,18 +4062,78 @@ mod tests {
         );
     }
 
+    /// Doc claim (`docs/root-block-collapse.md`, Outputs section):
+    /// `write_variant_cooccurrence_upto` restricts to the first
+    /// `n_informative` columns before building any row, so a pair involving
+    /// a block variant is not printed with `NA` fields — its row is ABSENT
+    /// entirely. Assert that end-to-end, with the block non-empty AND two
+    /// informative variants surviving, so the table is non-empty and the
+    /// omission is not just "nothing left to pair".
+    #[test]
+    fn variant_cooccurrence_omits_block_variants_entirely() {
+        let n_reads = 100usize;
+        let mut block_col = vec![Some(1u8); 90];
+        block_col.extend(vec![Some(0u8); 10]);
+        let informative_a: Vec<Option<u8>> =
+            (0..n_reads).map(|r| Some(if r % 2 == 0 { 1u8 } else { 0u8 })).collect();
+        let informative_b: Vec<Option<u8>> =
+            (0..n_reads).map(|r| Some(if r < 30 { 1u8 } else { 0u8 })).collect();
+        let binary = BinaryMatrix {
+            variants: vec![
+                "m.750A>G".to_string(),
+                "m.16183A>C".to_string(),
+                "m.9477G>A".to_string(),
+            ],
+            reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
+            data: vec![block_col, informative_a, informative_b],
+        };
+        let hap = lineage::deduplicate(&binary, 1);
+
+        // Pin the premise: the block is non-empty and two informative
+        // variants remain, so the pair table below is guaranteed non-empty
+        // and the omission assertion is not vacuous.
+        let rb = rootblock::partition(&binary, &crate::rootblock::RootBlockConfig::default());
+        assert_eq!(rb.block, vec![0], "test premise violated: expected v0 alone to block");
+        assert_eq!(
+            rb.informative,
+            vec![1, 2],
+            "test premise violated: expected 2 informative variants"
+        );
+
+        let dir = std::env::temp_dir().join("himito_rb_cooc_omit");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("t").to_str().unwrap().to_string();
+
+        run_scite_pipeline(
+            &binary, &hap, 0.01, 0.05, 200, 1, 7, 1,
+            Some(&crate::rootblock::RootBlockConfig::default()), &prefix,
+        ).unwrap();
+
+        let cooc = std::fs::read_to_string(format!("{prefix}.variant_cooccurrence.tsv")).unwrap();
+        assert!(
+            cooc.lines().count() > 1,
+            "test premise violated: expected a non-empty cooccurrence table:\n{cooc}"
+        );
+        assert!(
+            !cooc.contains("m.750A>G"),
+            "the block variant must be OMITTED entirely, not printed with NA fields:\n{cooc}"
+        );
+    }
+
     #[test]
     fn write_root_block_table_reports_tested_and_untested_candidates() {
-        use crate::rootblock::RootBlockAudit;
+        use crate::rootblock::{BlockReason, RootBlockAudit};
         let variants = vec!["m.750A>G".to_string(), "m.310T>TC".to_string()];
         let audit = vec![
             RootBlockAudit {
                 variant: 0, hf: 0.90, n_absent: 12,
                 min_q: Some(0.42), partner: Some(1), in_block: true,
+                reason: BlockReason::UnstructuredAbsences,
             },
             RootBlockAudit {
                 variant: 1, hf: 0.99, n_absent: 3,
                 min_q: None, partner: None, in_block: true,
+                reason: BlockReason::UntestedFewAbsences,
             },
         ];
         let path = std::env::temp_dir().join("himito_test_root_block.tsv");
@@ -4037,10 +4142,38 @@ mod tests {
         std::fs::remove_file(&path).ok();
 
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines[0], "variant\thf\tn_absent\tmin_q\tpartner_variant\tin_block");
-        assert_eq!(lines[1], "m.750A>G\t0.900000\t12\t4.200000e-1\tm.310T>TC\ttrue");
-        assert_eq!(lines[2], "m.310T>TC\t0.990000\t3\tNA\tNA\ttrue",
+        assert_eq!(lines[0], "variant\thf\tn_absent\tmin_q\tpartner_variant\tin_block\treason");
+        assert_eq!(lines[1], "m.750A>G\t0.900000\t12\t4.200000e-1\tm.310T>TC\ttrue\tunstructured_absences");
+        assert_eq!(lines[2], "m.310T>TC\t0.990000\t3\tNA\tNA\ttrue\tuntested_few_absences",
                    "untested candidates report NA, not 0");
+    }
+
+    /// A saturated tie (min_q == 1.0) means no candidate partner was ever
+    /// strictly better than the incumbent, so `partition`'s pass 3 leaves
+    /// whichever `u` happened to sit lowest in variant order — an index with
+    /// nothing to do with the decision. The table must not dress that up as
+    /// "the best-discriminating partner".
+    #[test]
+    fn write_root_block_table_reports_na_partner_when_min_q_saturates() {
+        use crate::rootblock::{BlockReason, RootBlockAudit};
+        let variants =
+            vec!["m.16189T>C".to_string(), "m.56AT>A".to_string(), "m.16188CT>C".to_string()];
+        let audit = vec![RootBlockAudit {
+            variant: 0, hf: 0.87, n_absent: 20,
+            min_q: Some(1.0), partner: Some(1), in_block: true,
+            reason: BlockReason::UnstructuredAbsences,
+        }];
+        let path = std::env::temp_dir().join("himito_test_root_block_saturated.tsv");
+        write_root_block_table(&audit, &variants, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines[1],
+            "m.16189T>C\t0.870000\t20\t1.000000e0\tNA\ttrue\tunstructured_absences",
+            "a saturated min_q must blank the partner column, not print the arbitrary incumbent"
+        );
     }
 
     #[test]

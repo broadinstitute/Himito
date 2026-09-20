@@ -25,6 +25,39 @@ impl Default for RootBlockConfig {
     }
 }
 
+/// Why a candidate ended up on its side of the partition, for the audit
+/// table's `reason` column. Purely descriptive — records an existing
+/// decision, it never participates in making one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockReason {
+    /// Admitted without testing: either rule 2 (too few jointly-covered
+    /// absences to test), or no candidate partner offered a testable alt
+    /// call at all (`partition`'s pass 3, `best.get(&v) == None`) — both are
+    /// "cannot assess structure, so admit" outcomes, just from different
+    /// gates.
+    UntestedFewAbsences,
+    /// Tested: every partner's q exceeded `max_q`. No evidence the absences
+    /// are structured, so blocked.
+    UnstructuredAbsences,
+    /// Tested: some partner's q was at or below `max_q`. The absences are
+    /// structured, so kept in the search.
+    StructuredAbsences,
+    /// Would have been blocked, but pulled back because its REF span
+    /// overlaps another variant (`resolve_span_conflicts` in `scite.rs`).
+    SpanConflict,
+}
+
+impl BlockReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockReason::UntestedFewAbsences => "untested_few_absences",
+            BlockReason::UnstructuredAbsences => "unstructured_absences",
+            BlockReason::StructuredAbsences => "structured_absences",
+            BlockReason::SpanConflict => "span_conflict",
+        }
+    }
+}
+
 /// One row per candidate, i.e. per variant clearing `min_hf`. Variants below the
 /// gate are never candidates and produce no row.
 #[derive(Debug, Clone)]
@@ -37,6 +70,7 @@ pub struct RootBlockAudit {
     /// The variant achieving `min_q`; `None` when untested.
     pub partner: Option<usize>,
     pub in_block: bool,
+    pub reason: BlockReason,
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +158,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
             block.push(v);
             audit.push(RootBlockAudit {
                 variant: v, hf, n_absent, min_q: None, partner: None, in_block: true,
+                reason: BlockReason::UntestedFewAbsences,
             });
         } else {
             pending.push((v, hf, n_absent));
@@ -164,17 +199,25 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
 
     // Pass 3: decide each pending candidate, preserving ascending order.
     for (v, hf, n_absent) in pending {
-        let (min_q, partner, in_block) = match best.get(&v) {
+        let (min_q, partner, in_block, reason) = match best.get(&v) {
             // No testable partner: cannot assess structure, so admit.
-            None => (None, None, true),
-            Some(&(q, u)) => (Some(q), Some(u), q > cfg.max_q),
+            None => (None, None, true, BlockReason::UntestedFewAbsences),
+            Some(&(q, u)) => {
+                let in_block = q > cfg.max_q;
+                let reason = if in_block {
+                    BlockReason::UnstructuredAbsences
+                } else {
+                    BlockReason::StructuredAbsences
+                };
+                (Some(q), Some(u), in_block, reason)
+            }
         };
         if in_block {
             block.push(v);
         } else {
             informative.push(v);
         }
-        audit.push(RootBlockAudit { variant: v, hf, n_absent, min_q, partner, in_block });
+        audit.push(RootBlockAudit { variant: v, hf, n_absent, min_q, partner, in_block, reason });
     }
 
     block.sort_unstable();
@@ -275,6 +318,7 @@ mod tests {
         assert_eq!(rb.audit[0].n_absent, 5);
         assert!(rb.audit[0].min_q.is_none(), "rule 2 admits without testing");
         assert!(rb.audit[0].partner.is_none());
+        assert_eq!(rb.audit[0].reason, BlockReason::UntestedFewAbsences);
     }
 
     /// A germline variant whose absences are scattered: the reads lacking it
@@ -292,6 +336,7 @@ mod tests {
         let a = &rb.audit[0];
         assert!(a.in_block);
         assert!(a.min_q.unwrap() > 0.05, "min_q was {:?}", a.min_q);
+        assert_eq!(a.reason, BlockReason::UnstructuredAbsences);
     }
 
     /// A real subclone: the reads lacking v0 all carry a private allele.
@@ -308,6 +353,7 @@ mod tests {
         assert!(!a.in_block);
         assert!(a.min_q.unwrap() < 0.05, "min_q was {:?}", a.min_q);
         assert_eq!(a.partner, Some(1));
+        assert_eq!(a.reason, BlockReason::StructuredAbsences);
     }
 
     /// Read-level dropout makes two germline variants drop out on the SAME bad
@@ -341,6 +387,10 @@ mod tests {
         let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
         assert_eq!(rb.block, vec![0]);
         assert!(rb.audit[0].min_q.is_none());
+        // Untestable for lack of a partner, not for too few absences (v0 has
+        // 10, clearing `min_absent`) — both are grouped under the same
+        // "untested, admitted" reason; see `BlockReason::UntestedFewAbsences`.
+        assert_eq!(rb.audit[0].reason, BlockReason::UntestedFewAbsences);
     }
 
     /// Regression guard for "one Benjamini-Hochberg correction across ALL

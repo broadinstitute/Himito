@@ -1,7 +1,13 @@
 # Collapsing homoplasmic variants into a root block
 
-Status: **implemented, not yet validated on data that exercises it.** On by
-default; `--no-root-block` disables. Shipped in commits `ad22eb6..c61be3c`.
+Status: **implemented and validated on one real sample; NOT ready for
+cross-depth or cross-technology comparison.** On by default;
+`--no-root-block` disables. Shipped in commits `ad22eb6..e174098`.
+
+It recovers the rCRS haplogroup backbone blindly on real PacBio data (see
+"Real-data validation" below), but its decision rule is depth-dependent, which
+is disqualifying for the comparison this feature exists to support. Read both
+caveats before using it for anything published.
 
 Caveats before trusting it:
 

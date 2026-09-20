@@ -1048,6 +1048,20 @@ pub fn write_variant_cooccurrence(matrix: &CleanedMatrix, path: &str) -> Result<
     write_pair_cooccurrence_table(&matrix.variants, &pairs, path)
 }
 
+/// Co-occurrence over the first `n` variants only. Block variants are invariant
+/// in the cleaned matrix (all-present by construction), so D'/r2 are undefined
+/// for any pair involving one; `dprime_r2` would return 0.0 via its zero-variance
+/// guard (`scite.rs:991`), which does not crash but is a false statement.
+pub fn write_variant_cooccurrence_upto(matrix: &CleanedMatrix, n: usize, path: &str) -> Result<()> {
+    let truncated = CleanedMatrix {
+        variants: matrix.variants[..n].to_vec(),
+        reads: matrix.reads.clone(),
+        data: matrix.data[..n].to_vec(),
+        attachment: matrix.attachment.clone(),
+    };
+    write_variant_cooccurrence(&truncated, path)
+}
+
 /// Same statistics on the raw (pre-SCITE) matrix. Reads with a missing call
 /// (`None`) at either site are excluded from that pair's table, so `n_co`
 /// counts only reads jointly covering both variants.
@@ -1231,10 +1245,39 @@ fn format_support(support: Option<f64>) -> String {
     }
 }
 
+/// Per-candidate record of the root-block decision, so it is auditable rather
+/// than silent. One row per variant clearing the HF gate; variants below the
+/// gate were never candidates and produce no row.
+pub fn write_root_block_table(
+    audit: &[crate::rootblock::RootBlockAudit],
+    variants: &[String],
+    path: &str,
+) -> Result<()> {
+    let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
+    writeln!(w, "variant\thf\tn_absent\tmin_q\tpartner_variant\tin_block")?;
+    for a in audit {
+        let min_q = match a.min_q {
+            Some(q) => format!("{q:.6e}"),
+            None => "NA".to_string(),
+        };
+        let partner = match a.partner {
+            Some(u) => variants[u].clone(),
+            None => "NA".to_string(),
+        };
+        writeln!(
+            w,
+            "{}\t{:.6}\t{}\t{min_q}\t{partner}\t{}",
+            variants[a.variant], a.hf, a.n_absent, a.in_block
+        )?;
+    }
+    Ok(())
+}
+
 pub fn write_mutation_tree(
     tree: &MutationTree,
     matrix: &CleanedMatrix,
     evidence: &[EdgeEvidence],
+    block_names: &[String],
     path: &str,
 ) -> Result<()> {
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
@@ -1260,6 +1303,17 @@ pub fn write_mutation_tree(
             "{node}\t{}\t{parent}\t{}\t{n_reads}\t{support}\t{n_child}\t{n_parent}",
             node_name(node),
             node_name(parent)
+        )?;
+    }
+    // The root block is ONE row carrying every member, because its internal
+    // order is exactly what the data does not determine.
+    if !block_names.is_empty() {
+        let root_reads = matrix.attachment.iter().filter(|&&a| a == tree.root()).count();
+        writeln!(
+            w,
+            "ROOT_BLOCK\t{}\t{}\tROOT\t{root_reads}\tNA\tNA\tNA",
+            block_names.join(","),
+            tree.root()
         )?;
     }
     Ok(())
@@ -1362,6 +1416,7 @@ pub fn write_read_lineage_newick(
     hap_matrix: &HaplotypeMatrix,
     rates: &ErrorRates,
     evidence: &[EdgeEvidence],
+    block_names: &[String],
     path: &str,
 ) -> Result<()> {
     let children = tree.children_of();
@@ -1380,6 +1435,15 @@ pub fn write_read_lineage_newick(
         &hap_matrix.variants,
         evidence,
     );
+
+    // The block rides on the root, reusing the NHX convention the branches
+    // already use. `emit_lineage_node` always terminates the root token with
+    // the literal `)ROOT`, which nothing else in the string can produce.
+    let body = if block_names.is_empty() {
+        body
+    } else {
+        body.replace(")ROOT", &format!(")ROOT[&&NHX:root_block={}]", block_names.join(",")))
+    };
 
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
     writeln!(w, "{body};")?;
@@ -1870,7 +1934,7 @@ pub fn run_scite_pipeline(
     info!("[SCITE] After unary-path polish log-likelihood: {ll_polish:.3}");
 
     let mut cleaned = attach_all_reads(binary, &tree, &rates);
-    let _n_informative = rootblock::append_block_to_cleaned(&mut cleaned, &block_names);
+    let n_informative = rootblock::append_block_to_cleaned(&mut cleaned, &block_names);
 
     // Per-edge order evidence: how much likelihood pins each mutation above its
     // parent, and the read counts behind it. Reported rather than acted on — a
@@ -1898,10 +1962,13 @@ pub fn run_scite_pipeline(
     }
 
     write_cleaned_matrix(&cleaned, &format!("{output_prefix}.cleaned_matrix.csv"))?;
-    write_variant_cooccurrence(&cleaned, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
+    write_variant_cooccurrence_upto(&cleaned, n_informative, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
     write_raw_variant_cooccurrence(full_binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
     write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
-    write_mutation_tree(&tree, &cleaned, &evidence, &format!("{output_prefix}.mutation_tree.tsv"))?;
+    write_mutation_tree(&tree, &cleaned, &evidence, &block_names, &format!("{output_prefix}.mutation_tree.tsv"))?;
+    if root_block.is_some() {
+        write_root_block_table(&rb.audit, &full_binary.variants, &format!("{output_prefix}.root_block.tsv"))?;
+    }
 
     // Deduplicate the SCITE-cleaned reads into haplotypes for the lineage tree.
     // Keep the tree's variant set/order (no prevalence re-filter) so the mutation
@@ -1921,6 +1988,7 @@ pub fn run_scite_pipeline(
         &cleaned_hap_matrix,
         &rates,
         &evidence,
+        &block_names,
         &format!("{output_prefix}.read_lineage.nwk"),
     )?;
 
@@ -2825,7 +2893,7 @@ mod tests {
             EdgeEvidence { support_ll: Some(4.25), counts: Some((3, 7)) },
         ];
         let path = std::env::temp_dir().join("himito_test_write_mutation_tree.tsv");
-        write_mutation_tree(&tree, &matrix, &evidence, path.to_str().unwrap()).unwrap();
+        write_mutation_tree(&tree, &matrix, &evidence, &[], path.to_str().unwrap()).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
         assert_eq!(
@@ -3006,7 +3074,7 @@ mod tests {
             EdgeEvidence { support_ll: Some(0.0), counts: Some((2, 2)) },
             EdgeEvidence { support_ll: Some(3.0), counts: Some((1, 4)) },
         ];
-        write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, path.to_str().unwrap())
+        write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, &[], path.to_str().unwrap())
             .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
@@ -3043,7 +3111,7 @@ mod tests {
 
         let path = std::env::temp_dir().join("himito_test_read_lineage_root_tip.nwk");
         let evidence = vec![EdgeEvidence { support_ll: None, counts: None }];
-        write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, path.to_str().unwrap())
+        write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, &[], path.to_str().unwrap())
             .unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
@@ -3830,6 +3898,10 @@ mod tests {
         let csv = std::fs::read_to_string(format!("{prefix}.cleaned_matrix.csv")).unwrap();
         assert!(csv.contains("m.750A>G"), "block variants stay in the cleaned matrix");
         assert!(csv.contains("m.302A>ACC"));
+
+        let tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
+        assert!(tsv.contains("ROOT_BLOCK"), "the germline variant should be blocked");
+        assert!(tsv.contains("m.302A>ACC"), "the informative variant stays a tree node");
     }
 
     #[test]
@@ -3943,6 +4015,68 @@ mod tests {
             raw.contains("m.750A>G"),
             "the blocked variant must still appear in the raw co-occurrence table:\n{raw}"
         );
+    }
+
+    #[test]
+    fn write_root_block_table_reports_tested_and_untested_candidates() {
+        use crate::rootblock::RootBlockAudit;
+        let variants = vec!["m.750A>G".to_string(), "m.310T>TC".to_string()];
+        let audit = vec![
+            RootBlockAudit {
+                variant: 0, hf: 0.90, n_absent: 12,
+                min_q: Some(0.42), partner: Some(1), in_block: true,
+            },
+            RootBlockAudit {
+                variant: 1, hf: 0.99, n_absent: 3,
+                min_q: None, partner: None, in_block: true,
+            },
+        ];
+        let path = std::env::temp_dir().join("himito_test_root_block.tsv");
+        write_root_block_table(&audit, &variants, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines[0], "variant\thf\tn_absent\tmin_q\tpartner_variant\tin_block");
+        assert_eq!(lines[1], "m.750A>G\t0.900000\t12\t4.200000e-1\tm.310T>TC\ttrue");
+        assert_eq!(lines[2], "m.310T>TC\t0.990000\t3\tNA\tNA\ttrue",
+                   "untested candidates report NA, not 0");
+    }
+
+    #[test]
+    fn write_mutation_tree_emits_one_row_for_the_whole_root_block() {
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        let matrix = small_cleaned_matrix();
+        let evidence = vec![
+            EdgeEvidence { support_ll: None, counts: None },
+            EdgeEvidence { support_ll: Some(4.25), counts: Some((3, 7)) },
+        ];
+        let block = vec!["m.750A>G".to_string(), "m.16183A>C".to_string()];
+        let path = std::env::temp_dir().join("himito_test_mt_block.tsv");
+        write_mutation_tree(&tree, &matrix, &evidence, &block, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        let block_rows: Vec<&str> =
+            content.lines().filter(|l| l.starts_with("ROOT_BLOCK")).collect();
+        assert_eq!(block_rows.len(), 1, "the block is ONE row, not one per member");
+        assert!(block_rows[0].contains("m.750A>G,m.16183A>C"));
+        assert!(block_rows[0].contains("ROOT"));
+    }
+
+    #[test]
+    fn write_mutation_tree_with_empty_block_emits_no_block_row() {
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        let matrix = small_cleaned_matrix();
+        let evidence = vec![
+            EdgeEvidence { support_ll: None, counts: None },
+            EdgeEvidence { support_ll: Some(4.25), counts: Some((3, 7)) },
+        ];
+        let path = std::env::temp_dir().join("himito_test_mt_noblock.tsv");
+        write_mutation_tree(&tree, &matrix, &evidence, &[], path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(!content.contains("ROOT_BLOCK"));
     }
 }
 

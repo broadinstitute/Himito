@@ -497,4 +497,14 @@ mod tests {
         assert_eq!(c.variants[0], "m.1A>G", "node 0 still resolves to its variant");
         assert_eq!(c.variants[1], "m.2A>G", "node 1 still resolves to its variant");
     }
+
+    #[test]
+    fn default_config_matches_the_documented_values() {
+        // These four numbers are quoted in docs/root-block-collapse.md and in
+        // the CLI help. Changing one without the others is a bug.
+        let c = RootBlockConfig::default();
+        assert!((c.min_hf - 0.80).abs() < 1e-12);
+        assert!((c.max_q - 0.05).abs() < 1e-12);
+        assert_eq!(c.min_absent, 10);
+    }
 }

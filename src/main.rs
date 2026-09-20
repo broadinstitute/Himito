@@ -595,6 +595,27 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 3)]
         mcmc_chains: usize,
 
+        /// disable root-block collapsing; every variant enters the mutation-tree
+        /// search, reproducing pre-1.2 behaviour
+        #[clap(long, action)]
+        no_root_block: bool,
+
+        /// root block: minimum HF for a variant to be CONSIDERED homoplasmic.
+        /// A gate only — the decision is whether the reads lacking the variant
+        /// carry any distinguishing allele
+        #[clap(long, value_parser, default_value_t = 0.80)]
+        root_block_min_hf: f64,
+
+        /// root block: Benjamini-Hochberg q above which a variant's absences
+        /// count as unstructured (dropout rather than a real subclone)
+        #[clap(long, value_parser, default_value_t = 0.05)]
+        root_block_max_q: f64,
+
+        /// root block: below this many absent calls, admit a high-HF variant
+        /// without testing — there is too little to assess either way
+        #[clap(long, value_parser, default_value_t = 10)]
+        root_block_min_absent: usize,
+
         /// output prefix; writes <prefix>.haplotype_map.tsv
         #[clap(short, long, value_parser, required = true)]
         output_prefix: String,
@@ -955,6 +976,10 @@ fn main() {
             fn_rate,
             mcmc_iterations,
             mcmc_chains,
+            no_root_block,
+            root_block_min_hf,
+            root_block_max_q,
+            root_block_min_absent,
             output_prefix,
         } => {
             let matrix_file = matrix_file.to_str().expect("matrix-file path is not valid UTF-8");
@@ -963,6 +988,15 @@ fn main() {
                 .map(|p| p.to_str().expect("vcf-file path is not valid UTF-8"));
             let (fp_rate, fn_rate) =
                 lineage::resolve_error_rates(&data_type, fp_rate, fn_rate);
+            let root_block = if no_root_block {
+                None
+            } else {
+                Some(rootblock::RootBlockConfig {
+                    min_hf: root_block_min_hf,
+                    max_q: root_block_max_q,
+                    min_absent: root_block_min_absent,
+                })
+            };
             if let Err(e) = lineage::start(
                 matrix_file,
                 vcf_file,
@@ -976,6 +1010,7 @@ fn main() {
                 mcmc_iterations,
                 mcmc_chains,
                 LINEAGE_MCMC_SEED,
+                root_block,
                 &output_prefix,
             ) {
                 eprintln!("Error running lineage analysis: {:#}", e);

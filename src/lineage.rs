@@ -695,6 +695,7 @@ pub fn start(
     mcmc_iterations: usize,
     mcmc_chains: usize,
     mcmc_seed: u64,
+    root_block: Option<crate::rootblock::RootBlockConfig>,
     output_prefix: &str,
 ) -> Result<()> {
     env_logger::init();
@@ -772,7 +773,7 @@ pub fn start(
         mcmc_chains,
         mcmc_seed,
         min_reads,
-        None,
+        root_block.as_ref(),
         output_prefix,
     )?;
 

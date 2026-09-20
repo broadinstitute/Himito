@@ -1679,6 +1679,112 @@ fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usiz
     }
 }
 
+/// A blocked (homoplasmic) variant whose REF span overlaps a variant that
+/// stays informative is not actually homoplasmic: if there is real
+/// heteroplasmy at that locus, the high-HF member is the major allele of a
+/// heteroplasmic site, not a fixed germline call, and belongs in the tree.
+/// `append_block_to_cleaned` marks every block member present on every read,
+/// which would otherwise assert two mutually-exclusive alleles on one
+/// molecule — structurally impossible pre-partition.
+///
+/// Two passes:
+/// 1. Pull any block member back into `informative` if its span overlaps a
+///    variant *currently* in `informative`, iterating to a fixpoint — pulling
+///    one member back can newly conflict with another block member that
+///    overlaps it, so a single sweep is not enough.
+/// 2. Among whatever remains blocked, no two members may overlap each other
+///    either (same contradiction, purely within the block). Resolve each
+///    overlapping cluster by keeping the highest-HF member (ties broken
+///    toward the lowest variant index, for a deterministic result) and
+///    pulling every other member of that cluster back to informative. At the
+///    default `min_hf = 0.80` two mutually-exclusive alleles cannot both
+///    clear the gate, so this is unreachable there; a lower
+///    `--root-block-min-hf` makes it reachable.
+///
+/// `variants` must be the full (unrestricted) variant list `rb` was computed
+/// over, so span indices line up. Sorts `block`/`informative`/`audit` by
+/// variant index on the way out, and flips `in_block` to `false` on every
+/// audit row for a pulled-back variant.
+fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> rootblock::RootBlock {
+    let spans = variant_spans(variants);
+    let audit_hf: HashMap<usize, f64> = rb.audit.iter().map(|a| (a.variant, a.hf)).collect();
+
+    let mut informative: std::collections::BTreeSet<usize> = rb.informative.iter().copied().collect();
+    let mut block: std::collections::BTreeSet<usize> = rb.block.iter().copied().collect();
+    let mut pulled_back: Vec<usize> = Vec::new();
+
+    loop {
+        let to_pull: Vec<usize> = block
+            .iter()
+            .copied()
+            .filter(|&v| informative.iter().any(|&u| spans[v].overlaps(&spans[u])))
+            .collect();
+        if to_pull.is_empty() {
+            break;
+        }
+        for v in to_pull {
+            block.remove(&v);
+            informative.insert(v);
+            pulled_back.push(v);
+        }
+    }
+
+    let remaining: Vec<usize> = block.iter().copied().collect();
+    let mut visited = vec![false; remaining.len()];
+    for start in 0..remaining.len() {
+        if visited[start] {
+            continue;
+        }
+        let mut component = vec![start];
+        visited[start] = true;
+        let mut i = 0;
+        while i < component.len() {
+            let cur = remaining[component[i]];
+            for (j, &candidate) in remaining.iter().enumerate() {
+                if !visited[j] && spans[cur].overlaps(&spans[candidate]) {
+                    visited[j] = true;
+                    component.push(j);
+                }
+            }
+            i += 1;
+        }
+        if component.len() > 1 {
+            let mut members: Vec<usize> = component.iter().map(|&ci| remaining[ci]).collect();
+            // Highest HF wins; ties go to the lowest variant index.
+            members.sort_by(|&a, &b| audit_hf[&b].partial_cmp(&audit_hf[&a]).unwrap().then(a.cmp(&b)));
+            for &v in &members[1..] {
+                block.remove(&v);
+                informative.insert(v);
+                pulled_back.push(v);
+            }
+        }
+    }
+
+    if !pulled_back.is_empty() {
+        pulled_back.sort_unstable();
+        let names: Vec<String> = pulled_back.iter().map(|&v| variants[v].clone()).collect();
+        info!(
+            "[SCITE] Root block: pulled {} variant(s) back into the search — their span \
+             overlaps a surviving informative variant, so any homoplasmy there is not clean: {}",
+            names.len(),
+            names.join(", ")
+        );
+    }
+
+    for a in rb.audit.iter_mut() {
+        if pulled_back.contains(&a.variant) {
+            a.in_block = false;
+        }
+    }
+
+    rb.block = block.into_iter().collect();
+    rb.informative = informative.into_iter().collect();
+    rb.block.sort_unstable();
+    rb.informative.sort_unstable();
+    rb.audit.sort_unstable_by_key(|a| a.variant);
+    rb
+}
+
 /// Run the MCMC mutation-tree search (starting from an NJ-tree-derived guess
 /// when one can be built), attach every read to its best-fitting node, and
 /// write all SCITE output files with the given `output_prefix`.
@@ -1712,6 +1818,14 @@ pub fn run_scite_pipeline(
         Some(cfg) => rootblock::partition(binary, cfg),
         None => rootblock::RootBlock::disabled(binary.variants.len()),
     };
+    // A block member sharing a REF span with a surviving informative variant
+    // is not homoplasmic — see `resolve_span_conflicts`. Must run against the
+    // full (unrestricted) variant list, before `binary` is shadowed below.
+    let rb = resolve_span_conflicts(rb, &binary.variants);
+    // `write_raw_variant_cooccurrence` reports the raw (pre-partition) data,
+    // where block variants are NOT invariant — they carry exactly the dropout
+    // that made them candidates — so it must keep seeing every variant.
+    let full_binary = binary;
     let block_names: Vec<String> =
         rb.block.iter().map(|&v| binary.variants[v].clone()).collect();
     if !block_names.is_empty() {
@@ -1733,11 +1847,6 @@ pub fn run_scite_pipeline(
     let search_hap_matrix =
         if block_names.is_empty() { None } else { Some(lineage::deduplicate(binary, min_reads)) };
     let hap_matrix: &HaplotypeMatrix = search_hap_matrix.as_ref().unwrap_or(hap_matrix);
-    // One variant is a valid, if degenerate, run: the tree can only be
-    // root → variant, so there is no topology to search and no variant pair to
-    // score. Every output file is still produced (the two co-occurrence tables
-    // are header-only), which keeps single-variant samples in the same reporting
-    // format as the rest.
     let no_informative = binary.variants.is_empty();
     if no_informative {
         info!(
@@ -1746,6 +1855,11 @@ pub fn run_scite_pipeline(
             block_names.len()
         );
     }
+    // One variant is a valid, if degenerate, run: the tree can only be
+    // root → variant, so there is no topology to search and no variant pair to
+    // score. Every output file is still produced (the two co-occurrence tables
+    // are header-only), which keeps single-variant samples in the same reporting
+    // format as the rest.
     let single_variant = binary.variants.len() == 1;
     if single_variant {
         info!(
@@ -1837,7 +1951,7 @@ pub fn run_scite_pipeline(
 
     write_cleaned_matrix(&cleaned, &format!("{output_prefix}.cleaned_matrix.csv"))?;
     write_variant_cooccurrence(&cleaned, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
-    write_raw_variant_cooccurrence(binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
+    write_raw_variant_cooccurrence(full_binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
     write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
     write_mutation_tree(&tree, &cleaned, &evidence, &format!("{output_prefix}.mutation_tree.tsv"))?;
 
@@ -3704,6 +3818,13 @@ mod tests {
             data: vec![alternating, blocky],
         };
         let hap = lineage::deduplicate(&binary, 1);
+
+        // Pin down the premise: this test is only meaningful if the partition
+        // actually produces an empty block. Without this, gutting `partition`
+        // to always return `disabled` would still pass.
+        let rb = rootblock::partition(&binary, &crate::rootblock::RootBlockConfig::default());
+        assert!(rb.block.is_empty(), "test premise violated: partition must find no block here");
+
         let dir = std::env::temp_dir().join("himito_rb_empty");
         std::fs::create_dir_all(&dir).unwrap();
         let on = dir.join("on").to_str().unwrap().to_string();
@@ -3715,7 +3836,14 @@ mod tests {
         ).unwrap();
         run_scite_pipeline(&binary, &hap, 0.01, 0.05, 200, 1, 7, 1, None, &off).unwrap();
 
-        for ext in [".mutation_tree.tsv", ".cleaned_matrix.csv", ".read_lineage.nwk"] {
+        for ext in [
+            ".mutation_tree.tsv",
+            ".cleaned_matrix.csv",
+            ".read_lineage.nwk",
+            ".variant_cooccurrence.tsv",
+            ".raw_variant_cooccurrence.tsv",
+            ".molecule_summary.tsv",
+        ] {
             let a = std::fs::read_to_string(format!("{on}{ext}")).unwrap();
             let b = std::fs::read_to_string(format!("{off}{ext}")).unwrap();
             assert_eq!(a, b, "{ext} differs between an empty-block run and a disabled run");
@@ -3754,6 +3882,116 @@ mod tests {
         let csv = std::fs::read_to_string(format!("{prefix}.cleaned_matrix.csv")).unwrap();
         assert!(csv.contains("m.750A>G"), "block variants stay in the cleaned matrix");
         assert!(csv.contains("m.302A>ACC"));
+    }
+
+    #[test]
+    fn resolve_span_conflicts_pulls_back_a_block_variant_overlapping_informative() {
+        // Same shape as the real failure: a blocked indel and an informative
+        // substitution both anchored at position 310, so their REF spans
+        // (both [310, 311)) overlap.
+        let variants = vec!["m.310T>TC".to_string(), "m.310T>C".to_string()];
+        let rb = rootblock::RootBlock {
+            block: vec![0],
+            informative: vec![1],
+            audit: vec![rootblock::RootBlockAudit {
+                variant: 0, hf: 0.92, n_absent: 12, min_q: None, partner: None, in_block: true,
+            }],
+        };
+        let rb = resolve_span_conflicts(rb, &variants);
+        assert!(rb.block.is_empty(), "the overlapping block member must be pulled back");
+        assert_eq!(rb.informative, vec![0, 1]);
+        assert!(
+            !rb.audit.iter().find(|a| a.variant == 0).unwrap().in_block,
+            "the audit row must reflect the reversal"
+        );
+    }
+
+    #[test]
+    fn resolve_span_conflicts_needs_more_than_one_pass_to_reach_a_fixpoint() {
+        // P is already informative. A overlaps P directly. B overlaps only A,
+        // not P. A single sweep pulls A back (it conflicts with the original
+        // informative set) but leaves B still blocked, even though B now
+        // conflicts with the freshly-informative A — a second pass is needed.
+        let variants = vec![
+            "m.300A>G".to_string(),   // P: informative, span [300, 301)
+            "m.300AT>A".to_string(),  // A: block, span [300, 302), overlaps P
+            "m.301TG>T".to_string(),  // B: block, span [301, 303), overlaps A only
+        ];
+        let rb = rootblock::RootBlock {
+            block: vec![1, 2],
+            informative: vec![0],
+            audit: vec![
+                rootblock::RootBlockAudit {
+                    variant: 1, hf: 0.85, n_absent: 15, min_q: None, partner: None, in_block: true,
+                },
+                rootblock::RootBlockAudit {
+                    variant: 2, hf: 0.88, n_absent: 20, min_q: None, partner: None, in_block: true,
+                },
+            ],
+        };
+        let rb = resolve_span_conflicts(rb, &variants);
+        assert!(rb.block.is_empty(), "both block members must clear through the fixpoint");
+        assert_eq!(rb.informative, vec![0, 1, 2]);
+        assert!(rb.audit.iter().all(|a| !a.in_block));
+    }
+
+    #[test]
+    fn resolve_span_conflicts_breaks_block_vs_block_overlap_by_hf_then_lowest_index() {
+        // Unreachable at the default min_hf = 0.80 (two mutually-exclusive
+        // alleles cannot both exceed 0.80), but a lower --root-block-min-hf
+        // makes it reachable: two block members at the same locus, tied HF,
+        // must resolve deterministically rather than by iteration order.
+        let variants = vec!["m.500A>G".to_string(), "m.500A>T".to_string()];
+        let rb = rootblock::RootBlock {
+            block: vec![0, 1],
+            informative: vec![],
+            audit: vec![
+                rootblock::RootBlockAudit {
+                    variant: 0, hf: 0.60, n_absent: 30, min_q: None, partner: None, in_block: true,
+                },
+                rootblock::RootBlockAudit {
+                    variant: 1, hf: 0.60, n_absent: 25, min_q: None, partner: None, in_block: true,
+                },
+            ],
+        };
+        let rb = resolve_span_conflicts(rb, &variants);
+        assert_eq!(rb.block, vec![0], "tied HF must resolve to the lowest variant index");
+        assert_eq!(rb.informative, vec![1]);
+        assert!(rb.audit.iter().find(|a| a.variant == 0).unwrap().in_block);
+        assert!(!rb.audit.iter().find(|a| a.variant == 1).unwrap().in_block);
+    }
+
+    #[test]
+    fn raw_cooccurrence_keeps_block_variants() {
+        // Block variants are not invariant in the RAW data — they carry
+        // exactly the dropout that made them candidates — so unlike the
+        // cleaned-matrix tables, the raw co-occurrence table must still
+        // report them.
+        let n_reads = 100usize;
+        let mut germline = vec![Some(1u8); 90];
+        germline.extend(vec![Some(0u8); 10]);
+        let real: Vec<Option<u8>> =
+            (0..n_reads).map(|r| Some(if r % 2 == 0 { 1u8 } else { 0u8 })).collect();
+        let binary = BinaryMatrix {
+            variants: vec!["m.750A>G".to_string(), "m.302A>ACC".to_string()],
+            reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
+            data: vec![germline, real],
+        };
+        let hap = lineage::deduplicate(&binary, 1);
+        let dir = std::env::temp_dir().join("himito_rb_raw_cooc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("t").to_str().unwrap().to_string();
+
+        run_scite_pipeline(
+            &binary, &hap, 0.01, 0.05, 200, 1, 7, 1,
+            Some(&crate::rootblock::RootBlockConfig::default()), &prefix,
+        ).unwrap();
+
+        let raw = std::fs::read_to_string(format!("{prefix}.raw_variant_cooccurrence.tsv")).unwrap();
+        assert!(
+            raw.contains("m.750A>G"),
+            "the blocked variant must still appear in the raw co-occurrence table:\n{raw}"
+        );
     }
 }
 

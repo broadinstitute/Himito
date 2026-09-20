@@ -952,7 +952,7 @@ fn lchoose(n: f64, k: f64) -> f64 {
 
 /// One-sided Fisher's exact p for enrichment of the `n11` cell. Returns
 /// `(odds_ratio, p_greater)`.
-fn fisher_greater(n11: usize, n10: usize, n01: usize, n00: usize) -> (f64, f64) {
+pub(crate) fn fisher_greater(n11: usize, n10: usize, n01: usize, n00: usize) -> (f64, f64) {
     let (a, b, c, d) = (n11 as f64, n10 as f64, n01 as f64, n00 as f64);
     let r1 = a + b;
     let r2 = c + d;

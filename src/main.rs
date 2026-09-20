@@ -13,6 +13,7 @@ mod correct;
 mod minorhap;
 mod callnumts;
 mod lineage;
+mod rootblock;
 mod scite;
 mod denoise;
 mod denoise_indel;

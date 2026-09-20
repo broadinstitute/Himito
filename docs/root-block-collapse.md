@@ -3,23 +3,42 @@
 Status: **implemented, not yet validated on data that exercises it.** On by
 default; `--no-root-block` disables. Shipped in commits `ad22eb6..c61be3c`.
 
-Two caveats before trusting it:
+Caveats before trusting it:
 
 * **The benchmark re-run promised below has NOT been done.** `sweep_fpfn.sh`
   needs `sim.matrix.csv` from a prior `run_eval.sh` run, which is not present,
   and regenerating it needs the simulation environment. `sweep_metrics.tsv` in
   the tree is still the pre-change baseline.
-* **No real-data run has yet produced a non-empty block.** On
-  `SMaHT/SMHT005-3AK-ont.matrix.csv` no variant clears the default `min_hf`
-  gate (that matrix tops out at HF 0.42), and lowering the gate to 0.3 admits
-  six candidates that the absence-structure test then correctly *rejects*
-  (q ≈ 1e-32 … 1e-65 — their absences are strongly marked by `m.8860A>G`, so
-  they are real subclones, not dropout). The test is behaving, but the kept
-  path is so far only covered by unit tests.
+* **Block membership is depth-dependent — a known limitation, not yet
+  fixed.** The decision rule is a q-value threshold (see "The decision rule"
+  below), and a q-value tests *statistical power*, not effect size: with more
+  reads, the same dropout pattern reaches significance and the variant is
+  pulled out of the block. Measured on `Himito_benchmark/HG002.matrix.csv` by
+  subsampling the same sample to different read counts: 125/250/500 reads all
+  block 10 variants, 1000 reads blocks 8, 2000 reads blocks only 3. The
+  planned fix is to replace the criterion with an **equivalence test** —
+  blocking on positive evidence that the association is negligible, rather
+  than on a failure to detect one, which would make membership converge as
+  depth increases instead of shrinking. That work is not yet done. Until it
+  lands, **do not use this feature to compare block composition across
+  different depths or technologies** — a shrinking block at higher depth is
+  an artifact of this test, not necessarily a real difference in the
+  underlying variants.
 
 Verified: the escape hatch is exact. All eight output files are byte-identical
 between a binary built at the pre-feature commit `4d59bd6` and this one run
 with `--no-root-block`, on real ONT data.
+
+**Real-data validation.** `SMaHT/SMHT005-3AK-pacbio.matrix.csv`, run at stock
+default thresholds, blocks exactly the nine variants that make up the rCRS
+haplogroup backbone: `m.263A>G, m.750A>G, m.1438A>G, m.3010G>A, m.4769A>G,
+m.8860A>G, m.9743A>G, m.15326A>G, m.16519T>C` (HF range 0.836–0.899). The one
+candidate the test rejects and keeps in the search, `m.16189T>C`, is refused
+at q = 1e-203 because its absences are marked by the adjacent poly-C indel
+`m.16188CT>C` — a read-level dropout confounder the test correctly separates
+from the real backbone. This is the feature's best validation to date: a
+haplogroup-defining variant set recovered blindly, with the one genuinely
+structured absence pattern in the matrix correctly excluded.
 
 ## Where we are
 
@@ -119,6 +138,11 @@ pub struct RootBlockAudit {
     /// The `u` achieving `min_q`; `None` under rule 2.
     pub partner: Option<usize>,
     pub in_block: bool,
+    /// Why: rule 2/no-testable-partner, tested-and-blocked, tested-and-kept,
+    /// or (set later by `resolve_span_conflicts`) span-conflict pull-back.
+    /// See "Outputs" below for the four values. Overwritten, not merged, by
+    /// the span-conflict pass.
+    pub reason: BlockReason,
 }
 
 pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock;
@@ -149,6 +173,17 @@ For a variant `v`:
    Too few absences to test structure, and too few to inform topology either
    way. This is the PacBio case (`readnum` 0-5 on the trunk).
 3. Otherwise, run the absence-structure test below.
+4. **Span-conflict pull-back** (`resolve_span_conflicts`, `scite.rs`), applied
+   after 1-3 have produced a candidate block: any block member whose REF span
+   overlaps *any* other variant in the full matrix — blocked or informative —
+   is pulled back into the search, unconditionally. `append_block_to_cleaned`
+   imputes every block member present on every read; wherever the overlapping
+   variant is also called present, that would assert two mutually-exclusive
+   alleles on one molecule, which was structurally impossible before the
+   partition ran. A real heteroplasmy at that locus means the high-HF member
+   is a major allele, not fixed germline, and belongs in the tree next to its
+   partner. This rule overrides whatever rules 1-3 decided; it never adds a
+   variant to the block, only removes one.
 
 #### Absence-structure test
 
@@ -212,21 +247,59 @@ designation corrects exactly the dropout that flagged the variant.
 clearing `--root-block-min-hf`. Variants below the gate produce no row:
 
 ```
-variant  hf  n_absent  min_q  partner_variant  in_block
+variant  hf  n_absent  min_q  partner_variant  in_block  reason
 ```
 
 `partner_variant` is the `u` achieving `min_q`. Candidates admitted by rule 2
 (untestable) report `min_q = NA`, `partner_variant = NA`, `in_block = true`.
+`partner_variant` is also reported as `NA` — even though `partner` is
+`Some(u)` internally — whenever `min_q >= 1.0`: a saturated tie means no
+partner was ever strictly better than the incumbent, so whichever `u` happens
+to sit lowest in variant order wins by construction, not by evidence, and
+printing it would read as "the best-discriminating partner" when it is
+nothing of the kind.
+
+`reason` disambiguates rows that would otherwise look identical or
+contradictory. It takes one of four values:
+
+* `untested_few_absences` — admitted without testing: either rule 2 (too few
+  jointly-covered absences), or no candidate partner offered a testable alt
+  call at all. Both report `min_q = NA`, `partner_variant = NA`.
+* `unstructured_absences` — tested; every partner's q exceeded `max_q`. No
+  evidence of structure, so blocked.
+* `structured_absences` — tested; some partner's q was at or below `max_q`.
+  The absences are structured, so kept in the search (`in_block = false`).
+* `span_conflict` — rule 3 (or rule 2) would have blocked this variant, but
+  rule 4 pulled it back because its REF span overlaps another variant. Without
+  this column, a span-conflict pull-back prints `min_q = NA`,
+  `partner_variant = NA`, `in_block = false` — the same `NA`/`NA` shape rule 2
+  produces, but with `in_block` flipped, and the table gives no reason why.
+  `reason` is what tells the two apart.
 
 **`<prefix>.mutation_tree.tsv`** — one extra row: reserved node id, `variant` =
 comma-joined block members, `parent_variant` = `ROOT`, `n_reads_attached` =
 reads attaching at root, support columns `NA`. Existing columns are unchanged so
 downstream parsers and the plotting script keep working.
 
-**`<prefix>.variant_cooccurrence.tsv`** — pairs involving a block variant emit
-`NA`. The variant is invariant in the cleaned matrix; `dprime_r2` guards zero
-variance and returns `0.0` (`scite.rs:991`), which does not crash but is a false
-statement.
+**`<prefix>.variant_cooccurrence.tsv`** — pairs involving a block variant are
+**omitted entirely**, not printed with `NA` fields. `write_variant_cooccurrence_upto`
+restricts the table to the first `n_informative` columns before building any
+row, so a block variant's row simply does not exist in this file (it is still
+present, with real statistics, in `<prefix>.raw_variant_cooccurrence.tsv`).
+The reason is the same one that motivates the restriction in the first place:
+the variant is invariant in the cleaned matrix, so `dprime_r2`'s zero-variance
+guard (`scite.rs:991`) would return `0.0` for any pair involving it, which
+does not crash but is a false statement about the data.
+
+**`<prefix>.molecule_summary.tsv`** — every block variant is listed in every
+read's `variants` column and counted in `n_variants`, **even for reads that
+did not span the locus.** This follows directly from imputation: block
+variants are homoplasmic by construction, so `CleanedMatrix` carries them as
+an all-`1` column for every read regardless of what that read actually
+covered, and `write_molecule_summary` reads straight off `CleanedMatrix`. This
+is consistent with `<prefix>.cleaned_matrix.csv`, which shows the same all-`1`
+columns, and is intended, not a bug — but it does mean per-read variant counts
+in this file are not raw observations for block members.
 
 **Newick** — the root already emits an explicit tip with no edge mutations
 (`scite.rs:1329`). Annotate that token with `[&&NHX:root_block=v1,v2,...]`,
@@ -277,8 +350,11 @@ The next run changes:
 * the Mitorsaw / MitoHiFi / mtdnaserver benchmark comparisons under
   `Himito_benchmark/`
 
-`--no-root-block` reproduces the old numbers. **Re-running the benchmark suite
-is part of this work, not a follow-up.**
+`--no-root-block` reproduces the old numbers. Re-running the benchmark suite
+was intended to be part of this work, not a follow-up — but per the header,
+**it has not actually been done**: `sweep_fpfn.sh` needs a `sim.matrix.csv`
+this checkout does not have, and `sweep_metrics.tsv` in the tree is still the
+pre-change baseline. Treat the benchmark comparison as outstanding.
 
 ## Rejected alternatives
 

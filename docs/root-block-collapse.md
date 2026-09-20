@@ -1,7 +1,25 @@
 # Collapsing homoplasmic variants into a root block
 
-Status: **designed, not implemented.** This records the design so the decision
-does not have to be re-derived.
+Status: **implemented, not yet validated on data that exercises it.** On by
+default; `--no-root-block` disables. Shipped in commits `ad22eb6..c61be3c`.
+
+Two caveats before trusting it:
+
+* **The benchmark re-run promised below has NOT been done.** `sweep_fpfn.sh`
+  needs `sim.matrix.csv` from a prior `run_eval.sh` run, which is not present,
+  and regenerating it needs the simulation environment. `sweep_metrics.tsv` in
+  the tree is still the pre-change baseline.
+* **No real-data run has yet produced a non-empty block.** On
+  `SMaHT/SMHT005-3AK-ont.matrix.csv` no variant clears the default `min_hf`
+  gate (that matrix tops out at HF 0.42), and lowering the gate to 0.3 admits
+  six candidates that the absence-structure test then correctly *rejects*
+  (q ≈ 1e-32 … 1e-65 — their absences are strongly marked by `m.8860A>G`, so
+  they are real subclones, not dropout). The test is behaving, but the kept
+  path is so far only covered by unit tests.
+
+Verified: the escape hatch is exact. All eight output files are byte-identical
+between a binary built at the pre-feature commit `4d59bd6` and this one run
+with `--no-root-block`, on real ONT data.
 
 ## Where we are
 

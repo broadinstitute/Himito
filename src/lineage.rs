@@ -772,6 +772,7 @@ pub fn start(
         mcmc_chains,
         mcmc_seed,
         min_reads,
+        None,
         output_prefix,
     )?;
 

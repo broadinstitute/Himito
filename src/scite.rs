@@ -10,6 +10,7 @@ use statrs::function::gamma::ln_gamma;
 use adjustp::{adjust, Procedure};
 
 use crate::lineage::{self, BinaryMatrix, HaplotypeMatrix};
+use crate::rootblock::{self, RootBlockConfig};
 
 /// A growable bitset over mutation/variant ids, backed by `Vec<u64>` words.
 ///
@@ -1696,6 +1697,7 @@ pub fn run_scite_pipeline(
     n_chains: usize,
     seed: u64,
     min_reads: usize,
+    root_block: Option<&RootBlockConfig>,
     output_prefix: &str,
 ) -> Result<HaplotypeMatrix> {
     if binary.variants.is_empty() {
@@ -1704,11 +1706,46 @@ pub fn run_scite_pipeline(
              relax the --min-hf / --max-hf thresholds."
         );
     }
+    // Partition before anything else looks at the matrix: everything below
+    // searches, scores and reports over `search_matrix`, not `binary`.
+    let rb = match root_block {
+        Some(cfg) => rootblock::partition(binary, cfg),
+        None => rootblock::RootBlock::disabled(binary.variants.len()),
+    };
+    let block_names: Vec<String> =
+        rb.block.iter().map(|&v| binary.variants[v].clone()).collect();
+    if !block_names.is_empty() {
+        info!(
+            "[SCITE] Root block: {} homoplasmic variant(s) removed from the search \
+             and reported unordered at the root: {}",
+            block_names.len(),
+            block_names.join(", ")
+        );
+    }
+    let search_matrix = rootblock::restrict(binary, &rb.informative);
+    let binary = &search_matrix;
+    // `hap_matrix` (used below only to seed the NJ-derived initial tree) was
+    // deduplicated from the *unrestricted* matrix by the caller, so its variant
+    // count no longer matches `binary` whenever the block is non-empty. Rebuild
+    // it over the restricted matrix in that case; when the block is empty this
+    // reproduces the caller's `hap_matrix` exactly (same matrix, same
+    // `min_reads`), so the disabled/empty-block outputs are unaffected.
+    let search_hap_matrix =
+        if block_names.is_empty() { None } else { Some(lineage::deduplicate(binary, min_reads)) };
+    let hap_matrix: &HaplotypeMatrix = search_hap_matrix.as_ref().unwrap_or(hap_matrix);
     // One variant is a valid, if degenerate, run: the tree can only be
     // root → variant, so there is no topology to search and no variant pair to
     // score. Every output file is still produced (the two co-occurrence tables
     // are header-only), which keeps single-variant samples in the same reporting
     // format as the rest.
+    let no_informative = binary.variants.is_empty();
+    if no_informative {
+        info!(
+            "[SCITE] Every variant is homoplasmic: the tree is ROOT plus a \
+             {}-variant block, so the MCMC search is skipped.",
+            block_names.len()
+        );
+    }
     let single_variant = binary.variants.len() == 1;
     if single_variant {
         info!(
@@ -1756,15 +1793,22 @@ pub fn run_scite_pipeline(
     );
 
     let rates = ErrorRates { fp_rate, fn_rate };
-    let (tree, ll) = run_mcmc_multichain(binary, &rates, n_iterations, n_chains, initial_tree.as_ref(), seed);
+    let (tree, ll) = if no_informative {
+        // Zero mutations: root only. `parent` is length n_mutations + 1 and the
+        // root's slot points at itself (see MutationTree::root).
+        (MutationTree { n_mutations: 0, parent: vec![0] }, 0.0)
+    } else {
+        run_mcmc_multichain(binary, &rates, n_iterations, n_chains, initial_tree.as_ref(), seed)
+    };
     info!("[SCITE] Best tree log-likelihood: {ll:.3}");
 
-    let tree = polish_unary_path_order(&tree, binary, &rates);
+    let tree = if no_informative { tree } else { polish_unary_path_order(&tree, binary, &rates) };
     let tree = enforce_position_exclusivity(&tree, &spans);
     let ll_polish = tree_log_likelihood(binary, &tree, &rates);
     info!("[SCITE] After unary-path polish log-likelihood: {ll_polish:.3}");
 
-    let cleaned = attach_all_reads(binary, &tree, &rates);
+    let mut cleaned = attach_all_reads(binary, &tree, &rates);
+    let _n_informative = rootblock::append_block_to_cleaned(&mut cleaned, &block_names);
 
     // Per-edge order evidence: how much likelihood pins each mutation above its
     // parent, and the read counts behind it. Reported rather than acted on — a
@@ -2753,7 +2797,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 50, 1, 7, 1, &prefix).unwrap();
+        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 50, 1, 7, 1, None, &prefix).unwrap();
 
         let nwk = format!("{prefix}.read_lineage.nwk");
         assert!(std::path::Path::new(&nwk).exists(), "expected {nwk} to exist");
@@ -2791,7 +2835,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 500, 2, 123, 1, &prefix).unwrap();
+        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 500, 2, 123, 1, None, &prefix).unwrap();
 
         let tree_tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
         // The mutation hangs directly off the root, with no order to resolve.
@@ -2853,7 +2897,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 500, 2, 123, 1, &prefix).unwrap();
+        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 500, 2, 123, 1, None, &prefix).unwrap();
 
         for suffix in [
             ".cleaned_matrix.csv",
@@ -3585,6 +3629,131 @@ mod tests {
         let reused = scorer.best_attachment(1, &small, &small_layout, &mut scratch);
         let fresh = scorer.best_attachment(1, &small, &small_layout, &mut Vec::new());
         assert_eq!(reused, fresh);
+    }
+
+    #[test]
+    fn run_scite_pipeline_with_all_variants_homoplasmic_does_not_panic() {
+        // Two germline variants, correlated dropout on the last 10 reads: both
+        // land in the block, leaving zero informative variants.
+        let n_reads = 100usize;
+        let mut row = vec![Some(1u8); 90];
+        row.extend(vec![Some(0u8); 10]);
+        let binary = BinaryMatrix {
+            variants: vec!["m.750A>G".to_string(), "m.16183A>C".to_string()],
+            reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
+            data: vec![row.clone(), row],
+        };
+        let hap = lineage::deduplicate(&binary, 1);
+        let dir = std::env::temp_dir().join("himito_rb_allblock");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("t").to_str().unwrap().to_string();
+
+        let out = run_scite_pipeline(
+            &binary,
+            &hap,
+            0.01,
+            0.05,
+            50,
+            1,
+            7,
+            1,
+            Some(&crate::rootblock::RootBlockConfig::default()),
+            &prefix,
+        );
+        assert!(out.is_ok(), "all-homoplasmic input must produce a tree, not an error");
+    }
+
+    #[test]
+    fn run_scite_pipeline_with_root_block_disabled_keeps_every_variant() {
+        let n_reads = 100usize;
+        let mut row = vec![Some(1u8); 90];
+        row.extend(vec![Some(0u8); 10]);
+        let binary = BinaryMatrix {
+            variants: vec!["m.750A>G".to_string(), "m.16183A>C".to_string()],
+            reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
+            data: vec![row.clone(), row],
+        };
+        let hap = lineage::deduplicate(&binary, 1);
+        let dir = std::env::temp_dir().join("himito_rb_disabled");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("t").to_str().unwrap().to_string();
+
+        run_scite_pipeline(&binary, &hap, 0.01, 0.05, 50, 1, 7, 1, None, &prefix).unwrap();
+
+        let tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
+        assert!(tsv.contains("m.750A>G"), "disabled must leave both variants in the tree");
+        assert!(tsv.contains("m.16183A>C"));
+        assert!(!tsv.contains("ROOT_BLOCK"), "disabled must emit no block row");
+    }
+
+    /// Spec requirement: an ENABLED run whose partition happens to be empty must
+    /// be indistinguishable from a disabled one. This is the guard that stops
+    /// the feature from perturbing data it was never meant to touch.
+    #[test]
+    fn enabled_run_with_empty_block_matches_disabled_run_exactly() {
+        // Both variants sit at HF 0.50, far below the 0.80 gate, so nothing is
+        // even a candidate.
+        let n_reads = 100usize;
+        let alternating: Vec<Option<u8>> =
+            (0..n_reads).map(|r| Some(if r % 2 == 0 { 1u8 } else { 0u8 })).collect();
+        let blocky: Vec<Option<u8>> =
+            (0..n_reads).map(|r| Some(if r < 50 { 1u8 } else { 0u8 })).collect();
+        let binary = BinaryMatrix {
+            variants: vec!["m.750A>G".to_string(), "m.16183A>C".to_string()],
+            reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
+            data: vec![alternating, blocky],
+        };
+        let hap = lineage::deduplicate(&binary, 1);
+        let dir = std::env::temp_dir().join("himito_rb_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let on = dir.join("on").to_str().unwrap().to_string();
+        let off = dir.join("off").to_str().unwrap().to_string();
+
+        run_scite_pipeline(
+            &binary, &hap, 0.01, 0.05, 200, 1, 7, 1,
+            Some(&crate::rootblock::RootBlockConfig::default()), &on,
+        ).unwrap();
+        run_scite_pipeline(&binary, &hap, 0.01, 0.05, 200, 1, 7, 1, None, &off).unwrap();
+
+        for ext in [".mutation_tree.tsv", ".cleaned_matrix.csv", ".read_lineage.nwk"] {
+            let a = std::fs::read_to_string(format!("{on}{ext}")).unwrap();
+            let b = std::fs::read_to_string(format!("{off}{ext}")).unwrap();
+            assert_eq!(a, b, "{ext} differs between an empty-block run and a disabled run");
+        }
+    }
+
+    /// Spec requirement: the existing single-variant short circuit
+    /// (`scite.rs:1712`) must still fire when the block leaves exactly one
+    /// informative variant behind. Asserts only on the cleaned matrix here;
+    /// the `ROOT_BLOCK` row it also produces arrives in Task 5, which extends
+    /// this test rather than adding a second one.
+    #[test]
+    fn one_informative_variant_after_partition_still_takes_the_single_variant_path() {
+        let n_reads = 100usize;
+        let mut germline = vec![Some(1u8); 90];
+        germline.extend(vec![Some(0u8); 10]);
+        let real: Vec<Option<u8>> =
+            (0..n_reads).map(|r| Some(if r % 2 == 0 { 1u8 } else { 0u8 })).collect();
+        let binary = BinaryMatrix {
+            variants: vec!["m.750A>G".to_string(), "m.302A>ACC".to_string()],
+            reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
+            data: vec![germline, real],
+        };
+        let hap = lineage::deduplicate(&binary, 1);
+        let dir = std::env::temp_dir().join("himito_rb_single");
+        std::fs::create_dir_all(&dir).unwrap();
+        let prefix = dir.join("t").to_str().unwrap().to_string();
+
+        run_scite_pipeline(
+            &binary, &hap, 0.01, 0.05, 200, 1, 7, 1,
+            Some(&crate::rootblock::RootBlockConfig::default()), &prefix,
+        ).unwrap();
+
+        // The germline variant left the search but survives in the cleaned
+        // matrix as an all-present column.
+        let csv = std::fs::read_to_string(format!("{prefix}.cleaned_matrix.csv")).unwrap();
+        assert!(csv.contains("m.750A>G"), "block variants stay in the cleaned matrix");
+        assert!(csv.contains("m.302A>ACC"));
     }
 }
 

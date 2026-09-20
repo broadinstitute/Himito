@@ -3947,7 +3947,7 @@ mod tests {
             informative: vec![1],
             audit: vec![rootblock::RootBlockAudit {
                 variant: 0, hf: 0.92, n_absent: 12, min_q: None, partner: None, in_block: true,
-                reason: rootblock::BlockReason::UntestedFewAbsences,
+                reason: rootblock::BlockReason::Untested,
             }],
         };
         let rb = resolve_span_conflicts(rb, &variants);
@@ -3982,11 +3982,11 @@ mod tests {
             audit: vec![
                 rootblock::RootBlockAudit {
                     variant: 1, hf: 0.85, n_absent: 15, min_q: None, partner: None, in_block: true,
-                    reason: rootblock::BlockReason::UntestedFewAbsences,
+                    reason: rootblock::BlockReason::Untested,
                 },
                 rootblock::RootBlockAudit {
                     variant: 2, hf: 0.88, n_absent: 20, min_q: None, partner: None, in_block: true,
-                    reason: rootblock::BlockReason::UntestedFewAbsences,
+                    reason: rootblock::BlockReason::Untested,
                 },
             ],
         };
@@ -4014,11 +4014,11 @@ mod tests {
             audit: vec![
                 rootblock::RootBlockAudit {
                     variant: 0, hf: 0.90, n_absent: 30, min_q: None, partner: None, in_block: true,
-                    reason: rootblock::BlockReason::UntestedFewAbsences,
+                    reason: rootblock::BlockReason::Untested,
                 },
                 rootblock::RootBlockAudit {
                     variant: 1, hf: 0.60, n_absent: 25, min_q: None, partner: None, in_block: true,
-                    reason: rootblock::BlockReason::UntestedFewAbsences,
+                    reason: rootblock::BlockReason::Untested,
                 },
             ],
         };
@@ -4133,7 +4133,7 @@ mod tests {
             RootBlockAudit {
                 variant: 1, hf: 0.99, n_absent: 3,
                 min_q: None, partner: None, in_block: true,
-                reason: BlockReason::UntestedFewAbsences,
+                reason: BlockReason::Untested,
             },
         ];
         let path = std::env::temp_dir().join("himito_test_root_block.tsv");
@@ -4144,7 +4144,7 @@ mod tests {
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines[0], "variant\thf\tn_absent\tmin_q\tpartner_variant\tin_block\treason");
         assert_eq!(lines[1], "m.750A>G\t0.900000\t12\t4.200000e-1\tm.310T>TC\ttrue\tunstructured_absences");
-        assert_eq!(lines[2], "m.310T>TC\t0.990000\t3\tNA\tNA\ttrue\tuntested_few_absences",
+        assert_eq!(lines[2], "m.310T>TC\t0.990000\t3\tNA\tNA\ttrue\tuntested",
                    "untested candidates report NA, not 0");
     }
 

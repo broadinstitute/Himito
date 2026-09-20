@@ -30,12 +30,15 @@ impl Default for RootBlockConfig {
 /// decision, it never participates in making one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockReason {
-    /// Admitted without testing: either rule 2 (too few jointly-covered
-    /// absences to test), or no candidate partner offered a testable alt
-    /// call at all (`partition`'s pass 3, `best.get(&v) == None`) — both are
-    /// "cannot assess structure, so admit" outcomes, just from different
-    /// gates.
-    UntestedFewAbsences,
+    /// Admitted without testing. Two distinct causes reach this: rule 2 (too
+    /// few jointly-covered absences to test at all), and no candidate partner
+    /// offering a testable alt call (`partition`'s pass 3,
+    /// `best.get(&v) == None`). Both mean "cannot assess structure, so admit",
+    /// and both print `NA` for `min_q`/`partner`, so the audit row does not
+    /// distinguish them — deliberately named for the shared outcome rather
+    /// than for either cause, since naming it after one would misreport the
+    /// other.
+    Untested,
     /// Tested: every partner's q exceeded `max_q`. No evidence the absences
     /// are structured, so blocked.
     UnstructuredAbsences,
@@ -50,7 +53,7 @@ pub enum BlockReason {
 impl BlockReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            BlockReason::UntestedFewAbsences => "untested_few_absences",
+            BlockReason::Untested => "untested",
             BlockReason::UnstructuredAbsences => "unstructured_absences",
             BlockReason::StructuredAbsences => "structured_absences",
             BlockReason::SpanConflict => "span_conflict",
@@ -158,7 +161,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
             block.push(v);
             audit.push(RootBlockAudit {
                 variant: v, hf, n_absent, min_q: None, partner: None, in_block: true,
-                reason: BlockReason::UntestedFewAbsences,
+                reason: BlockReason::Untested,
             });
         } else {
             pending.push((v, hf, n_absent));
@@ -201,7 +204,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
     for (v, hf, n_absent) in pending {
         let (min_q, partner, in_block, reason) = match best.get(&v) {
             // No testable partner: cannot assess structure, so admit.
-            None => (None, None, true, BlockReason::UntestedFewAbsences),
+            None => (None, None, true, BlockReason::Untested),
             Some(&(q, u)) => {
                 let in_block = q > cfg.max_q;
                 let reason = if in_block {
@@ -318,7 +321,7 @@ mod tests {
         assert_eq!(rb.audit[0].n_absent, 5);
         assert!(rb.audit[0].min_q.is_none(), "rule 2 admits without testing");
         assert!(rb.audit[0].partner.is_none());
-        assert_eq!(rb.audit[0].reason, BlockReason::UntestedFewAbsences);
+        assert_eq!(rb.audit[0].reason, BlockReason::Untested);
     }
 
     /// A germline variant whose absences are scattered: the reads lacking it
@@ -389,8 +392,8 @@ mod tests {
         assert!(rb.audit[0].min_q.is_none());
         // Untestable for lack of a partner, not for too few absences (v0 has
         // 10, clearing `min_absent`) — both are grouped under the same
-        // "untested, admitted" reason; see `BlockReason::UntestedFewAbsences`.
-        assert_eq!(rb.audit[0].reason, BlockReason::UntestedFewAbsences);
+        // "untested, admitted" reason; see `BlockReason::Untested`.
+        assert_eq!(rb.audit[0].reason, BlockReason::Untested);
     }
 
     /// Regression guard for "one Benjamini-Hochberg correction across ALL

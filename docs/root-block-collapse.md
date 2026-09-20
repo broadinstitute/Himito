@@ -262,7 +262,7 @@ nothing of the kind.
 `reason` disambiguates rows that would otherwise look identical or
 contradictory. It takes one of four values:
 
-* `untested_few_absences` — admitted without testing: either rule 2 (too few
+* `untested` — admitted without testing: either rule 2 (too few
   jointly-covered absences), or no candidate partner offered a testable alt
   call at all. Both report `min_q = NA`, `partner_variant = NA`.
 * `unstructured_absences` — tested; every partner's q exceeded `max_q`. No

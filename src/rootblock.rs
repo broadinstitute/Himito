@@ -294,6 +294,10 @@ mod tests {
         let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
         assert_eq!(rb.block, vec![0, 1], "correlated dropout is not a subclone");
         assert!(rb.informative.is_empty());
+        assert!(
+            rb.audit[0].min_q.unwrap() > 0.05,
+            "the confounder must be TESTED and survive, not skipped as untestable"
+        );
     }
 
     /// A candidate with no partner offering any alt call among jointly-covered
@@ -307,5 +311,107 @@ mod tests {
         let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
         assert_eq!(rb.block, vec![0]);
         assert!(rb.audit[0].min_q.is_none());
+    }
+
+    /// Regression guard for "one Benjamini-Hochberg correction across ALL
+    /// pairs together", not per-candidate. `v0` and `v1` each have exactly
+    /// one partner producing a moderate, non-trivial p (~0.0255 — neither
+    /// ~1.0 nor a vanishing extreme). In isolation (m=1 each) that p survives
+    /// BH untouched and both would stay informative. `v2` contributes three
+    /// more pairs, all non-significant (p = 1.0), that carry no signal of
+    /// their own but enlarge the pool to m=5, which is enough to push q for
+    /// v0 and v1 above `max_q`.
+    ///
+    /// If a refactor ever moved the `adjust` call inside the per-candidate
+    /// loop (pooling only each candidate's own partners), this test would
+    /// start failing: v0 and v1 would wrongly stay informative. Every other
+    /// fixture in this file has m=1 either way, or ties at p=1.0 exactly, so
+    /// none of them would catch that regression.
+    #[test]
+    fn pooled_bh_blocks_what_per_candidate_bh_would_keep_informative() {
+        let n_reads = 300;
+        let mut rows: Vec<Vec<i8>> = vec![vec![-1i8; n_reads]; 8];
+
+        // v0 (row 0): block A, reads 0..100. hf 0.90, n_absent 10.
+        for r in 0..90 {
+            rows[0][r] = 1;
+        }
+        for r in 90..100 {
+            rows[0][r] = 0;
+        }
+        // v1 (row 1): block B, reads 100..200. Same shape as v0.
+        for r in 100..190 {
+            rows[1][r] = 1;
+        }
+        for r in 190..200 {
+            rows[1][r] = 0;
+        }
+        // v2 (row 2): block C, reads 200..300. Same shape; exists only to
+        // supply padding pairs below.
+        for r in 200..290 {
+            rows[2][r] = 1;
+        }
+        for r in 290..300 {
+            rows[2][r] = 0;
+        }
+
+        // u0 (row 3): v0's only partner. Among v0's 10 absent reads (90..100):
+        // 5 alt, 5 ref. Among v0's 90 present reads (0..90): 15 alt, 75 ref.
+        // -> a=5, b=5, c=15, d=75, fisher_greater p = 0.02546 (moderate).
+        // u0's own hf = 20/100 = 0.20, below the gate, so it is never itself
+        // a candidate and contributes no row of its own.
+        for r in 0..15 {
+            rows[3][r] = 1;
+        }
+        for r in 15..90 {
+            rows[3][r] = 0;
+        }
+        for r in 90..95 {
+            rows[3][r] = 1;
+        }
+        for r in 95..100 {
+            rows[3][r] = 0;
+        }
+        // u1 (row 4): the same shape as u0, shifted onto v1's block (100..200).
+        for r in 100..115 {
+            rows[4][r] = 1;
+        }
+        for r in 115..190 {
+            rows[4][r] = 0;
+        }
+        for r in 190..195 {
+            rows[4][r] = 1;
+        }
+        for r in 195..200 {
+            rows[4][r] = 0;
+        }
+
+        // u_p1..u_p3 (rows 5,6,7): padding partners for v2. a=0, b=10, c=10,
+        // d=80 -> p = 1.0 exactly (a=0 saturates the one-sided Fisher test).
+        // Their own hf = 10/100 = 0.10, below the gate.
+        for k in 5..8 {
+            for r in 200..210 {
+                rows[k][r] = 1;
+            }
+            for r in 210..300 {
+                rows[k][r] = 0;
+            }
+        }
+
+        let rb = partition(&matrix(rows), &RootBlockConfig::default());
+        assert_eq!(
+            rb.block,
+            vec![0, 1, 2],
+            "pooling all 5 pairs must push v0's and v1's q past max_q"
+        );
+        let q0 = rb.audit[0].min_q.unwrap();
+        let q1 = rb.audit[1].min_q.unwrap();
+        assert!(q0 > 0.05, "q0 was {q0}");
+        assert!(q1 > 0.05, "q1 was {q1}");
+        // Confirms the underlying per-pair p-value really is moderate, not
+        // one of the trivial extremes (~0 or exactly 1.0) used elsewhere in
+        // this file — this test is about BH pooling, not about the Fisher
+        // test itself.
+        assert!(q0 < 0.5, "q0 was {q0}, expected a moderate (not saturated) value");
     }
 }

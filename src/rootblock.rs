@@ -6,6 +6,7 @@
 
 use crate::lineage::BinaryMatrix;
 use crate::scite::fisher_greater;
+use crate::scite::CleanedMatrix;
 use adjustp::{adjust, Procedure};
 use std::collections::HashMap;
 
@@ -180,6 +181,35 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
     informative.sort_unstable();
     audit.sort_unstable_by_key(|a| a.variant);
     RootBlock { block, informative, audit }
+}
+
+/// A `BinaryMatrix` holding only `keep`, in the order given. All reads survive.
+pub fn restrict(matrix: &BinaryMatrix, keep: &[usize]) -> BinaryMatrix {
+    BinaryMatrix {
+        variants: keep.iter().map(|&v| matrix.variants[v].clone()).collect(),
+        reads: matrix.reads.clone(),
+        data: keep.iter().map(|&v| matrix.data[v].clone()).collect(),
+    }
+}
+
+/// Append the root-block variants to a cleaned matrix as all-present columns,
+/// and return the number of informative columns that preceded them.
+///
+/// Block variants are homoplasmic by construction, so every read carries them —
+/// which is the point: the block designation corrects exactly the dropout that
+/// flagged the variant in the first place.
+///
+/// They go at the END because `write_mutation_tree` resolves node labels with
+/// `variants[node_id]` (`scite.rs:1246`) and node ids index the informative
+/// matrix. Prepending would silently relabel every node.
+pub fn append_block_to_cleaned(cleaned: &mut CleanedMatrix, block_names: &[String]) -> usize {
+    let n_informative = cleaned.variants.len();
+    let n_reads = cleaned.reads.len();
+    for name in block_names {
+        cleaned.variants.push(name.clone());
+        cleaned.data.push(vec![1u8; n_reads]);
+    }
+    n_informative
 }
 
 #[cfg(test)]
@@ -413,5 +443,58 @@ mod tests {
         // this file — this test is about BH pooling, not about the Fisher
         // test itself.
         assert!(q0 < 0.5, "q0 was {q0}, expected a moderate (not saturated) value");
+    }
+
+    use crate::scite::CleanedMatrix;
+
+    #[test]
+    fn restrict_keeps_only_named_variants_in_order_and_all_reads() {
+        let m = matrix(vec![run(1, 2), run(2, 1), run(3, 0)]);
+        let r = restrict(&m, &[2, 0]);
+        assert_eq!(r.variants, vec!["m.2A>G".to_string(), "m.0A>G".to_string()]);
+        assert_eq!(r.reads.len(), 3);
+        assert_eq!(r.data[0], vec![Some(1), Some(1), Some(1)]);
+        assert_eq!(r.data[1], vec![Some(1), Some(0), Some(0)]);
+    }
+
+    #[test]
+    fn restrict_to_nothing_yields_zero_variants_but_keeps_reads() {
+        let m = matrix(vec![run(1, 2)]);
+        let r = restrict(&m, &[]);
+        assert!(r.variants.is_empty());
+        assert!(r.data.is_empty());
+        assert_eq!(r.reads.len(), 3, "reads survive an empty informative set");
+    }
+
+    #[test]
+    fn append_block_adds_all_present_columns_at_the_end() {
+        let mut c = CleanedMatrix {
+            variants: vec!["m.1A>G".to_string()],
+            reads: vec!["r0".to_string(), "r1".to_string()],
+            data: vec![vec![1, 0]],
+            attachment: vec![0, 1],
+        };
+        let n_informative = append_block_to_cleaned(&mut c, &["m.9A>G".to_string()]);
+
+        assert_eq!(n_informative, 1, "returns the informative column count");
+        assert_eq!(c.variants, vec!["m.1A>G".to_string(), "m.9A>G".to_string()]);
+        assert_eq!(c.data[0], vec![1, 0], "informative column untouched");
+        assert_eq!(c.data[1], vec![1, 1], "block variants are present in every read");
+        assert_eq!(c.attachment, vec![0, 1], "attachments are not renumbered");
+    }
+
+    #[test]
+    fn append_block_preserves_index_alignment_with_tree_node_ids() {
+        // write_mutation_tree does `variants[node_id]`; node ids index the
+        // INFORMATIVE matrix, so appending must not move them.
+        let mut c = CleanedMatrix {
+            variants: vec!["m.1A>G".to_string(), "m.2A>G".to_string()],
+            reads: vec!["r0".to_string()],
+            data: vec![vec![1], vec![0]],
+            attachment: vec![0],
+        };
+        append_block_to_cleaned(&mut c, &["m.9A>G".to_string()]);
+        assert_eq!(c.variants[0], "m.1A>G", "node 0 still resolves to its variant");
+        assert_eq!(c.variants[1], "m.2A>G", "node 1 still resolves to its variant");
     }
 }

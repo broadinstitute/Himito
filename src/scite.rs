@@ -1679,27 +1679,21 @@ fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usiz
     }
 }
 
-/// A blocked (homoplasmic) variant whose REF span overlaps a variant that
-/// stays informative is not actually homoplasmic: if there is real
-/// heteroplasmy at that locus, the high-HF member is the major allele of a
-/// heteroplasmic site, not a fixed germline call, and belongs in the tree.
-/// `append_block_to_cleaned` marks every block member present on every read,
-/// which would otherwise assert two mutually-exclusive alleles on one
-/// molecule — structurally impossible pre-partition.
+/// A blocked (homoplasmic) variant whose REF span overlaps *any* other
+/// variant in the matrix — blocked or informative — cannot safely stay
+/// blocked. `append_block_to_cleaned` imputes every block member present on
+/// every read; wherever the overlapping variant is also called present (on
+/// its own path through the tree, or as another block member), that asserts
+/// two mutually-exclusive alleles on one molecule, which was structurally
+/// impossible pre-partition. A real heteroplasmy at that locus means the
+/// high-HF member is a major allele, not fixed germline, and belongs in the
+/// tree alongside its partner — this applies equally whether the partner is
+/// currently informative or currently blocked.
 ///
-/// Two passes:
-/// 1. Pull any block member back into `informative` if its span overlaps a
-///    variant *currently* in `informative`, iterating to a fixpoint — pulling
-///    one member back can newly conflict with another block member that
-///    overlaps it, so a single sweep is not enough.
-/// 2. Among whatever remains blocked, no two members may overlap each other
-///    either (same contradiction, purely within the block). Resolve each
-///    overlapping cluster by keeping the highest-HF member (ties broken
-///    toward the lowest variant index, for a deterministic result) and
-///    pulling every other member of that cluster back to informative. At the
-///    default `min_hf = 0.80` two mutually-exclusive alleles cannot both
-///    clear the gate, so this is unreachable there; a lower
-///    `--root-block-min-hf` makes it reachable.
+/// A single pass suffices: a variant's fate is decided by whether *anything
+/// else in the full matrix* overlaps its span, not by what else currently
+/// happens to be informative, so there is nothing for pulling one variant
+/// back to newly break for another.
 ///
 /// `variants` must be the full (unrestricted) variant list `rb` was computed
 /// over, so span indices line up. Sorts `block`/`informative`/`audit` by
@@ -1707,78 +1701,32 @@ fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usiz
 /// audit row for a pulled-back variant.
 fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> rootblock::RootBlock {
     let spans = variant_spans(variants);
-    let audit_hf: HashMap<usize, f64> = rb.audit.iter().map(|a| (a.variant, a.hf)).collect();
 
-    let mut informative: std::collections::BTreeSet<usize> = rb.informative.iter().copied().collect();
-    let mut block: std::collections::BTreeSet<usize> = rb.block.iter().copied().collect();
-    let mut pulled_back: Vec<usize> = Vec::new();
-
-    loop {
-        let to_pull: Vec<usize> = block
-            .iter()
-            .copied()
-            .filter(|&v| informative.iter().any(|&u| spans[v].overlaps(&spans[u])))
-            .collect();
-        if to_pull.is_empty() {
-            break;
-        }
-        for v in to_pull {
-            block.remove(&v);
-            informative.insert(v);
-            pulled_back.push(v);
-        }
-    }
-
-    let remaining: Vec<usize> = block.iter().copied().collect();
-    let mut visited = vec![false; remaining.len()];
-    for start in 0..remaining.len() {
-        if visited[start] {
-            continue;
-        }
-        let mut component = vec![start];
-        visited[start] = true;
-        let mut i = 0;
-        while i < component.len() {
-            let cur = remaining[component[i]];
-            for (j, &candidate) in remaining.iter().enumerate() {
-                if !visited[j] && spans[cur].overlaps(&spans[candidate]) {
-                    visited[j] = true;
-                    component.push(j);
-                }
-            }
-            i += 1;
-        }
-        if component.len() > 1 {
-            let mut members: Vec<usize> = component.iter().map(|&ci| remaining[ci]).collect();
-            // Highest HF wins; ties go to the lowest variant index.
-            members.sort_by(|&a, &b| audit_hf[&b].partial_cmp(&audit_hf[&a]).unwrap().then(a.cmp(&b)));
-            for &v in &members[1..] {
-                block.remove(&v);
-                informative.insert(v);
-                pulled_back.push(v);
-            }
-        }
-    }
+    let (pulled_back, kept): (Vec<usize>, Vec<usize>) = rb.block.iter().copied().partition(|&v| {
+        (0..variants.len()).any(|u| u != v && spans[v].overlaps(&spans[u]))
+    });
 
     if !pulled_back.is_empty() {
-        pulled_back.sort_unstable();
-        let names: Vec<String> = pulled_back.iter().map(|&v| variants[v].clone()).collect();
+        let mut names: Vec<String> = pulled_back.iter().map(|&v| variants[v].clone()).collect();
+        names.sort();
         info!(
             "[SCITE] Root block: pulled {} variant(s) back into the search — their span \
-             overlaps a surviving informative variant, so any homoplasmy there is not clean: {}",
-            names.len(),
+             overlaps another variant, so imputing them present on every read would assert \
+             two mutually-exclusive alleles on one molecule: {}",
+            pulled_back.len(),
             names.join(", ")
         );
     }
 
+    let pulled_back: std::collections::HashSet<usize> = pulled_back.into_iter().collect();
     for a in rb.audit.iter_mut() {
         if pulled_back.contains(&a.variant) {
             a.in_block = false;
         }
     }
 
-    rb.block = block.into_iter().collect();
-    rb.informative = informative.into_iter().collect();
+    rb.informative.extend(pulled_back.iter().copied());
+    rb.block = kept;
     rb.block.sort_unstable();
     rb.informative.sort_unstable();
     rb.audit.sort_unstable_by_key(|a| a.variant);
@@ -3907,11 +3855,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_span_conflicts_needs_more_than_one_pass_to_reach_a_fixpoint() {
-        // P is already informative. A overlaps P directly. B overlaps only A,
-        // not P. A single sweep pulls A back (it conflicts with the original
-        // informative set) but leaves B still blocked, even though B now
-        // conflicts with the freshly-informative A — a second pass is needed.
+    fn resolve_span_conflicts_drains_a_three_allele_chain_in_one_pass() {
+        // P is informative. A overlaps P directly. B overlaps only A, not P.
+        // Under the old fixpoint-over-informative rule this needed two passes
+        // (pulling A back only newly conflicted B on a second sweep). Under
+        // the current rule each variant's fate depends on whether *anything
+        // in the full matrix* overlaps it, so A and B are both decided from
+        // the start — this test's job is to prove the whole chain drains,
+        // not that iteration was needed to get there.
         let variants = vec![
             "m.300A>G".to_string(),   // P: informative, span [300, 301)
             "m.300AT>A".to_string(),  // A: block, span [300, 302), overlaps P
@@ -3930,24 +3881,25 @@ mod tests {
             ],
         };
         let rb = resolve_span_conflicts(rb, &variants);
-        assert!(rb.block.is_empty(), "both block members must clear through the fixpoint");
+        assert!(rb.block.is_empty(), "the whole overlapping chain must drain out of the block");
         assert_eq!(rb.informative, vec![0, 1, 2]);
         assert!(rb.audit.iter().all(|a| !a.in_block));
     }
 
     #[test]
-    fn resolve_span_conflicts_breaks_block_vs_block_overlap_by_hf_then_lowest_index() {
-        // Unreachable at the default min_hf = 0.80 (two mutually-exclusive
-        // alleles cannot both exceed 0.80), but a lower --root-block-min-hf
-        // makes it reachable: two block members at the same locus, tied HF,
-        // must resolve deterministically rather than by iteration order.
+    fn resolve_span_conflicts_empties_a_mutually_overlapping_block_cluster() {
+        // Two block members overlap only each other (no informative variant
+        // involved). Neither may safely stay blocked: whichever one were
+        // kept would still be imputed present on every read, and the other's
+        // presence calls (now in the search) would assert two
+        // mutually-exclusive alleles on the same molecule. Both must go.
         let variants = vec!["m.500A>G".to_string(), "m.500A>T".to_string()];
         let rb = rootblock::RootBlock {
             block: vec![0, 1],
             informative: vec![],
             audit: vec![
                 rootblock::RootBlockAudit {
-                    variant: 0, hf: 0.60, n_absent: 30, min_q: None, partner: None, in_block: true,
+                    variant: 0, hf: 0.90, n_absent: 30, min_q: None, partner: None, in_block: true,
                 },
                 rootblock::RootBlockAudit {
                     variant: 1, hf: 0.60, n_absent: 25, min_q: None, partner: None, in_block: true,
@@ -3955,10 +3907,9 @@ mod tests {
             ],
         };
         let rb = resolve_span_conflicts(rb, &variants);
-        assert_eq!(rb.block, vec![0], "tied HF must resolve to the lowest variant index");
-        assert_eq!(rb.informative, vec![1]);
-        assert!(rb.audit.iter().find(|a| a.variant == 0).unwrap().in_block);
-        assert!(!rb.audit.iter().find(|a| a.variant == 1).unwrap().in_block);
+        assert!(rb.block.is_empty(), "a mutually-overlapping block cluster must empty entirely");
+        assert_eq!(rb.informative, vec![0, 1]);
+        assert!(rb.audit.iter().all(|a| !a.in_block));
     }
 
     #[test]

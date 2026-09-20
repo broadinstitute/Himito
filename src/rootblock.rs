@@ -5,6 +5,9 @@
 //! See `docs/root-block-collapse.md` for why HF alone cannot make this call.
 
 use crate::lineage::BinaryMatrix;
+use crate::scite::fisher_greater;
+use adjustp::{adjust, Procedure};
+use std::collections::HashMap;
 
 /// `min_hf` is a candidate *gate*, not the decision — the decision is the
 /// absence-structure test in [`partition`].
@@ -62,48 +65,120 @@ pub(crate) fn hf_and_absent(matrix: &BinaryMatrix, v: usize) -> (f64, usize) {
     (hf, absent)
 }
 
+/// One-sided Fisher p for "reads absent at `v` are enriched for alt calls at
+/// `u`", over reads jointly covered at both.
+///
+/// The 2x2, with `a` as the enriched cell `fisher_greater` tests:
+///
+/// |             | `u` alt | `u` ref |
+/// |-------------|---------|---------|
+/// | `v` absent  | a       | b       |
+/// | `v` present | c       | d       |
+///
+/// The question is whether the molecules that LACK `v` are distinguished by
+/// carrying some other allele. A real subclone at `1 - HF` answers yes; dropout
+/// answers no.
+///
+/// Deliberately tested against `u`'s ALT calls rather than `u`'s absences:
+/// dropout is partly read-level, so two germline variants drop out on the same
+/// poor-quality reads and an absence-vs-absence test would call that a subclone.
+/// Demanding positive distinguishing evidence is what dropout cannot fake. See
+/// `read_level_dropout_confounder_still_joins_block`.
+///
+/// `None` when the pair carries no information: no jointly-covered absence at
+/// `v`, or no alt call at `u` among jointly-covered reads.
+fn absence_vs_alt_p(matrix: &BinaryMatrix, v: usize, u: usize) -> Option<f64> {
+    let (mut a, mut b, mut c, mut d) = (0usize, 0usize, 0usize, 0usize);
+    for r in 0..matrix.reads.len() {
+        let (Some(vv), Some(uu)) = (matrix.data[v][r], matrix.data[u][r]) else {
+            continue;
+        };
+        match (vv, uu) {
+            (0, 1) => a += 1,
+            (0, _) => b += 1,
+            (_, 1) => c += 1,
+            _ => d += 1,
+        }
+    }
+    if a + b == 0 || a + c == 0 {
+        return None;
+    }
+    Some(fisher_greater(a, b, c, d).1)
+}
+
 pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
+    let n = matrix.variants.len();
     let mut block = Vec::new();
     let mut informative = Vec::new();
     let mut audit = Vec::new();
 
-    for v in 0..matrix.variants.len() {
+    // Pass 1: apply rules 1 and 2, and collect the candidates needing rule 3.
+    // `pending` holds (variant, hf, n_absent) in ascending variant order.
+    let mut pending: Vec<(usize, f64, usize)> = Vec::new();
+    for v in 0..n {
         let (hf, n_absent) = hf_and_absent(matrix, v);
-
-        // Rule 1: below the gate, never a candidate.
         if hf < cfg.min_hf {
             informative.push(v);
-            continue;
-        }
-
-        // Rule 2: too few absences to assess structure, and too few to inform
-        // topology either way.
-        if n_absent < cfg.min_absent {
+        } else if n_absent < cfg.min_absent {
             block.push(v);
             audit.push(RootBlockAudit {
-                variant: v,
-                hf,
-                n_absent,
-                min_q: None,
-                partner: None,
-                in_block: true,
+                variant: v, hf, n_absent, min_q: None, partner: None, in_block: true,
             });
-            continue;
+        } else {
+            pending.push((v, hf, n_absent));
         }
-
-        // Rule 3 (absence-structure test) arrives in Task 2. Until then a
-        // testable candidate stays in the search.
-        informative.push(v);
-        audit.push(RootBlockAudit {
-            variant: v,
-            hf,
-            n_absent,
-            min_q: None,
-            partner: None,
-            in_block: false,
-        });
     }
 
+    // Pass 2: every (candidate, partner) p-value, then ONE Benjamini-Hochberg
+    // correction across all of them together.
+    let mut pairs: Vec<(usize, usize, f64)> = Vec::new();
+    for &(v, _, _) in &pending {
+        for u in 0..n {
+            if u == v {
+                continue;
+            }
+            if let Some(p) = absence_vs_alt_p(matrix, v, u) {
+                pairs.push((v, u, p));
+            }
+        }
+    }
+    let qs = if pairs.is_empty() {
+        Vec::new()
+    } else {
+        let pvals: Vec<f64> = pairs.iter().map(|&(_, _, p)| p).collect();
+        adjust(&pvals, Procedure::BenjaminiHochberg)
+    };
+
+    // Best (smallest q) partner per candidate. `pairs` is built in ascending
+    // `u` order, and only a strictly smaller q displaces the incumbent, so ties
+    // resolve to the lowest partner index and the result is deterministic.
+    let mut best: HashMap<usize, (f64, usize)> = HashMap::new();
+    for (idx, &(v, u, _)) in pairs.iter().enumerate() {
+        let q = qs[idx];
+        let slot = best.entry(v).or_insert((q, u));
+        if q < slot.0 {
+            *slot = (q, u);
+        }
+    }
+
+    // Pass 3: decide each pending candidate, preserving ascending order.
+    for (v, hf, n_absent) in pending {
+        let (min_q, partner, in_block) = match best.get(&v) {
+            // No testable partner: cannot assess structure, so admit.
+            None => (None, None, true),
+            Some(&(q, u)) => (Some(q), Some(u), q > cfg.max_q),
+        };
+        if in_block {
+            block.push(v);
+        } else {
+            informative.push(v);
+        }
+        audit.push(RootBlockAudit { variant: v, hf, n_absent, min_q, partner, in_block });
+    }
+
+    block.sort_unstable();
+    informative.sort_unstable();
+    audit.sort_unstable_by_key(|a| a.variant);
     RootBlock { block, informative, audit }
 }
 
@@ -170,5 +245,67 @@ mod tests {
         assert_eq!(rb.audit[0].n_absent, 5);
         assert!(rb.audit[0].min_q.is_none(), "rule 2 admits without testing");
         assert!(rb.audit[0].partner.is_none());
+    }
+
+    /// A germline variant whose absences are scattered: the reads lacking it
+    /// are not distinguished by carrying anything else.
+    #[test]
+    fn germline_with_scattered_absences_joins_block() {
+        // v0: 90 alt then 10 ref -> hf 0.90, n_absent 10 (testable).
+        // v1: alt on every even-indexed read -> among v0's absent reads
+        //     (90..100) exactly 5 are even, matching the global rate.
+        let v0 = run(90, 10);
+        let v1: Vec<i8> = (0..100).map(|r| if r % 2 == 0 { 1 } else { 0 }).collect();
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
+        assert_eq!(rb.block, vec![0], "unstructured absences -> block");
+        assert_eq!(rb.informative, vec![1]);
+        let a = &rb.audit[0];
+        assert!(a.in_block);
+        assert!(a.min_q.unwrap() > 0.05, "min_q was {:?}", a.min_q);
+    }
+
+    /// A real subclone: the reads lacking v0 all carry a private allele.
+    #[test]
+    fn true_subclone_with_private_allele_stays_informative() {
+        // v0: 90 alt then 10 ref -> hf 0.90, n_absent 10 (testable).
+        // v1: ref on 0..90, alt on 90..100 -> perfectly marks v0's absences.
+        let v0 = run(90, 10);
+        let v1: Vec<i8> = (0..100).map(|r| if r >= 90 { 1 } else { 0 }).collect();
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
+        assert!(rb.block.is_empty(), "structured absences must not be collapsed");
+        assert_eq!(rb.informative, vec![0, 1]);
+        let a = &rb.audit[0];
+        assert!(!a.in_block);
+        assert!(a.min_q.unwrap() < 0.05, "min_q was {:?}", a.min_q);
+        assert_eq!(a.partner, Some(1));
+    }
+
+    /// Read-level dropout makes two germline variants drop out on the SAME bad
+    /// reads. An absence-vs-absence test would read that as a subclone and keep
+    /// both in the search. Testing against the partner's ALT calls does not.
+    ///
+    /// DO NOT "simplify" absence_vs_alt_p into an absence-vs-absence test; this
+    /// test is the reason it is written the way it is.
+    #[test]
+    fn read_level_dropout_confounder_still_joins_block() {
+        // Reads 90..100 are poor quality: both variants drop out there.
+        let v0 = run(90, 10);
+        let v1 = run(90, 10);
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
+        assert_eq!(rb.block, vec![0, 1], "correlated dropout is not a subclone");
+        assert!(rb.informative.is_empty());
+    }
+
+    /// A candidate with no partner offering any alt call among jointly-covered
+    /// reads cannot be tested, and is admitted rather than left in the search.
+    #[test]
+    fn candidate_with_no_testable_partner_joins_block() {
+        // v1 is all-ref, so cell `a` (v0 absent & v1 alt) can never be non-zero
+        // and the pair is skipped entirely.
+        let v0 = run(90, 10);
+        let v1 = vec![0i8; 100];
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
+        assert_eq!(rb.block, vec![0]);
+        assert!(rb.audit[0].min_q.is_none());
     }
 }

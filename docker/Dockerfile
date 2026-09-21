@@ -10,5 +10,5 @@ RUN git clone https://github.com/broadinstitute/Himito.git \
     && git checkout hs_lineage_ \
     && cargo build --release
 
-RUN cargo install msbwt2 \
-    && msbwt2-build --help
+# RUN cargo install msbwt2 \
+#     && msbwt2-build --help

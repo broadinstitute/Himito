@@ -15,6 +15,7 @@ workflow Himito_lineage_eval {
         Float max_hf
         String chromo
         String? extra_args
+        Boolean snv_only = false
     }
 
     call CalculateCoverage as CalculateCoveragePacBio {
@@ -68,7 +69,8 @@ workflow Himito_lineage_eval {
             pacbio_vcf = PacbioCall.vcf,
             ont_vcf = OntCall.vcf,
             prefix = prefix,
-            extra_args = extra_args
+            extra_args = extra_args,
+            snv_only = snv_only
 
     }
 
@@ -258,6 +260,7 @@ task identify_shared_vcf {
     input {
         File pacbio_vcf
         File ont_vcf
+        Boolean snv_only
 
         String prefix
 
@@ -273,9 +276,10 @@ task identify_shared_vcf {
         mkdir -p "$TMPDIR"
 
         # Normalize to bgzip + tabix (Himito quick-start emits plain .vcf).
-        bcftools view -Oz -o pacbio.vcf.gz ~{pacbio_vcf}
+        # Optionally restrict to SNPs here (-v snps is a `view` option, not `isec`).
+        bcftools view ~{if snv_only then "-v snps" else ""} -Oz -o pacbio.vcf.gz ~{pacbio_vcf}
         bcftools index -t pacbio.vcf.gz
-        bcftools view -Oz -o ont.vcf.gz ~{ont_vcf}
+        bcftools view ~{if snv_only then "-v snps" else ""} -Oz -o ont.vcf.gz ~{ont_vcf}
         bcftools index -t ont.vcf.gz
 
         # Sites present in both VCFs (exact CHROM/POS/REF/ALT); keep PacBio records (-w1).

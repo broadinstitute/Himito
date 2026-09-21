@@ -1,1 +1,15 @@
-./HPRC
+SMaHT
+target
+HPRC
+test_data
+sr_benchmark
+HimitoPaperFigure
+Himito_benchmark
+Lineage_paper
+lineage_eval/benchmark_results/
+msaplot
+scripts
+plantgenome
+resource
+rtg_ref
+superpowers

@@ -525,6 +525,86 @@ fn parse_binary_matrix<R: std::io::Read>(
     Ok(BinaryMatrix { variants, reads, data })
 }
 
+/// Names of the near-fixed (homoplasmic) variants the heteroplasmy filter drops
+/// for sitting at or above the HF ceiling — the variants `load_and_filter_matrix`
+/// removes purely for *not bifurcating* the tree, not for lack of support.
+///
+/// A variant qualifies when it is supported by at least `min_presence` reads and
+/// its matrix-derived frequency (`present / (present + absent)`, the same
+/// covered-reads denominator [`parse_binary_matrix`] uses) is `>= max_hf`. Names
+/// already present in `exclude` (the variants that survived filtering, i.e. the
+/// informative + block set) are skipped so nothing is double-reported.
+///
+/// Read order matches the matrix header, but the caller only needs the names:
+/// these variants are homoplasmic, so their cleaned genotype is present in every
+/// read regardless of column order.
+pub fn collect_fixed_homoplasmies(
+    matrix_path: &str,
+    max_hf: f64,
+    min_presence: usize,
+    exclude: &std::collections::HashSet<String>,
+) -> Result<Vec<String>> {
+    let file = File::open(matrix_path)
+        .with_context(|| format!("Cannot read matrix CSV: {matrix_path}"))?;
+    let mut rdr = csv::Reader::from_reader(file);
+    let mut fixed = Vec::new();
+    for result in rdr.records() {
+        let rec = result?;
+        let vid = rec[0].to_string();
+        if exclude.contains(&vid) {
+            continue;
+        }
+        let mut present = 0usize;
+        let mut absent = 0usize;
+        for cell in rec.iter().skip(1) {
+            if cell.is_empty() {
+                continue;
+            }
+            match cell.parse::<u32>() {
+                Ok(n) if n >= 1 => present += 1,
+                Ok(_) => absent += 1,
+                Err(_) => {}
+            }
+        }
+        let covered = present + absent;
+        let freq = if covered > 0 { present as f64 / covered as f64 } else { 0.0 };
+        if present >= min_presence && freq >= max_hf {
+            fixed.push(vid);
+        }
+    }
+    Ok(fixed)
+}
+
+/// Copy the cleaned genotype matrix at `cleaned_csv` into `out_path`, then append
+/// one all-present row per name in `fixed` — the near-fixed homoplasmies
+/// [`collect_fixed_homoplasmies`] recovered. The result is the full read x
+/// variant genotype table, heteroplasmic *and* homoplasmic, that
+/// `cleaned_matrix.csv` alone cannot show because the HF ceiling removed the
+/// fixed sites before the tree was ever built.
+fn write_cleaned_matrix_all_variants(
+    cleaned_csv: &str,
+    out_path: &str,
+    fixed: &[String],
+) -> Result<()> {
+    let body = std::fs::read_to_string(cleaned_csv)
+        .with_context(|| format!("Cannot read {cleaned_csv}"))?;
+    // Column count from the header (`variant` + one column per read); the fixed
+    // rows must match it exactly.
+    let header = body.lines().next().unwrap_or("variant");
+    let n_reads = header.split(',').count().saturating_sub(1);
+    let mut w = BufWriter::new(
+        File::create(out_path).with_context(|| format!("Cannot create {out_path}"))?,
+    );
+    write!(w, "{body}")?;
+    if !body.ends_with('\n') {
+        writeln!(w)?;
+    }
+    let ones = ",1".repeat(n_reads);
+    for name in fixed {
+        writeln!(w, "{name}{ones}")?;
+    }
+    Ok(())
+}
 
 
 /// Collapse reads with identical binary profiles into unique haplotypes.
@@ -777,6 +857,25 @@ pub fn start(
         output_prefix,
     )?;
 
+    // Near-fixed homoplasmies were removed by the HF ceiling before the tree was
+    // built, so `cleaned_matrix.csv` never sees them. Recover them and emit a
+    // companion table carrying every variant — heteroplasmic and homoplasmic — so
+    // the homoplasmy set is reported in full regardless of coverage.
+    let kept: std::collections::HashSet<String> = binary.variants.iter().cloned().collect();
+    let fixed_homoplasmies =
+        collect_fixed_homoplasmies(matrix_file, max_hf, min_presence, &kept)?;
+    if !fixed_homoplasmies.is_empty() {
+        info!(
+            "[3/6] Recovered {} near-fixed homoplasmic variant(s) excluded by the HF ceiling.",
+            fixed_homoplasmies.len()
+        );
+    }
+    write_cleaned_matrix_all_variants(
+        &format!("{output_prefix}.cleaned_matrix.csv"),
+        &format!("{output_prefix}.cleaned_matrix_all_variants.csv"),
+        &fixed_homoplasmies,
+    )?;
+
     // ── Step 4: write final haplotype map (filtered by SCITE) ─────────────────
     // No re-filtering here, by design: the cleaned matrix holds exactly the
     // variants the tree was built on, and re-applying prevalence/HF filters after
@@ -865,6 +964,47 @@ mod tests {
         let hf = from_vcf(&["m.100A>G"]);
         let matrix = parse_binary_matrix(Cursor::new(csv), &hf, 1, 1).unwrap();
         assert!(matrix.variants.is_empty());
+    }
+
+    #[test]
+    fn collect_fixed_homoplasmies_finds_near_fixed_sites_not_already_kept() {
+        // m.100: freq 4/4 = 1.0 (>= max_hf 0.95), supported -> recovered.
+        // m.200: freq 3/4 = 0.75 (< max_hf) -> heteroplasmic, not recovered.
+        // m.300: freq 1.0 but only 1 supporting read (< min_presence 2) -> noise.
+        // m.400: freq 1.0 and supported, but already kept -> excluded.
+        let csv = "variant,r1,r2,r3,r4\n\
+                   m.100A>G,1,1,1,1\n\
+                   m.200C>T,1,1,1,0\n\
+                   m.300G>A,1,,,\n\
+                   m.400T>C,1,1,1,1\n";
+        let path = std::env::temp_dir().join("himito_test_fixed_homoplasmies.csv");
+        std::fs::write(&path, csv).unwrap();
+        let mut kept = std::collections::HashSet::new();
+        kept.insert("m.400T>C".to_string());
+        let fixed =
+            collect_fixed_homoplasmies(path.to_str().unwrap(), 0.95, 2, &kept).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(fixed, vec!["m.100A>G".to_string()]);
+    }
+
+    #[test]
+    fn write_cleaned_matrix_all_variants_appends_all_present_rows() {
+        let cleaned = std::env::temp_dir().join("himito_test_cleaned_src.csv");
+        std::fs::write(&cleaned, "variant,r1,r2,r3\nm.200C>T,1,0,1\n").unwrap();
+        let out = std::env::temp_dir().join("himito_test_cleaned_all.csv");
+        write_cleaned_matrix_all_variants(
+            cleaned.to_str().unwrap(),
+            out.to_str().unwrap(),
+            &["m.100A>G".to_string()],
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&out).unwrap();
+        std::fs::remove_file(&cleaned).ok();
+        std::fs::remove_file(&out).ok();
+        assert_eq!(
+            content,
+            "variant,r1,r2,r3\nm.200C>T,1,0,1\nm.100A>G,1,1,1\n"
+        );
     }
 
     #[test]

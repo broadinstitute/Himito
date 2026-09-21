@@ -616,6 +616,12 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 10)]
         root_block_min_absent: usize,
 
+        /// root block: minimum enrichment odds ratio for a partner's absences to
+        /// count as a real subclone rather than depth-inflated significance.
+        /// Larger is stricter and keeps more variants homoplasmic at high depth
+        #[clap(long, value_parser, default_value_t = 2.0)]
+        root_block_min_or: f64,
+
         /// output prefix; writes <prefix>.haplotype_map.tsv
         #[clap(short, long, value_parser, required = true)]
         output_prefix: String,
@@ -980,6 +986,7 @@ fn main() {
             root_block_min_hf,
             root_block_max_q,
             root_block_min_absent,
+            root_block_min_or,
             output_prefix,
         } => {
             let matrix_file = matrix_file.to_str().expect("matrix-file path is not valid UTF-8");
@@ -995,6 +1002,10 @@ fn main() {
                     min_hf: root_block_min_hf,
                     max_q: root_block_max_q,
                     min_absent: root_block_min_absent,
+                    min_or: root_block_min_or,
+                    // Make the HF gate and min_absent depth-relative using the
+                    // same dropout rate the tree search assumes.
+                    dropout_rate: fn_rate,
                 })
             };
             if let Err(e) = lineage::start(

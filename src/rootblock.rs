@@ -17,11 +17,24 @@ pub struct RootBlockConfig {
     pub min_hf: f64,
     pub max_q: f64,
     pub min_absent: usize,
+    /// Effect-size floor for rule 3: a partner's enrichment odds ratio must
+    /// reach this before its absences count as *structured*. A one-sided Fisher
+    /// p shrinks with read count, so significance alone would move true
+    /// homoplasmies into the search as coverage rises; demanding a real odds
+    /// ratio (which a genuine subclone produces but dropout does not) decouples
+    /// the call from depth.
+    pub min_or: f64,
+    /// Per-read dropout rate used to make the HF gate and the `min_absent`
+    /// threshold depth-relative: expected dropout absences (`dropout_rate x
+    /// covered`) are discounted from the observed absent count before either is
+    /// judged. `0.0` reproduces the original absolute, coverage-sensitive
+    /// behaviour; the pipeline passes the SCITE false-negative rate.
+    pub dropout_rate: f64,
 }
 
 impl Default for RootBlockConfig {
     fn default() -> Self {
-        Self { min_hf: 0.80, max_q: 0.05, min_absent: 10 }
+        Self { min_hf: 0.80, max_q: 0.05, min_absent: 10, min_or: 2.0, dropout_rate: 0.0 }
     }
 }
 
@@ -124,8 +137,9 @@ pub(crate) fn hf_and_absent(matrix: &BinaryMatrix, v: usize) -> (f64, usize) {
 /// `read_level_dropout_confounder_still_joins_block`.
 ///
 /// `None` when the pair carries no information: no jointly-covered absence at
-/// `v`, or no alt call at `u` among jointly-covered reads.
-fn absence_vs_alt_p(matrix: &BinaryMatrix, v: usize, u: usize) -> Option<f64> {
+/// `v`, or no alt call at `u` among jointly-covered reads. Otherwise
+/// `Some((odds_ratio, p))` for the enrichment of the `v`-absent / `u`-alt cell.
+fn absence_vs_alt(matrix: &BinaryMatrix, v: usize, u: usize) -> Option<(f64, f64)> {
     let (mut a, mut b, mut c, mut d) = (0usize, 0usize, 0usize, 0usize);
     for r in 0..matrix.reads.len() {
         let (Some(vv), Some(uu)) = (matrix.data[v][r], matrix.data[u][r]) else {
@@ -141,7 +155,7 @@ fn absence_vs_alt_p(matrix: &BinaryMatrix, v: usize, u: usize) -> Option<f64> {
     if a + b == 0 || a + c == 0 {
         return None;
     }
-    Some(fisher_greater(a, b, c, d).1)
+    Some(fisher_greater(a, b, c, d))
 }
 
 pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
@@ -154,10 +168,25 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
     // `pending` holds (variant, hf, n_absent) in ascending variant order.
     let mut pending: Vec<(usize, f64, usize)> = Vec::new();
     for v in 0..n {
+        let present = matrix.data[v].iter().filter(|c| **c == Some(1)).count();
         let (hf, n_absent) = hf_and_absent(matrix, v);
-        if hf < cfg.min_hf {
+        let covered = present + n_absent;
+
+        // Dropout inflates the absent count, which drags observed HF below the
+        // gate and pushes it past `min_absent` as depth grows — both shed true
+        // homoplasmies with coverage. Discount the absences a pure-dropout
+        // homoplasmy would produce before judging either. With
+        // `dropout_rate == 0` `corrected_hf == hf` and the threshold is the raw
+        // `min_absent`, so the original behaviour is preserved exactly.
+        let expected_dropout = cfg.dropout_rate * covered as f64;
+        let corrected_absent = (n_absent as f64 - expected_dropout).max(0.0);
+        let denom = present as f64 + corrected_absent;
+        let corrected_hf = if denom > 0.0 { present as f64 / denom } else { 0.0 };
+        let effective_min_absent = cfg.min_absent.max(expected_dropout.ceil() as usize);
+
+        if corrected_hf < cfg.min_hf {
             informative.push(v);
-        } else if n_absent < cfg.min_absent {
+        } else if n_absent < effective_min_absent {
             block.push(v);
             audit.push(RootBlockAudit {
                 variant: v, hf, n_absent, min_q: None, partner: None, in_block: true,
@@ -168,51 +197,66 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
         }
     }
 
-    // Pass 2: every (candidate, partner) p-value, then ONE Benjamini-Hochberg
-    // correction across all of them together.
-    let mut pairs: Vec<(usize, usize, f64)> = Vec::new();
+    // Pass 2: every (candidate, partner) p-value and odds ratio, then ONE
+    // Benjamini-Hochberg correction across all p-values together.
+    let mut pairs: Vec<(usize, usize, f64, f64)> = Vec::new();
     for &(v, _, _) in &pending {
         for u in 0..n {
             if u == v {
                 continue;
             }
-            if let Some(p) = absence_vs_alt_p(matrix, v, u) {
-                pairs.push((v, u, p));
+            if let Some((or, p)) = absence_vs_alt(matrix, v, u) {
+                pairs.push((v, u, or, p));
             }
         }
     }
     let qs = if pairs.is_empty() {
         Vec::new()
     } else {
-        let pvals: Vec<f64> = pairs.iter().map(|&(_, _, p)| p).collect();
+        let pvals: Vec<f64> = pairs.iter().map(|&(_, _, _, p)| p).collect();
         adjust(&pvals, Procedure::BenjaminiHochberg)
     };
 
-    // Best (smallest q) partner per candidate. `pairs` is built in ascending
-    // `u` order, and only a strictly smaller q displaces the incumbent, so ties
-    // resolve to the lowest partner index and the result is deterministic.
+    // Two best-partner tables, both built in ascending `u` order with strict-<
+    // updates so ties resolve to the lowest partner index deterministically:
+    //   `best`          — smallest q over ALL partners, for the audit's min_q.
+    //   `best_material`  — smallest q among partners whose odds ratio clears
+    //                      `min_or`, for the decision. Only a materially large
+    //                      enrichment (which a real subclone produces and
+    //                      dropout cannot) can pull a variant out of the block,
+    //                      so the call no longer tightens with coverage.
     let mut best: HashMap<usize, (f64, usize)> = HashMap::new();
-    for (idx, &(v, u, _)) in pairs.iter().enumerate() {
+    let mut best_material: HashMap<usize, (f64, usize)> = HashMap::new();
+    for (idx, &(v, u, or, _)) in pairs.iter().enumerate() {
         let q = qs[idx];
         let slot = best.entry(v).or_insert((q, u));
         if q < slot.0 {
             *slot = (q, u);
         }
+        if or >= cfg.min_or {
+            let mslot = best_material.entry(v).or_insert((q, u));
+            if q < mslot.0 {
+                *mslot = (q, u);
+            }
+        }
     }
 
     // Pass 3: decide each pending candidate, preserving ascending order.
     for (v, hf, n_absent) in pending {
+        let structured = best_material.get(&v).is_some_and(|&(q, _)| q <= cfg.max_q);
         let (min_q, partner, in_block, reason) = match best.get(&v) {
             // No testable partner: cannot assess structure, so admit.
             None => (None, None, true, BlockReason::Untested),
-            Some(&(q, u)) => {
-                let in_block = q > cfg.max_q;
-                let reason = if in_block {
-                    BlockReason::UnstructuredAbsences
+            Some(&(bq, bu)) => {
+                if structured {
+                    // Report the partner that carried the structured signal, not
+                    // merely the smallest-q one (they coincide unless a
+                    // sub-`min_or` partner happens to have an even smaller q).
+                    let &(mq, mu) = best_material.get(&v).unwrap();
+                    (Some(mq), Some(mu), false, BlockReason::StructuredAbsences)
                 } else {
-                    BlockReason::StructuredAbsences
-                };
-                (Some(q), Some(u), in_block, reason)
+                    (Some(bq), Some(bu), true, BlockReason::UnstructuredAbsences)
+                }
             }
         };
         if in_block {
@@ -359,11 +403,56 @@ mod tests {
         assert_eq!(a.reason, BlockReason::StructuredAbsences);
     }
 
+    /// The effect-size floor is what stops coverage from eroding the homoplasmy
+    /// set. At high depth a one-sided Fisher p reaches significance on a *small*
+    /// enrichment, so q alone would move a true homoplasmy into the search. Here
+    /// the absences are enriched for a partner allele (q well below `max_q`) but
+    /// the odds ratio is only ~1.56: with the default `min_or = 2.0` the variant
+    /// stays blocked; drop the floor to 1.0 and the same data reclassifies it.
+    #[test]
+    fn effect_size_floor_keeps_significant_but_weak_enrichment_in_block() {
+        let n = 3000;
+        let mut v0 = vec![0i8; n];
+        for r in 0..2700 {
+            v0[r] = 1;
+        }
+        // v0: hf 0.90, n_absent 300 (well past min_absent, so it is tested).
+        let mut v1 = vec![0i8; n];
+        // Among v0's present reads (0..2700): 540 alt. Among v0's absent reads
+        // (2700..3000): 84 alt. -> a=84, b=216, c=540, d=2160: OR 1.556, p ~1e-3.
+        for r in 0..540 {
+            v1[r] = 1;
+        }
+        for r in 2700..2784 {
+            v1[r] = 1;
+        }
+        let m = matrix(vec![v0, v1]);
+
+        let rb = partition(&m, &RootBlockConfig::default());
+        assert_eq!(rb.block, vec![0], "weak enrichment must stay homoplasmic");
+        assert_eq!(rb.informative, vec![1]);
+        let a = &rb.audit[0];
+        assert!(a.in_block);
+        assert_eq!(a.reason, BlockReason::UnstructuredAbsences);
+        assert!(
+            a.min_q.unwrap() <= 0.05,
+            "the enrichment IS significant (min_q {:?}) — only the odds-ratio floor blocks it",
+            a.min_q
+        );
+
+        // Same data, floor removed: significance alone now reclassifies it.
+        let no_floor = RootBlockConfig { min_or: 1.0, ..RootBlockConfig::default() };
+        let rb = partition(&m, &no_floor);
+        assert_eq!(rb.informative, vec![0, 1], "without the floor, q alone wins");
+        assert!(rb.block.is_empty());
+        assert_eq!(rb.audit[0].reason, BlockReason::StructuredAbsences);
+    }
+
     /// Read-level dropout makes two germline variants drop out on the SAME bad
     /// reads. An absence-vs-absence test would read that as a subclone and keep
     /// both in the search. Testing against the partner's ALT calls does not.
     ///
-    /// DO NOT "simplify" absence_vs_alt_p into an absence-vs-absence test; this
+    /// DO NOT "simplify" absence_vs_alt into an absence-vs-absence test; this
     /// test is the reason it is written the way it is.
     #[test]
     fn read_level_dropout_confounder_still_joins_block() {

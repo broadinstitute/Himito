@@ -218,16 +218,10 @@ pub fn neighbor_joining(hap_matrix: &HaplotypeMatrix) -> Result<Tree> {
     let mut tree = Tree { nodes, root: root_id };
 
     // ── Re-root at ancestral haplotype's parent (outgroup rooting) ───────────
-    // The ancestral (reference) haplotype carries no alt calls. Match on the
-    // absence of any `Some(1)` rather than an exact all-`Some(0)` profile, so an
-    // otherwise-reference haplotype with uncovered sites (`None`) still roots the
-    // tree. Haplotypes are sorted fewest-mutations-first, so the first match is
-    // the best-covered ancestral candidate.
-    if let Some(og_hap) = hap_matrix
-        .haplotypes
-        .iter()
-        .find(|h| !h.profile.iter().any(|&c| c == Some(1)))
-    {
+    // Pick the no-alt haplotype with the most covered reference calls; require
+    // at least one `Some` so an all-`None` read is not treated as ancestral.
+    // Review 2026-09-25 T2
+    if let Some(og_hap) = pick_outgroup(hap_matrix) {
         reroot_at_outgroup_parent(&mut tree, &og_hap.id);
         eprintln!(
             "      Rooted at parent of ancestral haplotype ({}) — outgroup rooting",
@@ -236,6 +230,26 @@ pub fn neighbor_joining(hap_matrix: &HaplotypeMatrix) -> Result<Tree> {
     }
 
     Ok(tree)
+}
+
+/// Choose the ancestral (no-alt) haplotype to use as the NJ outgroup.
+///
+/// Among haplotypes with no alt calls, prefer the one with the most covered
+/// reference sites, then the highest read count; keep the earlier haplotype on
+/// a full tie so the choice is deterministic. All-`None` profiles are excluded
+/// because zero coverage is not evidence of ancestry. Review 2026-09-25 T2
+fn pick_outgroup(hm: &HaplotypeMatrix) -> Option<&Haplotype> {
+    hm.haplotypes
+        .iter()
+        .filter(|h| !h.profile.iter().any(|&c| c == Some(1)))
+        .filter(|h| h.profile.iter().any(|c| c.is_some()))
+        .max_by(|a, b| {
+            let cov = |h: &Haplotype| h.profile.iter().filter(|c| c.is_some()).count();
+            cov(a)
+                .cmp(&cov(b))
+                .then(a.count.cmp(&b.count))
+                .then(std::cmp::Ordering::Less)
+        })
 }
 
 /// Re-root `tree` so that the parent of `outgroup_label` becomes the new root.
@@ -914,6 +928,53 @@ mod tests {
     /// produced it after applying the HF band.
     fn from_vcf(names: &[&str]) -> HfFilter {
         HfFilter::FromVcf(names.iter().map(|n| (n.to_string(), 0.5)).collect())
+    }
+
+    fn hp(id: &str, profile: Vec<Option<u8>>, count: usize) -> Haplotype {
+        Haplotype {
+            id: id.to_string(),
+            profile,
+            reads: vec![],
+            count,
+        }
+    }
+
+    #[test]
+    fn pick_outgroup_prefers_best_covered_ancestral_haplotype() {
+        let hm = HaplotypeMatrix {
+            variants: vec!["v0".into(), "v1".into()],
+            haplotypes: vec![
+                hp("H0000", vec![None, None], 1),
+                hp("H0001", vec![Some(0), Some(0)], 5),
+                hp("H0002", vec![Some(1), Some(1)], 5),
+            ],
+        };
+        assert_eq!(pick_outgroup(&hm).map(|h| h.id.as_str()), Some("H0001"));
+    }
+
+    #[test]
+    fn pick_outgroup_rejects_zero_coverage_ancestor() {
+        let hm = HaplotypeMatrix {
+            variants: vec!["v0".into(), "v1".into()],
+            haplotypes: vec![
+                hp("H0000", vec![None, None], 1),
+                hp("H0001", vec![Some(1), Some(1)], 5),
+            ],
+        };
+        assert_eq!(pick_outgroup(&hm).map(|h| h.id.as_str()), None);
+    }
+
+    #[test]
+    fn pick_outgroup_tie_keeps_earlier_haplotype() {
+        let hm = HaplotypeMatrix {
+            variants: vec!["v0".into(), "v1".into()],
+            haplotypes: vec![
+                hp("H0000", vec![Some(0), Some(0)], 5),
+                hp("H0001", vec![Some(0), Some(0)], 5),
+                hp("H0002", vec![Some(1), Some(1)], 5),
+            ],
+        };
+        assert_eq!(pick_outgroup(&hm).map(|h| h.id.as_str()), Some("H0000"));
     }
 
     #[test]

@@ -145,8 +145,19 @@ pub fn normalize_left(refseq: &[u8], anchor: u32, allele: &Allele) -> (u32, Alle
     }
 }
 
+/// Smallest prefix `p` such that `unit` is `p` repeated (e.g. "AA"->"A", "ATAT"->"AT").
+fn primitive_period(unit: &[u8]) -> &[u8] {
+    let n = unit.len();
+    for p in 1..=n {
+        if n % p == 0 && unit.chunks(p).all(|c| c == &unit[..p]) {
+            return &unit[..p];
+        }
+    }
+    unit
+}
+
 /// Reference repeat context `L` at a normalized site: how many tandem copies of the
-/// event's own sequence surround it. For a 1bp event this is the homopolymer run
+/// event's primitive repeat unit surround it. For a 1bp event this is the homopolymer run
 /// length. Unique sequence gives 1. This is where ONT's indel error mass concentrates,
 /// so it scales both the error rate and the candidacy floor.
 pub fn repeat_context(refseq: &[u8], norm_pos: u32, allele: &Allele) -> u32 {
@@ -164,13 +175,15 @@ pub fn repeat_context(refseq: &[u8], norm_pos: u32, allele: &Allele) -> u32 {
     if unit.is_empty() {
         return 1;
     }
+    // Review 2026-09-25 T1: count copies of the primitive repeat unit, not the whole event.
+    let unit = primitive_period(&unit);
     let u = unit.len();
     let start = norm_pos as usize + 1;
 
     // Copies running rightward from the event position...
     let mut copies = 0u32;
     let mut p = start;
-    while refseq.get(p..p + u).map_or(false, |w| w == &unit[..]) {
+    while refseq.get(p..p + u).map_or(false, |w| w == unit) {
         copies += 1;
         p += u;
     }
@@ -178,7 +191,7 @@ pub fn repeat_context(refseq: &[u8], norm_pos: u32, allele: &Allele) -> u32 {
     // left, but counting both directions keeps the measure independent of which
     // end the aligner happened to anchor.)
     let mut p = start;
-    while p >= u && refseq.get(p - u..p).map_or(false, |w| w == &unit[..]) {
+    while p >= u && refseq.get(p - u..p).map_or(false, |w| w == unit) {
         copies += 1;
         p -= u;
     }
@@ -720,6 +733,22 @@ mod indel_tests {
         // Deleting the single G at index 2 (anchor 1): "G" occurs once here.
         assert_eq!(repeat_context(r, 1, &Allele::Del(1)), 1);
         assert_eq!(repeat_context(r, 1, &Allele::Ref), 1);
+    }
+
+    #[test]
+    fn repeat_context_uses_primitive_period_for_multibase_hp_events() {
+        let r = b"CAAAAAAAAG"; // 8 A
+        for a in [Allele::Del(1), Allele::Del(2), Allele::Del(3),
+                  Allele::Ins(b"A".to_vec()), Allele::Ins(b"AA".to_vec())] {
+            assert_eq!(repeat_context(r, 0, &a), 8, "{a:?}");
+        }
+    }
+
+    #[test]
+    fn repeat_context_reduces_tandem_multiples_to_their_period() {
+        let r = b"CATATATATG"; // (AT)x4
+        assert_eq!(repeat_context(r, 0, &Allele::Ins(b"ATAT".to_vec())), 4);
+        assert_eq!(repeat_context(r, 0, &Allele::Del(4)), 4);
     }
 
     #[test]

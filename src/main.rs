@@ -733,7 +733,7 @@ fn main() {
                     // caller's HF cut here made the two impossible to tune apart, and
                     // at 0.01 the site model keeps marginal noise alleles whose reads
                     // then reach the VCF (precision 0.837 vs 0.967 at 0.03).
-                    DENOISE_KEEP_VAF, DENOISE_MIN_STRAND, DENOISE_STRAND_BIAS_P, 0.7,
+                    DENOISE_KEEP_VAF, 0.7,
                     // Indel correction is on in QuickStart. Every other field keeps
                     // its `Default` value, which `validate_indel_opts` accepts as-is,
                     // so there is nothing to validate here.
@@ -843,8 +843,8 @@ fn main() {
                 }
             }
             if let Err(e) = denoise::start(
-                &input, &output, &reference, &data_type, vaf, DENOISE_MIN_STRAND,
-                DENOISE_STRAND_BIAS_P, DENOISE_HOMOPLASMIC_VAF, &iopts, stats.as_ref(),
+                &input, &output, &reference, &data_type, vaf,
+                DENOISE_HOMOPLASMIC_VAF, &iopts, stats.as_ref(),
             ) {
                 eprintln!("Error running denoise: {e:#}");
                 std::process::exit(1);
@@ -1003,9 +1003,8 @@ fn main() {
                     max_q: root_block_max_q,
                     min_absent: root_block_min_absent,
                     min_or: root_block_min_or,
-                    // Make the HF gate and min_absent depth-relative using the
-                    // same dropout rate the tree search assumes.
-                    dropout_rate: fn_rate,
+                    // The dropout rate that makes the HF gate depth-relative is
+                    // the SCITE fn rate, supplied by `run_scite_pipeline`.
                 })
             };
             if let Err(e) = lineage::start(

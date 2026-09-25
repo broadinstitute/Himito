@@ -91,7 +91,10 @@ pub fn hamming_distance_matrix(matrix: &HaplotypeMatrix) -> DistMatrix {
 ///   ancestor), the tree is re-rooted at that haplotype's parent so the
 ///   outgroup hangs directly from the root.
 /// * Otherwise the NJ root (midpoint of the final two-taxon join) is kept.
-pub fn neighbor_joining(dist: &DistMatrix, hap_matrix: &HaplotypeMatrix) -> Result<Tree> {
+pub fn neighbor_joining(hap_matrix: &HaplotypeMatrix) -> Result<Tree> {
+    // The distance matrix is a pure function of `hap_matrix`; taking both let a
+    // caller pass a matrix built from different haplotypes than the leaves.
+    let dist = hamming_distance_matrix(hap_matrix);
     let n = dist.labels.len();
     if n < 2 {
         bail!("Need at least 2 haplotypes to build a tree, found {n}");
@@ -846,7 +849,6 @@ pub fn start(
     // with the same `min_reads` and the same deterministic ordering.
     let cleaned_hap_matrix = crate::scite::run_scite_pipeline(
         &binary,
-        &hap_matrix,
         fp_rate,
         fn_rate,
         mcmc_iterations,

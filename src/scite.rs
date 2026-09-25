@@ -1840,7 +1840,6 @@ fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> 
 /// disk and deduplicating it a second time.
 pub fn run_scite_pipeline(
     binary: &BinaryMatrix,
-    hap_matrix: &HaplotypeMatrix,
     fp_rate: f64,
     fn_rate: f64,
     n_iterations: usize,
@@ -1859,7 +1858,7 @@ pub fn run_scite_pipeline(
     // Partition before anything else looks at the matrix: everything below
     // searches, scores and reports over `search_matrix`, not `binary`.
     let rb = match root_block {
-        Some(cfg) => rootblock::partition(binary, cfg),
+        Some(cfg) => rootblock::partition(binary, cfg, fn_rate),
         None => rootblock::RootBlock::disabled(binary.variants.len()),
     };
     // A block member sharing a REF span with a surviving informative variant
@@ -1882,15 +1881,13 @@ pub fn run_scite_pipeline(
     }
     let search_matrix = rootblock::restrict(binary, &rb.informative);
     let binary = &search_matrix;
-    // `hap_matrix` (used below only to seed the NJ-derived initial tree) was
-    // deduplicated from the *unrestricted* matrix by the caller, so its variant
-    // count no longer matches `binary` whenever the block is non-empty. Rebuild
-    // it over the restricted matrix in that case; when the block is empty this
-    // reproduces the caller's `hap_matrix` exactly (same matrix, same
-    // `min_reads`), so the disabled/empty-block outputs are unaffected.
-    let search_hap_matrix =
-        if block_names.is_empty() { None } else { Some(lineage::deduplicate(binary, min_reads)) };
-    let hap_matrix: &HaplotypeMatrix = search_hap_matrix.as_ref().unwrap_or(hap_matrix);
+    // Haplotypes over the SEARCH matrix, used only to seed the NJ-derived initial
+    // tree. Built here rather than taken from the caller: the caller's haplotypes
+    // are over the unrestricted matrix, so they only lined up when the root block
+    // was empty -- and in that case this is the identical computation (same
+    // matrix, same `min_reads`, deterministic ordering).
+    let search_hap_matrix = lineage::deduplicate(binary, min_reads);
+    let hap_matrix = &search_hap_matrix;
     let no_informative = binary.variants.is_empty();
     if no_informative {
         info!(
@@ -1913,8 +1910,7 @@ pub fn run_scite_pipeline(
             binary.variants[0]
         );
     }
-    let dist = lineage::hamming_distance_matrix(hap_matrix);
-    let initial_tree = lineage::neighbor_joining(&dist, hap_matrix)
+    let initial_tree = lineage::neighbor_joining(hap_matrix)
         .ok()
         .map(|nj_tree| from_nj_tree(hap_matrix, &nj_tree));
     info!(
@@ -2428,8 +2424,7 @@ mod tests {
                 },
             ],
         };
-        let dist = lineage::hamming_distance_matrix(&hap_matrix);
-        let nj_tree = lineage::neighbor_joining(&dist, &hap_matrix).unwrap();
+        let nj_tree = lineage::neighbor_joining(&hap_matrix).unwrap();
         let tree = from_nj_tree(&hap_matrix, &nj_tree);
         assert!(!violates_position_exclusivity(
             &tree,
@@ -2951,7 +2946,6 @@ mod tests {
             .map(|i| (0..n_reads).map(|j| Some(u8::from(j > i))).collect())
             .collect();
         let matrix = BinaryMatrix { variants, reads, data };
-        let hap_matrix = lineage::deduplicate(&matrix, 1);
 
         let prefix = std::env::temp_dir()
             .join("himito_test_scite_pipeline_65var")
@@ -2959,7 +2953,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 50, 1, 7, 1, None, &prefix).unwrap();
+        run_scite_pipeline(&matrix, 0.01, 0.1, 50, 1, 7, 1, None, &prefix).unwrap();
 
         let nwk = format!("{prefix}.read_lineage.nwk");
         assert!(std::path::Path::new(&nwk).exists(), "expected {nwk} to exist");
@@ -2989,7 +2983,6 @@ mod tests {
                 .chain([None])
                 .collect()],
         };
-        let hap_matrix = lineage::deduplicate(&matrix, 1);
 
         let prefix = std::env::temp_dir()
             .join("himito_test_scite_pipeline_1var")
@@ -2997,7 +2990,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 500, 2, 123, 1, None, &prefix).unwrap();
+        run_scite_pipeline(&matrix, 0.01, 0.1, 500, 2, 123, 1, None, &prefix).unwrap();
 
         let tree_tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
         // The mutation hangs directly off the root, with no order to resolve.
@@ -3051,7 +3044,6 @@ mod tests {
                 vec![Some(1); 6].into_iter().chain(vec![Some(0); 3]).chain([Some(1)]).collect(),
             ],
         };
-        let hap_matrix = lineage::deduplicate(&matrix, 1);
 
         let prefix = std::env::temp_dir()
             .join("himito_test_scite_pipeline_out")
@@ -3059,7 +3051,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, &hap_matrix, 0.01, 0.1, 500, 2, 123, 1, None, &prefix).unwrap();
+        run_scite_pipeline(&matrix, 0.01, 0.1, 500, 2, 123, 1, None, &prefix).unwrap();
 
         for suffix in [
             ".cleaned_matrix.csv",
@@ -3805,14 +3797,12 @@ mod tests {
             reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
             data: vec![row.clone(), row],
         };
-        let hap = lineage::deduplicate(&binary, 1);
         let dir = std::env::temp_dir().join("himito_rb_allblock");
         std::fs::create_dir_all(&dir).unwrap();
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
         let out = run_scite_pipeline(
             &binary,
-            &hap,
             0.01,
             0.05,
             50,
@@ -3835,12 +3825,11 @@ mod tests {
             reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
             data: vec![row.clone(), row],
         };
-        let hap = lineage::deduplicate(&binary, 1);
         let dir = std::env::temp_dir().join("himito_rb_disabled");
         std::fs::create_dir_all(&dir).unwrap();
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
-        run_scite_pipeline(&binary, &hap, 0.01, 0.05, 50, 1, 7, 1, None, &prefix).unwrap();
+        run_scite_pipeline(&binary, 0.01, 0.05, 50, 1, 7, 1, None, &prefix).unwrap();
 
         let tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
         assert!(tsv.contains("m.750A>G"), "disabled must leave both variants in the tree");
@@ -3865,12 +3854,11 @@ mod tests {
             reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
             data: vec![alternating, blocky],
         };
-        let hap = lineage::deduplicate(&binary, 1);
 
         // Pin down the premise: this test is only meaningful if the partition
         // actually produces an empty block. Without this, gutting `partition`
         // to always return `disabled` would still pass.
-        let rb = rootblock::partition(&binary, &crate::rootblock::RootBlockConfig::default());
+        let rb = rootblock::partition(&binary, &crate::rootblock::RootBlockConfig::default(), 0.05);
         assert!(rb.block.is_empty(), "test premise violated: partition must find no block here");
 
         let dir = std::env::temp_dir().join("himito_rb_empty");
@@ -3879,10 +3867,10 @@ mod tests {
         let off = dir.join("off").to_str().unwrap().to_string();
 
         run_scite_pipeline(
-            &binary, &hap, 0.01, 0.05, 200, 1, 7, 1,
+            &binary, 0.01, 0.05, 200, 1, 7, 1,
             Some(&crate::rootblock::RootBlockConfig::default()), &on,
         ).unwrap();
-        run_scite_pipeline(&binary, &hap, 0.01, 0.05, 200, 1, 7, 1, None, &off).unwrap();
+        run_scite_pipeline(&binary, 0.01, 0.05, 200, 1, 7, 1, None, &off).unwrap();
 
         for ext in [
             ".mutation_tree.tsv",
@@ -3915,13 +3903,12 @@ mod tests {
             reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
             data: vec![germline, real],
         };
-        let hap = lineage::deduplicate(&binary, 1);
         let dir = std::env::temp_dir().join("himito_rb_single");
         std::fs::create_dir_all(&dir).unwrap();
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
         run_scite_pipeline(
-            &binary, &hap, 0.01, 0.05, 200, 1, 7, 1,
+            &binary, 0.01, 0.05, 200, 1, 7, 1,
             Some(&crate::rootblock::RootBlockConfig::default()), &prefix,
         ).unwrap();
 
@@ -4045,13 +4032,12 @@ mod tests {
             reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
             data: vec![germline, real],
         };
-        let hap = lineage::deduplicate(&binary, 1);
         let dir = std::env::temp_dir().join("himito_rb_raw_cooc");
         std::fs::create_dir_all(&dir).unwrap();
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
         run_scite_pipeline(
-            &binary, &hap, 0.01, 0.05, 200, 1, 7, 1,
+            &binary, 0.01, 0.05, 200, 1, 7, 1,
             Some(&crate::rootblock::RootBlockConfig::default()), &prefix,
         ).unwrap();
 
@@ -4087,12 +4073,11 @@ mod tests {
             reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
             data: vec![block_col, informative_a, informative_b],
         };
-        let hap = lineage::deduplicate(&binary, 1);
 
         // Pin the premise: the block is non-empty and two informative
         // variants remain, so the pair table below is guaranteed non-empty
         // and the omission assertion is not vacuous.
-        let rb = rootblock::partition(&binary, &crate::rootblock::RootBlockConfig::default());
+        let rb = rootblock::partition(&binary, &crate::rootblock::RootBlockConfig::default(), 0.05);
         assert_eq!(rb.block, vec![0], "test premise violated: expected v0 alone to block");
         assert_eq!(
             rb.informative,
@@ -4105,7 +4090,7 @@ mod tests {
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
         run_scite_pipeline(
-            &binary, &hap, 0.01, 0.05, 200, 1, 7, 1,
+            &binary, 0.01, 0.05, 200, 1, 7, 1,
             Some(&crate::rootblock::RootBlockConfig::default()), &prefix,
         ).unwrap();
 

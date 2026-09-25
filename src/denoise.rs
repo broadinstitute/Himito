@@ -600,7 +600,7 @@ fn apply_corrections(
     models: &IndelModels,
     iopts: &indel::IndelOpts,
     stats: &mut DenoiseStats,
-) -> Result<(u64, u64)> {
+) -> Result<()> {
     let mut reader = Reader::from_path(in_bam)
         .with_context(|| format!("cannot open BAM {in_bam:?}"))?;
     let header_view = reader.header().to_owned();
@@ -679,12 +679,8 @@ fn apply_corrections(
                                 }
                             }
 
-                            // `flank` is validated/clamped to >= 1 here (see IndelOpts::flank's
-                            // doc comment). The clamp is not a no-truncation safety
-                            // requirement -- at flank == 0 the FIX-4 match-run bound below is
-                            // already exactly the no-truncation bound -- it only guarantees
-                            // some flanking match context is required around every edit.
-                            let flank = iopts.flank.max(1) as i64;
+                            // Fixed flank (>= 1 by construction; see `INDEL_FLANK`).
+                            let flank = indel::INDEL_FLANK as i64;
                             // A gained deletion consumes up to max_len reference bases to the
                             // right, so the right-hand requirement is larger than the left.
                             let reach = flank + iopts.max_len as i64;
@@ -966,7 +962,9 @@ fn apply_corrections(
              not found in the supplied reference; written through unchanged."
         );
     }
-    Ok((reads_processed, reads_modified))
+    stats.reads_processed = reads_processed;
+    stats.reads_modified = reads_modified;
+    Ok(())
 }
 
 pub fn start(
@@ -975,12 +973,14 @@ pub fn start(
     reference: &PathBuf,
     data_type: &str,
     vaf: f64,
-    min_strand: u32,
-    strand_bias_p: f64,
     homoplasmic_vaf: f64,
     indels: &indel::IndelOpts,
     stats_out: Option<&PathBuf>,
 ) -> Result<()> {
+    // The per-strand count gate and the strand-bias p are fixed crate constants
+    // (no caller ever varied them); `fit_site`/`compute_corrections` keep them as
+    // parameters only so their unit tests can exercise other values.
+    let (min_strand, strand_bias_p) = (crate::DENOISE_MIN_STRAND, crate::DENOISE_STRAND_BIAS_P);
     // PacBio (and anything non-ONT) is a byte-identical passthrough.
     if !data_type.starts_with("ont") {
         std::fs::copy(input, output)
@@ -1001,11 +1001,7 @@ pub fn start(
     let (corrections, models, mut stats) = compute_corrections(
         input, &refs, min_strand, vaf, strand_bias_p, homoplasmic_vaf, indels,
     )?;
-    let (reads_processed, reads_modified) = apply_corrections(
-        input, output, &corrections, &refs, &models, indels, &mut stats,
-    )?;
-    stats.reads_processed = reads_processed;
-    stats.reads_modified = reads_modified;
+    apply_corrections(input, output, &corrections, &refs, &models, indels, &mut stats)?;
 
     let rate = if stats.bases_examined > 0 {
         stats.bases_modified as f64 / stats.bases_examined as f64
@@ -1357,10 +1353,11 @@ mod tests {
         refs.insert(b"chrM".to_vec(), b"AAAAAA".to_vec());
         let models = IndelModels::new();
         let mut stats = DenoiseStats::default();
-        let (proc, modified) = apply_corrections(
+        apply_corrections(
             &inb, &outb, &corr, &refs, &models, &indel::IndelOpts::default(), &mut stats,
         )
         .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
         assert_eq!(proc, 1);
         assert_eq!(modified, 1);
 
@@ -1382,7 +1379,7 @@ mod tests {
         std::fs::write(&reff, ">chrM\nAAAAAA\n").unwrap();
         write_test_bam(&inb, "chrM", 6, &[("r0", 0, b"AAGAAA", false)]);
 
-        start(&inb, &outb, &reff, "pacbio", 0.01, 2, SB_P, HOM_VAF, &indel::IndelOpts::default(), None).unwrap();
+        start(&inb, &outb, &reff, "pacbio", 0.01, HOM_VAF, &indel::IndelOpts::default(), None).unwrap();
         assert_eq!(std::fs::read(&inb).unwrap(), std::fs::read(&outb).unwrap());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1402,7 +1399,7 @@ mod tests {
         reads.push(("rerr", 0, b"AAGAAA", false));
         write_test_bam(&inb, "chrM", 6, &reads);
 
-        start(&inb, &outb, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, &indel::IndelOpts::default(), Some(&statsf)).unwrap();
+        start(&inb, &outb, &reff, "ont-r10", 0.01, HOM_VAF, &indel::IndelOpts::default(), Some(&statsf)).unwrap();
 
         let mut r = Reader::from_path(&outb).unwrap();
         let mut modified_ok = false;
@@ -1512,10 +1509,11 @@ mod tests {
 
         let models = IndelModels::new();
         let mut stats = DenoiseStats::default();
-        let (proc, modified) = apply_corrections(
+        apply_corrections(
             &inb, &outb, &corr, &refs, &models, &indel::IndelOpts::default(), &mut stats,
         )
         .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
         assert_eq!(proc, 1);
         assert_eq!(modified, 0, "a record on a contig missing from refs must not be rewritten");
 
@@ -2140,10 +2138,11 @@ mod tests {
 
         let corr: Corrections = HashMap::new();
         let mut stats = DenoiseStats::default();
-        let (proc, modified) = apply_corrections(
+        apply_corrections(
             &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
         )
         .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
         assert_eq!(proc, 1);
         assert_eq!(modified, 0, "the read must not be rewritten -- it has no query base at 12");
 
@@ -2194,10 +2193,11 @@ mod tests {
 
         let corr: Corrections = HashMap::new();
         let mut stats = DenoiseStats::default();
-        let (proc, modified) = apply_corrections(
+        apply_corrections(
             &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
         )
         .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
         assert_eq!(proc, 1);
         assert_eq!(modified, 0, "the read must not be rewritten -- its real flank is one base short");
 
@@ -2252,10 +2252,11 @@ mod tests {
 
         let corr: Corrections = HashMap::new();
         let mut stats = DenoiseStats::default();
-        let (proc, modified) = apply_corrections(
+        apply_corrections(
             &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
         )
         .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
         assert_eq!(proc, 1);
         assert_eq!(modified, 1);
 
@@ -2331,10 +2332,11 @@ mod tests {
 
         let corr: Corrections = HashMap::new();
         let mut stats = DenoiseStats::default();
-        let (proc, modified) = apply_corrections(
+        apply_corrections(
             &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
         )
         .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
         assert_eq!(proc, 1);
         assert_eq!(modified, 1, "the site-5 deletion must still be applied");
 
@@ -2454,10 +2456,11 @@ mod tests {
 
         let corr: Corrections = HashMap::new();
         let mut stats = DenoiseStats::default();
-        let (proc, modified) = apply_corrections(
+        apply_corrections(
             &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
         )
         .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
         assert_eq!(proc, 1);
         assert_eq!(modified, 0, "the guarded read must not be rewritten");
 
@@ -2563,10 +2566,11 @@ mod tests {
         let models = IndelModels::new();
         let mut stats = DenoiseStats::default();
         let corr: Corrections = HashMap::new();
-        let (proc, modified) = apply_corrections(
+        apply_corrections(
             &inb, &outb, &corr, &refs, &models, &indel::IndelOpts::default(), &mut stats,
         )
-        .unwrap(); // must not panic on an unchecked tid2name offset
+        .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified); // must not panic on an unchecked tid2name offset
         assert_eq!(proc, 1);
         assert_eq!(modified, 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -2615,10 +2619,11 @@ mod tests {
 
         let models = IndelModels::new();
         let mut stats = DenoiseStats::default();
-        let (proc, modified) = apply_corrections(
+        apply_corrections(
             &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
         )
         .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
         assert_eq!(proc, 1);
         assert_eq!(modified, 0, "the walk never reaches ref_pos 11, so nothing may change");
 
@@ -2731,10 +2736,11 @@ mod tests {
 
         let models = IndelModels::new();
         let mut stats = DenoiseStats::default();
-        let (proc, modified) = apply_corrections(
+        apply_corrections(
             &inb, &outb, &corr, &refs, &models, &indels_on(), &mut stats,
         )
         .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
         assert_eq!(proc, 1);
         assert_eq!(modified, 1, "one of the two Ins ops must actually be reverted");
 
@@ -2777,8 +2783,8 @@ mod tests {
         write_cigar_bam(&inb, "chrM", 29, &reads);
 
         let off = indel::IndelOpts::default();
-        start(&inb, &out_a, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, &off, None).unwrap();
-        start(&inb, &out_b, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, &off, None).unwrap();
+        start(&inb, &out_a, &reff, "ont-r10", 0.01, HOM_VAF, &off, None).unwrap();
+        start(&inb, &out_b, &reff, "ont-r10", 0.01, HOM_VAF, &off, None).unwrap();
         assert_eq!(std::fs::read(&out_a).unwrap(), std::fs::read(&out_b).unwrap());
 
         // And the indel-bearing read keeps its insertion.
@@ -2824,7 +2830,7 @@ mod tests {
         reads.push(("rerr", 0, b"AAGAAA", err_cigar.clone(), false));
         write_cigar_bam(&inb, "chrM", 6, &reads);
 
-        start(&inb, &outb, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, &indel::IndelOpts::default(), None).unwrap();
+        start(&inb, &outb, &reff, "ont-r10", 0.01, HOM_VAF, &indel::IndelOpts::default(), None).unwrap();
 
         let mut r = Reader::from_path(&outb).unwrap();
         let mut seen = false;
@@ -2863,7 +2869,7 @@ mod tests {
 
         let mut on = indel::IndelOpts::default();
         on.enabled = true;
-        start(&inb, &outb, &reff, "ont-r10", 0.01, 2, SB_P, HOM_VAF, &on, Some(&statsf)).unwrap();
+        start(&inb, &outb, &reff, "ont-r10", 0.01, HOM_VAF, &on, Some(&statsf)).unwrap();
 
         let mut r = Reader::from_path(&outb).unwrap();
         let mut seen = false;

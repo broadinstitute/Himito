@@ -24,17 +24,11 @@ pub struct RootBlockConfig {
     /// ratio (which a genuine subclone produces but dropout does not) decouples
     /// the call from depth.
     pub min_or: f64,
-    /// Per-read dropout rate used to make the HF gate and the `min_absent`
-    /// threshold depth-relative: expected dropout absences (`dropout_rate x
-    /// covered`) are discounted from the observed absent count before either is
-    /// judged. `0.0` reproduces the original absolute, coverage-sensitive
-    /// behaviour; the pipeline passes the SCITE false-negative rate.
-    pub dropout_rate: f64,
 }
 
 impl Default for RootBlockConfig {
     fn default() -> Self {
-        Self { min_hf: 0.80, max_q: 0.05, min_absent: 10, min_or: 2.0, dropout_rate: 0.0 }
+        Self { min_hf: 0.80, max_q: 0.05, min_absent: 10, min_or: 2.0 }
     }
 }
 
@@ -158,7 +152,14 @@ fn absence_vs_alt(matrix: &BinaryMatrix, v: usize, u: usize) -> Option<(f64, f64
     Some(fisher_greater(a, b, c, d))
 }
 
-pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
+/// `dropout_rate` is the per-read dropout (false-negative) rate used to make the
+/// HF gate and `min_absent` depth-relative: expected dropout absences
+/// (`dropout_rate x covered`) are discounted before either is judged. `0.0`
+/// reproduces the absolute, coverage-sensitive behaviour. It is a parameter
+/// rather than a `RootBlockConfig` field because it is not a root-block knob:
+/// it is the SCITE false-negative rate, and taking it from the one place that
+/// owns it (`run_scite_pipeline`) means the two can never disagree.
+pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64) -> RootBlock {
     let n = matrix.variants.len();
     let mut block = Vec::new();
     let mut informative = Vec::new();
@@ -178,7 +179,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig) -> RootBlock {
         // homoplasmy would produce before judging either. With
         // `dropout_rate == 0` `corrected_hf == hf` and the threshold is the raw
         // `min_absent`, so the original behaviour is preserved exactly.
-        let expected_dropout = cfg.dropout_rate * covered as f64;
+        let expected_dropout = dropout_rate * covered as f64;
         let corrected_absent = (n_absent as f64 - expected_dropout).max(0.0);
         let denom = present as f64 + corrected_absent;
         let corrected_hf = if denom > 0.0 { present as f64 / denom } else { 0.0 };
@@ -347,7 +348,7 @@ mod tests {
     fn variant_below_hf_gate_is_informative_and_unaudited() {
         // hf = 50/100 = 0.50, below the 0.80 gate
         let m = matrix(vec![run(50, 50)]);
-        let rb = partition(&m, &RootBlockConfig::default());
+        let rb = partition(&m, &RootBlockConfig::default(), 0.0);
         assert_eq!(rb.informative, vec![0]);
         assert!(rb.block.is_empty());
         assert!(rb.audit.is_empty(), "sub-gate variants produce no audit row");
@@ -357,7 +358,7 @@ mod tests {
     fn high_hf_variant_with_too_few_absences_joins_block_untested() {
         // hf = 95/100 = 0.95 (>= 0.80), n_absent = 5 (< 10) -> rule 2
         let m = matrix(vec![run(95, 5)]);
-        let rb = partition(&m, &RootBlockConfig::default());
+        let rb = partition(&m, &RootBlockConfig::default(), 0.0);
         assert_eq!(rb.block, vec![0]);
         assert!(rb.informative.is_empty());
         assert_eq!(rb.audit.len(), 1);
@@ -377,7 +378,7 @@ mod tests {
         //     (90..100) exactly 5 are even, matching the global rate.
         let v0 = run(90, 10);
         let v1: Vec<i8> = (0..100).map(|r| if r % 2 == 0 { 1 } else { 0 }).collect();
-        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.0);
         assert_eq!(rb.block, vec![0], "unstructured absences -> block");
         assert_eq!(rb.informative, vec![1]);
         let a = &rb.audit[0];
@@ -393,7 +394,7 @@ mod tests {
         // v1: ref on 0..90, alt on 90..100 -> perfectly marks v0's absences.
         let v0 = run(90, 10);
         let v1: Vec<i8> = (0..100).map(|r| if r >= 90 { 1 } else { 0 }).collect();
-        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.0);
         assert!(rb.block.is_empty(), "structured absences must not be collapsed");
         assert_eq!(rb.informative, vec![0, 1]);
         let a = &rb.audit[0];
@@ -428,7 +429,7 @@ mod tests {
         }
         let m = matrix(vec![v0, v1]);
 
-        let rb = partition(&m, &RootBlockConfig::default());
+        let rb = partition(&m, &RootBlockConfig::default(), 0.0);
         assert_eq!(rb.block, vec![0], "weak enrichment must stay homoplasmic");
         assert_eq!(rb.informative, vec![1]);
         let a = &rb.audit[0];
@@ -442,7 +443,7 @@ mod tests {
 
         // Same data, floor removed: significance alone now reclassifies it.
         let no_floor = RootBlockConfig { min_or: 1.0, ..RootBlockConfig::default() };
-        let rb = partition(&m, &no_floor);
+        let rb = partition(&m, &no_floor, 0.0);
         assert_eq!(rb.informative, vec![0, 1], "without the floor, q alone wins");
         assert!(rb.block.is_empty());
         assert_eq!(rb.audit[0].reason, BlockReason::StructuredAbsences);
@@ -459,7 +460,7 @@ mod tests {
         // Reads 90..100 are poor quality: both variants drop out there.
         let v0 = run(90, 10);
         let v1 = run(90, 10);
-        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.0);
         assert_eq!(rb.block, vec![0, 1], "correlated dropout is not a subclone");
         assert!(rb.informative.is_empty());
         assert!(
@@ -476,7 +477,7 @@ mod tests {
         // and the pair is skipped entirely.
         let v0 = run(90, 10);
         let v1 = vec![0i8; 100];
-        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default());
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.0);
         assert_eq!(rb.block, vec![0]);
         assert!(rb.audit[0].min_q.is_none());
         // Untestable for lack of a partner, not for too few absences (v0 has
@@ -570,7 +571,7 @@ mod tests {
             }
         }
 
-        let rb = partition(&matrix(rows), &RootBlockConfig::default());
+        let rb = partition(&matrix(rows), &RootBlockConfig::default(), 0.0);
         assert_eq!(
             rb.block,
             vec![0, 1, 2],

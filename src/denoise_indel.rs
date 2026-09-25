@@ -54,6 +54,14 @@ impl Allele {
     }
 }
 
+/// Minimum plain match-context flank required on each side of an indel edit.
+/// Was `IndelOpts::flank`, a field no caller ever changed from 5 and every use
+/// site had to clamp to >= 1; as a constant it is >= 1 by construction. It is a
+/// quality bar (some flanking match context around every edit), not the
+/// no-truncation bound -- the gained-deletion run check `m + flank + 1` would be
+/// exact even at 0.
+pub const INDEL_FLANK: usize = 5;
+
 /// Tunable parameters for indel denoising. `Default` is DISABLED, so every existing
 /// caller that passes `IndelOpts::default()` keeps byte-identical v1 behavior.
 #[derive(Debug, Clone)]
@@ -67,20 +75,6 @@ pub struct IndelOpts {
     pub err_cap: f64,
     pub floor_mult: f64,
     pub delta: f64,
-    /// Minimum plain match-context flank required on each side of an edit.
-    /// Consumers must clamp this to at least 1 wherever it is used. This is
-    /// NOT itself a no-truncation safety requirement: at `flank == 0` the
-    /// FIX-4 match-run bound for a gained deletion, `m + flank + 1` (anchor
-    /// base + `m` deleted bases + `flank` genuine right-hand flank matches),
-    /// is already exactly `m + 1` -- the true no-truncation bound -- so
-    /// nothing would trip or truncate even unclamped. The clamp instead
-    /// guarantees that SOME flanking match context (rather than none) is
-    /// always required around an edit, which this feature wants
-    /// unconditionally as a quality bar, independent of that arithmetic.
-    /// `apply_corrections` enforces the clamp via `iopts.flank.max(1)`; this
-    /// field itself is left unvalidated (a `pub` field with no constructor)
-    /// so any future direct caller must not assume 0 is safe here.
-    pub flank: usize,
     /// An allele carried by at least this fraction of reads at a site is never
     /// corrected away, regardless of candidacy. This guards against `vaf_floor`
     /// exceeding 1.0 in deep repeat contexts (which would otherwise make it
@@ -102,7 +96,6 @@ impl Default for IndelOpts {
             err_cap: 0.4,
             floor_mult: 3.0,
             delta: 0.3,
-            flank: 5,
             protect_vaf: 0.2,
         }
     }

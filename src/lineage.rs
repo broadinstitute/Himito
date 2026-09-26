@@ -3,7 +3,7 @@ use anyhow::{bail,Context, Result};
 use rust_htslib::bcf::{Read, Reader}; // Read trait must be in scope for .records()
 use std::io::{BufWriter, Write};
 use std::fs::File;
-use log::info;
+use log::{info, warn};
 
 // ─── Tree data structure ──────────────────────────────────────────────────────
 
@@ -392,6 +392,20 @@ pub struct BinaryMatrix {
 pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
     let mut reader = Reader::from_path(vcf_path)
         .with_context(|| format!("Cannot read VCF: {vcf_path}"))?;
+    // Plan 2026-09-26 T4. `call` writes this only when indels were left-aligned.
+    // A missing line means homopolymer indels may be split across several names.
+    let left_aligned = reader.header().header_records().iter().any(|rec| {
+        matches!(
+            rec,
+            rust_htslib::bcf::header::HeaderRecord::Generic { key, .. }
+                if key == "HimitoNormalization"
+        )
+    });
+    if !left_aligned {
+        warn!(
+            "VCF was not left-aligned; homopolymer indels may be split across several variant names; re-run `Himito call` without `--no-left-align`"
+        );
+    }
     let mut map = HfMap::new();
 
     for result in reader.records() {
@@ -1311,6 +1325,100 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.99
         assert_eq!(map.get("m.200C>T").copied(), Some(0.9_f32 as f64));
         // The later duplicate record (HF 0.99) does not overwrite the first.
         assert_eq!(map.len(), 3);
+    }
+
+    // Plan 2026-09-26 T4. Captures `warn!` so the missing-header case is observable.
+    struct NormalizationLog;
+
+    static NORMALIZATION_LOG: std::sync::Mutex<Vec<(std::thread::ThreadId, String)>> =
+        std::sync::Mutex::new(Vec::new());
+
+    impl log::Log for NormalizationLog {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                NORMALIZATION_LOG.lock().unwrap().push((
+                    std::thread::current().id(),
+                    record.args().to_string(),
+                ));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn install_normalization_log() {
+        static LOGGER: NormalizationLog = NormalizationLog;
+        let _ = log::set_logger(&LOGGER);
+        log::set_max_level(log::LevelFilter::Warn);
+    }
+
+    fn logs_during(f: impl FnOnce()) -> Vec<String> {
+        let me = std::thread::current().id();
+        let start = NORMALIZATION_LOG.lock().unwrap().len();
+        f();
+        NORMALIZATION_LOG.lock().unwrap()[start..]
+            .iter()
+            .filter(|(id, _)| *id == me)
+            .map(|(_, line)| line.clone())
+            .collect()
+    }
+
+    fn minimal_pass_vcf(extra_header: &str) -> String {
+        format!(
+            "\
+##fileformat=VCFv4.2
+##contig=<ID=chrM,length=16569>
+{extra_header}##FORMAT=<ID=HF,Number=A,Type=Float,Description=\"Heteroplasmic fraction\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1
+chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
+"
+        )
+    }
+
+    /// Plan 2026-09-26 T4. A VCF without `##HimitoNormalization` must still parse,
+    /// and must warn once that homopolymer indels may be split across names.
+    #[test]
+    fn parse_vcf_warns_once_when_header_lacks_himito_normalization() {
+        install_normalization_log();
+        let missing = std::env::temp_dir().join("himito_test_parse_vcf_no_norm.vcf");
+        std::fs::write(&missing, minimal_pass_vcf("")).unwrap();
+        let logs = logs_during(|| {
+            parse_vcf(missing.to_str().unwrap(), 0.0, 1.0).unwrap();
+        });
+        std::fs::remove_file(&missing).ok();
+        let hits: Vec<_> = logs
+            .iter()
+            .filter(|l| l.contains("VCF was not left-aligned"))
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected one left-align warning, got {logs:?}"
+        );
+        assert!(
+            hits[0].contains("without `--no-left-align`"),
+            "warning should name --no-left-align, got {}",
+            hits[0]
+        );
+
+        let present = std::env::temp_dir().join("himito_test_parse_vcf_with_norm.vcf");
+        std::fs::write(
+            &present,
+            minimal_pass_vcf("##HimitoNormalization=left-aligned\n"),
+        )
+        .unwrap();
+        let logs = logs_during(|| {
+            parse_vcf(present.to_str().unwrap(), 0.0, 1.0).unwrap();
+        });
+        std::fs::remove_file(&present).ok();
+        assert!(
+            logs.iter().all(|l| !l.contains("VCF was not left-aligned")),
+            "left-aligned header must not warn, got {logs:?}"
+        );
     }
 
     /// Plan 2026-09-26 T3. Temp prefixes are stable across runs, so leftovers

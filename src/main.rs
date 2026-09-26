@@ -203,15 +203,18 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.10)]
         strand_bias_drop_max_hf: f64,
 
-        /// left-align indels against the reference, as `bcftools norm` does, so that
+        /// (default) left-align indels against the reference, as `bcftools norm` does, so that
         /// equivalent spellings of one event in a homopolymer or tandem repeat
         /// collapse into a single record with their supporting reads pooled. This
         /// changes reported POS/REF/ALT, AC and HF for indels, and the variant names
         /// used as row labels in the output matrix. An indel that would shift past
         /// the start of the reference stops there rather than wrapping around the
         /// circular origin.
-        #[clap(long, action)]
-        left_align: bool,
+        #[clap(long = "left-align", action, hide = true)]
+        left_align_compat: bool, // accepted for backwards compatibility; now a no-op
+        /// disable indel left-alignment (reproduces pre-2026-09 variant names)
+        #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat")]
+        no_left_align: bool,
 
     },
 
@@ -422,15 +425,18 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.10)]
         strand_bias_drop_max_hf: f64,
 
-        /// left-align indels against the reference, as `bcftools norm` does, so that
+        /// (default) left-align indels against the reference, as `bcftools norm` does, so that
         /// equivalent spellings of one event in a homopolymer or tandem repeat
         /// collapse into a single record with their supporting reads pooled. This
         /// changes reported POS/REF/ALT, AC and HF for indels, and the variant names
         /// used as row labels in the output matrix. An indel that would shift past
         /// the start of the reference stops there rather than wrapping around the
         /// circular origin.
-        #[clap(long, action)]
-        left_align: bool,
+        #[clap(long = "left-align", action, hide = true)]
+        left_align_compat: bool, // accepted for backwards compatibility; now a no-op
+        /// disable indel left-alignment (reproduces pre-2026-09 variant names)
+        #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat")]
+        no_left_align: bool,
     },
 
     /// Extract Major Haplotype as Fasta file from Graph
@@ -709,8 +715,11 @@ fn main() {
             permutation_rounds,
             strand_bias_action,
             strand_bias_drop_max_hf,
-            left_align,
+            no_left_align,
+            left_align_compat: _,
         } => {
+            // Plan 2026-09-26 T4
+            let left_align = !no_left_align;
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold_) =
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold, permutation_frequency_threshold);
             let mt_output = output_prefix.with_extension("mt.bam");
@@ -893,8 +902,11 @@ fn main() {
             permutation_rounds,
             strand_bias_action,
             strand_bias_drop_max_hf,
-            left_align,
+            no_left_align,
+            left_align_compat: _,
         } => {
+            // Plan 2026-09-26 T4
+            let left_align = !no_left_align;
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, frequency_threshold, permutation_frequency_threshold);
             call::start(
@@ -1115,5 +1127,96 @@ mod lineage_opts_validation_tests {
     #[test]
     fn mcmc_chains_one_is_accepted() {
         assert!(validate_lineage_opts(1).is_ok());
+    }
+}
+
+// Plan 2026-09-26 T4. Effective left-alignment is the default; `--left-align`
+// remains accepted and `--no-left-align` turns it off.
+#[cfg(test)]
+mod left_align_cli_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> clap::error::Result<Cli> {
+        Cli::try_parse_from(args)
+    }
+
+    fn effective_left_align(cli: Cli) -> bool {
+        match cli.command {
+            Commands::Call { no_left_align, .. } | Commands::QuickStart { no_left_align, .. } => {
+                !no_left_align
+            }
+            other => panic!("unexpected subcommand: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_left_aligns_by_default() {
+        let cli = parse(&["Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf"]).unwrap();
+        assert!(effective_left_align(cli));
+    }
+
+    #[test]
+    fn call_left_align_flag_still_left_aligns() {
+        let cli = parse(&[
+            "Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf", "--left-align",
+        ])
+        .unwrap();
+        assert!(effective_left_align(cli));
+    }
+
+    #[test]
+    fn call_no_left_align_disables_it() {
+        let cli = parse(&[
+            "Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf", "--no-left-align",
+        ])
+        .unwrap();
+        assert!(!effective_left_align(cli));
+    }
+
+    #[test]
+    fn call_rejects_both_left_align_flags() {
+        let err = parse(&[
+            "Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf",
+            "--left-align", "--no-left-align",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn quickstart_left_aligns_by_default() {
+        let cli = parse(&[
+            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out",
+        ])
+        .unwrap();
+        assert!(effective_left_align(cli));
+    }
+
+    #[test]
+    fn quickstart_left_align_flag_still_left_aligns() {
+        let cli = parse(&[
+            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out", "--left-align",
+        ])
+        .unwrap();
+        assert!(effective_left_align(cli));
+    }
+
+    #[test]
+    fn quickstart_no_left_align_disables_it() {
+        let cli = parse(&[
+            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out", "--no-left-align",
+        ])
+        .unwrap();
+        assert!(!effective_left_align(cli));
+    }
+
+    #[test]
+    fn quickstart_rejects_both_left_align_flags() {
+        let err = parse(&[
+            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out",
+            "--left-align", "--no-left-align",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 }

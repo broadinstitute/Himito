@@ -670,6 +670,8 @@ pub fn init_rayon_threads(threads: Option<usize>) -> AnyhowResult<()> {
 }
 
 fn main() {
+    // Review 2026-09-25 T5: a library function must not install the process logger, and denoise/scite logs were otherwise silent.
+    env_logger::init();
     let args = Cli::parse();
     init_rayon_threads(args.global.threads);
     match args.command {

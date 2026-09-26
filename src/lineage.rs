@@ -795,7 +795,6 @@ pub fn start(
     root_block: Option<crate::rootblock::RootBlockConfig>,
     output_prefix: &str,
 ) -> Result<()> {
-    env_logger::init();
     // No `data_type` parameter: the rates arrive already resolved by
     // `resolve_error_rates`, and the accepted-vocabulary check now lives on the
     // clap flag itself (`main.rs`'s `DATA_TYPES`), so an unrecognised value is

@@ -171,7 +171,7 @@ Himito includes a new function for inferring mitochondrial mutation history from
 
 Given a Himito read–variant matrix (`<prefix>.matrix.csv` from `call`) and the corresponding VCF, the `lineage` command filters to informative heteroplasmic sites, deduplicates reads into haplotypes, and runs an MCMC search over mutation trees and identify a ML tree (algorithm adapted from SCITE, Kuipers J et al. Single-cell sequencing data reveals widespread recurrence and loss of mutational hits in the life histories of tumorus. Genome Research 2017; 27:1885-1894.). The initial tree is a Neighbor–Joining tree constructed from reads instead of a random tree though. Sequencing errors are modeled with configurable false-positive (defaul 0.001) and false-negative rates (defaul 0.05). 
 
-Outputs include a mutation tree, read-level lineage Newick tree, cleaned read–variant matrix, variant co-occurrence tables, and haplotype maps.
+Outputs include a mutation tree, read-level lineage Newick tree, the cleaned read–variant matrix `<prefix>.cleaned_matrix_all_variants.csv`, the variant co-occurrence table `variant_cooccurrence.tsv`, and haplotype maps. The raw co-occurrence table and `raw_haplotype_map.tsv` are written only with `--debug`.
 
 ```
 ./target/release/Himito lineage -m <prefix>.matrix.csv \
@@ -181,9 +181,8 @@ Outputs include a mutation tree, read-level lineage Newick tree, cleaned read–
                                  --max-hf 0.95
 ```
 
-Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix.csv`, `<output_prefix>.raw_haplotype_map.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`.
+Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix_all_variants.csv`, `<output_prefix>.variant_cooccurrence.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv` and `<output_prefix>.raw_variant_cooccurrence.tsv`.
 
 To Do: 
-1. mutation/error rate in homopolymer regions could be different (higher FP rate). 
-2. add four gamete test
-3. Add posteriors, convergence and confidence metrics
+1. add four gamete test
+2. Add posteriors, convergence and confidence metrics

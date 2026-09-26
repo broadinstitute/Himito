@@ -308,7 +308,7 @@ task Himito_lineage {
         File pb_mutation_tree = "~{prefix}.pb.mutation_tree.tsv"
         File pb_read_lineage = "~{prefix}.pb.read_lineage.nwk"
         File pb_var_cooccurrence = "~{prefix}.pb.variant_cooccurrence.tsv"
-        File pb_read_var_mat = "~{prefix}.pb.cleaned_matrix.csv"
+        File pb_read_var_mat = "~{prefix}.pb.cleaned_matrix_all_variants.csv"
         File pb_haplotype_map = "~{prefix}.pb.cleaned_haplotype_map.tsv" 
         File pb_molecule_summary = "~{prefix}.pb.molecule_summary.tsv" 
     }

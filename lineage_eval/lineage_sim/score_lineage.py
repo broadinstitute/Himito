@@ -111,7 +111,7 @@ def parse_clone_haplotypes(path: str) -> set[frozenset[str]]:
     return haps
 
 
-def parse_matrix_haplotypes(path: str) -> set[frozenset[str]]:
+def parse_matrix_haplotypes(path: str, keep: set[str] | None = None) -> set[frozenset[str]]:
     """Reconstructed haplotypes from Himito's lineage matrix, as variant sets.
 
     The matrix is variants (rows) x reads (columns); reads sharing a genotype
@@ -119,16 +119,24 @@ def parse_matrix_haplotypes(path: str) -> set[frozenset[str]]:
     <prefix>.cleaned_haplotype_map.tsv. Only '1' counts as present: the pre-clean
     matrix writes an empty cell for "read does not span this site", and reading
     that as a mutation would invent haplotypes.
+
+    Plan 2026-09-26 T3. ``keep``, when given, ignores rows whose variant is not
+    in the set. ``cleaned_matrix_all_variants.csv`` appends near-fixed
+    homoplasmies that were not rows of the old ``cleaned_matrix.csv``; passing
+    the mutation-tree variant names leaves haplotype scores unchanged.
     """
     with open(path) as fh:
         rows = list(csv.reader(fh))
     if not rows:
         return set()
-    variants = [r[0] for r in rows[1:]]
+    body = rows[1:]
+    if keep is not None:
+        body = [r for r in body if r and r[0] in keep]
+    variants = [r[0] for r in body]
     haps = set()
     for i in range(len(rows[0]) - 1):
         haps.add(frozenset(
-            v for v, row in zip(variants, rows[1:])
+            v for v, row in zip(variants, body)
             if len(row) > i + 1 and row[i + 1] == "1"
         ))
     return haps
@@ -269,7 +277,9 @@ def main() -> None:
     # Optional pair: Himito's per-read genotype matrix and the simulator's clone
     # table. Supply both to get the hap_* columns; omit both and they read NA.
     ap.add_argument("--recon-matrix", default="",
-                    help="Himito <prefix>.cleaned_matrix.csv (reconstructed haplotypes)")
+                    help="Himito <prefix>.cleaned_matrix_all_variants.csv "
+                         "(reconstructed haplotypes; rows outside the mutation "
+                         "tree, including appended near-fixed homoplasmies, are ignored)")
     ap.add_argument("--truth-clones", default="",
                     help="simulate_tree.py truth/clones.tsv (truth clone genomes)")
     ap.add_argument("--profile", default="NA")
@@ -289,7 +299,18 @@ def main() -> None:
     truth_haps = recon_haps = None
     if args.recon_matrix:
         truth_haps = parse_clone_haplotypes(args.truth_clones)
-        recon_haps = parse_matrix_haplotypes(args.recon_matrix)
+        # Plan 2026-09-26 T3. These names are the rows of the old
+        # cleaned_matrix.csv: every mutation-tree key except ROOT, with a
+        # comma-joined ROOT_BLOCK key split into its member variants.
+        keep: set[str] = set()
+        for key in recon_pm:
+            if key == "ROOT":
+                continue
+            if "," in key:
+                keep.update(part for part in key.split(",") if part)
+            else:
+                keep.add(key)
+        recon_haps = parse_matrix_haplotypes(args.recon_matrix, keep=keep)
 
     m = score(truth_pm, recon_pm, truth_vars, detected,
               truth_haps=truth_haps, recon_haps=recon_haps)

@@ -59,8 +59,8 @@ for fp in $FP_GRID; do
       # Without these the sweep reported hap_* as NA in every row, so a cell that
       # split reads into the wrong clones looked identical to one that did not.
       HAP_ARGS=()
-      if [[ -s "${pfx}.cleaned_matrix.csv" && -s "$OUTDIR/truth/clones.tsv" ]]; then
-        HAP_ARGS=(--recon-matrix "${pfx}.cleaned_matrix.csv"
+      if [[ -s "${pfx}.cleaned_matrix_all_variants.csv" && -s "$OUTDIR/truth/clones.tsv" ]]; then
+        HAP_ARGS=(--recon-matrix "${pfx}.cleaned_matrix_all_variants.csv"
                   --truth-clones "$OUTDIR/truth/clones.tsv")
       fi
       python "$HERE/score_lineage.py" \

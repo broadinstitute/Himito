@@ -354,14 +354,14 @@ task Himito_lineage {
         File pb_mutation_tree = "~{prefix}.pb.mutation_tree.tsv"
         File pb_read_lineage = "~{prefix}.pb.read_lineage.nwk"
         File pb_var_cooccurrence = "~{prefix}.pb.variant_cooccurrence.tsv"
-        File pb_read_var_mat = "~{prefix}.pb.cleaned_matrix.csv"
+        File pb_read_var_mat = "~{prefix}.pb.cleaned_matrix_all_variants.csv"
         File pb_haplotype_map = "~{prefix}.pb.cleaned_haplotype_map.tsv" 
         File pb_molecule_summary = "~{prefix}.pb.molecule_summary.tsv" 
 
         File ont_mutation_tree = "~{prefix}.ont.mutation_tree.tsv"
         File ont_read_lineage = "~{prefix}.ont.read_lineage.nwk"
         File ont_var_cooccurrence = "~{prefix}.ont.variant_cooccurrence.tsv"
-        File ont_read_var_mat = "~{prefix}.ont.cleaned_matrix.csv"
+        File ont_read_var_mat = "~{prefix}.ont.cleaned_matrix_all_variants.csv"
         File ont_haplotype_map = "~{prefix}.ont.cleaned_haplotype_map.tsv" 
         File ont_molecule_summary = "~{prefix}.ont.molecule_summary.tsv" 
     }

@@ -657,6 +657,104 @@ pub fn read_events(
     out
 }
 
+/// Size of the overlap between the half-open reference intervals `[s1, e1)` and
+/// `[s2, e2)`. Plan 2026-09-26 T8a.
+fn overlap(s1: u32, e1: u32, s2: u32, e2: u32) -> u32 {
+    e1.min(e2).saturating_sub(s1.max(s2))
+}
+
+/// Plan 2026-09-26 T8a: the read's HOMOPOLYMER-LENGTH allele at the HP site whose
+/// normalized anchor is `a` and whose run is `[a + 1, e)` with length `R = e - a - 1`
+/// and base `b = refseq[a + 1]`.
+///
+/// The value is the net length change the read applies to that run,
+/// `k = (#inserted b bases) - (#deleted bases)`, read straight off the read's own
+/// CIGAR. Unlike `read_events`, which reports one allele per CIGAR op and therefore
+/// cannot say what a read with BOTH an insertion and a deletion in one run actually
+/// carries (the "ambiguous carry" case, FIX 5), a length is always single-valued:
+/// `I(1)` plus `D(1)` inside the run is simply `Some(0)`.
+///
+/// `None` means the read is UNINFORMATIVE at this site -- not that it observes the
+/// reference length. That is the case when:
+/// * it does not span `[a, e + INDEL_FLANK)`, so it either never saw the run's full
+///   length or has no right-hand match context to anchor a rewrite against (the
+///   Review 2026-09-25 T3 gate, one flank wider than pass 1's depth gate, so a read
+///   that may vote here is always a read pass 1 already counted in depth);
+/// * it has no aligned query base at the anchor `a` itself (the canonical rewrite
+///   hangs off that base);
+/// * an inserted base inside the run is not `b` -- that breaks the run rather than
+///   changing its length, and the length model has nothing to say about it;
+/// * an `N` op crosses the run, where the read has no alignment at all.
+pub fn hp_allele(
+    pos: i64,
+    cigar: &CigarString,
+    seq: &[u8],
+    refseq: &[u8],
+    a: u32,
+    e: u32,
+) -> Option<i32> {
+    if e < a + 2 {
+        return None;
+    }
+    let b = *refseq.get(a as usize + 1)?;
+    if (pos.max(0) as i64) > a as i64 {
+        return None;
+    }
+    // The canonical rewrite emits the anchor base first, so the read must actually
+    // have one there (same test pass 1 uses to gate a vote; see FIX 2).
+    if match_run_len(pos, cigar, a) == 0 {
+        return None;
+    }
+
+    let mut rp = pos.max(0) as u32; // next reference position
+    let mut qp = 0usize; // next query position
+    let mut last_aligned: Option<u32> = None;
+    let mut k: i32 = 0;
+
+    for op in cigar.iter() {
+        match *op {
+            Cigar::Match(n) | Cigar::Equal(n) | Cigar::Diff(n) => {
+                rp += n;
+                qp += n as usize;
+                if n > 0 {
+                    last_aligned = Some(rp - 1);
+                }
+            }
+            Cigar::Ins(n) => {
+                // An insertion belongs to this run when it is anchored on the anchor
+                // base itself (where left-normalization puts it) or on any base of
+                // the run. One anchored at `e` or beyond is a different event.
+                let inside = last_aligned.is_some_and(|l| l >= a && l < e);
+                if inside {
+                    if seq.get(qp..qp + n as usize)?.iter().any(|&c| c != b) {
+                        return None;
+                    }
+                    k += n as i32;
+                }
+                qp += n as usize;
+            }
+            Cigar::Del(n) => {
+                k -= overlap(rp, rp + n, a + 1, e) as i32;
+                rp += n;
+            }
+            Cigar::RefSkip(n) => {
+                if overlap(rp, rp + n, a + 1, e) > 0 {
+                    return None;
+                }
+                rp += n;
+            }
+            Cigar::SoftClip(n) => qp += n as usize,
+            Cigar::HardClip(_) | Cigar::Pad(_) => {}
+        }
+    }
+
+    // `rp` is now the read's exclusive reference end.
+    if rp < e + INDEL_FLANK as u32 {
+        return None;
+    }
+    Some(k)
+}
+
 #[cfg(test)]
 mod indel_tests {
     use super::*;
@@ -1337,6 +1435,104 @@ mod indel_tests {
             "the insertion must anchor at the last ALIGNED base (119), not the last \
              DELETED one (121)"
         );
+    }
+
+    // ---- Plan 2026-09-26 T8a: homopolymer-length allele ----
+    // REF29's A-run is 8..=15, so the HP site's normalized anchor is 7, its
+    // exclusive run end is 16, R = 8 and b = b'A'.
+    const HP_A: u32 = 7;
+    const HP_E: u32 = 16;
+
+    #[test]
+    fn hp_allele_of_a_pure_match_read_is_zero() {
+        let k = hp_allele(0, &cs(vec![Cigar::Match(29)]), REF29, REF29, HP_A, HP_E);
+        assert_eq!(k, Some(0), "a read matching the whole run carries the reference length");
+    }
+
+    #[test]
+    fn hp_allele_counts_an_insertion_of_the_run_base() {
+        // 16M 1I 13M: the extra A is anchored on REF29[15], the last base of the run.
+        let mut seq = REF29[..16].to_vec();
+        seq.push(b'A');
+        seq.extend_from_slice(&REF29[16..]);
+        let cig = cs(vec![Cigar::Match(16), Cigar::Ins(1), Cigar::Match(13)]);
+        assert_eq!(hp_allele(0, &cig, &seq, REF29, HP_A, HP_E), Some(1));
+    }
+
+    #[test]
+    fn hp_allele_counts_a_deletion_inside_the_run() {
+        // 10M 2D 17M: REF29[10] and REF29[11] are deleted, both inside the run.
+        let mut seq = REF29[..10].to_vec();
+        seq.extend_from_slice(&REF29[12..]);
+        let cig = cs(vec![Cigar::Match(10), Cigar::Del(2), Cigar::Match(17)]);
+        assert_eq!(hp_allele(0, &cig, &seq, REF29, HP_A, HP_E), Some(-2));
+    }
+
+    #[test]
+    fn hp_allele_of_an_offsetting_insertion_and_deletion_is_zero() {
+        // 10M 1I 2M 1D 16M: one A gained and one A lost, both inside the run, so the
+        // run's LENGTH is unchanged. This is exactly the "ambiguous carry" shape that
+        // the event-based model has to refuse (FIX 5): as a length it is simply 0.
+        let mut seq = REF29[..10].to_vec();
+        seq.push(b'A');
+        seq.extend_from_slice(&REF29[10..12]);
+        seq.extend_from_slice(&REF29[13..]);
+        let cig = cs(vec![
+            Cigar::Match(10),
+            Cigar::Ins(1),
+            Cigar::Match(2),
+            Cigar::Del(1),
+            Cigar::Match(16),
+        ]);
+        assert_eq!(hp_allele(0, &cig, &seq, REF29, HP_A, HP_E), Some(0));
+    }
+
+    #[test]
+    fn hp_allele_is_undefined_when_the_inserted_base_is_not_the_run_base() {
+        // A G spliced into an A-run is not a length change at all -- it breaks the
+        // run, and the length model has nothing to say about it.
+        let mut seq = REF29[..16].to_vec();
+        seq.push(b'G');
+        seq.extend_from_slice(&REF29[16..]);
+        let cig = cs(vec![Cigar::Match(16), Cigar::Ins(1), Cigar::Match(13)]);
+        assert_eq!(hp_allele(0, &cig, &seq, REF29, HP_A, HP_E), None);
+    }
+
+    #[test]
+    fn hp_allele_is_undefined_for_a_read_ending_inside_the_run() {
+        // Ends at reference 13, five bases into the run: it cannot testify to the
+        // run's length, so it is uninformative rather than a REF observation.
+        let cig = cs(vec![Cigar::Match(13)]);
+        assert_eq!(hp_allele(0, &cig, &REF29[..13], REF29, HP_A, HP_E), None);
+    }
+
+    #[test]
+    fn hp_allele_is_undefined_without_the_right_hand_flank() {
+        // Reaches the end of the run (16) but not `INDEL_FLANK` past it, so it has
+        // no match context to anchor a rewrite against.
+        let need = HP_E as usize + INDEL_FLANK;
+        let cig = cs(vec![Cigar::Match(need as u32 - 1)]);
+        assert_eq!(hp_allele(0, &cig, &REF29[..need - 1], REF29, HP_A, HP_E), None);
+        let cig = cs(vec![Cigar::Match(need as u32)]);
+        assert_eq!(hp_allele(0, &cig, &REF29[..need], REF29, HP_A, HP_E), Some(0));
+    }
+
+    #[test]
+    fn hp_allele_is_undefined_when_the_anchor_base_is_not_aligned() {
+        // 5M 5D 19M deletes REF29[5..10), which swallows the anchor (7): there is no
+        // aligned base to hang the canonical rewrite off.
+        let mut seq = REF29[..5].to_vec();
+        seq.extend_from_slice(&REF29[10..]);
+        let cig = cs(vec![Cigar::Match(5), Cigar::Del(5), Cigar::Match(19)]);
+        assert_eq!(hp_allele(0, &cig, &seq, REF29, HP_A, HP_E), None);
+    }
+
+    #[test]
+    fn hp_allele_is_undefined_when_an_n_op_crosses_the_run() {
+        let mut seq = REF29[..10].to_vec();
+        seq.extend_from_slice(&REF29[12..]);
+        let cig = cs(vec![Cigar::Match(10), Cigar::RefSkip(2), Cigar::Match(17)]);
+        assert_eq!(hp_allele(0, &cig, &seq, REF29, HP_A, HP_E), None);
     }
 }
 

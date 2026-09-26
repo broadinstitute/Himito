@@ -461,6 +461,18 @@ fn compute_corrections(
         } else {
             0
         };
+        // Plan 2026-09-26 T8b: `Some((e, b))` when the HP length model is on and THIS
+        // column is the normalized anchor of a homopolymer run. Then the column casts
+        // one LENGTH vote per spanning read (below), and the event-based votes that
+        // normalize here are skipped instead -- one read, one vote, whatever mixture
+        // of `I`/`D` ops its CIGAR happens to use inside the run.
+        let hp_votes_here = if iopts.enabled && iopts.hp_length_model {
+            indel::hp_site(refseq, refpos as u32)
+        } else {
+            None
+        };
+        // (qname, length allele, reverse) for this column's HP-length votes.
+        let mut hp_col_votes: Vec<(Vec<u8>, indel::Allele, bool)> = Vec::new();
 
         for a in col.alignments() {
             let rec = a.record();
@@ -477,6 +489,29 @@ fn compute_corrections(
                     if reference_end >= tract_need_end {
                         col_depth += 1;
                         if rec.is_reverse() { col_rev += 1 } else { col_fwd += 1 }
+
+                        // Plan 2026-09-26 T8b: one HP-LENGTH vote per read at an HP
+                        // site, cast here at the site's own column rather than
+                        // wherever the aligner happened to place an op. `hp_allele`'s
+                        // span gate is one flank STRICTER than `tract_need_end`, so a
+                        // read that votes here is always a read this depth counted --
+                        // `alt_total <= depth` still holds. Only a nonzero length is
+                        // recorded; `fit_indel_site` derives REF support from
+                        // `depth - alt_total`, exactly as for event votes.
+                        if let Some((hp_e, b)) = hp_votes_here {
+                            let cigar = rec.cigar().take();
+                            let seq = rec.seq().as_bytes();
+                            let k = indel::hp_allele(
+                                rec.pos(), &cigar, &seq, refseq, refpos as u32, hp_e,
+                            );
+                            if let Some(k) = k.filter(|k| *k != 0) {
+                                hp_col_votes.push((
+                                    rec.qname().to_vec(),
+                                    indel::hp_length_allele(k, b),
+                                    rec.is_reverse(),
+                                ));
+                            }
+                        }
                     }
                     // Decide the event's allele first, WITHOUT touching the CIGAR;
                     // `rec.cigar()` re-parses and allocates the whole CIGAR from raw
@@ -533,9 +568,31 @@ fn compute_corrections(
 
         if iopts.enabled {
             depths.insert((name.to_vec(), refpos as u32), (col_depth, col_fwd, col_rev));
+            // Plan 2026-09-26 T8b: the HP-length votes for this column, if it is an
+            // HP site. `add_from_read` still enforces one ALT vote per read per site,
+            // so a read that also reaches this site through some event elsewhere
+            // cannot double-vote.
+            for (qname, allele, reverse) in hp_col_votes {
+                let voted = sites
+                    .entry((name.to_vec(), refpos as u32))
+                    .or_default()
+                    .add_from_read(&qname, allele, reverse);
+                if !voted {
+                    stats.indel_events_duplicate_site += 1;
+                }
+            }
             for (qname, allele, reverse, rpos, cigar, reference_end) in col_events {
                 let (norm_pos, norm_allele) =
                     indel::normalize_left(refseq, refpos as u32, &allele);
+                // Plan 2026-09-26 T8b: at an HP site the length vote cast at the
+                // site's own column REPLACES the event-based votes -- the whole point
+                // is that one read contributes one length, not one allele per CIGAR
+                // op. Dropped silently: the read has already spoken at this site (or
+                // was found uninformative there by `hp_allele`'s stricter gate), so
+                // none of the drop counters below describes what happened.
+                if iopts.hp_length_model && indel::hp_site(refseq, norm_pos).is_some() {
+                    continue;
+                }
                 // `normalize_left` walks the reference with no knowledge of read
                 // boundaries: a read whose alignment starts (or ends) inside a
                 // repeat can normalize an event to a column outside its own
@@ -1669,6 +1726,11 @@ mod tests {
         indel::IndelOpts { enabled: true, ..Default::default() }
     }
 
+    /// Plan 2026-09-26 T8: the same options with the generic HP length model on.
+    fn indels_hp_on() -> indel::IndelOpts {
+        indel::IndelOpts { enabled: true, hp_length_model: true, ..Default::default() }
+    }
+
     const CLEAN_SEQ: &[u8] = b"ACGTACGTAAAAAAAACGTACGTACGTAC"; // == REF29, 29bp
     // An extra A inside the run: 16M 1I 13M. Aligner anchors at index 15;
     // normalization pulls the site to index 7.
@@ -1731,6 +1793,51 @@ mod tests {
             "insertion frequency should be 0.9, got {f_ins} (depth double-counted?)"
         );
         assert_eq!(model.context_len, 8, "site 7 sits in an 8bp homopolymer run");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hp_length_votes_give_the_same_site_frequencies_as_the_event_votes() {
+        // Plan 2026-09-26 T8b: with the HP length model on, pass 1 casts ONE vote per
+        // spanning read per HP site from `hp_allele` and skips the event-based votes
+        // that normalize there. Depth is untouched (it already uses the T3 gate), so
+        // the fixture from `site_depth_counts_each_spanning_read_exactly_once` -- 9
+        // reads carrying an extra A plus one clean read -- must produce the identical
+        // model: Ins("A") at 0.9 in an 8bp context.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_hp_votes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, HP_INS_SEQ, hp_ins_cigar(), i % 2 == 0));
+        }
+        reads.push(("rdrop", 0, CLEAN_SEQ, clean_cigar(), false));
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let (_corr, models, _stats) =
+            compute_corrections(&bam, &indel_refs(), 2, 0.01, SB_P, HOM_VAF, &indels_hp_on())
+                .unwrap();
+
+        let list = models.get(&b"chrM".to_vec()).expect("chrM must have sites");
+        let (_, model) = list.iter().find(|(p, _)| *p == 7).expect("site at 7");
+        let ins = indel::Allele::Ins(b"A".to_vec());
+        let f_ins = model.kept.iter().find(|(a, _)| *a == ins).expect("insertion kept").1;
+        assert!(
+            (f_ins - 0.9).abs() < 1e-9,
+            "insertion frequency must still be 0.9 with the HP length model on, got {f_ins}"
+        );
+        assert_eq!(model.context_len, 8, "site 7 sits in an 8bp homopolymer run");
+        assert_eq!(
+            model.hp_run,
+            Some((16u32, b'A')),
+            "site 7 must be recognized as the HP site of REF29's A-run"
+        );
+        // Site 7 is the run's only normalized anchor: positions 8..=13 also have a
+        // >= 2bp A-run after them, but they are not left-normalized anchors, so
+        // admitting them would have the model rewrite one run through six sites.
+        let hp_sites: Vec<u32> =
+            list.iter().filter(|(_, m)| m.hp_run.is_some()).map(|(p, _)| *p).collect();
+        assert_eq!(hp_sites, vec![7], "the A-run must yield exactly one HP site");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2405,6 +2512,8 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
             strand_rejected: vec![],
+            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
+            hp_run: None,
         };
         let mut models = IndelModels::new();
         models.entry(b"chrM".to_vec()).or_default().push((12u32, model));
@@ -2445,6 +2554,8 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
             strand_rejected: vec![],
+            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
+            hp_run: None,
         }
     }
 
@@ -2567,6 +2678,8 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(2), 0.9)],
             strand_rejected: vec![],
+            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
+            hp_run: None,
         };
         let mut models = IndelModels::new();
         models.entry(b"chrM".to_vec()).or_default().push((18u32, model));
@@ -2626,6 +2739,8 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(1), 0.9)],
             strand_rejected: vec![],
+            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
+            hp_run: None,
         };
         let mut models = IndelModels::new();
         models.entry(b"chrM".to_vec()).or_default().push((9u32, model));
@@ -2701,6 +2816,8 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(3), 0.9)],
             strand_rejected: vec![],
+            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
+            hp_run: None,
         };
         // Site 7 (inside site 5's Del(3) span, 6..=8): Ref -> Ins("A")
         // dominates 90/10. If reached, MAP assignment would genuinely want to
@@ -2713,6 +2830,8 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
             strand_rejected: vec![],
+            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
+            hp_run: None,
         };
         let mut models = IndelModels::new();
         models
@@ -2840,6 +2959,8 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(2), 0.9)],
             strand_rejected: vec![],
+            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
+            hp_run: None,
         };
         let mut models = IndelModels::new();
         models.entry(b"chrM".to_vec()).or_default().push((18u32, model));

@@ -67,6 +67,11 @@ pub const INDEL_FLANK: usize = 5;
 #[derive(Debug, Clone)]
 pub struct IndelOpts {
     pub enabled: bool,
+    /// Plan 2026-09-26 T8: treat a homopolymer as a single LENGTH variable, so any
+    /// kept length is reachable from any other -- including the `Ins -> Del` and
+    /// grow-a-deletion transitions the event-based model has to refuse. OFF by
+    /// default (CLI `--indel-hp-length-model`) until an eval shows it helps.
+    pub hp_length_model: bool,
     /// Exclusive upper bound: with 5, lengths 1..=4 are correctable.
     pub max_len: u32,
     pub vaf: f64,
@@ -89,6 +94,7 @@ impl Default for IndelOpts {
     fn default() -> Self {
         IndelOpts {
             enabled: false,
+            hp_length_model: false,
             max_len: 5,
             vaf: 0.05,
             err0: 0.01,
@@ -225,6 +231,44 @@ pub fn hp_tract_end(refseq: &[u8], anchor: u32) -> u32 {
     }
 }
 
+/// Plan 2026-09-26 T8: is `anchor` the normalized anchor of an HP site? If so,
+/// returns the run's exclusive reference end `e` and its base `b`, i.e. the run is
+/// `[anchor + 1, e)` with length `R = e - anchor - 1 >= 2`.
+///
+/// Three conditions, matching the definition in the task brief:
+/// * the repeat unit has period 1 -- automatic here, since `hp_tract_end` walks a
+///   run of one repeated base;
+/// * `hp_tract_end(refseq, anchor) - (anchor + 1) >= 2`, which `hp_tract_end`
+///   already enforces by returning `anchor + 1` for a lone base;
+/// * `anchor` is a NORMALIZED anchor, i.e. `refseq[anchor] != b`. Without this the
+///   8bp A-run in `REF29` would present as seven overlapping HP sites (anchors
+///   7..=13), each wanting to rewrite the same run; `normalize_left` collapses
+///   every indel in a run onto its leftmost anchor, and so does this. Position 0
+///   is exempt because `normalize_left` cannot shift below it either.
+pub fn hp_site(refseq: &[u8], anchor: u32) -> Option<(u32, u8)> {
+    let start = anchor as usize + 1;
+    let e = hp_tract_end(refseq, anchor);
+    if (e as usize) < start + 2 {
+        return None;
+    }
+    let b = *refseq.get(start)?;
+    if anchor > 0 && refseq.get(anchor as usize) == Some(&b) {
+        return None;
+    }
+    Some((e, b))
+}
+
+/// Plan 2026-09-26 T8b: the `Allele` a homopolymer length change `k` corresponds to,
+/// so votes and assignments at an HP site share one vocabulary with the rest of the
+/// site model.
+pub fn hp_length_allele(k: i32, b: u8) -> Allele {
+    match k {
+        0 => Allele::Ref,
+        k if k > 0 => Allele::Ins(vec![b; k as usize]),
+        k => Allele::Del((-k) as u32),
+    }
+}
+
 /// Per-junction indel error probability, growing with repeat context and capped.
 /// This is the likelihood term that base quality supplies for substitutions and that
 /// indels have no equivalent for: without it, MAP assignment degenerates to
@@ -335,6 +379,14 @@ pub struct IndelSiteModel {
     /// is kept) is not included here and remains eligible for protection. Sorted
     /// for the same determinism reason as `kept` and `obs_vaf`.
     pub strand_rejected: Vec<Allele>,
+    /// Plan 2026-09-26 T8: `Some((e, b))` when the HP length model is ON and this
+    /// site is an HP site (see `hp_site`), i.e. its alleles are lengths of the
+    /// homopolymer run `[norm_pos + 1, e)` of base `b`. `None` otherwise -- both
+    /// when the model is off and when the site is not a homopolymer -- so one
+    /// `is_some()` is the "treat this site as a length" switch for `assign_allele`
+    /// and the write-back pass, and the model's off-by-default guarantee lives in
+    /// exactly one place (`fit_indel_site`).
+    pub hp_run: Option<(u32, u8)>,
 }
 
 /// Decide which alleles survive at a site and compute their frequencies.
@@ -438,7 +490,12 @@ pub fn fit_indel_site(
     obs_vaf.sort_by(|(a, _), (b, _)| a.cmp(b));
     strand_rejected.sort();
 
-    IndelSiteModel { kept, eps, context_len, strand_biased, obs_vaf, strand_rejected }
+    // Plan 2026-09-26 T8: the single place the HP length model is switched on. Every
+    // downstream consumer keys off `hp_run.is_some()`, so with the flag off the
+    // whole feature is unreachable by construction.
+    let hp_run = if o.hp_length_model { hp_site(refseq, norm_pos) } else { None };
+
+    IndelSiteModel { kept, eps, context_len, strand_biased, obs_vaf, strand_rejected, hp_run }
 }
 
 /// Outcome of MAP assignment for one read at one site.
@@ -1435,6 +1492,35 @@ mod indel_tests {
             "the insertion must anchor at the last ALIGNED base (119), not the last \
              DELETED one (121)"
         );
+    }
+
+    // ---- Plan 2026-09-26 T8b: HP site recognition ----
+
+    #[test]
+    fn hp_site_is_the_runs_leftmost_anchor_only() {
+        // REF29's A-run is 8..=15. Anchor 7 is its normalized anchor; 8..=13 each
+        // still have a >= 2bp A-run after them but are NOT normalized anchors, and
+        // admitting them would have the model rewrite one run through seven sites.
+        assert_eq!(hp_site(REF29, 7), Some((16, b'A')));
+        for anchor in 8..=14u32 {
+            assert_eq!(hp_site(REF29, anchor), None, "anchor {anchor} is not normalized");
+        }
+    }
+
+    #[test]
+    fn hp_site_rejects_unique_sequence_and_lone_bases() {
+        // A single following base is not a run (`hp_tract_end` says so), and the last
+        // base of the run has only unique sequence after it.
+        assert_eq!(hp_site(REF29, 15), None, "REF29[16] = C is a lone base");
+        assert_eq!(hp_site(REF29, 20), None);
+        assert_eq!(hp_site(REF29, 28), None, "nothing follows the last base");
+    }
+
+    #[test]
+    fn hp_length_allele_maps_a_length_change_to_an_allele() {
+        assert_eq!(hp_length_allele(0, b'A'), Allele::Ref);
+        assert_eq!(hp_length_allele(2, b'A'), Allele::Ins(b"AA".to_vec()));
+        assert_eq!(hp_length_allele(-3, b'A'), Allele::Del(3));
     }
 
     // ---- Plan 2026-09-26 T8a: homopolymer-length allele ----

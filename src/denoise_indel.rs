@@ -2219,13 +2219,19 @@ pub fn rewrite_read(
 ///
 /// The surviving query bases are the read's OWN bases over the run, with the excess
 /// dropped from the LEFT (where the canonical deletion sits) or copies of `b`
-/// prepended on the left (where the canonical insertion sits). Synthesized bases
-/// take the minimum of their flanking qualities, exactly like `fill_qual`.
+/// The emitted query bases over the run are `R + target_k` copies of `b` -- a pure
+/// homopolymer, never a slice of the read (Plan 2026-09-26 T8, review fix 3). The
+/// site decided the run's LENGTH, so the run is re-emitted at that length and
+/// whatever the read carried inside it does not survive; a substitution in there is
+/// dropped by `apply_corrections` for the same reason. QUALITY is not rewritten
+/// wholesale: the read's own qualities over the run are kept, and only positions
+/// that did not exist before take the minimum of their flanking qualities, exactly
+/// like `fill_qual`.
 ///
-/// `b` is the run's base, passed in rather than read off the read (Plan 2026-09-26
-/// T8, review fix 1). It is a property of the REFERENCE, so taking it from the query
-/// would both corrupt a run whose first read base is a substitution and make a run
-/// the read deleted entirely unrewritable -- there is no query base left to copy.
+/// `b` is the run's base, passed in rather than read off the read (review fix 1).
+/// It is a property of the REFERENCE, so taking it from the query would both
+/// corrupt a run whose first read base is a substitution and make a run the read
+/// deleted entirely unrewritable -- there is no query base left to copy.
 ///
 /// `None` (the read is left untouched) when:
 /// * `[a + 1, e)` is not a run of at least 2, or `target_k < -R`;
@@ -2262,7 +2268,9 @@ pub fn rewrite_hp_run(
     let mut post_ops: Vec<Cigar> = Vec::new();
     let mut post_seq: Vec<u8> = Vec::new();
     let mut post_qual: Vec<u8> = Vec::new();
-    let mut run_seq: Vec<u8> = Vec::new();
+    // Only the run's QUALITIES are accumulated. Its bases are not: the body is
+    // re-emitted as a pure run of `b` (review fix 3), so the read's own bases inside
+    // the run are read past for bounds-checking and then discarded.
     let mut run_qual: Vec<u8> = Vec::new();
     // Reference bases of the run the read actually accounts for. Must reach `run_len`
     // or the read does not cover the whole run.
@@ -2290,7 +2298,6 @@ pub fn rewrite_hp_run(
                         pre_qual.push(q);
                     } else if cur < e {
                         run_ref += 1;
-                        run_seq.push(base);
                         run_qual.push(q);
                     } else {
                         past = true;
@@ -2310,7 +2317,6 @@ pub fn rewrite_hp_run(
                 // Anchored on the anchor base (where left-normalization puts it) or
                 // on any base of the run: part of the run's length, so absorbed.
                 if last_aligned.is_some_and(|l| l >= a && l < e) {
-                    run_seq.extend_from_slice(bases);
                     run_qual.extend_from_slice(quals);
                 } else if past {
                     push_op(&mut post_ops, Cigar::Ins(n as u32));
@@ -2380,16 +2386,26 @@ pub fn rewrite_hp_run(
         return None;
     }
 
-    // Canonical body: `run_len + target_k` query bases, adjusted on the left.
+    // Canonical body: the run becomes exactly `run_len + target_k` copies of `b`.
+    //
+    // Plan 2026-09-26 T8 (review fix 3): a pure run of `b`, never a slice of the
+    // read. The body used to be "synthesized `b` x add, then the read's own run
+    // bases", which only holds when the read has at most `run_len` query bases in
+    // the run. A read that carries EXTRA bases there (its own insertion) needs
+    // fewer synthesized copies, so its own bases slid left into the `I(k)` stretch
+    // and the emitted insertion contained whatever the read had -- including a
+    // substitution, i.e. a homopolymer insertion of a base the run does not
+    // contain. The site decided a LENGTH, so the run is re-emitted wholesale at
+    // that length and the read's content inside it does not survive. That is the
+    // same premise under which `apply_corrections` drops substitution edits falling
+    // inside the run (`subs_dropped_in_hp_rewrite`).
     let target_len = (run_len + target_k) as usize;
-    let mut body_seq: Vec<u8> = Vec::with_capacity(target_len);
+    let body_seq: Vec<u8> = vec![b; target_len];
+    // QUALITY is not rewritten wholesale: the read's own qualities over the run are
+    // kept, and only the positions that did not exist before are synthesized, at the
+    // minimum of the flanking qualities exactly as `fill_qual` does.
     let mut body_qual: Vec<u8> = Vec::with_capacity(target_len);
-    if let Some(add) = target_len.checked_sub(run_seq.len()).filter(|n| *n > 0) {
-        // Plan 2026-09-26 T8 (review fix 1): `b`, the run's REFERENCE base, not
-        // `run_seq.first()`. The read's first base inside the run may be a
-        // substitution -- copying it would lengthen the run with a base the
-        // homopolymer does not contain -- and when the read deleted the run
-        // outright there is no first base at all, which used to abort the rewrite.
+    if let Some(add) = target_len.checked_sub(run_qual.len()).filter(|n| *n > 0) {
         let right = run_qual.first().copied().or_else(|| post_qual.first().copied());
         let f = match (pre_qual.last().copied(), right) {
             (Some(l), Some(r)) => l.min(r),
@@ -2397,11 +2413,9 @@ pub fn rewrite_hp_run(
             (None, Some(r)) => r,
             (None, None) => 0,
         };
-        body_seq.extend(std::iter::repeat(b).take(add));
         body_qual.extend(std::iter::repeat(f).take(add));
     }
-    let drop = run_seq.len().saturating_sub(target_len);
-    body_seq.extend_from_slice(&run_seq[drop..]);
+    let drop = run_qual.len().saturating_sub(target_len);
     body_qual.extend_from_slice(&run_qual[drop..]);
 
     let mut ops = pre_ops;
@@ -3156,8 +3170,12 @@ mod rewrite_tests {
         // Plan 2026-09-26 T8 (review fix 1): the read has a substitution at the FIRST
         // base of the run (reference 4, A -> C). Growing the run used to copy
         // `run_seq.first()`, which is that `C`, inventing a base the homopolymer does
-        // not contain. The synthesized base must be the run base `b`; the read's own
-        // substituted base is left alone, since only the run's LENGTH is being decided.
+        // not contain. Every base the rewrite emits over the run must be `b`.
+        //
+        // Review fix 3 tightened this: the run comes out as a PURE run of `b`, so the
+        // read's `C` does not survive anywhere in it. Under fix 1 alone the `C` was
+        // merely displaced one position to the right, which is just as wrong -- the
+        // site decided a length, and a run of A with a C in the middle is not a run.
         let c = cig(vec![Cigar::Match(16)]);
         let mut seq = REF.to_vec();
         seq[4] = b'C';
@@ -3167,8 +3185,43 @@ mod rewrite_tests {
         );
         assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Ins(1), Cigar::Match(12)]));
         assert_eq!(r.seq[4], b'A', "the synthesized base is the run base, not the read's C");
-        assert_eq!(r.seq[5], b'C', "the read's own substitution survives the rewrite");
-        assert_eq!(r.seq, b"ACGTACAAAACGTACGT".to_vec());
+        assert!(
+            !r.seq[4..10].contains(&b'C'),
+            "the rewritten run must be a pure run of the tract base"
+        );
+        assert_eq!(r.seq, b"ACGTAAAAAACGTACGT".to_vec());
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn hp_rewrite_insertion_is_never_a_slice_of_the_read() {
+        // Plan 2026-09-26 T8 (review fix 3): 9M 1I 7M puts SIX query bases in the
+        // five-base run, and the first of them is a substitution (reference 4,
+        // A -> C). Building the body as "synthesized `b` x add, then the read's own
+        // run bases" then needs only `add = 7 - 6 = 1` synthesized base, so the
+        // read's `C` slid into the second position -- which is inside `I(2)`. The
+        // emitted insertion was `AC`: a homopolymer insertion carrying a base the
+        // homopolymer does not contain.
+        //
+        // The run is decided as a LENGTH and rewritten wholesale, so the whole
+        // stretch is `k + R` copies of `b` and the insertion cannot be a slice of
+        // the read no matter how many query bases the read had in the run.
+        let c = cig(vec![Cigar::Match(9), Cigar::Ins(1), Cigar::Match(7)]);
+        let mut seq = REF[..9].to_vec();
+        seq[4] = b'C';
+        seq.push(b'A');
+        seq.extend_from_slice(&REF[9..]);
+        let qual = vec![30u8; 17];
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, 2).expect("must rewrite"),
+        );
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Ins(2), Cigar::Match(12)]));
+        assert_eq!(
+            &r.seq[4..6],
+            b"AA",
+            "the insertion must be 2 copies of the run base, not a slice of the read"
+        );
+        assert_eq!(r.seq, b"ACGTAAAAAAACGTACGT".to_vec());
         assert_invariants(&c, &r);
     }
 

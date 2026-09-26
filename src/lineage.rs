@@ -1114,6 +1114,20 @@ pub fn resolve_error_rates(
     )
 }
 
+/// Plan 2026-09-26 T6. Placeholder until the T7 sweep: twice the resolved
+/// global rate, capped at 0.5. An explicit flag is used verbatim, including 0.
+pub fn resolve_hp_rates(
+    fp_rate: f64,
+    fn_rate: f64,
+    hp_fp_rate: Option<f64>,
+    hp_fn_rate: Option<f64>,
+) -> (f64, f64) {
+    (
+        hp_fp_rate.unwrap_or((2.0 * fp_rate).min(0.5)),
+        hp_fn_rate.unwrap_or((2.0 * fn_rate).min(0.5)),
+    )
+}
+
 pub fn start(
     matrix_file: &str,
     vcf_file: Option<&str>,
@@ -1124,6 +1138,7 @@ pub fn start(
     min_reads: usize,
     fp_rate: f64,
     fn_rate: f64,
+    hp_rates: (f64, f64),
     mcmc_iterations: usize,
     mcmc_chains: usize,
     mcmc_seed: u64,
@@ -1136,7 +1151,7 @@ pub fn start(
     // clap flag itself (`main.rs`'s `DATA_TYPES`), so an unrecognised value is
     // rejected before any file is opened rather than here.
     info!("Starting lineage analysis...");
-    info!("SCITE fp={fp_rate}, fn={fn_rate}");
+    info!("SCITE fp={fp_rate}, fn={fn_rate}, hp_fp={}, hp_fn={}", hp_rates.0, hp_rates.1);
 
     // ── Step 1: decide how HF is judged, then filter the binary matrix ────────
     // The VCF is optional, and which branch runs is exactly what decides where
@@ -1218,6 +1233,7 @@ pub fn start(
         &binary,
         fp_rate,
         fn_rate,
+        hp_rates,
         mcmc_iterations,
         mcmc_chains,
         mcmc_seed,
@@ -1373,6 +1389,17 @@ mod tests {
         );
         // 0.0 is a real user choice, not "unset".
         assert_eq!(resolve_error_rates("ont-r10", Some(0.0), Some(0.0)), (0.0, 0.0));
+    }
+
+    #[test]
+    fn resolve_hp_rates_defaults_to_twice_the_global_rate_capped_at_half() {
+        // Plan 2026-09-26 T6. The factor 2 is a placeholder until the T7 sweep.
+        assert_eq!(resolve_hp_rates(0.005, 0.05, None, None), (0.01, 0.1));
+        // 2 × 0.4 = 0.8, which the cap pulls back to 0.5. The fn side stays under it.
+        assert_eq!(resolve_hp_rates(0.4, 0.01, None, None), (0.5, 0.02));
+        // An explicit flag is used verbatim, including a value above the cap and 0.
+        assert_eq!(resolve_hp_rates(0.005, 0.05, Some(0.9), None), (0.9, 0.1));
+        assert_eq!(resolve_hp_rates(0.005, 0.05, None, Some(0.0)), (0.01, 0.0));
     }
 
     #[test]
@@ -1795,6 +1822,7 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
             1,
             0.01,
             0.1,
+            (0.01, 0.1),
             20,
             1,
             7,

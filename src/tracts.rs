@@ -51,8 +51,9 @@ pub fn overlaps_tract_in(tracts: &[Tract], span: &VariantSpan) -> bool {
     tracts.iter().any(|t| tract_span(t).overlaps(span))
 }
 
-/// Whether `span` overlaps any [`KNOWN_TRACTS`] entry (used by T6).
-#[allow(dead_code)] // consumed by plan T6 (per-locus SCITE error rates).
+/// Whether `span` overlaps any [`KNOWN_TRACTS`] entry.
+///
+/// Plan 2026-09-26 T6 uses this to assign the higher HP-tract SCITE rates.
 pub fn overlaps_tract(span: &VariantSpan) -> bool {
     overlaps_tract_in(KNOWN_TRACTS, span)
 }

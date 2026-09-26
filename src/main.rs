@@ -594,6 +594,16 @@ enum Commands {
         #[clap(long, value_parser)]
         fn_rate: Option<f64>,
 
+        /// SCITE false-positive rate inside known HP tracts
+        /// (optional; default is min(0.5, 2 × the resolved --fp-rate))
+        #[clap(long, value_parser)]
+        hp_fp_rate: Option<f64>,
+
+        /// SCITE false-negative rate inside known HP tracts
+        /// (optional; default is min(0.5, 2 × the resolved --fn-rate))
+        #[clap(long, value_parser)]
+        hp_fn_rate: Option<f64>,
+
         /// number of MCMC iterations per chain
         #[clap(long, value_parser, default_value_t = 5000)]
         mcmc_iterations: usize,
@@ -1006,6 +1016,8 @@ fn main() {
             data_type,
             fp_rate,
             fn_rate,
+            hp_fp_rate,
+            hp_fn_rate,
             mcmc_iterations,
             mcmc_chains,
             no_root_block,
@@ -1022,6 +1034,8 @@ fn main() {
                 .map(|p| p.to_str().expect("vcf-file path is not valid UTF-8"));
             let (fp_rate, fn_rate) =
                 lineage::resolve_error_rates(&data_type, fp_rate, fn_rate);
+            // Plan 2026-09-26 T6. Factor 2 is a placeholder until the T7 sweep.
+            let hp_rates = lineage::resolve_hp_rates(fp_rate, fn_rate, hp_fp_rate, hp_fn_rate);
             let root_block = if no_root_block {
                 None
             } else {
@@ -1051,6 +1065,7 @@ fn main() {
                 LINEAGE_MIN_READS,
                 fp_rate,
                 fn_rate,
+                hp_rates,
                 mcmc_iterations,
                 mcmc_chains,
                 LINEAGE_MCMC_SEED,

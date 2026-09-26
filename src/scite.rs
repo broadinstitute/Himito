@@ -167,29 +167,61 @@ impl MutationTree {
 }
 
 /// Fixed sequencing/genotyping error rates used in the SCITE likelihood model.
+///
+/// Plan 2026-09-26 T6. `per_variant[v]` overrides the global rates at variant
+/// `v`. An empty vector (see [`ErrorRates::uniform`]) keeps today's scoring.
+/// An index past the vector also uses the global rates, on purpose:
+/// `write_read_lineage_newick` scores haplotype profiles that include appended
+/// root-block columns past `n_mutations`, and those columns must keep the
+/// global false-positive term.
 pub struct ErrorRates {
     /// alpha: P(observed = 1 | true = 0) — false positive rate.
     pub fp_rate: f64,
     /// beta: P(observed = 0 | true = 1) — false negative rate.
     pub fn_rate: f64,
+    /// Optional `(fp, fn)` per variant index. Empty means every variant uses
+    /// the global rates.
+    pub per_variant: Vec<(f64, f64)>,
 }
 
 impl ErrorRates {
+    /// Global rates for every variant. `per_variant` is empty.
+    pub fn uniform(fp: f64, fnr: f64) -> Self {
+        ErrorRates {
+            fp_rate: fp,
+            fn_rate: fnr,
+            per_variant: Vec::new(),
+        }
+    }
+
     /// The rates as every likelihood computation must use them: clamped into
     /// `[RATE_FLOOR, 1 - RATE_FLOOR]` so no logarithm is infinite.
     ///
-    /// Both scoring paths go through here, which is load-bearing rather than
-    /// tidiness. `attach_all_reads` scores reads through [`AttachmentScorer`]
-    /// while `write_read_lineage_newick` scores haplotype profiles through
-    /// [`best_attachment`]. If one clamped and the other did not, then at
-    /// `--fp-rate 0` — a supported input — the unclamped path would score every
-    /// node that fails to explain an alt call at exactly `-inf`, fall through
-    /// its tie-break to the root, and place a haplotype tip on a different node
-    /// than the reads that compose it.
+    /// Both scoring paths go through [`Self::clamped_for`], which is
+    /// load-bearing rather than tidiness. `attach_all_reads` scores reads
+    /// through [`AttachmentScorer`] while `write_read_lineage_newick` scores
+    /// haplotype profiles through [`best_attachment`]. If one clamped and the
+    /// other did not, then at `--fp-rate 0` — a supported input — the unclamped
+    /// path would score every node that fails to explain an alt call at exactly
+    /// `-inf`, fall through its tie-break to the root, and place a haplotype tip
+    /// on a different node than the reads that compose it.
     fn clamped(&self) -> (f64, f64) {
+        Self::clamp_pair(self.fp_rate, self.fn_rate)
+    }
+
+    /// Plan 2026-09-26 T6. `per_variant[v]` when `v` is in range, otherwise the
+    /// global rates. Out-of-range is the root-block columns past `n_mutations`.
+    fn clamped_for(&self, v: usize) -> (f64, f64) {
+        match self.per_variant.get(v) {
+            Some(&(fp, fnr)) => Self::clamp_pair(fp, fnr),
+            None => self.clamped(),
+        }
+    }
+
+    fn clamp_pair(fp: f64, fnr: f64) -> (f64, f64) {
         (
-            self.fp_rate.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR),
-            self.fn_rate.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR),
+            fp.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR),
+            fnr.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR),
         )
     }
 }
@@ -203,10 +235,11 @@ pub fn attachment_log_likelihood(
     ancestor_mask: &Mask,
     rates: &ErrorRates,
 ) -> f64 {
-    let (fp, fn_rate) = rates.clamped();
     let mut ll = 0.0;
     for (i, call) in profile.iter().enumerate() {
         let Some(observed) = call else { continue };
+        // Plan 2026-09-26 T6. Each variant carries its own clamped rates.
+        let (fp, fn_rate) = rates.clamped_for(i);
         let expected_mutated = ancestor_mask.get(i);
         let p = match (*observed, expected_mutated) {
             (1, false) => fp,
@@ -305,14 +338,16 @@ impl TreeLayout {
 /// A SCITE mutation tree is a perfect phylogeny: `genotype(child)` is
 /// `genotype(parent)` plus exactly one mutation. So the log-likelihood of a read
 /// at a child differs from its value at the parent by a single term — the one
-/// for the child's own mutation. `delta[read][m]` holds that term and
-/// `base[read]` holds the score at the root (nothing mutated); every node's
-/// score is the root's plus the deltas along its path, which one forward pass
-/// over `TreeLayout::preorder` accumulates.
+/// for the child's own mutation. That term is `delta[variant][code]` for the
+/// read's call at the variant (Plan 2026-09-26 T6: the three codes share a
+/// table, but the table is per variant). `base[read]` holds the score at the
+/// root (nothing mutated); every node's score is the root's plus the deltas
+/// along its path, which one forward pass over `TreeLayout::preorder`
+/// accumulates.
 ///
-/// `delta` is indexed `[read][variant]` rather than `[variant][read]` so the
-/// scoring pass, which walks variants for a fixed read, reads contiguous memory.
-/// A cell the read does not cover: it costs nothing at any node.
+/// Call codes are stored row-major by read, so the scoring pass — which walks
+/// every variant for one fixed read — reads a contiguous slice. A cell the
+/// read does not cover costs nothing at any node.
 const CODE_UNCOVERED: u8 = 0;
 /// An explicit reference call.
 const CODE_REF: u8 = 1;
@@ -323,10 +358,10 @@ pub struct AttachmentScorer {
     /// `base[r]` = log P(read r's calls | genotype is all-reference).
     base: Vec<f64>,
     /// `code[r * n_variants + m]` — one of the three `CODE_*` values, naming
-    /// which entry of `delta_by_code` cell `(r, m)` contributes.
+    /// which entry of `delta[m]` cell `(r, m)` contributes.
     ///
     /// Stored as one byte per cell rather than the `f64` it selects, because
-    /// the per-cell term takes exactly three values across the whole matrix:
+    /// the per-cell term takes exactly three values for a given variant:
     /// an `f64` per cell spends 64 bits carrying 2 bits of information. At
     /// 100k reads x 200 variants that is ~20MB instead of ~160MB. Flat rather
     /// than `Vec<Vec<u8>>` for the same reason — a row-per-read layout adds a
@@ -338,26 +373,33 @@ pub struct AttachmentScorer {
     code: Vec<u8>,
     /// Row stride of `code`.
     n_variants: usize,
-    /// Indexed by a `CODE_*` value: log P(call | m mutated) − log P(call | m
-    /// not mutated), which depends only on the call, never on which variant it
-    /// was.
-    delta_by_code: [f64; 3],
+    /// Plan 2026-09-26 T6. `delta[variant][code]` is
+    /// log P(call | variant mutated) − log P(call | variant not mutated).
+    /// The code is still one byte; only the three log-deltas depend on which
+    /// variant the call sits on.
+    delta: Vec<[f64; 3]>,
 }
 
 impl AttachmentScorer {
     pub fn new(matrix: &BinaryMatrix, rates: &ErrorRates) -> Self {
-        let (fp, fnr) = rates.clamped();
-        let ln_fp = fp.ln();
-        let ln_1mfp = (1.0 - fp).ln();
-        let ln_fn = fnr.ln();
-        let ln_1mfn = (1.0 - fnr).ln();
-
         let n_variants = matrix.variants.len();
         let n_reads = matrix.reads.len();
         let mut base = vec![0.0f64; n_reads];
         let mut code = vec![CODE_UNCOVERED; n_reads * n_variants];
+        // CODE_UNCOVERED stays 0: an uncovered cell costs nothing at any node.
+        let mut delta = vec![[0.0f64; 3]; n_variants];
 
         for m in 0..n_variants {
+            // Plan 2026-09-26 T6. Root score and the mutation delta both use
+            // this variant's own rates, not one matrix-wide pair.
+            let (fp, fnr) = rates.clamped_for(m);
+            let ln_fp = fp.ln();
+            let ln_1mfp = (1.0 - fp).ln();
+            let ln_fn = fnr.ln();
+            let ln_1mfn = (1.0 - fnr).ln();
+            delta[m][CODE_REF as usize] = ln_fn - ln_1mfp;
+            delta[m][CODE_ALT as usize] = ln_1mfn - ln_fp;
+
             for r in 0..n_reads {
                 match matrix.data[m][r] {
                     Some(1) => {
@@ -375,11 +417,7 @@ impl AttachmentScorer {
             }
         }
 
-        let mut delta_by_code = [0.0f64; 3];
-        delta_by_code[CODE_REF as usize] = ln_fn - ln_1mfp;
-        delta_by_code[CODE_ALT as usize] = ln_1mfn - ln_fp;
-
-        AttachmentScorer { base, code, n_variants, delta_by_code }
+        AttachmentScorer { base, code, n_variants, delta }
     }
 
     /// How many reads this scorer was built over.
@@ -418,7 +456,8 @@ impl AttachmentScorer {
         let codes = &self.code[read * self.n_variants..(read + 1) * self.n_variants];
         for &node in &layout.preorder {
             if node != root {
-                let delta = self.delta_by_code[codes[node] as usize];
+                // Plan 2026-09-26 T6. `node` is the variant acquired on this edge.
+                let delta = self.delta[node][codes[node] as usize];
                 scratch[node] = scratch[tree.parent[node]] + delta;
             }
         }
@@ -570,6 +609,27 @@ pub fn variant_spans(variants: &[String]) -> Vec<VariantSpan> {
         );
     }
     spans
+}
+
+/// Plan 2026-09-26 T6. One `(fp, fn)` per search-matrix variant. A span that
+/// overlaps a [`crate::tracts::KNOWN_TRACTS`] entry — every collapsed T5 tract
+/// allele included — gets `hp_rates`. Every other span keeps the global pair.
+fn per_variant_rates(
+    spans: &[VariantSpan],
+    fp_rate: f64,
+    fn_rate: f64,
+    hp_rates: (f64, f64),
+) -> Vec<(f64, f64)> {
+    spans
+        .iter()
+        .map(|span| {
+            if crate::tracts::overlaps_tract(span) {
+                hp_rates
+            } else {
+                (fp_rate, fn_rate)
+            }
+        })
+        .collect()
 }
 
 /// Whether any mutation in `tree` has a strict ancestor whose REF interval
@@ -1872,6 +1932,7 @@ pub fn run_scite_pipeline(
     binary: &BinaryMatrix,
     fp_rate: f64,
     fn_rate: f64,
+    hp_rates: (f64, f64),
     n_iterations: usize,
     n_chains: usize,
     seed: u64,
@@ -1889,6 +1950,7 @@ pub fn run_scite_pipeline(
     // Partition before anything else looks at the matrix: everything below
     // searches, scores and reports over `search_matrix`, not `binary`.
     let rb = match root_block {
+        // TODO(plan T6): dropout_rate is still the global fn, not the HP-tract fn.
         Some(cfg) => rootblock::partition(binary, cfg, fn_rate),
         None => rootblock::RootBlock::disabled(binary.variants.len()),
     };
@@ -1953,6 +2015,16 @@ pub fn run_scite_pipeline(
     // do not overlap each other), so report the constrained pairs rather than
     // grouping into sites. Index order keeps the log deterministic.
     let spans = variant_spans(&binary.variants);
+    // Plan 2026-09-26 T6. Restrict has already re-indexed `binary.variants`,
+    // so these rates line up with the search matrix and not the pre-partition names.
+    let per_variant = per_variant_rates(&spans, fp_rate, fn_rate, hp_rates);
+    let n_hp = spans.iter().filter(|span| crate::tracts::overlaps_tract(span)).count();
+    info!(
+        "[SCITE] {n_hp} of {} variant(s) overlap a known HP tract and use fp={}, fn={}",
+        spans.len(),
+        hp_rates.0,
+        hp_rates.1
+    );
     let conflict_pairs: Vec<String> = (0..spans.len())
         .flat_map(|i| (i + 1..spans.len()).map(move |j| (i, j)))
         .filter(|&(i, j)| spans[i].overlaps(&spans[j]))
@@ -1977,7 +2049,7 @@ pub fn run_scite_pipeline(
         }
     );
 
-    let rates = ErrorRates { fp_rate, fn_rate };
+    let rates = ErrorRates { fp_rate, fn_rate, per_variant };
     let (tree, ll) = if no_informative {
         // Zero mutations: root only. `parent` is length n_mutations + 1 and the
         // root's slot points at itself (see MutationTree::root).
@@ -2116,7 +2188,7 @@ mod tests {
     fn attachment_log_likelihood_matches_hand_computed_value() {
         let profile = vec![Some(1), Some(0), None];
         let ancestor_mask = Mask::from_bits(&[0, 1]);
-        let rates = ErrorRates { fp_rate: 0.1, fn_rate: 0.2 };
+        let rates = ErrorRates::uniform(0.1, 0.2);
 
         let expected = (1.0 - rates.fn_rate).ln() + rates.fn_rate.ln();
         let actual = attachment_log_likelihood(&profile, &ancestor_mask, &rates);
@@ -2127,7 +2199,7 @@ mod tests {
     fn attachment_log_likelihood_scores_true_negative_and_false_positive() {
         let profile = vec![Some(0), Some(1)];
         let ancestor_mask = Mask::new();
-        let rates = ErrorRates { fp_rate: 0.1, fn_rate: 0.2 };
+        let rates = ErrorRates::uniform(0.1, 0.2);
 
         let expected = (1.0 - rates.fp_rate).ln() + rates.fp_rate.ln();
         let actual = attachment_log_likelihood(&profile, &ancestor_mask, &rates);
@@ -2137,7 +2209,7 @@ mod tests {
     #[test]
     fn best_attachment_picks_the_node_matching_observed_mutations() {
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 2, 2] };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.3 };
+        let rates = ErrorRates::uniform(0.01, 0.3);
         let profile = vec![Some(1), Some(0)];
 
         let expected_ll = (1.0 - rates.fn_rate).ln() + (1.0 - rates.fp_rate).ln();
@@ -2152,7 +2224,7 @@ mod tests {
         // explicit ref at B, so ROOT and A explain it identically well. ROOT is
         // the parsimonious choice; attaching to A would invent an alt call at A.
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let rates = ErrorRates::uniform(0.01, 0.1);
         let profile = vec![None, Some(0)];
 
         let (node, ll) = best_attachment(&profile, &tree, &rates);
@@ -2166,7 +2238,7 @@ mod tests {
         // No observed call at all -> every node has log-likelihood 0. The read
         // carries no evidence, so it must not be assigned any mutation.
         let tree = MutationTree { n_mutations: 3, parent: vec![3, 0, 1, 3] };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let rates = ErrorRates::uniform(0.01, 0.1);
         let profile = vec![None, None, None];
 
         let (node, ll) = best_attachment(&profile, &tree, &rates);
@@ -2179,7 +2251,7 @@ mod tests {
         // r_partial is uncovered at A and an explicit ref at B: attaching it
         // below A would write A=1 into the cleaned matrix out of nothing.
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
-        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = BinaryMatrix {
             variants: vec!["A".to_string(), "B".to_string()],
             reads: vec!["r_both".to_string(), "r_partial".to_string()],
@@ -2196,7 +2268,7 @@ mod tests {
     #[test]
     fn tree_log_likelihood_sums_best_attachment_over_all_reads() {
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 2, 2] };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.3 };
+        let rates = ErrorRates::uniform(0.01, 0.3);
         let matrix = BinaryMatrix {
             variants: vec!["A".to_string(), "B".to_string()],
             reads: vec!["r1".to_string(), "r2".to_string()],
@@ -2212,7 +2284,7 @@ mod tests {
     #[test]
     fn tree_log_likelihood_with_scorer_matches_the_reference_implementation() {
         let mut rng = StdRng::seed_from_u64(0xBEEF);
-        let rates = ErrorRates { fp_rate: 0.005, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.005, 0.05);
 
         for trial in 0..100usize {
             let n_variants = 1 + trial % 8;
@@ -2251,6 +2323,65 @@ mod tests {
             let wrapped = tree_log_likelihood(&matrix, &tree, &rates);
             assert!((wrapped - want).abs() < 1e-9, "trial {trial}: wrapper {wrapped} vs {want}");
         }
+
+        // Plan 2026-09-26 T6. A second case whose rates differ by variant. Both
+        // scoring paths must still agree to 1e-9, and the likelihood must move
+        // relative to the global rates — otherwise `per_variant` is ignored.
+        let mut rng = StdRng::seed_from_u64(0xF00D);
+        let global = ErrorRates::uniform(0.005, 0.05);
+        let mut saw_rate_effect = false;
+        for trial in 0..100usize {
+            let n_variants = 1 + trial % 8;
+            let n_reads = 1 + trial % 11;
+            let data: Vec<Vec<Option<u8>>> = (0..n_variants)
+                .map(|_| {
+                    (0..n_reads)
+                        .map(|_| match rng.random_range(0..3u8) {
+                            0 => None,
+                            1 => Some(0),
+                            _ => Some(1),
+                        })
+                        .collect()
+                })
+                .collect();
+            let matrix = BinaryMatrix {
+                variants: (0..n_variants).map(|i| format!("m.{}A>G", 100 + i)).collect(),
+                reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
+                data,
+            };
+            let tree = MutationTree::random(n_variants, &mut rng);
+            let mut rates = ErrorRates::uniform(0.005, 0.05);
+            rates.per_variant = (0..n_variants)
+                .map(|i| if i % 2 == 0 { (0.2, 0.4) } else { (0.001, 0.02) })
+                .collect();
+
+            let score = |rates: &ErrorRates| -> f64 {
+                (0..n_reads)
+                    .map(|r| {
+                        let profile: Vec<Option<u8>> =
+                            matrix.data.iter().map(|row| row[r]).collect();
+                        best_attachment(&profile, &tree, rates).1
+                    })
+                    .sum()
+            };
+            let want = score(&rates);
+            if (want - score(&global)).abs() > 1e-6 {
+                saw_rate_effect = true;
+            }
+
+            let scorer = AttachmentScorer::new(&matrix, &rates);
+            let got = tree_log_likelihood_with(&tree, &scorer);
+            assert!((got - want).abs() < 1e-9, "per-variant trial {trial}: {got} vs {want}");
+            let wrapped = tree_log_likelihood(&matrix, &tree, &rates);
+            assert!(
+                (wrapped - want).abs() < 1e-9,
+                "per-variant trial {trial}: wrapper {wrapped} vs {want}"
+            );
+        }
+        assert!(
+            saw_rate_effect,
+            "non-uniform per_variant must change at least one likelihood"
+        );
     }
 
     #[test]
@@ -2267,7 +2398,7 @@ mod tests {
                 vec![Some(1), Some(1), Some(1), Some(0)],
             ],
         };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let rates = ErrorRates::uniform(0.01, 0.1);
         let tree = MutationTree { n_mutations: 3, parent: vec![1, 2, 3, 3] };
 
         let cleaned = attach_all_reads(&matrix, &tree, &rates);
@@ -2282,6 +2413,89 @@ mod tests {
                 assert_eq!(cleaned.data[v][r], u8::from(mask.get(v)), "cell ({v}, {r})");
             }
         }
+
+        // Plan 2026-09-26 T6. Non-uniform rates: the incremental scorer must
+        // still match the reference, and a high fn at B must attach below B.
+        let chain = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        let chain_matrix = BinaryMatrix {
+            variants: vec!["A".into(), "B".into()],
+            reads: vec!["r".into()],
+            data: vec![vec![Some(1)], vec![Some(0)]],
+        };
+        let high = ErrorRates {
+            fp_rate: 0.01,
+            fn_rate: 0.05,
+            per_variant: vec![(0.01, 0.05), (0.01, 0.999)],
+        };
+        let cleaned = attach_all_reads(&chain_matrix, &chain, &high);
+        let profile = vec![Some(1), Some(0)];
+        let (want_node, want_ll) = best_attachment(&profile, &chain, &high);
+        assert_eq!(want_node, 1, "high fn at B must attach below B");
+        assert_eq!(cleaned.attachment[0], want_node);
+        let scorer = AttachmentScorer::new(&chain_matrix, &high);
+        let layout = TreeLayout::new(&chain);
+        let (got_node, got_ll) = scorer.best_attachment(0, &chain, &layout, &mut Vec::new());
+        assert_eq!(got_node, want_node);
+        assert!((got_ll - want_ll).abs() < 1e-9, "{got_ll} vs {want_ll}");
+    }
+
+    /// Plan 2026-09-26 T6. Chain root → A → B. The read carries A and is absent
+    /// at B. When B's false-negative rate is high enough that a dropout is more
+    /// likely than a true ref, the read attaches at B. The global rate leaves
+    /// it at A, above B.
+    #[test]
+    fn absence_at_a_high_fn_variant_attaches_below_that_variant() {
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        let profile = vec![Some(1u8), Some(0)];
+
+        let global = ErrorRates::uniform(0.01, 0.05);
+        let (above, _) = best_attachment(&profile, &tree, &global);
+        assert_eq!(above, 0, "global fn keeps the absence above B");
+
+        let high = ErrorRates {
+            fp_rate: 0.01,
+            fn_rate: 0.05,
+            per_variant: vec![(0.01, 0.05), (0.01, 0.999)],
+        };
+        let (below, _) = best_attachment(&profile, &tree, &high);
+        assert_eq!(below, 1, "high fn at B explains the absence as dropout");
+    }
+
+    /// Plan 2026-09-26 T6. Known-tract spans, including a T5 tract allele and a
+    /// boundary straddler, take the HP rates. Everything else keeps the global pair.
+    #[test]
+    fn per_variant_rates_are_higher_inside_known_hp_tracts() {
+        let variants = vec![
+            "m.3243A>G".to_string(),
+            "m.16189T>C".to_string(),
+            "m.16183ACCCCCTCCCC>ACCCCCCCCCC".to_string(),
+            "m.16193CA>C".to_string(),
+            "m.16182A>C".to_string(),
+        ];
+        let spans = variant_spans(&variants);
+        let rates = per_variant_rates(&spans, 0.01, 0.05, (0.02, 0.10));
+        assert_eq!(rates[0], (0.01, 0.05), "outside every tract");
+        assert_eq!(rates[1], (0.02, 0.10), "HVS1-C SNV");
+        assert_eq!(rates[2], (0.02, 0.10), "T5 tract allele");
+        assert_eq!(rates[3], (0.02, 0.10), "straddles the tract boundary");
+        assert_eq!(rates[4], (0.01, 0.05), "one base before the tract");
+    }
+
+    /// Plan 2026-09-26 T6. Columns past `per_variant` — the root-block genotypes
+    /// appended beyond `n_mutations` — stay on the global rate.
+    #[test]
+    fn columns_past_per_variant_use_the_global_rate() {
+        let profile = vec![Some(1), Some(1)];
+        let ancestor_mask = Mask::new();
+        let rates = ErrorRates {
+            fp_rate: 0.1,
+            fn_rate: 0.2,
+            per_variant: vec![(0.3, 0.4)],
+        };
+        // Variant 0 uses its own fp (0.3); the extra column falls back to 0.1.
+        let expected = 0.3_f64.ln() + 0.1_f64.ln();
+        let actual = attachment_log_likelihood(&profile, &ancestor_mask, &rates);
+        assert!((actual - expected).abs() < 1e-12, "{actual} vs {expected}");
     }
 
     #[test]
@@ -2500,7 +2714,7 @@ mod tests {
             reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
             data: vec![anc, ins, sub],
         };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let rates = ErrorRates::uniform(0.01, 0.1);
         let mut rng = StdRng::seed_from_u64(11);
         let (tree, _ll) = run_mcmc(&matrix, &rates, 3000, None, &mut rng);
 
@@ -2557,7 +2771,7 @@ mod tests {
             reads: vec!["r0".into()],
             data: vec![vec![Some(0)], vec![Some(1)], vec![Some(0)], vec![Some(0)]],
         };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.6 };
+        let rates = ErrorRates::uniform(0.01, 0.6);
         let start = MutationTree { n_mutations: 4, parent: vec![2, 2, 4, 4, 4] };
         let start_ll = tree_log_likelihood(&matrix, &start, &rates);
 
@@ -2627,7 +2841,7 @@ mod tests {
                 vec![Some(0), Some(0), Some(0), Some(0), Some(0), Some(0), Some(1), Some(1), Some(1), Some(0), Some(0), Some(0)],
             ],
         };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.01, 0.05);
         let start = MutationTree { n_mutations: 4, parent: vec![4, 4, 4, 4, 4] };
         let start_ll = tree_log_likelihood(&matrix, &start, &rates);
 
@@ -2661,7 +2875,7 @@ mod tests {
                 vec![Some(0), Some(0), Some(0), Some(1), Some(1), Some(1), Some(0), Some(0), Some(0)],
             ],
         };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.01, 0.05);
 
         // Brute-force every acyclic parent vector on 3 mutations.
         let mut optimum = f64::NEG_INFINITY;
@@ -2800,7 +3014,7 @@ mod tests {
             reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
             data: vec![data_a, data_b],
         };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let rates = ErrorRates::uniform(0.01, 0.1);
 
         let mut rng = StdRng::seed_from_u64(42);
         let (tree, _ll) = run_mcmc(&matrix, &rates, 3000, None, &mut rng);
@@ -2829,7 +3043,7 @@ mod tests {
             reads: (0..n_reads).map(|i| format!("r{i}")).collect(),
             data: vec![data_a, data_b],
         };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let rates = ErrorRates::uniform(0.01, 0.1);
 
         let (tree, _ll) = run_mcmc_multichain(&matrix, &rates, 1000, 4, None, 7);
         assert_eq!(tree.parent[1], 0);
@@ -2838,7 +3052,7 @@ mod tests {
     #[test]
     fn attach_all_reads_imputes_missing_and_corrects_false_negatives() {
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] }; // A ancestor of B
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let rates = ErrorRates::uniform(0.01, 0.1);
         let matrix = BinaryMatrix {
             variants: vec!["A".to_string(), "B".to_string()],
             reads: vec!["r_full".to_string(), "r_missingB".to_string(), "r_errorA".to_string()],
@@ -2991,7 +3205,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, 0.01, 0.1, 50, 1, 7, 1, None, false, &prefix).unwrap();
+        run_scite_pipeline(&matrix, 0.01, 0.1, (0.01, 0.1), 50, 1, 7, 1, None, false, &prefix).unwrap();
 
         let nwk = format!("{prefix}.read_lineage.nwk");
         assert!(std::path::Path::new(&nwk).exists(), "expected {nwk} to exist");
@@ -3028,7 +3242,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, 0.01, 0.1, 500, 2, 123, 1, None, false, &prefix).unwrap();
+        run_scite_pipeline(&matrix, 0.01, 0.1, (0.01, 0.1), 500, 2, 123, 1, None, false, &prefix).unwrap();
 
         let tree_tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
         // The mutation hangs directly off the root, with no order to resolve.
@@ -3089,7 +3303,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, 0.01, 0.1, 500, 2, 123, 1, None, false, &prefix).unwrap();
+        run_scite_pipeline(&matrix, 0.01, 0.1, (0.01, 0.1), 500, 2, 123, 1, None, false, &prefix).unwrap();
 
         // Plan 2026-09-26 T3. debug is false, so cleaned_matrix.csv and
         // raw_variant_cooccurrence.tsv are not part of the default outputs.
@@ -3116,7 +3330,7 @@ mod tests {
         //   D: two haplotypes H1, H2              -> ancestral node anc3
         //   H3 attaches to internal node B        -> length-0 tip, reads only
         let tree = MutationTree { n_mutations: 4, parent: vec![4, 0, 1, 1, 4] };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.01, 0.05);
 
         let hap_matrix = HaplotypeMatrix {
             variants: vec!["mA".into(), "mB".into(), "mC".into(), "mD".into()],
@@ -3162,7 +3376,7 @@ mod tests {
         // to the root and supplies the ancestral tip's id/count directly — no
         // synthetic Hroot, and its reads are not double-counted elsewhere.
         let tree = MutationTree { n_mutations: 1, parent: vec![1, 1] };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.01, 0.05);
         let hap_matrix = HaplotypeMatrix {
             variants: vec!["mA".into()],
             haplotypes: vec![
@@ -3188,7 +3402,7 @@ mod tests {
     #[test]
     fn polish_unary_path_order_restores_af_preferred_order() {
         // Higher AF on A, lower on B; reversed tree has B under ROOT, A under B.
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.01, 0.05);
         let matrix = BinaryMatrix {
             variants: vec!["A".into(), "B".into()],
             reads: (0..10).map(|i| format!("r{i}")).collect(),
@@ -3208,7 +3422,7 @@ mod tests {
     #[test]
     fn polish_unary_path_order_is_noop_when_order_already_matches_af() {
         // Correct A→B already matches AF order; polish must leave parents unchanged.
-        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.001 };
+        let rates = ErrorRates::uniform(0.001, 0.001);
         let matrix = BinaryMatrix {
             variants: vec!["A".into(), "B".into()],
             reads: (0..10).map(|i| format!("r{i}")).collect(),
@@ -3284,7 +3498,7 @@ mod tests {
         // Same coverage-biased pair as above, with the tree already in the wrong
         // order (B ancestral). A global-AF sort agrees with the wrong order and
         // therefore proposes nothing at all.
-        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(
             &["A", "B"],
             &[
@@ -3305,7 +3519,7 @@ mod tests {
         // best ordering: 0 -> 2 -> 1 scores -6.722 and is the exhaustive ML over
         // all six permutations. A single accept/reject on one candidate stops at
         // the first improvement; adjacent swaps reach the optimum.
-        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(
             &["m0", "m1", "m2"],
             &["10010001111", "0.101.0010.", "101010011.."],
@@ -3327,7 +3541,7 @@ mod tests {
         // interior node and every one of the six orderings has the same
         // likelihood. The climb must settle on the orientation-preferred order
         // (index order, since every statistic ties here) instead of cycling.
-        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(
             &["A", "B", "C"],
             &["111111110000", "111111110000", "111111110000"],
@@ -3348,7 +3562,7 @@ mod tests {
     fn edge_order_support_is_flat_when_no_read_separates_two_mutations() {
         // Same block-carried data: nothing distinguishes A above B from B above
         // A, so the edge carries no evidence at all.
-        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(
             &["A", "B", "C"],
             &["111111110000", "111111110000", "111111110000"],
@@ -3366,7 +3580,7 @@ mod tests {
     fn edge_order_support_is_large_when_reads_pin_the_order() {
         // Six reads carry A without B, none carry B without A, so putting B
         // above A would have to explain all six as dropouts at B.
-        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(&["A", "B"], &["1111111111", "1111000000"]);
         let chain = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
 
@@ -3399,7 +3613,7 @@ mod tests {
 
     #[test]
     fn edge_evidence_reports_the_counts_behind_each_order() {
-        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(&["A", "B"], &["110", "101"]);
         let chain = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
 
@@ -3418,7 +3632,7 @@ mod tests {
         // shared across every node — must equal what `edge_order_support`
         // computes node by node, rebuilding both each time.
         let mut rng = StdRng::seed_from_u64(0xED6E);
-        let rates = ErrorRates { fp_rate: 0.005, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.005, 0.05);
 
         for trial in 0..100usize {
             let n_variants = 2 + trial % 7;
@@ -3470,7 +3684,7 @@ mod tests {
     #[test]
     fn polish_unary_path_order_moves_distal_children_to_new_tip() {
         // Path ROOT→0→1 with distal children 2,3 under tip 1. AF prefers 1 ancestral to 0.
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.01, 0.05);
         let matrix = BinaryMatrix {
             variants: vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
             reads: (0..8).map(|i| format!("r{i}")).collect(),
@@ -3563,7 +3777,7 @@ mod tests {
             parent[c] = if par == "ROOT" { root } else { ix(par) };
         }
         let tree = MutationTree { n_mutations: n, parent };
-        let rates = ErrorRates { fp_rate: 0.001, fn_rate: 0.05 };
+        let rates = ErrorRates::uniform(0.001, 0.05);
         let ll0 = tree_log_likelihood(&binary, &tree, &rates);
         let polished = polish_unary_path_order(&tree, &binary, &rates);
         let ll1 = tree_log_likelihood(&binary, &polished, &rates);
@@ -3620,7 +3834,7 @@ mod tests {
         ];
 
         for (fp_rate, fn_rate) in rate_settings {
-        let rates = ErrorRates { fp_rate, fn_rate };
+        let rates = ErrorRates::uniform(fp_rate, fn_rate);
 
         for trial in 0..300usize {
             let n_variants = 1 + trial % 9;
@@ -3713,7 +3927,7 @@ mod tests {
             reads: vec!["r0".to_string()],
             data: vec![vec![Some(1)], vec![Some(0)]],
         };
-        let rates = ErrorRates { fp_rate: 0.0, fn_rate: 0.0 };
+        let rates = ErrorRates::uniform(0.0, 0.0);
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
         let scorer = AttachmentScorer::new(&matrix, &rates);
         let layout = TreeLayout::new(&tree);
@@ -3727,12 +3941,13 @@ mod tests {
 
     #[test]
     fn attachment_scorer_stores_one_byte_per_cell_in_a_single_allocation() {
-        // The per-cell term takes exactly three values across the whole matrix,
-        // so it is stored as a byte code into a 3-entry table rather than as an
-        // f64 per cell. Pinned because nothing else would notice the day someone
-        // "simplifies" this back to a Vec<Vec<f64>>: every other test would still
-        // pass, and the cost — ~160MB instead of ~20MB at 100k reads x 200
-        // variants, plus 100k separate allocations — is invisible at test sizes.
+        // The per-cell term takes exactly three values for a given variant, so
+        // it is stored as a byte code into that variant's 3-entry table rather
+        // than as an f64 per cell. Pinned because nothing else would notice the
+        // day someone "simplifies" this back to a Vec<Vec<f64>>: every other
+        // test would still pass, and the cost — ~160MB instead of ~20MB at
+        // 100k reads x 200 variants, plus 100k separate allocations — is
+        // invisible at test sizes.
         let (n_variants, n_reads) = (64usize, 256usize);
         let matrix = BinaryMatrix {
             variants: (0..n_variants).map(|i| format!("m.{}A>G", 100 + i)).collect(),
@@ -3740,15 +3955,19 @@ mod tests {
             data: vec![vec![Some(1); n_reads]; n_variants],
         };
         let scorer =
-            AttachmentScorer::new(&matrix, &ErrorRates { fp_rate: 0.005, fn_rate: 0.05 });
+            AttachmentScorer::new(&matrix, &ErrorRates::uniform(0.005, 0.05));
 
         assert_eq!(std::mem::size_of_val(&scorer.code[0]), 1, "one byte per cell");
         assert_eq!(scorer.code.len(), n_reads * n_variants, "flat, not nested");
         assert_eq!(scorer.n_variants, n_variants, "row stride is the variant count");
-        // Three distinct deltas is the whole premise; uncovered must cost zero.
-        assert_eq!(scorer.delta_by_code[CODE_UNCOVERED as usize], 0.0);
-        assert!(scorer.delta_by_code[CODE_REF as usize] < 0.0, "a ref call argues against");
-        assert!(scorer.delta_by_code[CODE_ALT as usize] > 0.0, "an alt call argues for");
+        // Each variant has a 3-entry table; uncovered must cost zero. Uniform
+        // rates make every variant's table identical.
+        assert_eq!(scorer.delta.len(), n_variants);
+        for table in &scorer.delta {
+            assert_eq!(table[CODE_UNCOVERED as usize], 0.0);
+            assert!(table[CODE_REF as usize] < 0.0, "a ref call argues against");
+            assert!(table[CODE_ALT as usize] > 0.0, "an alt call argues for");
+        }
     }
 
     #[test]
@@ -3773,7 +3992,7 @@ mod tests {
             data: vec![vec![Some(1)], vec![Some(1)]],
         };
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 2, 2] };
-        let rates = ErrorRates { fp_rate: 0.0, fn_rate: 0.0 };
+        let rates = ErrorRates::uniform(0.0, 0.0);
 
         let profile: Vec<Option<u8>> = matrix.data.iter().map(|row| row[0]).collect();
         let (ref_node, ref_ll) = best_attachment(&profile, &tree, &rates);
@@ -3811,7 +4030,7 @@ mod tests {
                 vec![Some(0), Some(1)],
             ],
         };
-        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.1 };
+        let rates = ErrorRates::uniform(0.01, 0.1);
         let scorer = AttachmentScorer::new(&matrix, &rates);
         let mut scratch = Vec::new();
 
@@ -3850,6 +4069,7 @@ mod tests {
             &binary,
             0.01,
             0.05,
+            (0.01, 0.05),
             50,
             1,
             7,
@@ -3875,7 +4095,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
-        run_scite_pipeline(&binary, 0.01, 0.05, 50, 1, 7, 1, None, false, &prefix).unwrap();
+        run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), 50, 1, 7, 1, None, false, &prefix).unwrap();
 
         let tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
         assert!(tsv.contains("m.750A>G"), "disabled must leave both variants in the tree");
@@ -3913,10 +4133,10 @@ mod tests {
         let off = dir.join("off").to_str().unwrap().to_string();
 
         run_scite_pipeline(
-            &binary, 0.01, 0.05, 200, 1, 7, 1,
+            &binary, 0.01, 0.05, (0.01, 0.05), 200, 1, 7, 1,
             Some(&crate::rootblock::RootBlockConfig::default()), false, &on,
         ).unwrap();
-        run_scite_pipeline(&binary, 0.01, 0.05, 200, 1, 7, 1, None, false, &off).unwrap();
+        run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), 200, 1, 7, 1, None, false, &off).unwrap();
 
         // Plan 2026-09-26 T3. debug is false on both runs, so
         // cleaned_matrix.csv and raw_variant_cooccurrence.tsv are not written.
@@ -3956,7 +4176,7 @@ mod tests {
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
         let out = run_scite_pipeline(
-            &binary, 0.01, 0.05, 200, 1, 7, 1,
+            &binary, 0.01, 0.05, (0.01, 0.05), 200, 1, 7, 1,
             Some(&crate::rootblock::RootBlockConfig::default()), false, &prefix,
         ).unwrap();
 
@@ -4090,7 +4310,7 @@ mod tests {
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
         run_scite_pipeline(
-            &binary, 0.01, 0.05, 200, 1, 7, 1,
+            &binary, 0.01, 0.05, (0.01, 0.05), 200, 1, 7, 1,
             Some(&crate::rootblock::RootBlockConfig::default()), true, &prefix,
         ).unwrap();
 
@@ -4145,7 +4365,7 @@ mod tests {
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
         run_scite_pipeline(
-            &binary, 0.01, 0.05, 200, 1, 7, 1,
+            &binary, 0.01, 0.05, (0.01, 0.05), 200, 1, 7, 1,
             Some(&crate::rootblock::RootBlockConfig::default()), false, &prefix,
         ).unwrap();
 

@@ -656,6 +656,13 @@ fn validate_indel_opts(o: &denoise_indel::IndelOpts) -> AnyhowResult<()> {
     Ok(())
 }
 
+fn validate_lineage_opts(mcmc_chains: usize) -> AnyhowResult<()> {
+    if mcmc_chains == 0 {
+        anyhow::bail!("--mcmc-chains must be at least 1 (got {mcmc_chains})");
+    }
+    Ok(())
+}
+
 pub fn init_rayon_threads(threads: Option<usize>) -> AnyhowResult<()> {
     let Some(n) = threads else {
         return Ok(());
@@ -1009,6 +1016,11 @@ fn main() {
                     // the SCITE fn rate, supplied by `run_scite_pipeline`.
                 })
             };
+            // Review 2026-09-25 T6
+            if let Err(e) = validate_lineage_opts(mcmc_chains) {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
             if let Err(e) = lineage::start(
                 matrix_file,
                 vcf_file,
@@ -1077,4 +1089,23 @@ mod indel_opts_validation_tests {
     // those fields. They now always hold `IndelOpts::default()`, which
     // `shipped_defaults_pass_validation` above covers; a test that pokes a
     // value no user can supply would only be testing the poke.
+}
+
+#[cfg(test)]
+mod lineage_opts_validation_tests {
+    use super::*;
+
+    #[test]
+    fn mcmc_chains_zero_is_rejected() {
+        let err = validate_lineage_opts(0).unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "--mcmc-chains must be at least 1 (got 0)"
+        );
+    }
+
+    #[test]
+    fn mcmc_chains_one_is_accepted() {
+        assert!(validate_lineage_opts(1).is_ok());
+    }
 }

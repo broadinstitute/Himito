@@ -1016,7 +1016,9 @@ fn main() {
                     // the SCITE fn rate, supplied by `run_scite_pipeline`.
                 })
             };
-            // Review 2026-09-25 T6
+            // Review 2026-09-25 T6: reject 0 chains here. `run_mcmc_multichain`
+            // panics on an empty chain list, and a CLI flag should fail with a
+            // message instead of a library panic.
             if let Err(e) = validate_lineage_opts(mcmc_chains) {
                 eprintln!("Error: {e:#}");
                 std::process::exit(1);

@@ -3060,6 +3060,30 @@ mod rewrite_tests {
     }
 
     #[test]
+    fn hp_rewrite_refuses_to_grow_a_run_the_read_deleted_entirely() {
+        // Plan 2026-09-26 T8d: 4M 5D 7M deletes the whole A-run, so the read has NO
+        // query base left inside it and the run's base cannot be read off the read.
+        // `rewrite_hp_run` takes no `refseq`, so there is nowhere else to get it: the
+        // read is left untouched and the caller books a missed correction.
+        //
+        // This is the one length transition the path declines, and it is not rare in
+        // real data -- on the T8f eval cell it accounted for 6096 of the 17570 misses,
+        // almost all in 2bp runs. Shrinking the same read further is still fine.
+        let c = cig(vec![Cigar::Match(4), Cigar::Del(5), Cigar::Match(7)]);
+        let mut seq = REF[..4].to_vec();
+        seq.extend_from_slice(&REF[9..]);
+        let qual = vec![30u8; 11];
+        assert!(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, 0).is_none(),
+            "growing back from an entirely deleted run needs a base the read does not have"
+        );
+        assert!(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -5).is_some(),
+            "the read already carries this length, so no base has to be synthesized"
+        );
+    }
+
+    #[test]
     fn hp_rewrite_refuses_a_target_shorter_than_nothing() {
         let c = cig(vec![Cigar::Match(16)]);
         let seq = REF.to_vec();

@@ -1813,7 +1813,7 @@ fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> 
     for a in rb.audit.iter_mut() {
         if pulled_back.contains(&a.variant) {
             a.in_block = false;
-            // Overwrite whatever `partition` recorded (untested/unstructured):
+            // Overwrite whatever `partition` recorded (high_raw_vaf/unstructured):
             // the span conflict is why this variant is NOT in the block, and
             // that reason must win over the one that would have applied had
             // the conflict not existed.
@@ -3934,7 +3934,7 @@ mod tests {
             informative: vec![1],
             audit: vec![rootblock::RootBlockAudit {
                 variant: 0, hf: 0.92, n_absent: 12, min_q: None, partner: None, in_block: true,
-                reason: rootblock::BlockReason::Untested,
+                reason: rootblock::BlockReason::HighRawVaf,
             }],
         };
         let rb = resolve_span_conflicts(rb, &variants);
@@ -3969,11 +3969,11 @@ mod tests {
             audit: vec![
                 rootblock::RootBlockAudit {
                     variant: 1, hf: 0.85, n_absent: 15, min_q: None, partner: None, in_block: true,
-                    reason: rootblock::BlockReason::Untested,
+                    reason: rootblock::BlockReason::HighRawVaf,
                 },
                 rootblock::RootBlockAudit {
                     variant: 2, hf: 0.88, n_absent: 20, min_q: None, partner: None, in_block: true,
-                    reason: rootblock::BlockReason::Untested,
+                    reason: rootblock::BlockReason::HighRawVaf,
                 },
             ],
         };
@@ -4001,11 +4001,11 @@ mod tests {
             audit: vec![
                 rootblock::RootBlockAudit {
                     variant: 0, hf: 0.90, n_absent: 30, min_q: None, partner: None, in_block: true,
-                    reason: rootblock::BlockReason::Untested,
+                    reason: rootblock::BlockReason::HighRawVaf,
                 },
                 rootblock::RootBlockAudit {
                     variant: 1, hf: 0.60, n_absent: 25, min_q: None, partner: None, in_block: true,
-                    reason: rootblock::BlockReason::Untested,
+                    reason: rootblock::BlockReason::HighRawVaf,
                 },
             ],
         };
@@ -4105,8 +4105,36 @@ mod tests {
         );
     }
 
+    /// Plan 2026-09-26 T2. A rule-2 row (too few absences to test) must report
+    /// `high_raw_vaf`, and the old reason string must not appear in the file.
     #[test]
-    fn write_root_block_table_reports_tested_and_untested_candidates() {
+    fn write_root_block_table_rule2_reason_is_high_raw_vaf() {
+        let n_reads = 100usize;
+        let mut row = vec![Some(1u8); 95];
+        row.extend(vec![Some(0u8); 5]);
+        let binary = BinaryMatrix {
+            variants: vec!["m.750A>G".to_string()],
+            reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
+            data: vec![row],
+        };
+        let rb = rootblock::partition(&binary, &RootBlockConfig::default(), 0.0);
+        assert_eq!(rb.audit.len(), 1, "rule 2 must emit one audit row");
+        assert!(rb.audit[0].in_block);
+        assert!(rb.audit[0].min_q.is_none());
+        let path = std::env::temp_dir().join("himito_test_root_block_high_raw_vaf.tsv");
+        write_root_block_table(&rb.audit, &binary.variants, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(
+            !content.contains("untested"),
+            "the reason string untested must not appear:\n{content}"
+        );
+        let reason = content.lines().nth(1).unwrap().split('\t').nth(6).unwrap();
+        assert_eq!(reason, "high_raw_vaf");
+    }
+
+    #[test]
+    fn write_root_block_table_reports_tested_and_high_raw_vaf_candidates() {
         use crate::rootblock::{BlockReason, RootBlockAudit};
         let variants = vec!["m.750A>G".to_string(), "m.310T>TC".to_string()];
         let audit = vec![
@@ -4118,7 +4146,7 @@ mod tests {
             RootBlockAudit {
                 variant: 1, hf: 0.99, n_absent: 3,
                 min_q: None, partner: None, in_block: true,
-                reason: BlockReason::Untested,
+                reason: BlockReason::HighRawVaf,
             },
         ];
         let path = std::env::temp_dir().join("himito_test_root_block.tsv");
@@ -4129,8 +4157,8 @@ mod tests {
         let lines: Vec<&str> = content.lines().collect();
         assert_eq!(lines[0], "variant\thf\tn_absent\tmin_q\tpartner_variant\tin_block\treason");
         assert_eq!(lines[1], "m.750A>G\t0.900000\t12\t4.200000e-1\tm.310T>TC\ttrue\tunstructured_absences");
-        assert_eq!(lines[2], "m.310T>TC\t0.990000\t3\tNA\tNA\ttrue\tuntested",
-                   "untested candidates report NA, not 0");
+        assert_eq!(lines[2], "m.310T>TC\t0.990000\t3\tNA\tNA\ttrue\thigh_raw_vaf",
+                   "high_raw_vaf candidates report NA, not 0");
     }
 
     /// A saturated tie (min_q == 1.0) means no candidate partner was ever

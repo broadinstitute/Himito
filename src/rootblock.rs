@@ -37,15 +37,15 @@ impl Default for RootBlockConfig {
 /// decision, it never participates in making one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockReason {
-    /// Admitted without testing. Two distinct causes reach this: rule 2 (too
-    /// few jointly-covered absences to test at all), and no candidate partner
-    /// offering a testable alt call (`partition`'s pass 3,
-    /// `best.get(&v) == None`). Both mean "cannot assess structure, so admit",
-    /// and both print `NA` for `min_q`/`partner`, so the audit row does not
-    /// distinguish them — deliberately named for the shared outcome rather
-    /// than for either cause, since naming it after one would misreport the
-    /// other.
-    Untested,
+    /// Admitted without a partner test, reported as `high_raw_vaf`. Two
+    /// distinct causes reach this: rule 2 (too few jointly-covered absences
+    /// to test at all), and no candidate partner offering a testable alt call
+    /// (`partition`'s pass 3, `best.get(&v) == None`). Both mean the raw HF
+    /// cleared the gate and structure could not be assessed, so the variant
+    /// is admitted to the block. Both print `NA` for `min_q`/`partner`, so
+    /// the audit row does not distinguish them.
+    /// Plan 2026-09-26 T2.
+    HighRawVaf,
     /// Tested: every partner's q exceeded `max_q`. No evidence the absences
     /// are structured, so blocked.
     UnstructuredAbsences,
@@ -60,7 +60,7 @@ pub enum BlockReason {
 impl BlockReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            BlockReason::Untested => "untested",
+            BlockReason::HighRawVaf => "high_raw_vaf",
             BlockReason::UnstructuredAbsences => "unstructured_absences",
             BlockReason::StructuredAbsences => "structured_absences",
             BlockReason::SpanConflict => "span_conflict",
@@ -77,7 +77,7 @@ pub struct RootBlockAudit {
     pub n_absent: usize,
     /// `None` when admitted without testing (too few absences).
     pub min_q: Option<f64>,
-    /// The variant achieving `min_q`; `None` when untested.
+    /// The variant achieving `min_q`; `None` for `HighRawVaf`.
     pub partner: Option<usize>,
     pub in_block: bool,
     pub reason: BlockReason,
@@ -190,7 +190,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64
             block.push(v);
             audit.push(RootBlockAudit {
                 variant: v, hf, n_absent, min_q: None, partner: None, in_block: true,
-                reason: BlockReason::Untested,
+                reason: BlockReason::HighRawVaf,
             });
         } else {
             pending.push((v, hf, n_absent));
@@ -246,7 +246,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64
         let structured = best_material.get(&v).is_some_and(|&(q, _)| q <= cfg.max_q);
         let (min_q, partner, in_block, reason) = match best.get(&v) {
             // No testable partner: cannot assess structure, so admit.
-            None => (None, None, true, BlockReason::Untested),
+            None => (None, None, true, BlockReason::HighRawVaf),
             Some(&(bq, bu)) => {
                 if structured {
                     // Report the partner that carried the structured signal, not
@@ -368,7 +368,7 @@ mod tests {
     }
 
     #[test]
-    fn high_hf_variant_with_too_few_absences_joins_block_untested() {
+    fn high_hf_variant_with_too_few_absences_joins_block_as_high_raw_vaf() {
         // hf = 95/100 = 0.95 (>= 0.80), n_absent = 5 (< 10) -> rule 2
         let m = matrix(vec![run(95, 5)]);
         let rb = partition(&m, &RootBlockConfig::default(), 0.0);
@@ -379,7 +379,7 @@ mod tests {
         assert_eq!(rb.audit[0].n_absent, 5);
         assert!(rb.audit[0].min_q.is_none(), "rule 2 admits without testing");
         assert!(rb.audit[0].partner.is_none());
-        assert_eq!(rb.audit[0].reason, BlockReason::Untested);
+        assert_eq!(rb.audit[0].reason, BlockReason::HighRawVaf);
     }
 
     /// A germline variant whose absences are scattered: the reads lacking it
@@ -495,8 +495,9 @@ mod tests {
         assert!(rb.audit[0].min_q.is_none());
         // Untestable for lack of a partner, not for too few absences (v0 has
         // 10, clearing `min_absent`) — both are grouped under the same
-        // "untested, admitted" reason; see `BlockReason::Untested`.
-        assert_eq!(rb.audit[0].reason, BlockReason::Untested);
+        // admitted-without-test reason; see `BlockReason::HighRawVaf`.
+        // Plan 2026-09-26 T2.
+        assert_eq!(rb.audit[0].reason, BlockReason::HighRawVaf);
     }
 
     /// Regression guard for "one Benjamini-Hochberg correction across ALL

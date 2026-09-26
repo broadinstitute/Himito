@@ -385,6 +385,20 @@ pub struct BinaryMatrix {
     pub data: Vec<Vec<Option<u8>>>,
 }
 
+/// Every row of a Himito `.matrix.csv`, binarised but **unfiltered**.
+///
+/// Plan 2026-09-26 T5. The filter pass and the fixed-homoplasmy scan used to
+/// each open and parse the CSV themselves; both now consume one of these, so
+/// the file is read once and any row-level transform (tract collapse) is seen
+/// by both. Cells are `Some(1)` (alt), `Some(0)` (explicit ref) or `None`
+/// (empty/unparseable, i.e. uncovered).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawMatrix {
+    pub variants: Vec<String>,
+    pub reads: Vec<String>,
+    pub data: Vec<Vec<Option<u8>>>,
+}
+
 /// Parse a Himito VCF file and return a map from variant ID to HF value.
 ///
 /// Variant IDs are reconstructed as `m.<POS><REF>><ALT>` (the format Himito
@@ -512,6 +526,11 @@ impl HfFilter {
 ///   without-VCF variant sets agree.
 ///
 /// Counts are binarised: any count ≥ 1 becomes 1.
+///
+/// Plan 2026-09-26 T5: `start` no longer goes through here — it needs the raw
+/// rows before filtering — but the one-call path-based form is kept for other
+/// callers and tests.
+#[allow(dead_code)]
 pub fn load_and_filter_matrix(
     matrix_path: &str,
     hf: &HfFilter,
@@ -520,18 +539,17 @@ pub fn load_and_filter_matrix(
 ) -> Result<BinaryMatrix> {
     let file = std::fs::File::open(matrix_path)
         .with_context(|| format!("Cannot read matrix CSV: {matrix_path}"))?;
-    parse_binary_matrix(file, hf, min_presence, min_absence)
+    let raw = read_raw_matrix(file)?;
+    Ok(filter_matrix(&raw, hf, min_presence, min_absence))
 }
 
-/// `Read`-generic core of [`load_and_filter_matrix`] so it can be exercised
-/// without touching disk. `Some(0)` = explicit ref call, `Some(1)` = alt,
-/// `None` = missing/uncovered (empty cell in the CSV).
-fn parse_binary_matrix<R: std::io::Read>(
-    reader: R,
-    hf: &HfFilter,
-    min_presence: usize,
-    min_absence: usize,
-) -> Result<BinaryMatrix> {
+/// Parse every row of a Himito `.matrix.csv` into a [`RawMatrix`], applying no
+/// filter at all. `Some(0)` = explicit ref call, `Some(1)` = alt, `None` =
+/// missing/uncovered (empty or unparseable cell).
+///
+/// `Read`-generic so it can be exercised without touching disk.
+/// Plan 2026-09-26 T5.
+pub fn read_raw_matrix<R: std::io::Read>(reader: R) -> Result<RawMatrix> {
     let mut rdr = csv::Reader::from_reader(reader);
     let headers = rdr.headers()?.clone();
     let reads: Vec<String> = headers.iter().skip(1).map(String::from).collect();
@@ -541,25 +559,42 @@ fn parse_binary_matrix<R: std::io::Read>(
 
     for result in rdr.records() {
         let rec = result?;
-        let vid = rec[0].to_string();
+        variants.push(rec[0].to_string());
+        data.push(
+            rec.iter()
+                .skip(1)
+                .map(|v| {
+                    if v.is_empty() {
+                        None
+                    } else {
+                        v.parse::<u32>().ok().map(|n| u8::from(n >= 1))
+                    }
+                })
+                .collect(),
+        );
+    }
 
-        // Cheap early skip: on the VCF path the verdict needs only the name, so
-        // rows that cannot survive are never parsed.
-        if hf.rejects_by_name(&vid) {
+    Ok(RawMatrix { variants, reads, data })
+}
+
+/// Apply the prevalence and heteroplasmy filters to a [`RawMatrix`].
+/// Plan 2026-09-26 T5: split out of the old `parse_binary_matrix`; the order of
+/// the two filters, and their semantics, are unchanged.
+pub fn filter_matrix(
+    raw: &RawMatrix,
+    hf: &HfFilter,
+    min_presence: usize,
+    min_absence: usize,
+) -> BinaryMatrix {
+    let mut variants: Vec<String> = Vec::new();
+    let mut data: Vec<Vec<Option<u8>>> = Vec::new();
+
+    for (vid, row) in raw.variants.iter().zip(raw.data.iter()) {
+        // On the VCF path the verdict needs only the name, so rows that cannot
+        // survive are rejected before anything is counted.
+        if hf.rejects_by_name(vid) {
             continue;
         }
-
-        let row: Vec<Option<u8>> = rec
-            .iter()
-            .skip(1)
-            .map(|v| {
-                if v.is_empty() {
-                    None
-                } else {
-                    v.parse::<u32>().ok().map(|n| u8::from(n >= 1))
-                }
-            })
-            .collect();
 
         let present = row.iter().filter(|c| **c == Some(1)).count();
         let absent = row.iter().filter(|c| **c == Some(0)).count();
@@ -574,15 +609,15 @@ fn parse_binary_matrix<R: std::io::Read>(
         let covered = present + absent;
         let freq = if covered > 0 { present as f64 / covered as f64 } else { 0.0 };
 
-        if !hf.keeps(&vid, freq) {
+        if !hf.keeps(vid, freq) {
             continue;
         }
 
-        variants.push(vid);
-        data.push(row);
+        variants.push(vid.clone());
+        data.push(row.clone());
     }
 
-    Ok(BinaryMatrix { variants, reads, data })
+    BinaryMatrix { variants, reads: raw.reads.clone(), data }
 }
 
 /// Names of the near-fixed (homoplasmic) variants the heteroplasmy filter drops
@@ -591,48 +626,36 @@ fn parse_binary_matrix<R: std::io::Read>(
 ///
 /// A variant qualifies when it is supported by at least `min_presence` reads and
 /// its matrix-derived frequency (`present / (present + absent)`, the same
-/// covered-reads denominator [`parse_binary_matrix`] uses) is `>= max_hf`. Names
+/// covered-reads denominator [`filter_matrix`] uses) is `>= max_hf`. Names
 /// already present in `exclude` (the variants that survived filtering, i.e. the
 /// informative + block set) are skipped so nothing is double-reported.
 ///
 /// Read order matches the matrix header, but the caller only needs the names:
 /// these variants are homoplasmic, so their cleaned genotype is present in every
 /// read regardless of column order.
+///
+/// Plan 2026-09-26 T5: takes the already-parsed [`RawMatrix`] rather than a path,
+/// so the CSV is read once and this scan sees the same rows the filter saw.
 pub fn collect_fixed_homoplasmies(
-    matrix_path: &str,
+    raw: &RawMatrix,
     max_hf: f64,
     min_presence: usize,
     exclude: &std::collections::HashSet<String>,
-) -> Result<Vec<String>> {
-    let file = File::open(matrix_path)
-        .with_context(|| format!("Cannot read matrix CSV: {matrix_path}"))?;
-    let mut rdr = csv::Reader::from_reader(file);
+) -> Vec<String> {
     let mut fixed = Vec::new();
-    for result in rdr.records() {
-        let rec = result?;
-        let vid = rec[0].to_string();
-        if exclude.contains(&vid) {
+    for (vid, row) in raw.variants.iter().zip(raw.data.iter()) {
+        if exclude.contains(vid) {
             continue;
         }
-        let mut present = 0usize;
-        let mut absent = 0usize;
-        for cell in rec.iter().skip(1) {
-            if cell.is_empty() {
-                continue;
-            }
-            match cell.parse::<u32>() {
-                Ok(n) if n >= 1 => present += 1,
-                Ok(_) => absent += 1,
-                Err(_) => {}
-            }
-        }
+        let present = row.iter().filter(|c| **c == Some(1)).count();
+        let absent = row.iter().filter(|c| **c == Some(0)).count();
         let covered = present + absent;
         let freq = if covered > 0 { present as f64 / covered as f64 } else { 0.0 };
         if present >= min_presence && freq >= max_hf {
-            fixed.push(vid);
+            fixed.push(vid.clone());
         }
     }
-    Ok(fixed)
+    fixed
 }
 
 /// Write `cleaned` to `out_path`, then append one all-present row per name in
@@ -851,7 +874,13 @@ pub fn start(
     };
 
     info!("[1/6] Loading and filtering matrix: {}", matrix_file);
-    let binary = load_and_filter_matrix(matrix_file, &hf, min_presence, min_absence)?;
+    // Plan 2026-09-26 T5: parse the CSV once. The filter below and the
+    // fixed-homoplasmy scan further down both read these same rows.
+    let raw = read_raw_matrix(
+        File::open(matrix_file)
+            .with_context(|| format!("Cannot read matrix CSV: {matrix_file}"))?,
+    )?;
+    let binary = filter_matrix(&raw, &hf, min_presence, min_absence);
     if binary.variants.is_empty() {
         anyhow::bail!(
             "No informative variants remain after filtering. \
@@ -914,8 +943,7 @@ pub fn start(
     // Plan 2026-09-26 T3: append those rows in memory instead of re-reading
     // cleaned_matrix.csv.
     let kept: std::collections::HashSet<String> = binary.variants.iter().cloned().collect();
-    let fixed_homoplasmies =
-        collect_fixed_homoplasmies(matrix_file, max_hf, min_presence, &kept)?;
+    let fixed_homoplasmies = collect_fixed_homoplasmies(&raw, max_hf, min_presence, &kept);
     if !fixed_homoplasmies.is_empty() {
         info!(
             "[3/6] Recovered {} near-fixed homoplasmic variant(s) excluded by the HF ceiling.",
@@ -965,6 +993,18 @@ mod tests {
     /// produced it after applying the HF band.
     fn from_vcf(names: &[&str]) -> HfFilter {
         HfFilter::FromVcf(names.iter().map(|n| (n.to_string(), 0.5)).collect())
+    }
+
+    /// Parse `csv` and filter it, i.e. what the old `parse_binary_matrix` did in
+    /// one call. Plan 2026-09-26 T5.
+    fn filter_from_csv(
+        csv: &str,
+        hf: &HfFilter,
+        min_presence: usize,
+        min_absence: usize,
+    ) -> BinaryMatrix {
+        let raw = read_raw_matrix(Cursor::new(csv.to_string())).unwrap();
+        filter_matrix(&raw, hf, min_presence, min_absence)
     }
 
     fn hp(id: &str, profile: Vec<Option<u8>>, count: usize) -> Haplotype {
@@ -1044,7 +1084,7 @@ mod tests {
     fn load_and_filter_matrix_preserves_missing_values() {
         let csv = "variant,r1,r2,r3\nm.100A>G,1,0,\nm.200C>T,0,1,1\n";
         let hf = from_vcf(&["m.100A>G", "m.200C>T"]);
-        let matrix = parse_binary_matrix(Cursor::new(csv), &hf, 1, 1).unwrap();
+        let matrix = filter_from_csv(csv, &hf, 1, 1);
 
         assert_eq!(matrix.variants, vec!["m.100A>G", "m.200C>T"]);
         assert_eq!(matrix.reads, vec!["r1", "r2", "r3"]);
@@ -1062,7 +1102,7 @@ mod tests {
         // present=1 (r1), absent=0 (no explicit ref call) -> fails min_absence=1
         let csv = "variant,r1,r2\nm.100A>G,1,\n";
         let hf = from_vcf(&["m.100A>G"]);
-        let matrix = parse_binary_matrix(Cursor::new(csv), &hf, 1, 1).unwrap();
+        let matrix = filter_from_csv(csv, &hf, 1, 1);
         assert!(matrix.variants.is_empty());
     }
 
@@ -1077,13 +1117,10 @@ mod tests {
                    m.200C>T,1,1,1,0\n\
                    m.300G>A,1,,,\n\
                    m.400T>C,1,1,1,1\n";
-        let path = std::env::temp_dir().join("himito_test_fixed_homoplasmies.csv");
-        std::fs::write(&path, csv).unwrap();
+        let raw = read_raw_matrix(Cursor::new(csv.to_string())).unwrap();
         let mut kept = std::collections::HashSet::new();
         kept.insert("m.400T>C".to_string());
-        let fixed =
-            collect_fixed_homoplasmies(path.to_str().unwrap(), 0.95, 2, &kept).unwrap();
-        std::fs::remove_file(&path).ok();
+        let fixed = collect_fixed_homoplasmies(&raw, 0.95, 2, &kept);
         assert_eq!(fixed, vec!["m.100A>G".to_string()]);
     }
 
@@ -1528,6 +1565,18 @@ mod vcf_parity_tests {
         csv
     }
 
+    /// Parse `csv` and filter it, i.e. what the old `parse_binary_matrix` did in
+    /// one call. Plan 2026-09-26 T5.
+    fn filter_from_csv(
+        csv: &str,
+        hf: &HfFilter,
+        min_presence: usize,
+        min_absence: usize,
+    ) -> BinaryMatrix {
+        let raw = read_raw_matrix(Cursor::new(csv.to_string())).unwrap();
+        filter_matrix(&raw, hf, min_presence, min_absence)
+    }
+
     #[test]
     fn no_vcf_matrix_frequency_filter_matches_vcf_hf_filter() {
         // present/absent/uncovered per variant, thresholds min_hf=0.2 max_hf=0.85:
@@ -1554,22 +1603,20 @@ mod vcf_parity_tests {
         with_vcf_hf.insert("m.100A>G".to_string(), 0.50);
         with_vcf_hf.insert("m.200C>T".to_string(), 0.25);
 
-        let with_vcf = parse_binary_matrix(
-            Cursor::new(csv.clone()),
+        let with_vcf = filter_from_csv(
+            &csv,
             &HfFilter::FromVcf(with_vcf_hf),
             min_presence,
             min_absence,
-        )
-        .unwrap();
+        );
 
         // "Without VCF": frequency recomputed from the matrix against the band.
-        let without_vcf = parse_binary_matrix(
-            Cursor::new(csv),
+        let without_vcf = filter_from_csv(
+            &csv,
             &HfFilter::FromMatrix { min: min_hf, max: max_hf },
             min_presence,
             min_absence,
-        )
-        .unwrap();
+        );
 
         // Both keep exactly the two heteroplasmic variants, same order, same data.
         assert_eq!(without_vcf.variants, vec!["m.100A>G", "m.200C>T"]);
@@ -1584,13 +1631,12 @@ mod vcf_parity_tests {
         // counted: present=2 absent=2 uncovered=6 -> covered HF 2/4 = 0.50,
         // row.len() HF 2/10 = 0.20. A threshold between the two isolates the bug.
         let csv = build_csv(&[("m.500A>C", ["1", "1", "0", "0", "", "", "", "", "", ""])]);
-        let kept = parse_binary_matrix(
-            Cursor::new(csv),
+        let kept = filter_from_csv(
+            &csv,
             &HfFilter::FromMatrix { min: 0.30, max: 0.85 },
             1,
             1,
-        )
-        .unwrap();
+        );
         // Covered-read denominator (0.50) retains it; the old row.len() denominator
         // (0.20 < 0.30) would have dropped it.
         assert_eq!(kept.variants, vec!["m.500A>C"]);
@@ -1606,13 +1652,7 @@ mod vcf_parity_tests {
         // for, and admitting variants the VCF had excluded. `FromVcf` says
         // which mode is in play independently of how many entries it holds.
         let csv = build_csv(&[("m.100A>G", ["1", "1", "1", "0", "0", "0", "", "", "", ""])]);
-        let kept = parse_binary_matrix(
-            Cursor::new(csv),
-            &HfFilter::FromVcf(HfMap::new()),
-            1,
-            1,
-        )
-        .unwrap();
+        let kept = filter_from_csv(&csv, &HfFilter::FromVcf(HfMap::new()), 1, 1);
         assert!(
             kept.variants.is_empty(),
             "an empty VCF map must keep nothing, got {:?}",

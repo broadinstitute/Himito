@@ -308,10 +308,16 @@ pub struct DenoiseStats {
     /// the ALT side.
     pub indel_events_out_of_span: u64,
     /// Review 2026-09-25 T3: votes dropped in pass 1 because the read ENDS (or
-    /// soft-clips) inside the homopolymer/repeat tract at the site, so it cannot
-    /// testify to the tract's length at all. Depth applies the identical gate, so
-    /// this only tracks the ALT side -- as with `indel_events_out_of_span`, the
-    /// two must move together or `alt_total <= depth` breaks.
+    /// soft-clips) inside the HOMOPOLYMER RUN at the site the event normalized
+    /// into, so it cannot testify to that run's length at all. The gate is applied
+    /// at the LEFT-NORMALIZED position, which is where depth for the site is
+    /// counted -- the observed column is a different, laxer anchor (see the
+    /// `tract_need_end` comment below and
+    /// `alt_vote_is_gated_at_the_normalized_site_not_the_observed_column`).
+    ///
+    /// Scope: `hp_tract_end` measures a single-base run only, so this counter
+    /// covers homopolymers. Tandem repeats whose unit is longer than one base are
+    /// OUT OF SCOPE here and get no span requirement beyond the event position.
     pub indel_events_not_spanning_repeat: u64,
     /// Votes dropped in pass 1 because the SAME read already cast an ALT vote at
     /// this normalized site via a different one of its own events (see FIX 1 in
@@ -320,6 +326,12 @@ pub struct DenoiseStats {
     /// repeat. Without this cap the read would contribute two ALT votes while
     /// depth counts it once, letting `alt_total` exceed `depth`.
     pub indel_events_duplicate_site: u64,
+    /// Review 2026-09-25 T3: sites skipped because every read ended inside the
+    /// homopolymer run there, so none could show its length and the site's depth
+    /// came out zero. Only counted for columns where at least one alignment DID
+    /// have a query base and failed the run-span gate; a column no alignment
+    /// reached at all is ordinary missing coverage and is not counted here.
+    pub indel_sites_dropped_no_spanning_depth: u64,
     pub reads_reassigned_ref_to_ins: u64,
     pub reads_reassigned_ref_to_del: u64,
     pub reads_reassigned_indel_to_ref: u64,
@@ -388,6 +400,12 @@ fn compute_corrections(
     // column as well as its event at the anchor column, so counting observations
     // would count that read twice and halve every real indel's apparent frequency.
     let mut depths: HashMap<(Vec<u8>, u32), (u32, u32, u32)> = HashMap::new();
+    // Review 2026-09-25 T3: per column, how many alignments HAD a query base here but
+    // failed the run-span gate below. Only columns with a nonzero count are stored, so
+    // a column no alignment reached is simply absent. This distinguishes "no coverage"
+    // from "coverage that all died inside the homopolymer" when a site is dropped for
+    // zero depth, which would otherwise vanish without a trace.
+    let mut tract_excluded: HashMap<(Vec<u8>, u32), u32> = HashMap::new();
 
     let mut plp = reader.pileup();
     plp.set_max_depth(1_000_000);
@@ -412,20 +430,33 @@ fn compute_corrections(
         let mut col_depth = 0u32;
         let mut col_fwd = 0u32;
         let mut col_rev = 0u32;
-        // (qname, allele, reverse, read's own POS, read's own CIGAR). The read's
-        // full CIGAR travels with the event so the ALT-vote gate can be checked
-        // AFTER normalization, once we know which column the event actually
-        // folds into (see CRITICAL 2 / FIX 2), via `indel::match_run_len`. qname
-        // travels too so a read carrying two of its OWN events that normalize to
-        // the same site casts at most one vote there (see FIX 1).
-        let mut col_events: Vec<(Vec<u8>, indel::Allele, bool, i64, CigarString)> = Vec::new();
+        let mut col_tract_excluded = 0u32;
+        // (qname, allele, reverse, read's own POS, read's own CIGAR, read's exclusive
+        // reference end). Everything the ALT-vote gates need travels with the event,
+        // because BOTH of those gates can only be evaluated AFTER normalization, once
+        // we know which column the event actually folds into: the CIGAR for
+        // `indel::match_run_len` (see CRITICAL 2 / FIX 2), and the reference end for
+        // the run-span check (Review 2026-09-25 T3). qname travels too so a read
+        // carrying two of its OWN events that normalize to the same site casts at most
+        // one vote there (see FIX 1).
+        let mut col_events: Vec<(Vec<u8>, indel::Allele, bool, i64, CigarString, i64)> =
+            Vec::new();
         // Review 2026-09-25 T3: the exclusive reference end a read must reach to be
-        // allowed to speak at this column at all -- the whole homopolymer/repeat tract
-        // starting right after it, PLUS one right-hand anchoring base. A read that ends
-        // (or soft-clips) inside the tract cannot show the run's length: it is evidence
-        // for neither the reference length nor any indel of it, so counting it as a
-        // plain REF observation only dilutes every real alt's VAF. Depends solely on
-        // the reference and this column, so it is hoisted out of the alignment loop.
+        // counted in THIS column's depth -- the whole homopolymer run starting right
+        // after it, PLUS one right-hand anchoring base. A read that ends (or
+        // soft-clips) inside the run cannot show the run's length: it is evidence for
+        // neither the reference length nor any indel of it, so counting it as a plain
+        // REF observation only dilutes every real alt's VAF. Depends solely on the
+        // reference and this column, so it is hoisted out of the alignment loop.
+        //
+        // This bound is the DEPTH gate for this column and nothing more. It must NOT
+        // be reused to admit an ALT vote, because left-normalization moves the vote to
+        // a different column with its own, possibly stricter, bound -- see the gate
+        // beside the `match_run_len` check further down.
+        //
+        // Scope: `hp_tract_end` walks a single-base run, so only homopolymers get a
+        // span requirement. Tandem repeats with a unit longer than one base are out of
+        // scope and are bounded by the event position alone, as before.
         let tract_need_end = if iopts.enabled {
             indel::hp_tract_end(refseq, refpos as u32) as i64 + 1
         } else {
@@ -440,13 +471,15 @@ fn compute_corrections(
 
             if iopts.enabled && !a.is_refskip() {
                 if let Some(q) = a.qpos() {
-                    // Review 2026-09-25 T3: `reference_end` is exclusive. Depth and the
-                    // ALT vote below MUST use this identical gate -- gating only one of
-                    // the two would let `alt_total` exceed `depth` at this column.
-                    let spans_tract = rec.reference_end() >= tract_need_end;
-                    if spans_tract {
+                    // Review 2026-09-25 T3: `reference_end` is exclusive. This decides
+                    // only whether the read joins THIS column's depth. The event's ALT
+                    // vote is gated separately, against the column it normalizes into.
+                    let reference_end = rec.reference_end();
+                    if reference_end >= tract_need_end {
                         col_depth += 1;
                         if rec.is_reverse() { col_rev += 1 } else { col_fwd += 1 }
+                    } else {
+                        col_tract_excluded += 1;
                     }
                     // Decide the event's allele first, WITHOUT touching the CIGAR;
                     // `rec.cigar()` re-parses and allocates the whole CIGAR from raw
@@ -469,17 +502,17 @@ fn compute_corrections(
                     };
                     if let Some(allele) = ev_allele {
                         stats.indel_events_examined += 1;
-                        if spans_tract {
-                            col_events.push((
-                                rec.qname().to_vec(),
-                                allele,
-                                rec.is_reverse(),
-                                rec.pos(),
-                                rec.cigar().take(),
-                            ));
-                        } else {
-                            stats.indel_events_not_spanning_repeat += 1;
-                        }
+                        // Collected unconditionally: whether this read may vote depends
+                        // on the NORMALIZED column, not on this one (Review 2026-09-25
+                        // T3), and normalization has not happened yet.
+                        col_events.push((
+                            rec.qname().to_vec(),
+                            allele,
+                            rec.is_reverse(),
+                            rec.pos(),
+                            rec.cigar().take(),
+                            reference_end,
+                        ));
                     }
                 }
             }
@@ -503,7 +536,10 @@ fn compute_corrections(
 
         if iopts.enabled {
             depths.insert((name.to_vec(), refpos as u32), (col_depth, col_fwd, col_rev));
-            for (qname, allele, reverse, rpos, cigar) in col_events {
+            if col_tract_excluded > 0 {
+                tract_excluded.insert((name.to_vec(), refpos as u32), col_tract_excluded);
+            }
+            for (qname, allele, reverse, rpos, cigar, reference_end) in col_events {
                 let (norm_pos, norm_allele) =
                     indel::normalize_left(refseq, refpos as u32, &allele);
                 // `normalize_left` walks the reference with no knowledge of read
@@ -519,6 +555,20 @@ fn compute_corrections(
                 // contiguous M/=/X run starting there.
                 if indel::match_run_len(rpos, &cigar, norm_pos) == 0 {
                     stats.indel_events_out_of_span += 1;
+                    continue;
+                }
+                // Review 2026-09-25 T3: the run-span gate belongs HERE, at `norm_pos`,
+                // not at the column the event was observed in. The two anchors really
+                // do disagree: `hp_tract_end` reports `anchor + 1` when only a single
+                // base follows, so an insertion sitting on the penultimate base of a
+                // homopolymer sees a laxer bound at its observed column than at the
+                // column it normalizes into. Depth for this site was counted at
+                // `norm_pos` under `norm_pos`'s own bound, so the vote must clear that
+                // same bound or `alt_total` exceeds `depth` (the `debug_assert!` in
+                // `fit_indel_site`). Scope is homopolymers only; a tandem repeat with a
+                // unit longer than one base imposes nothing beyond `norm_pos` itself.
+                if reference_end < indel::hp_tract_end(refseq, norm_pos) as i64 + 1 {
+                    stats.indel_events_not_spanning_repeat += 1;
                     continue;
                 }
                 // A read carrying two of ITS OWN events (e.g. an insertion and a
@@ -593,6 +643,14 @@ fn compute_corrections(
                 .copied()
                 .unwrap_or((0, 0, 0));
             if depth == 0 {
+                // Review 2026-09-25 T3: distinguish the two ways depth can be zero.
+                // If alignments were present here but every one of them failed the
+                // run-span gate, the site is lost specifically because no read lived
+                // long enough to show the homopolymer's length -- worth a counter,
+                // since silently skipping it looks identical to having no coverage.
+                if tract_excluded.get(&(contig.clone(), norm_pos)).is_some_and(|&n| n > 0) {
+                    stats.indel_sites_dropped_no_spanning_depth += 1;
+                }
                 continue; // nothing spans this site; nothing to decide
             }
             site.depth = depth;
@@ -1739,6 +1797,64 @@ mod tests {
         assert_eq!(
             stats.indel_events_not_spanning_repeat, 1,
             "`sins`'s vote is the one event dropped for not spanning the run"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn alt_vote_is_gated_at_the_normalized_site_not_the_observed_column() {
+        // Review 2026-09-25 T3: the depth gate and the ALT-vote gate are anchored at
+        // DIFFERENT columns, because left-normalization moves the vote. `15M 1I 1M`
+        // from POS 0 anchors its insertion on REF29[14] -- the PENULTIMATE base of
+        // the A-run (8..=15) -- and reaches exclusive reference end 16. At the
+        // OBSERVED column 14 the following run is the lone A at 15, which
+        // `hp_tract_end` declines to call a run, so that column asks only for end
+        // >= 16: satisfied, and the read is counted in depth there. But the event
+        // left-normalizes to site 7, whose requirement is 16 + 1 = 17, so this read
+        // was NEVER in depth at 7. Charging the vote to 7 anyway makes `alt_total`
+        // exceed `depth` there -- tripping the `debug_assert!` in `fit_indel_site`
+        // under `cargo test`, and in release silently fabricating an insertion out
+        // of reads that never saw the run's length.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_vote_gate_norm_pos");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+
+        // ref[0..15] + an extra 'A' + ref[15]: 17 query bases, 15M 1I 1M, end 16.
+        let pen_seq: Vec<u8> = {
+            let mut s = REF29[0..15].to_vec();
+            s.push(b'A');
+            s.push(REF29[15]);
+            s
+        };
+        let pen_cigar = vec![Cigar::Match(15), Cigar::Ins(1), Cigar::Match(1)];
+
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        // The only read reaching past the whole run plus its anchor: depth 1 at 7.
+        reads.push(("rspan", 0, CLEAN_SEQ, clean_cigar(), false));
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, pen_seq.as_slice(), pen_cigar.clone(), i % 2 == 0));
+        }
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        // Must not panic: nine votes against a depth of one is the invariant break.
+        let (_corr, models, stats) =
+            compute_corrections(&bam, &indel_refs(), 2, 0.01, SB_P, HOM_VAF, &indels_on()).unwrap();
+
+        assert_eq!(
+            stats.indel_events_not_spanning_repeat,
+            NAMES.len() as u64,
+            "every 15M1I1M read's vote must be dropped at the NORMALIZED site 7, \
+             whose run it does not span -- not waved through by column 14's laxer bound"
+        );
+        let kept_ins_at_7 = models.get(&b"chrM".to_vec()).is_some_and(|list| {
+            list.iter().any(|(p, m)| {
+                *p == 7
+                    && m.kept.iter().any(|(a, _)| *a == indel::Allele::Ins(b"A".to_vec()))
+            })
+        });
+        assert!(
+            !kept_ins_at_7,
+            "site 7 must not keep an insertion cast only by reads that never spanned its run"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -838,6 +838,8 @@ mod indel_tests {
     fn indel_opts_default_is_disabled() {
         let o = IndelOpts::default();
         assert!(!o.enabled, "indel correction must be opt-in");
+        // Plan 2026-09-26 T8f: and the generic HP length model is opt-in on top of it.
+        assert!(!o.hp_length_model, "the HP length model must be opt-in");
         assert_eq!(o.max_len, 5);
     }
 

@@ -323,6 +323,13 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.2)]
         indel_protect_vaf: f64,
 
+        /// EXPERIMENTAL (off by default): treat a homopolymer as a single LENGTH, so
+        /// any kept length is reachable from any other -- including the insertion ->
+        /// deletion and grow-a-deletion moves the per-event model has to refuse, which
+        /// leave +/-1 miscalls "in the wrong direction" uncorrected. Requires --indels.
+        #[clap(long, value_parser, default_value_t = false)]
+        indel_hp_length_model: bool,
+
         /// optional path to write denoise statistics as JSON
         #[clap(long, value_parser)]
         stats: Option<PathBuf>,
@@ -769,8 +776,15 @@ fn main() {
                     DENOISE_KEEP_VAF, 0.7,
                     // Indel correction is on in QuickStart. Every other field keeps
                     // its `Default` value, which `validate_indel_opts` accepts as-is,
-                    // so there is nothing to validate here.
-                    &denoise_indel::IndelOpts { enabled: true, ..Default::default() },
+                    // so there is nothing to validate here. The generic HP length
+                    // model is spelled out rather than left to `Default` (Plan
+                    // 2026-09-26 T8f): it stays OFF in the combined pipeline until an
+                    // eval shows it helps, and that has to be visible here.
+                    &denoise_indel::IndelOpts {
+                        enabled: true,
+                        hp_length_model: false,
+                        ..Default::default()
+                    },
                     None,
                 ) {
                     eprintln!("Warning: denoise failed ({e:#}); falling back to raw mt BAM.");
@@ -857,14 +871,18 @@ fn main() {
             vaf,
             indels,
             indel_protect_vaf,
+            indel_hp_length_model,
             stats,
         } => {
-            // Every field except `enabled` and `protect_vaf` keeps its `Default`
-            // value: the flags that used to set them all shipped defaults
-            // identical to `IndelOpts::default()` and nothing ever overrode them.
+            // Every field except `enabled`, `protect_vaf` and `hp_length_model` keeps
+            // its `Default` value: the flags that used to set them all shipped
+            // defaults identical to `IndelOpts::default()` and nothing ever overrode
+            // them.
             let iopts = denoise_indel::IndelOpts {
                 enabled: indels,
                 protect_vaf: indel_protect_vaf,
+                // Plan 2026-09-26 T8f: opt-in, and only meaningful with --indels.
+                hp_length_model: indel_hp_length_model,
                 ..Default::default()
             };
             // Only validate when --indels is actually in effect: a user who
@@ -1125,6 +1143,25 @@ mod indel_opts_validation_tests {
     // those fields. They now always hold `IndelOpts::default()`, which
     // `shipped_defaults_pass_validation` above covers; a test that pokes a
     // value no user can supply would only be testing the poke.
+
+    #[test]
+    fn hp_length_model_is_off_unless_the_flag_is_passed() {
+        // Plan 2026-09-26 T8f: the flag is the ONLY way to reach the generic HP
+        // length model, so "off by default" has to be a property of argument
+        // parsing, not just of `IndelOpts::default()`.
+        use clap::Parser;
+        let base = [
+            "Himito", "denoise", "-i", "in.bam", "-o", "out.bam", "-r", "ref.fa", "--indels",
+        ];
+        let hp_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Commands::Denoise { indel_hp_length_model, .. } => indel_hp_length_model,
+            other => panic!("expected the Denoise subcommand, got {other:?}"),
+        };
+        assert!(!hp_of(&base), "--indels alone must not enable the HP length model");
+        let mut on = base.to_vec();
+        on.push("--indel-hp-length-model");
+        assert!(hp_of(&on), "the flag must enable it");
+    }
 }
 
 #[cfg(test)]

@@ -153,12 +153,12 @@ fn absence_vs_alt(matrix: &BinaryMatrix, v: usize, u: usize) -> Option<(f64, f64
 }
 
 /// `dropout_rate` is the per-read dropout (false-negative) rate used to make the
-/// HF gate and `min_absent` depth-relative: expected dropout absences
-/// (`dropout_rate x covered`) are discounted before either is judged. `0.0`
-/// reproduces the absolute, coverage-sensitive behaviour. It is a parameter
-/// rather than a `RootBlockConfig` field because it is not a root-block knob:
-/// it is the SCITE false-negative rate, and taking it from the one place that
-/// owns it (`run_scite_pipeline`) means the two can never disagree.
+/// HF gate depth-relative: expected dropout absences (`dropout_rate x covered`)
+/// are discounted before the gate is judged. `0.0` reproduces the absolute,
+/// coverage-sensitive behaviour. It is a parameter rather than a
+/// `RootBlockConfig` field because it is not a root-block knob: it is the SCITE
+/// false-negative rate, and taking it from the one place that owns it
+/// (`run_scite_pipeline`) means the two can never disagree.
 pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64) -> RootBlock {
     let n = matrix.variants.len();
     let mut block = Vec::new();
@@ -174,20 +174,19 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64
         let covered = present + n_absent;
 
         // Dropout inflates the absent count, which drags observed HF below the
-        // gate and pushes it past `min_absent` as depth grows — both shed true
-        // homoplasmies with coverage. Discount the absences a pure-dropout
-        // homoplasmy would produce before judging either. With
-        // `dropout_rate == 0` `corrected_hf == hf` and the threshold is the raw
-        // `min_absent`, so the original behaviour is preserved exactly.
+        // gate as depth grows and sheds true homoplasmies with coverage.
+        // Discount the absences a pure-dropout homoplasmy would produce before
+        // judging the HF gate. With `dropout_rate == 0` `corrected_hf == hf`.
+        // Review 2026-09-25 T4: rule 2 uses raw `min_absent`; testability is a
+        // sample-size question, not depth-relative.
         let expected_dropout = dropout_rate * covered as f64;
         let corrected_absent = (n_absent as f64 - expected_dropout).max(0.0);
         let denom = present as f64 + corrected_absent;
         let corrected_hf = if denom > 0.0 { present as f64 / denom } else { 0.0 };
-        let effective_min_absent = cfg.min_absent.max(expected_dropout.ceil() as usize);
 
         if corrected_hf < cfg.min_hf {
             informative.push(v);
-        } else if n_absent < effective_min_absent {
+        } else if n_absent < cfg.min_absent {
             block.push(v);
             audit.push(RootBlockAudit {
                 variant: v, hf, n_absent, min_q: None, partner: None, in_block: true,
@@ -352,6 +351,20 @@ mod tests {
         assert_eq!(rb.informative, vec![0]);
         assert!(rb.block.is_empty());
         assert!(rb.audit.is_empty(), "sub-gate variants produce no audit row");
+    }
+
+    /// At high depth, depth-inflated `min_absent` wrongly skips the structure
+    /// test for a real subclone below the dropout rate. Rule 2 must use raw
+    /// `min_absent`; dropout correction applies to the HF gate only.
+    /// Review 2026-09-25 T4.
+    #[test]
+    fn subclone_below_dropout_rate_is_tested_when_min_absent_met() {
+        let n = 1000;
+        let v0 = run(960, 40);
+        let v1: Vec<i8> = (0..n).map(|r| if r >= 960 { 1 } else { 0 }).collect();
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.05);
+        assert_eq!(rb.informative, vec![0, 1]);
+        assert_eq!(rb.audit[0].reason, BlockReason::StructuredAbsences);
     }
 
     #[test]

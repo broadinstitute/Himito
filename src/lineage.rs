@@ -53,8 +53,11 @@ pub struct DistMatrix {
 
 /// Build a pairwise Hamming distance matrix from haplotype binary profiles.
 ///
-/// Distance = (number of differing positions) / (total number of variant positions).
-/// If there are no variants (shouldn't happen after filtering), all distances are 0.
+/// Distance = (number of differing jointly covered positions) / (number of jointly
+/// covered positions). Pairs with no jointly covered site are filled with the mean
+/// of the finite off-diagonal distances, or 0.0 when no pair has shared coverage.
+/// The matrix never contains NaN. If there are no variants (shouldn't happen after
+/// filtering), all distances are 0.
 pub fn hamming_distance_matrix(matrix: &HaplotypeMatrix) -> DistMatrix {
     let n = matrix.haplotypes.len();
     let labels: Vec<String> = matrix.haplotypes.iter().map(|h| h.id.clone()).collect();
@@ -72,9 +75,35 @@ pub fn hamming_distance_matrix(matrix: &HaplotypeMatrix) -> DistMatrix {
                     }
                 }
             }
-            let d = if compared > 0 { diff as f64 / compared as f64 } else { 0.0 };
+            // Plan 2026-09-26 T1: mark pairs with no shared coverage for mean-fill.
+            let d = if compared > 0 {
+                diff as f64 / compared as f64
+            } else {
+                f64::NAN
+            };
             data[i][j] = d;
             data[j][i] = d;
+        }
+    }
+
+    // Plan 2026-09-26 T1: mean of finite off-diagonal distances (i < j), else 0.0.
+    let mut sum = 0.0;
+    let mut count = 0usize;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if data[i][j].is_finite() {
+                sum += data[i][j];
+                count += 1;
+            }
+        }
+    }
+    let mean = if count > 0 { sum / count as f64 } else { 0.0 };
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if !data[i][j].is_finite() {
+                data[i][j] = mean;
+                data[j][i] = mean;
+            }
         }
     }
 
@@ -1155,6 +1184,49 @@ mod tests {
 
     fn hap2(id: &str, a: Option<u8>, b: Option<u8>) -> Haplotype {
         Haplotype { id: id.into(), profile: vec![a, b], reads: vec![], count: 1 }
+    }
+
+    #[test]
+    fn hamming_distance_matrix_fills_uncovered_pairs_with_mean_distance() {
+        // Plan 2026-09-26 T1. H0 and H1 share no covered site. H0–H2 and H1–H2
+        // each differ at their only jointly covered site, so the mean of the
+        // defined off-diagonal distances is 1.0.
+        let hap_matrix = HaplotypeMatrix {
+            variants: vec!["A".into(), "B".into()],
+            haplotypes: vec![
+                hap2("H0", Some(1), None),
+                hap2("H1", None, Some(1)),
+                hap2("H2", Some(0), Some(0)),
+            ],
+        };
+        let dist = hamming_distance_matrix(&hap_matrix);
+        assert_eq!(dist.data[0][2], 1.0);
+        assert_eq!(dist.data[2][0], 1.0);
+        assert_eq!(dist.data[1][2], 1.0);
+        assert_eq!(dist.data[2][1], 1.0);
+        assert_eq!(dist.data[0][1], 1.0);
+        assert_eq!(dist.data[1][0], 1.0);
+        for row in &dist.data {
+            for &v in row {
+                assert!(v.is_finite());
+            }
+        }
+    }
+
+    #[test]
+    fn hamming_distance_matrix_zero_fills_when_no_pair_has_shared_coverage() {
+        // Plan 2026-09-26 T1. With no finite off-diagonal distance, the fill is 0.0.
+        let hap_matrix = HaplotypeMatrix {
+            variants: vec!["A".into(), "B".into()],
+            haplotypes: vec![
+                hap2("H0", Some(1), None),
+                hap2("H1", None, Some(1)),
+            ],
+        };
+        let dist = hamming_distance_matrix(&hap_matrix);
+        assert_eq!(dist.data[0][1], 0.0);
+        assert_eq!(dist.data[1][0], 0.0);
+        assert!(dist.data.iter().flatten().all(|v| v.is_finite()));
     }
 
     #[test]

@@ -621,35 +621,23 @@ pub fn collect_fixed_homoplasmies(
     Ok(fixed)
 }
 
-/// Copy the cleaned genotype matrix at `cleaned_csv` into `out_path`, then append
-/// one all-present row per name in `fixed` — the near-fixed homoplasmies
-/// [`collect_fixed_homoplasmies`] recovered. The result is the full read x
-/// variant genotype table, heteroplasmic *and* homoplasmic, that
-/// `cleaned_matrix.csv` alone cannot show because the HF ceiling removed the
-/// fixed sites before the tree was ever built.
+/// Write `cleaned` to `out_path`, then append one all-present row per name in
+/// `fixed` — the near-fixed homoplasmies [`collect_fixed_homoplasmies`]
+/// recovered. The result is the full read x variant genotype table,
+/// heteroplasmic *and* homoplasmic. Plan 2026-09-26 T3: this used to copy
+/// `cleaned_matrix.csv` off disk; it now clones the in-memory matrix.
 fn write_cleaned_matrix_all_variants(
-    cleaned_csv: &str,
-    out_path: &str,
+    cleaned: &crate::scite::CleanedMatrix,
     fixed: &[String],
+    out_path: &str,
 ) -> Result<()> {
-    let body = std::fs::read_to_string(cleaned_csv)
-        .with_context(|| format!("Cannot read {cleaned_csv}"))?;
-    // Column count from the header (`variant` + one column per read); the fixed
-    // rows must match it exactly.
-    let header = body.lines().next().unwrap_or("variant");
-    let n_reads = header.split(',').count().saturating_sub(1);
-    let mut w = BufWriter::new(
-        File::create(out_path).with_context(|| format!("Cannot create {out_path}"))?,
-    );
-    write!(w, "{body}")?;
-    if !body.ends_with('\n') {
-        writeln!(w)?;
-    }
-    let ones = ",1".repeat(n_reads);
+    let mut matrix = cleaned.clone();
+    let n_reads = matrix.reads.len();
     for name in fixed {
-        writeln!(w, "{name}{ones}")?;
+        matrix.variants.push(name.clone());
+        matrix.data.push(vec![1u8; n_reads]);
     }
-    Ok(())
+    crate::scite::write_cleaned_matrix(&matrix, out_path)
 }
 
 
@@ -822,6 +810,7 @@ pub fn start(
     mcmc_chains: usize,
     mcmc_seed: u64,
     root_block: Option<crate::rootblock::RootBlockConfig>,
+    debug: bool,
     output_prefix: &str,
 ) -> Result<()> {
     // No `data_type` parameter: the rates arrive already resolved by
@@ -878,9 +867,11 @@ pub fn start(
             violations.len()
         );
     }
-    // Global haplotype map (all variants)
-    let hmap_path = format!("{}.raw_haplotype_map.tsv", output_prefix);
-    write_haplotype_map(&hap_matrix, &hmap_path)?;
+    // Plan 2026-09-26 T3. The pre-SCITE haplotype map is a debug artifact.
+    if debug {
+        let hmap_path = format!("{}.raw_haplotype_map.tsv", output_prefix);
+        write_haplotype_map(&hap_matrix, &hmap_path)?;
+    }
 
     // ── Step 3: SCITE mutation-tree search (NJ-informed MCMC) ─────────────────
     info!("[3/6] Running SCITE mutation-tree search...");
@@ -889,7 +880,7 @@ pub fn start(
     // deduplicating it a second time with fully-permissive thresholds; the
     // result was provably the same matrix, since both paths dedup the same cells
     // with the same `min_reads` and the same deterministic ordering.
-    let cleaned_hap_matrix = crate::scite::run_scite_pipeline(
+    let out = crate::scite::run_scite_pipeline(
         &binary,
         fp_rate,
         fn_rate,
@@ -898,13 +889,16 @@ pub fn start(
         mcmc_seed,
         min_reads,
         root_block.as_ref(),
+        debug,
         output_prefix,
     )?;
 
     // Near-fixed homoplasmies were removed by the HF ceiling before the tree was
-    // built, so `cleaned_matrix.csv` never sees them. Recover them and emit a
+    // built, so the cleaned matrix never sees them. Recover them and emit a
     // companion table carrying every variant — heteroplasmic and homoplasmic — so
     // the homoplasmy set is reported in full regardless of coverage.
+    // Plan 2026-09-26 T3: append those rows in memory instead of re-reading
+    // cleaned_matrix.csv.
     let kept: std::collections::HashSet<String> = binary.variants.iter().cloned().collect();
     let fixed_homoplasmies =
         collect_fixed_homoplasmies(matrix_file, max_hf, min_presence, &kept)?;
@@ -915,10 +909,11 @@ pub fn start(
         );
     }
     write_cleaned_matrix_all_variants(
-        &format!("{output_prefix}.cleaned_matrix.csv"),
-        &format!("{output_prefix}.cleaned_matrix_all_variants.csv"),
+        &out.cleaned,
         &fixed_homoplasmies,
+        &format!("{output_prefix}.cleaned_matrix_all_variants.csv"),
     )?;
+    let cleaned_hap_matrix = out.cleaned_haplotypes;
 
     // ── Step 4: write final haplotype map (filtered by SCITE) ─────────────────
     // No re-filtering here, by design: the cleaned matrix holds exactly the
@@ -1080,17 +1075,21 @@ mod tests {
 
     #[test]
     fn write_cleaned_matrix_all_variants_appends_all_present_rows() {
-        let cleaned = std::env::temp_dir().join("himito_test_cleaned_src.csv");
-        std::fs::write(&cleaned, "variant,r1,r2,r3\nm.200C>T,1,0,1\n").unwrap();
+        // Plan 2026-09-26 T3. Built in memory; the expected text is unchanged.
+        let cleaned = crate::scite::CleanedMatrix {
+            variants: vec!["m.200C>T".to_string()],
+            reads: vec!["r1".to_string(), "r2".to_string(), "r3".to_string()],
+            data: vec![vec![1, 0, 1]],
+            attachment: vec![0, 0, 0],
+        };
         let out = std::env::temp_dir().join("himito_test_cleaned_all.csv");
         write_cleaned_matrix_all_variants(
-            cleaned.to_str().unwrap(),
-            out.to_str().unwrap(),
+            &cleaned,
             &["m.100A>G".to_string()],
+            out.to_str().unwrap(),
         )
         .unwrap();
         let content = std::fs::read_to_string(&out).unwrap();
-        std::fs::remove_file(&cleaned).ok();
         std::fs::remove_file(&out).ok();
         assert_eq!(
             content,
@@ -1312,6 +1311,90 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.99
         assert_eq!(map.get("m.200C>T").copied(), Some(0.9_f32 as f64));
         // The later duplicate record (HF 0.99) does not overwrite the first.
         assert_eq!(map.len(), 3);
+    }
+
+    /// Plan 2026-09-26 T3. Temp prefixes are stable across runs, so leftovers
+    /// from a previous debug run must be removed before the absence check.
+    fn prepare_debug_output_prefix(dir_name: &str) -> (String, String) {
+        let dir = std::env::temp_dir().join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let matrix_path = dir.join("matrix.csv");
+        std::fs::write(
+            &matrix_path,
+            "variant,r1,r2,r3,r4\n\
+             m.100A>G,1,1,0,0\n\
+             m.200C>T,1,0,1,0\n",
+        )
+        .unwrap();
+        let prefix = dir.join("out").to_str().unwrap().to_string();
+        for suffix in [
+            ".cleaned_matrix.csv",
+            ".raw_haplotype_map.tsv",
+            ".raw_variant_cooccurrence.tsv",
+            ".cleaned_matrix_all_variants.csv",
+            ".cleaned_haplotype_map.tsv",
+            ".mutation_tree.tsv",
+            ".variant_cooccurrence.tsv",
+            ".molecule_summary.tsv",
+            ".read_lineage.nwk",
+            ".root_block.tsv",
+        ] {
+            std::fs::remove_file(format!("{prefix}{suffix}")).ok();
+        }
+        (matrix_path.to_str().unwrap().to_string(), prefix)
+    }
+
+    fn run_small_lineage(matrix: &str, prefix: &str, debug: bool) {
+        start(
+            matrix,
+            None,
+            0.01,
+            0.95,
+            1,
+            1,
+            1,
+            0.01,
+            0.1,
+            20,
+            1,
+            7,
+            None,
+            debug,
+            prefix,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn debug_false_omits_raw_files_and_cleaned_matrix() {
+        // Plan 2026-09-26 T3.
+        let (matrix, prefix) = prepare_debug_output_prefix("himito_t3_debug_off");
+        run_small_lineage(&matrix, &prefix, false);
+        for suffix in [
+            ".cleaned_matrix.csv",
+            ".raw_haplotype_map.tsv",
+            ".raw_variant_cooccurrence.tsv",
+        ] {
+            let path = format!("{prefix}{suffix}");
+            assert!(
+                !std::path::Path::new(&path).exists(),
+                "{path} must not be written when debug is false"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_true_writes_both_raw_files() {
+        // Plan 2026-09-26 T3.
+        let (matrix, prefix) = prepare_debug_output_prefix("himito_t3_debug_on");
+        run_small_lineage(&matrix, &prefix, true);
+        for suffix in [".raw_haplotype_map.tsv", ".raw_variant_cooccurrence.tsv"] {
+            let path = format!("{prefix}{suffix}");
+            assert!(
+                std::path::Path::new(&path).exists(),
+                "{path} must be written when debug is true"
+            );
+        }
     }
 }
 

@@ -871,7 +871,7 @@ pub fn run_mcmc_multichain(
 
 /// The fully-imputed, denoised genotype matrix implied by attaching every
 /// read to its single best-fitting node in `tree`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CleanedMatrix {
     pub variants: Vec<String>,
     pub reads: Vec<String>,
@@ -1853,15 +1853,21 @@ fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> 
     rb
 }
 
+/// Plan 2026-09-26 T3. `cleaned` is the matrix after `append_block_to_cleaned`
+/// (what `<prefix>.cleaned_matrix.csv` used to hold). `cleaned_haplotypes`
+/// backs the tips of `<prefix>.read_lineage.nwk`.
+pub struct SciteOutput {
+    pub cleaned: CleanedMatrix,
+    pub cleaned_haplotypes: HaplotypeMatrix,
+}
+
 /// Run the MCMC mutation-tree search (starting from an NJ-tree-derived guess
 /// when one can be built), attach every read to its best-fitting node, and
-/// write all SCITE output files with the given `output_prefix`.
+/// write the SCITE output files with the given `output_prefix`.
 ///
-/// Returns the SCITE-cleaned reads deduplicated into haplotypes — the same
-/// matrix that backs the tips of `<output_prefix>.read_lineage.nwk`. The caller
-/// needs exactly this to write `<prefix>.cleaned_haplotype_map.tsv`; handing it
-/// back is what lets `lineage::start` skip re-reading `cleaned_matrix.csv` off
-/// disk and deduplicating it a second time.
+/// `debug` also writes `<prefix>.raw_variant_cooccurrence.tsv`. The cleaned
+/// matrix itself is returned in memory and is not written here; `lineage::start`
+/// turns it into `<prefix>.cleaned_matrix_all_variants.csv`.
 pub fn run_scite_pipeline(
     binary: &BinaryMatrix,
     fp_rate: f64,
@@ -1871,8 +1877,9 @@ pub fn run_scite_pipeline(
     seed: u64,
     min_reads: usize,
     root_block: Option<&RootBlockConfig>,
+    debug: bool,
     output_prefix: &str,
-) -> Result<HaplotypeMatrix> {
+) -> Result<SciteOutput> {
     if binary.variants.is_empty() {
         anyhow::bail!(
             "SCITE requires at least 1 variant (got 0); \
@@ -2013,9 +2020,13 @@ pub fn run_scite_pipeline(
         );
     }
 
-    write_cleaned_matrix(&cleaned, &format!("{output_prefix}.cleaned_matrix.csv"))?;
+    // Plan 2026-09-26 T3. Do not write cleaned_matrix.csv; lineage::start emits
+    // cleaned_matrix_all_variants.csv from `cleaned`. The raw co-occurrence
+    // table is a debug artifact.
     write_variant_cooccurrence_upto(&cleaned, n_informative, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
-    write_raw_variant_cooccurrence(full_binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
+    if debug {
+        write_raw_variant_cooccurrence(full_binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
+    }
     write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
     write_mutation_tree(&tree, &cleaned, &evidence, &block_names, &format!("{output_prefix}.mutation_tree.tsv"))?;
     if root_block.is_some() {
@@ -2044,7 +2055,10 @@ pub fn run_scite_pipeline(
         &format!("{output_prefix}.read_lineage.nwk"),
     )?;
 
-    Ok(cleaned_hap_matrix)
+    Ok(SciteOutput {
+        cleaned,
+        cleaned_haplotypes: cleaned_hap_matrix,
+    })
 }
 
 #[cfg(test)]
@@ -2977,14 +2991,14 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, 0.01, 0.1, 50, 1, 7, 1, None, &prefix).unwrap();
+        run_scite_pipeline(&matrix, 0.01, 0.1, 50, 1, 7, 1, None, false, &prefix).unwrap();
 
         let nwk = format!("{prefix}.read_lineage.nwk");
         assert!(std::path::Path::new(&nwk).exists(), "expected {nwk} to exist");
+        // Plan 2026-09-26 T3. debug is false here, so cleaned_matrix.csv and
+        // raw_variant_cooccurrence.tsv are not written.
         for suffix in [
-            ".cleaned_matrix.csv",
             ".variant_cooccurrence.tsv",
-            ".raw_variant_cooccurrence.tsv",
             ".molecule_summary.tsv",
             ".mutation_tree.tsv",
             ".read_lineage.nwk",
@@ -3014,7 +3028,7 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, 0.01, 0.1, 500, 2, 123, 1, None, &prefix).unwrap();
+        run_scite_pipeline(&matrix, 0.01, 0.1, 500, 2, 123, 1, None, false, &prefix).unwrap();
 
         let tree_tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
         // The mutation hangs directly off the root, with no order to resolve.
@@ -3022,18 +3036,18 @@ mod tests {
             tree_tsv.contains("0\tm.100A>G\t1\tROOT\t"),
             "expected m.100A>G under ROOT, got:\n{tree_tsv}"
         );
-        // Header-only co-occurrence tables: a single variant forms no pair.
-        for suffix in [".variant_cooccurrence.tsv", ".raw_variant_cooccurrence.tsv"] {
-            let content = std::fs::read_to_string(format!("{prefix}{suffix}")).unwrap();
-            assert_eq!(content.lines().count(), 1, "expected header only in {suffix}");
-        }
+        // Header-only co-occurrence table: a single variant forms no pair.
+        // Plan 2026-09-26 T3. debug is false, so the raw table is not written;
+        // the cleaned table is still header-only.
+        let content = std::fs::read_to_string(format!("{prefix}.variant_cooccurrence.tsv")).unwrap();
+        assert_eq!(content.lines().count(), 1, "expected header only in .variant_cooccurrence.tsv");
         let nwk = std::fs::read_to_string(format!("{prefix}.read_lineage.nwk")).unwrap();
         assert!(nwk.contains("mutation=m.100A>G"), "got newick: {nwk}");
 
+        // Plan 2026-09-26 T3. debug is false, so cleaned_matrix.csv and
+        // raw_variant_cooccurrence.tsv are not part of the default outputs.
         for suffix in [
-            ".cleaned_matrix.csv",
             ".variant_cooccurrence.tsv",
-            ".raw_variant_cooccurrence.tsv",
             ".molecule_summary.tsv",
             ".mutation_tree.tsv",
             ".read_lineage.nwk",
@@ -3075,12 +3089,12 @@ mod tests {
             .unwrap()
             .to_string();
 
-        run_scite_pipeline(&matrix, 0.01, 0.1, 500, 2, 123, 1, None, &prefix).unwrap();
+        run_scite_pipeline(&matrix, 0.01, 0.1, 500, 2, 123, 1, None, false, &prefix).unwrap();
 
+        // Plan 2026-09-26 T3. debug is false, so cleaned_matrix.csv and
+        // raw_variant_cooccurrence.tsv are not part of the default outputs.
         for suffix in [
-            ".cleaned_matrix.csv",
             ".variant_cooccurrence.tsv",
-            ".raw_variant_cooccurrence.tsv",
             ".molecule_summary.tsv",
             ".mutation_tree.tsv",
             ".read_lineage.nwk",
@@ -3837,6 +3851,7 @@ mod tests {
             7,
             1,
             Some(&crate::rootblock::RootBlockConfig::default()),
+            false,
             &prefix,
         );
         assert!(out.is_ok(), "all-homoplasmic input must produce a tree, not an error");
@@ -3856,7 +3871,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
-        run_scite_pipeline(&binary, 0.01, 0.05, 50, 1, 7, 1, None, &prefix).unwrap();
+        run_scite_pipeline(&binary, 0.01, 0.05, 50, 1, 7, 1, None, false, &prefix).unwrap();
 
         let tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
         assert!(tsv.contains("m.750A>G"), "disabled must leave both variants in the tree");
@@ -3895,16 +3910,16 @@ mod tests {
 
         run_scite_pipeline(
             &binary, 0.01, 0.05, 200, 1, 7, 1,
-            Some(&crate::rootblock::RootBlockConfig::default()), &on,
+            Some(&crate::rootblock::RootBlockConfig::default()), false, &on,
         ).unwrap();
-        run_scite_pipeline(&binary, 0.01, 0.05, 200, 1, 7, 1, None, &off).unwrap();
+        run_scite_pipeline(&binary, 0.01, 0.05, 200, 1, 7, 1, None, false, &off).unwrap();
 
+        // Plan 2026-09-26 T3. debug is false on both runs, so
+        // cleaned_matrix.csv and raw_variant_cooccurrence.tsv are not written.
         for ext in [
             ".mutation_tree.tsv",
-            ".cleaned_matrix.csv",
             ".read_lineage.nwk",
             ".variant_cooccurrence.tsv",
-            ".raw_variant_cooccurrence.tsv",
             ".molecule_summary.tsv",
         ] {
             let a = std::fs::read_to_string(format!("{on}{ext}")).unwrap();
@@ -3936,16 +3951,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let prefix = dir.join("t").to_str().unwrap().to_string();
 
-        run_scite_pipeline(
+        let out = run_scite_pipeline(
             &binary, 0.01, 0.05, 200, 1, 7, 1,
-            Some(&crate::rootblock::RootBlockConfig::default()), &prefix,
+            Some(&crate::rootblock::RootBlockConfig::default()), false, &prefix,
         ).unwrap();
 
-        // The germline variant left the search but survives in the cleaned
-        // matrix as an all-present column.
-        let csv = std::fs::read_to_string(format!("{prefix}.cleaned_matrix.csv")).unwrap();
-        assert!(csv.contains("m.750A>G"), "block variants stay in the cleaned matrix");
-        assert!(csv.contains("m.302A>ACC"));
+        // Plan 2026-09-26 T3. The germline variant left the search but survives
+        // in the in-memory cleaned matrix (formerly cleaned_matrix.csv) as an
+        // all-present row.
+        assert!(
+            out.cleaned.variants.iter().any(|v| v == "m.750A>G"),
+            "block variants stay in the cleaned matrix"
+        );
+        assert!(out.cleaned.variants.iter().any(|v| v == "m.302A>ACC"));
 
         let tsv = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
         assert!(tsv.contains("ROOT_BLOCK"), "the germline variant should be blocked");
@@ -4069,7 +4087,7 @@ mod tests {
 
         run_scite_pipeline(
             &binary, 0.01, 0.05, 200, 1, 7, 1,
-            Some(&crate::rootblock::RootBlockConfig::default()), &prefix,
+            Some(&crate::rootblock::RootBlockConfig::default()), true, &prefix,
         ).unwrap();
 
         let raw = std::fs::read_to_string(format!("{prefix}.raw_variant_cooccurrence.tsv")).unwrap();
@@ -4124,7 +4142,7 @@ mod tests {
 
         run_scite_pipeline(
             &binary, 0.01, 0.05, 200, 1, 7, 1,
-            Some(&crate::rootblock::RootBlockConfig::default()), &prefix,
+            Some(&crate::rootblock::RootBlockConfig::default()), false, &prefix,
         ).unwrap();
 
         let cooc = std::fs::read_to_string(format!("{prefix}.variant_cooccurrence.tsv")).unwrap();

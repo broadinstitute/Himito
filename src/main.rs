@@ -622,6 +622,10 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 2.0)]
         root_block_min_or: f64,
 
+        /// also write raw_haplotype_map.tsv and raw_variant_cooccurrence.tsv
+        #[clap(long, action)]
+        debug: bool,
+
         /// output prefix; writes <prefix>.haplotype_map.tsv
         #[clap(short, long, value_parser, required = true)]
         output_prefix: String,
@@ -996,6 +1000,7 @@ fn main() {
             root_block_max_q,
             root_block_min_absent,
             root_block_min_or,
+            debug,
             output_prefix,
         } => {
             let matrix_file = matrix_file.to_str().expect("matrix-file path is not valid UTF-8");
@@ -1037,6 +1042,7 @@ fn main() {
                 mcmc_chains,
                 LINEAGE_MCMC_SEED,
                 root_block,
+                debug,
                 &output_prefix,
             ) {
                 eprintln!("Error running lineage analysis: {:#}", e);

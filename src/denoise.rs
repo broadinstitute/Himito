@@ -1894,7 +1894,14 @@ mod tests {
     // A spurious G after index 18, in unique sequence: 19M 1I 10M.
     const UNIQ_INS_SEQ: &[u8] = b"ACGTACGTAAAAAAAACGTGACGTACGTAC"; // 30bp
 
+    // One A missing from the run: 8M 1D 20M. The deletion is already anchored on
+    // REF29[7], the run's normalized anchor. Plan 2026-09-26 T8e.
+    const HP_DEL_SEQ: &[u8] = b"ACGTACGTAAAAAAACGTACGTACGTAC"; // 28bp
+
     fn clean_cigar() -> Vec<Cigar> { vec![Cigar::Match(29)] }
+    fn hp_del_cigar() -> Vec<Cigar> {
+        vec![Cigar::Match(8), Cigar::Del(1), Cigar::Match(20)]
+    }
     fn hp_ins_cigar() -> Vec<Cigar> { vec![Cigar::Match(16), Cigar::Ins(1), Cigar::Match(13)] }
     fn uniq_ins_cigar() -> Vec<Cigar> { vec![Cigar::Match(19), Cigar::Ins(1), Cigar::Match(10)] }
 
@@ -2815,6 +2822,119 @@ mod tests {
             seq[19], b'T',
             "the substitution OUTSIDE the run must still be applied, at reference 20"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Plan 2026-09-26 T8e: 8 reads carrying `Del(1)` in REF29's A-run (strand
+    /// balanced 4/4), one carrying `Ins(1)`, one clean. The site keeps `Del(1)`, so
+    /// the lone `Ins(1)` read carries a length nobody else has and a ±1 miscall "in
+    /// the wrong direction" is exactly what it is.
+    fn hp_wrong_direction_reads() -> Vec<(&'static str, i64, &'static [u8], Vec<Cigar>, bool)> {
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES[..8].iter().enumerate() {
+            reads.push((n, 0, HP_DEL_SEQ, hp_del_cigar(), i % 2 == 0));
+        }
+        reads.push(("rins", 0, HP_INS_SEQ, hp_ins_cigar(), false));
+        reads.push(("rref", 0, CLEAN_SEQ, clean_cigar(), true));
+        reads
+    }
+
+    /// The read's SEQ length must equal the query consumption of its CIGAR -- the
+    /// check `samtools quickcheck`/`view` applies to every record.
+    fn assert_samtools_valid(rec: &Record) {
+        let query: u32 = rec
+            .cigar()
+            .iter()
+            .map(|op| match op {
+                Cigar::Match(n) | Cigar::Ins(n) | Cigar::SoftClip(n) | Cigar::Equal(n)
+                | Cigar::Diff(n) => *n,
+                _ => 0,
+            })
+            .sum();
+        let seq = rec.seq().as_bytes();
+        assert_eq!(
+            seq.len() as u32,
+            query,
+            "SEQ length must equal the CIGAR's query consumption for {}",
+            String::from_utf8_lossy(rec.qname())
+        );
+        assert_eq!(seq.len(), rec.qual().len(), "SEQ and QUAL lengths must agree");
+    }
+
+    fn run_denoise_pair(
+        dir: &Path,
+        iopts: &indel::IndelOpts,
+    ) -> (DenoiseStats, HashMap<Vec<u8>, (Vec<u8>, CigarString)>) {
+        std::fs::create_dir_all(dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+        write_cigar_bam(&inb, "chrM", 29, &hp_wrong_direction_reads());
+        let refs = indel_refs();
+        let (corr, models, mut stats) =
+            compute_corrections(&inb, &refs, 2, 0.01, SB_P, HOM_VAF, iopts).unwrap();
+        apply_corrections(&inb, &outb, &corr, &refs, &models, iopts, &mut stats).unwrap();
+
+        let mut out = HashMap::new();
+        let mut r = Reader::from_path(&outb).unwrap();
+        for rec in r.records() {
+            let rec = rec.unwrap();
+            assert_samtools_valid(&rec);
+            out.insert(rec.qname().to_vec(), (rec.seq().as_bytes(), rec.cigar().take()));
+        }
+        (stats, out)
+    }
+
+    #[test]
+    fn hp_wrong_direction_read_is_refused_with_the_model_off() {
+        // Today's behaviour, pinned: `Ins(1)` -> `Del(1)` is cross-kind, which
+        // `rewrite_read` cannot express, so the read is left untouched and counted.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_hp_e2e_off");
+        let (stats, out) = run_denoise_pair(&dir, &indels_on());
+
+        let (seq, cigar) = out.get(&b"rins".to_vec()).expect("rins must be written out");
+        assert_eq!(seq.as_slice(), HP_INS_SEQ, "SEQ must be untouched");
+        assert_eq!(*cigar, CigarString(hp_ins_cigar()), "CIGAR must be untouched");
+        assert!(
+            stats.assignments_skipped_unsupported_transition >= 1,
+            "the refusal must be counted"
+        );
+        assert_eq!(stats.subs_dropped_in_hp_rewrite, 0, "no HP rewrite may happen");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hp_wrong_direction_read_is_corrected_with_the_model_on() {
+        // Plan 2026-09-26 T8e: the same fixture, with `--indel-hp-length-model`. The
+        // `Ins(1)` read is rewritten to the site's kept length, in canonical
+        // left-aligned form, and the clean read -- which the site also wants at
+        // `Del(1)` -- comes out identical to it.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_hp_e2e_on");
+        let (stats, out) = run_denoise_pair(&dir, &indels_hp_on());
+
+        let (seq, cigar) = out.get(&b"rins".to_vec()).expect("rins must be written out");
+        assert_eq!(*cigar, CigarString(hp_del_cigar()), "the run must become 8M 1D 20M");
+        assert_eq!(seq.as_slice(), HP_DEL_SEQ, "the read must carry a 7bp A-run");
+        assert_eq!(
+            stats.assignments_skipped_unsupported_transition, 0,
+            "nothing may be refused at an HP site under the length model"
+        );
+        assert_eq!(
+            stats.reads_reassigned_indel_to_indel, 1,
+            "exactly one Ins(1) -> Del(1) move"
+        );
+        assert_eq!(
+            stats.reassignments_by_hp_length.get(8).copied().unwrap_or(0),
+            2,
+            "both moves are booked against the 8bp run: rins and rref"
+        );
+        assert_eq!(stats.indel_edits_emitted_but_not_applied, 0);
+
+        // The eight reads that already carry the kept length must be untouched.
+        for n in NAMES[..8].iter() {
+            let (seq, cigar) = out.get(&n.as_bytes().to_vec()).expect("read must survive");
+            assert_eq!(seq.as_slice(), HP_DEL_SEQ, "{n} must be untouched");
+            assert_eq!(*cigar, CigarString(hp_del_cigar()), "{n} must be untouched");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

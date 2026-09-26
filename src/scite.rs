@@ -1160,6 +1160,30 @@ fn sign_test_p(a: usize, b: usize) -> f64 {
         .min(1.0)
 }
 
+/// Upper tail `P(X >= k)` for `X ~ Binomial(n, p)`, using the same
+/// log-gamma binomial coefficient as [`sign_test_p`].
+///
+/// `p` outside `(0, 1)` is not used by the excess-absence rule (`dropout_rate
+/// == 0` skips that rule). Plan 2026-09-26 T2.
+pub(crate) fn binomial_upper_tail(n: usize, k: usize, p: f64) -> f64 {
+    if k == 0 || n == 0 {
+        return 1.0;
+    }
+    if k > n || !(p > 0.0 && p < 1.0) {
+        return if p >= 1.0 { 1.0 } else { 0.0 };
+    }
+    let ln_p = p.ln();
+    let ln_q = (1.0 - p).ln();
+    let nf = n as f64;
+    (k..=n)
+        .map(|i| {
+            let ii = i as f64;
+            (lchoose(nf, ii) + ii * ln_p + (nf - ii) * ln_q).exp()
+        })
+        .sum::<f64>()
+        .min(1.0)
+}
+
 /// Log-likelihood lost by swapping `node` with its parent, i.e. the evidence
 /// pinning this edge's direction. `None` when the parent is the root.
 ///
@@ -3787,11 +3811,14 @@ mod tests {
 
     #[test]
     fn run_scite_pipeline_with_all_variants_homoplasmic_does_not_panic() {
-        // Two germline variants, correlated dropout on the last 10 reads: both
-        // land in the block, leaving zero informative variants.
+        // Two germline variants, correlated dropout on the last 5 reads: both
+        // land in the block, leaving zero informative variants. 5 absences,
+        // not 10: at fn = 0.05 the effect-size floor is 10, and 10 absences
+        // is already a significant excess (plan 2026-09-26 T2), so it would
+        // leave the block.
         let n_reads = 100usize;
-        let mut row = vec![Some(1u8); 90];
-        row.extend(vec![Some(0u8); 10]);
+        let mut row = vec![Some(1u8); 95];
+        row.extend(vec![Some(0u8); 5]);
         let binary = BinaryMatrix {
             variants: vec!["m.750A>G".to_string(), "m.16183A>C".to_string()],
             reads: (0..n_reads).map(|r| format!("r{r}")).collect(),
@@ -3894,8 +3921,10 @@ mod tests {
     #[test]
     fn one_informative_variant_after_partition_still_takes_the_single_variant_path() {
         let n_reads = 100usize;
-        let mut germline = vec![Some(1u8); 90];
-        germline.extend(vec![Some(0u8); 10]);
+        // 5 absences, not 10: 10/100 at fn = 0.05 clears the excess-absence
+        // floor and would leave the block (plan 2026-09-26 T2).
+        let mut germline = vec![Some(1u8); 95];
+        germline.extend(vec![Some(0u8); 5]);
         let real: Vec<Option<u8>> =
             (0..n_reads).map(|r| Some(if r % 2 == 0 { 1u8 } else { 0u8 })).collect();
         let binary = BinaryMatrix {
@@ -4023,8 +4052,10 @@ mod tests {
         // cleaned-matrix tables, the raw co-occurrence table must still
         // report them.
         let n_reads = 100usize;
-        let mut germline = vec![Some(1u8); 90];
-        germline.extend(vec![Some(0u8); 10]);
+        // 5 absences, not 10: 10/100 at fn = 0.05 is an excess absence and
+        // would not be blocked (plan 2026-09-26 T2).
+        let mut germline = vec![Some(1u8); 95];
+        germline.extend(vec![Some(0u8); 5]);
         let real: Vec<Option<u8>> =
             (0..n_reads).map(|r| Some(if r % 2 == 0 { 1u8 } else { 0u8 })).collect();
         let binary = BinaryMatrix {
@@ -4058,8 +4089,10 @@ mod tests {
     #[test]
     fn variant_cooccurrence_omits_block_variants_entirely() {
         let n_reads = 100usize;
-        let mut block_col = vec![Some(1u8); 90];
-        block_col.extend(vec![Some(0u8); 10]);
+        // 5 absences, not 10: 10/100 at fn = 0.05 is an excess absence and
+        // would not be blocked (plan 2026-09-26 T2).
+        let mut block_col = vec![Some(1u8); 95];
+        block_col.extend(vec![Some(0u8); 5]);
         let informative_a: Vec<Option<u8>> =
             (0..n_reads).map(|r| Some(if r % 2 == 0 { 1u8 } else { 0u8 })).collect();
         let informative_b: Vec<Option<u8>> =

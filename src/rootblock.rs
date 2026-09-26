@@ -52,6 +52,14 @@ pub enum BlockReason {
     /// Tested: some partner's q was at or below `max_q`. The absences are
     /// structured, so kept in the search.
     StructuredAbsences,
+    /// Absences exceed what dropout explains. The one-sided binomial tail
+    /// `P(X >= n_absent)` for `X ~ Binomial(covered, dropout_rate)` is at or
+    /// below `max_q`, and `n_absent` clears the `min_or` effect-size floor.
+    /// Kept in the search with `partner = None` and `min_q` equal to that
+    /// tail. Checked before the partner test, and skipped entirely when
+    /// `dropout_rate == 0`.
+    /// Plan 2026-09-26 T2.
+    ExcessAbsences,
     /// Would have been blocked, but pulled back because its REF span
     /// overlaps another variant (`resolve_span_conflicts` in `scite.rs`).
     SpanConflict,
@@ -63,6 +71,7 @@ impl BlockReason {
             BlockReason::HighRawVaf => "high_raw_vaf",
             BlockReason::UnstructuredAbsences => "unstructured_absences",
             BlockReason::StructuredAbsences => "structured_absences",
+            BlockReason::ExcessAbsences => "excess_absences",
             BlockReason::SpanConflict => "span_conflict",
         }
     }
@@ -77,7 +86,8 @@ pub struct RootBlockAudit {
     pub n_absent: usize,
     /// `None` when admitted without testing (too few absences).
     pub min_q: Option<f64>,
-    /// The variant achieving `min_q`; `None` for `HighRawVaf`.
+    /// The variant achieving `min_q`; `None` for `HighRawVaf` and for
+    /// `ExcessAbsences` (that reason stores the binomial tail in `min_q`).
     pub partner: Option<usize>,
     pub in_block: bool,
     pub reason: BlockReason,
@@ -165,9 +175,10 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64
     let mut informative = Vec::new();
     let mut audit = Vec::new();
 
-    // Pass 1: apply rules 1 and 2, and collect the candidates needing rule 3.
-    // `pending` holds (variant, hf, n_absent) in ascending variant order.
-    let mut pending: Vec<(usize, f64, usize)> = Vec::new();
+    // Pass 1: apply rules 1 and 2, and collect the candidates needing the
+    // excess-absence check and rule 3. `pending` holds
+    // (variant, hf, n_absent, covered) in ascending variant order.
+    let mut pending: Vec<(usize, f64, usize, usize)> = Vec::new();
     for v in 0..n {
         let present = matrix.data[v].iter().filter(|c| **c == Some(1)).count();
         let (hf, n_absent) = hf_and_absent(matrix, v);
@@ -193,9 +204,39 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64
                 reason: BlockReason::HighRawVaf,
             });
         } else {
-            pending.push((v, hf, n_absent));
+            pending.push((v, hf, n_absent, covered));
         }
     }
+
+    // Plan 2026-09-26 T2. Excess absences versus dropout, before any partner
+    // test. A significant tail alone is not enough: `n_absent` must also clear
+    // `min_or * dropout_rate * covered`, so a tiny excess that only becomes
+    // significant at high depth stays blocked. `dropout_rate == 0` skips the
+    // rule entirely, which is what the zero-dropout tests rely on.
+    let pending: Vec<(usize, f64, usize)> = if dropout_rate > 0.0 {
+        let mut rest = Vec::new();
+        for (v, hf, n_absent, covered) in pending {
+            let p_excess = crate::scite::binomial_upper_tail(covered, n_absent, dropout_rate);
+            let effect_floor = cfg.min_or * dropout_rate * covered as f64;
+            if p_excess <= cfg.max_q && n_absent as f64 >= effect_floor {
+                informative.push(v);
+                audit.push(RootBlockAudit {
+                    variant: v,
+                    hf,
+                    n_absent,
+                    min_q: Some(p_excess),
+                    partner: None,
+                    in_block: false,
+                    reason: BlockReason::ExcessAbsences,
+                });
+            } else {
+                rest.push((v, hf, n_absent));
+            }
+        }
+        rest
+    } else {
+        pending.into_iter().map(|(v, hf, n_absent, _covered)| (v, hf, n_absent)).collect()
+    };
 
     // Pass 2: every (candidate, partner) p-value and odds ratio, then ONE
     // Benjamini-Hochberg correction across all p-values together.
@@ -497,6 +538,55 @@ mod tests {
         // 10, clearing `min_absent`) — both are grouped under the same
         // admitted-without-test reason; see `BlockReason::HighRawVaf`.
         // Plan 2026-09-26 T2.
+        assert_eq!(rb.audit[0].reason, BlockReason::HighRawVaf);
+    }
+
+    /// Plan 2026-09-26 T2. 150 absences in 1000 reads at dropout 0.05 is far
+    /// above the expected 50 and above the effect-size floor
+    /// `min_or * dropout_rate * covered` = 100. No partner marks the absent
+    /// reads, so only the excess-absence rule can keep `v0` informative.
+    #[test]
+    fn excess_absences_keep_variant_informative_without_a_partner() {
+        let n = 1000;
+        let v0 = run(850, 150);
+        let v1 = vec![0i8; n];
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.05);
+        assert_eq!(rb.informative, vec![0, 1]);
+        assert!(rb.block.is_empty());
+        let a = &rb.audit[0];
+        assert!(!a.in_block);
+        assert_eq!(a.reason.as_str(), "excess_absences");
+        assert!(a.partner.is_none());
+        let q = a.min_q.expect("excess absences record the binomial tail");
+        assert!(q <= 0.05, "min_q was {q}");
+    }
+
+    /// Plan 2026-09-26 T2. 55 absences in the same 1000 reads (floor 100) are
+    /// not a significant excess over dropout 0.05, so `v0` stays blocked.
+    #[test]
+    fn modest_absence_count_stays_blocked() {
+        let n = 1000;
+        let v0 = run(945, 55);
+        let v1 = vec![0i8; n];
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.05);
+        assert_eq!(rb.block, vec![0]);
+        assert_eq!(rb.informative, vec![1]);
+        assert!(rb.audit[0].in_block);
+        assert_ne!(rb.audit[0].reason.as_str(), "excess_absences");
+    }
+
+    /// Plan 2026-09-26 T2. `dropout_rate == 0` skips the excess-absence rule,
+    /// so the 150-absent matrix stays blocked exactly as the partner test
+    /// decides it.
+    #[test]
+    fn zero_dropout_skips_the_excess_absence_rule() {
+        let n = 1000;
+        let v0 = run(850, 150);
+        let v1 = vec![0i8; n];
+        let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.0);
+        assert_eq!(rb.block, vec![0]);
+        assert_eq!(rb.informative, vec![1]);
+        assert_ne!(rb.audit[0].reason.as_str(), "excess_absences");
         assert_eq!(rb.audit[0].reason, BlockReason::HighRawVaf);
     }
 

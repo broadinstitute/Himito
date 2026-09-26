@@ -315,6 +315,18 @@ pub struct IndelSite {
     /// only make the denoiser very rarely slightly more conservative at a
     /// site, at collision-probability odds no realistic pileup will hit.
     voted: std::collections::HashSet<u64>,
+    /// Plan 2026-09-26 T8 (review fix 2): reads whose HP LENGTH allele is exactly
+    /// the reference length, i.e. `hp_allele == Some(0)`. At an HP site this, and
+    /// NOT `depth - alt_total`, is the reference support.
+    ///
+    /// The two differ because `hp_allele` returns `None` for a read that is
+    /// UNINFORMATIVE about the run's length -- an insertion of some base other than
+    /// `b`, an `N` across the run, or a read that clears pass 1's depth gate
+    /// (`hp_tract_end + 1`) but not the vote's wider flank gate
+    /// (`e + INDEL_FLANK`). Such a read observes neither the reference length nor
+    /// any alternative, so subtracting only the ALT votes from depth silently
+    /// booked it as evidence FOR the reference and diluted every real alt.
+    hp_ref: u32,
 }
 
 impl IndelSite {
@@ -335,14 +347,30 @@ impl IndelSite {
     /// FIX 5 in the task-9 review round): callers outside this module have
     /// exactly one way to record a vote, and it always enforces the cap.
     pub fn add_from_read(&mut self, qname: &[u8], allele: Allele, reverse: bool) -> bool {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        qname.hash(&mut h);
-        if !self.voted.insert(h.finish()) {
+        if !self.mark_voted(qname) {
             return false;
         }
         self.add(allele, reverse);
         true
+    }
+
+    /// Plan 2026-09-26 T8 (review fix 2): record that `qname` observes the HP site's
+    /// REFERENCE length. Shares the one-vote-per-read cap with `add_from_read`, so a
+    /// read counts once here or once there, never both.
+    pub fn add_hp_ref(&mut self, qname: &[u8]) -> bool {
+        if !self.mark_voted(qname) {
+            return false;
+        }
+        self.hp_ref += 1;
+        true
+    }
+
+    /// Claim this read's single vote at this site. `false` if it already voted.
+    fn mark_voted(&mut self, qname: &[u8]) -> bool {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        qname.hash(&mut h);
+        self.voted.insert(h.finish())
     }
 
     fn alt_total(&self) -> u32 {
@@ -431,11 +459,36 @@ pub fn fit_indel_site(
         site.alt_total(),
         site.depth
     );
+    // Plan 2026-09-26 T8 (review fix 2): every HP vote, reference or alt, comes from
+    // a read that cleared the depth gate and votes at most once, so the two together
+    // can only ever be a SUBSET of depth. The slack is the uninformative reads.
+    debug_assert!(
+        site.hp_ref + site.alt_total() <= site.depth,
+        "HP site accounting invariant violated: hp_ref ({}) + alt_total ({}) exceeds depth ({})",
+        site.hp_ref,
+        site.alt_total(),
+        site.depth
+    );
+
+    // Plan 2026-09-26 T8: the single place the HP length model is switched on. Every
+    // downstream consumer keys off `hp_run.is_some()`, so with the flag off the
+    // whole feature is unreachable by construction.
+    let hp_run = if o.hp_length_model { hp_site(refseq, norm_pos) } else { None };
 
     let mut strand_biased = 0usize;
-    // Raw counts over kept alleles; REF gets whatever depth the events did not claim.
+    // Raw counts over kept alleles.
     let mut raw: Vec<(Allele, f64)> = Vec::new();
-    let ref_support = depth.saturating_sub(site.alt_total());
+    // Plan 2026-09-26 T8 (review fix 2): at an HP site the reference is an OBSERVED
+    // length like any other, counted from the reads that actually showed it
+    // (`hp_allele == Some(0)`). Everywhere else REF still gets whatever depth the
+    // events did not claim. The difference is the uninformative reads: `depth` uses
+    // the spanning-read gate and so includes reads whose length could not be read
+    // off at all, and those are evidence for nothing.
+    let ref_support = if hp_run.is_some() {
+        site.hp_ref
+    } else {
+        depth.saturating_sub(site.alt_total())
+    };
     raw.push((Allele::Ref, ref_support as f64));
 
     // RAW observed VAF for every allele, whether kept or not, for the protection
@@ -489,11 +542,6 @@ pub fn fit_indel_site(
     kept.sort_by(|(a, _), (b, _)| a.cmp(b));
     obs_vaf.sort_by(|(a, _), (b, _)| a.cmp(b));
     strand_rejected.sort();
-
-    // Plan 2026-09-26 T8: the single place the HP length model is switched on. Every
-    // downstream consumer keys off `hp_run.is_some()`, so with the flag off the
-    // whole feature is unreachable by construction.
-    let hp_run = if o.hp_length_model { hp_site(refseq, norm_pos) } else { None };
 
     IndelSiteModel { kept, eps, context_len, strand_biased, obs_vaf, strand_rejected, hp_run }
 }
@@ -2170,19 +2218,20 @@ pub fn rewrite_read(
 /// elsewhere in the read still line up afterwards.
 ///
 /// The surviving query bases are the read's OWN bases over the run, with the excess
-/// dropped from the LEFT (where the canonical deletion sits) or copies of the run
-/// base prepended on the left (where the canonical insertion sits). Synthesized bases
+/// dropped from the LEFT (where the canonical deletion sits) or copies of `b`
+/// prepended on the left (where the canonical insertion sits). Synthesized bases
 /// take the minimum of their flanking qualities, exactly like `fill_qual`.
+///
+/// `b` is the run's base, passed in rather than read off the read (Plan 2026-09-26
+/// T8, review fix 1). It is a property of the REFERENCE, so taking it from the query
+/// would both corrupt a run whose first read base is a substitution and make a run
+/// the read deleted entirely unrewritable -- there is no query base left to copy.
 ///
 /// `None` (the read is left untouched) when:
 /// * `[a + 1, e)` is not a run of at least 2, or `target_k < -R`;
 /// * the read has no aligned query base at the anchor `a`, or does not cover the
 ///   whole run -- it cannot testify to a length it never saw;
-/// * an `N` op crosses the run;
-/// * bases must be synthesized but the read has NO query base left in the run, so
-///   the run base cannot be read off the read (the caller does not pass `refseq`).
-///   That is only reachable when the read deletes the entire run and the target is
-///   longer, the one length transition this path declines.
+/// * an `N` op crosses the run.
 pub fn rewrite_hp_run(
     pos: i64,
     cigar: &CigarString,
@@ -2190,6 +2239,7 @@ pub fn rewrite_hp_run(
     qual: &[u8],
     a: u32,
     e: u32,
+    b: u8,
     target_k: i32,
 ) -> Option<(CigarString, Vec<u8>, Vec<u8>)> {
     if e < a + 2 {
@@ -2335,7 +2385,11 @@ pub fn rewrite_hp_run(
     let mut body_seq: Vec<u8> = Vec::with_capacity(target_len);
     let mut body_qual: Vec<u8> = Vec::with_capacity(target_len);
     if let Some(add) = target_len.checked_sub(run_seq.len()).filter(|n| *n > 0) {
-        let b = *run_seq.first()?;
+        // Plan 2026-09-26 T8 (review fix 1): `b`, the run's REFERENCE base, not
+        // `run_seq.first()`. The read's first base inside the run may be a
+        // substitution -- copying it would lengthen the run with a base the
+        // homopolymer does not contain -- and when the read deleted the run
+        // outright there is no first base at all, which used to abort the rewrite.
         let right = run_qual.first().copied().or_else(|| post_qual.first().copied());
         let f = match (pre_qual.last().copied(), right) {
             (Some(l), Some(r)) => l.min(r),
@@ -2934,6 +2988,7 @@ mod rewrite_tests {
     // run end is 9, R = 5 and b = b'A'.
     const HPR_A: u32 = 3;
     const HPR_E: u32 = 9;
+    const HPR_B: u8 = b'A';
 
     /// `rewrite_hp_run` returns the same three pieces `rewrite_read` does; wrap them
     /// so the existing `assert_invariants` can check reference consumption and
@@ -2954,7 +3009,7 @@ mod rewrite_tests {
         let seq = REF.to_vec();
         let qual = vec![30u8; 16];
         let r = hp_result(
-            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, 0).expect("must rewrite"),
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, 0).expect("must rewrite"),
         );
         assert_eq!(r.cigar, c);
         assert_eq!(r.seq, seq);
@@ -2970,7 +3025,7 @@ mod rewrite_tests {
         let seq = REF.to_vec();
         let qual = vec![30u8; 16];
         let r = hp_result(
-            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -1).expect("must rewrite"),
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, -1).expect("must rewrite"),
         );
         assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Del(1), Cigar::Match(11)]));
         assert_eq!(r.seq.len(), 15, "one base must leave the read");
@@ -2984,7 +3039,7 @@ mod rewrite_tests {
         let seq = REF.to_vec();
         let qual = vec![30u8; 16];
         let r = hp_result(
-            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, 1).expect("must rewrite"),
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, 1).expect("must rewrite"),
         );
         assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Ins(1), Cigar::Match(12)]));
         assert_eq!(r.seq, b"ACGTAAAAAACGTACGT".to_vec(), "the run must grow to 6 A's");
@@ -3002,7 +3057,7 @@ mod rewrite_tests {
         seq.extend_from_slice(&REF[9..]);
         let qual = vec![30u8; 17];
         let r = hp_result(
-            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, 0).expect("must rewrite"),
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, 0).expect("must rewrite"),
         );
         assert_eq!(r.cigar, cig(vec![Cigar::Match(16)]));
         assert_eq!(r.seq, REF.to_vec());
@@ -3019,7 +3074,7 @@ mod rewrite_tests {
         seq.extend_from_slice(&REF[9..]);
         let qual = vec![30u8; 17];
         let r = hp_result(
-            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -1).expect("must rewrite"),
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, -1).expect("must rewrite"),
         );
         assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Del(1), Cigar::Match(11)]));
         assert_eq!(r.seq, b"ACGTAAAACGTACGT".to_vec());
@@ -3035,7 +3090,7 @@ mod rewrite_tests {
         seq.extend_from_slice(&REF[5..]);
         let qual = vec![30u8; 15];
         let r = hp_result(
-            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -3).expect("must rewrite"),
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, -3).expect("must rewrite"),
         );
         assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Del(3), Cigar::Match(9)]));
         assert_eq!(r.seq.len(), 13);
@@ -3048,7 +3103,7 @@ mod rewrite_tests {
         let seq = REF.to_vec();
         let qual = vec![30u8; 16];
         let r = hp_result(
-            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -5).expect("must rewrite"),
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, -5).expect("must rewrite"),
         );
         assert_eq!(
             r.cigar,
@@ -3060,27 +3115,61 @@ mod rewrite_tests {
     }
 
     #[test]
-    fn hp_rewrite_refuses_to_grow_a_run_the_read_deleted_entirely() {
-        // Plan 2026-09-26 T8d: 4M 5D 7M deletes the whole A-run, so the read has NO
-        // query base left inside it and the run's base cannot be read off the read.
-        // `rewrite_hp_run` takes no `refseq`, so there is nowhere else to get it: the
-        // read is left untouched and the caller books a missed correction.
+    fn hp_rewrite_grows_a_run_the_read_deleted_entirely() {
+        // Plan 2026-09-26 T8 (review fix 1): 4M 5D 7M deletes the whole A-run, so the
+        // read has NO query base left inside it. That used to make the rewrite
+        // decline, because the base to synthesize was taken from the read. The run's
+        // base is a property of the REFERENCE, so it is passed in instead and a fully
+        // deleted run is rewritable to any length like any other.
         //
-        // This is the one length transition the path declines, and it is not rare in
-        // real data -- on the T8f eval cell it accounted for 6096 of the 17570 misses,
-        // almost all in 2bp runs. Shrinking the same read further is still fine.
+        // This transition is not rare: on the T8f eval cell it accounted for 6096 of
+        // the 17570 misses, almost all in 2bp runs.
         let c = cig(vec![Cigar::Match(4), Cigar::Del(5), Cigar::Match(7)]);
         let mut seq = REF[..4].to_vec();
         seq.extend_from_slice(&REF[9..]);
         let qual = vec![30u8; 11];
-        assert!(
-            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, 0).is_none(),
-            "growing back from an entirely deleted run needs a base the read does not have"
+
+        // ...back to the reference length: the whole run is synthesized as `b`.
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, 0).expect("must rewrite"),
         );
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(16)]));
+        assert_eq!(r.seq, REF.to_vec(), "the restored run must be five A's");
+        assert_invariants(&c, &r);
+
+        // ...and past it, to a run two bases longer than the reference.
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, 2).expect("must rewrite"),
+        );
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Ins(2), Cigar::Match(12)]));
+        assert_eq!(r.seq, b"ACGTAAAAAAACGTACGT".to_vec());
+        assert_invariants(&c, &r);
+
         assert!(
-            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -5).is_some(),
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, -5).is_some(),
             "the read already carries this length, so no base has to be synthesized"
         );
+    }
+
+    #[test]
+    fn hp_rewrite_synthesizes_the_run_base_not_whatever_the_read_carries() {
+        // Plan 2026-09-26 T8 (review fix 1): the read has a substitution at the FIRST
+        // base of the run (reference 4, A -> C). Growing the run used to copy
+        // `run_seq.first()`, which is that `C`, inventing a base the homopolymer does
+        // not contain. The synthesized base must be the run base `b`; the read's own
+        // substituted base is left alone, since only the run's LENGTH is being decided.
+        let c = cig(vec![Cigar::Match(16)]);
+        let mut seq = REF.to_vec();
+        seq[4] = b'C';
+        let qual = vec![30u8; 16];
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, 1).expect("must rewrite"),
+        );
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Ins(1), Cigar::Match(12)]));
+        assert_eq!(r.seq[4], b'A', "the synthesized base is the run base, not the read's C");
+        assert_eq!(r.seq[5], b'C', "the read's own substitution survives the rewrite");
+        assert_eq!(r.seq, b"ACGTACAAAACGTACGT".to_vec());
+        assert_invariants(&c, &r);
     }
 
     #[test]
@@ -3088,7 +3177,7 @@ mod rewrite_tests {
         let c = cig(vec![Cigar::Match(16)]);
         let seq = REF.to_vec();
         let qual = vec![30u8; 16];
-        assert!(rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -6).is_none());
+        assert!(rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, -6).is_none());
     }
 
     #[test]
@@ -3097,12 +3186,12 @@ mod rewrite_tests {
         let c = cig(vec![Cigar::Match(6)]);
         let seq = REF[..6].to_vec();
         let qual = vec![30u8; 6];
-        assert!(rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -1).is_none());
+        assert!(rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, -1).is_none());
         // Starts at reference 5, inside the run: same, from the other side.
         let c = cig(vec![Cigar::Match(11)]);
         let seq = REF[5..].to_vec();
         let qual = vec![30u8; 11];
-        assert!(rewrite_hp_run(5, &c, &seq, &qual, HPR_A, HPR_E, -1).is_none());
+        assert!(rewrite_hp_run(5, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, -1).is_none());
     }
 
     #[test]
@@ -3114,7 +3203,7 @@ mod rewrite_tests {
         seq.extend_from_slice(&REF[2..14]);
         let qual = vec![30u8; 14];
         let r = hp_result(
-            rewrite_hp_run(2, &c, &seq, &qual, HPR_A, HPR_E, 1).expect("must rewrite"),
+            rewrite_hp_run(2, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, 1).expect("must rewrite"),
         );
         assert_eq!(
             r.cigar,
@@ -3135,7 +3224,7 @@ mod rewrite_tests {
         qual[3] = 20;
         qual[4] = 30;
         let r = hp_result(
-            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, 1).expect("must rewrite"),
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, HPR_B, 1).expect("must rewrite"),
         );
         assert_eq!(r.qual[4], 20, "min(20, 30), not 40 and not an invented value");
         assert_eq!(r.qual[3], 20, "the anchor's own quality must survive");

@@ -483,8 +483,12 @@ fn compute_corrections(
         } else {
             None
         };
-        // (qname, length allele, reverse) for this column's HP-length votes.
+        // (qname, length allele, reverse) for this column's HP-length ALT votes.
         let mut hp_col_votes: Vec<(Vec<u8>, indel::Allele, bool)> = Vec::new();
+        // Plan 2026-09-26 T8 (review fix 2): qnames of the reads that observe the
+        // run's REFERENCE length here (`hp_allele == Some(0)`). Kept apart from the
+        // ALT votes because reference support is not an entry in `IndelSite::obs`.
+        let mut hp_col_ref: Vec<Vec<u8>> = Vec::new();
 
         for a in col.alignments() {
             let rec = a.record();
@@ -507,21 +511,28 @@ fn compute_corrections(
                         // wherever the aligner happened to place an op. `hp_allele`'s
                         // span gate is one flank STRICTER than `tract_need_end`, so a
                         // read that votes here is always a read this depth counted --
-                        // `alt_total <= depth` still holds. Only a nonzero length is
-                        // recorded; `fit_indel_site` derives REF support from
-                        // `depth - alt_total`, exactly as for event votes.
+                        // `alt_total <= depth` still holds.
+                        //
+                        // Review fix 2: all THREE outcomes of `hp_allele` are
+                        // distinct and must stay distinct. `Some(k != 0)` is an ALT
+                        // observation, `Some(0)` is a REFERENCE observation, and
+                        // `None` is no observation at all -- the read is in depth but
+                        // said nothing about this run's length, so it must not be
+                        // folded into either. Deriving REF from `depth - alt_total`
+                        // silently made `None` and `Some(0)` the same thing.
                         if let Some((hp_e, b)) = hp_votes_here {
                             let cigar = rec.cigar().take();
                             let seq = rec.seq().as_bytes();
-                            let k = indel::hp_allele(
+                            match indel::hp_allele(
                                 rec.pos(), &cigar, &seq, refseq, refpos as u32, hp_e,
-                            );
-                            if let Some(k) = k.filter(|k| *k != 0) {
-                                hp_col_votes.push((
+                            ) {
+                                Some(0) => hp_col_ref.push(rec.qname().to_vec()),
+                                Some(k) => hp_col_votes.push((
                                     rec.qname().to_vec(),
                                     indel::hp_length_allele(k, b),
                                     rec.is_reverse(),
-                                ));
+                                )),
+                                None => {}
                             }
                         }
                     }
@@ -584,13 +595,21 @@ fn compute_corrections(
             // HP site. `add_from_read` still enforces one ALT vote per read per site,
             // so a read that also reaches this site through some event elsewhere
             // cannot double-vote.
-            for (qname, allele, reverse) in hp_col_votes {
-                let voted = sites
-                    .entry((name.to_vec(), refpos as u32))
-                    .or_default()
-                    .add_from_read(&qname, allele, reverse);
-                if !voted {
-                    stats.indel_events_duplicate_site += 1;
+            //
+            // Review fix 2: the reference observers are recorded alongside them, but
+            // only when some read actually carries a DIFFERENT length here. A site
+            // where every spanning read agrees on the reference length has nothing to
+            // correct, so it is still not materialized and `indel_sites_examined`
+            // still counts only sites with a candidate ALT.
+            if !hp_col_votes.is_empty() {
+                let site = sites.entry((name.to_vec(), refpos as u32)).or_default();
+                for (qname, allele, reverse) in hp_col_votes {
+                    if !site.add_from_read(&qname, allele, reverse) {
+                        stats.indel_events_duplicate_site += 1;
+                    }
+                }
+                for qname in hp_col_ref {
+                    site.add_hp_ref(&qname);
                 }
             }
             for (qname, allele, reverse, rpos, cigar, reference_end) in col_events {
@@ -874,7 +893,11 @@ fn apply_corrections(
                         // deliberately NOT `IndelEdit`s: `rewrite_read` edits one
                         // CIGAR op in place and cannot express them, so they are
                         // applied first, by `rewrite_hp_run`, below.
-                        let mut hp_moves: Vec<(u32, u32, indel::Allele, indel::Allele)> =
+                        // (anchor, run end, run base, observed length, target length).
+                        // The run base travels with the move: `rewrite_hp_run`
+                        // synthesizes added bases from it, and it is a property of the
+                        // REFERENCE, not of whatever the read carries inside the run.
+                        let mut hp_moves: Vec<(u32, u32, u8, indel::Allele, indel::Allele)> =
                             Vec::new();
 
                         if iopts.enabled {
@@ -992,7 +1015,7 @@ fn apply_corrections(
                                             }
                                             indel::Assignment::Move(t) => t,
                                         };
-                                        hp_moves.push((*pos, hp_e, observed, target));
+                                        hp_moves.push((*pos, hp_e, hp_b, observed, target));
                                         continue;
                                     }
                                     // FIX 5: this read's own CIGAR carries two DIFFERENT
@@ -1149,13 +1172,13 @@ fn apply_corrections(
                             let mut hp_qual: Option<Vec<u8>> = None;
                             // Half-open reference spans of the runs actually rewritten.
                             let mut hp_runs: Vec<(u32, u32)> = Vec::new();
-                            for (a, e, from, to) in &hp_moves {
+                            for (a, e, b, from, to) in &hp_moves {
                                 let rewritten = {
                                     let c = hp_cigar.as_ref().unwrap_or(&cigar);
                                     let s = hp_seq.as_ref().unwrap_or(&seq);
                                     let q = hp_qual.as_ref().unwrap_or(&qual);
                                     indel::rewrite_hp_run(
-                                        rec.pos(), c, s, q, *a, *e, to.net_len(),
+                                        rec.pos(), c, s, q, *a, *e, *b, to.net_len(),
                                     )
                                 };
                                 match rewritten {
@@ -2001,6 +2024,61 @@ mod tests {
         let hp_sites: Vec<u32> =
             list.iter().filter(|(_, m)| m.hp_run.is_some()).map(|(p, _)| *p).collect();
         assert_eq!(hp_sites, vec![7], "the A-run must yield exactly one HP site");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_undefined_hp_allele_does_not_count_as_reference_support() {
+        // Plan 2026-09-26 T8 (review fix 2): reference support at an HP site is the
+        // reads that actually testify to the REFERENCE length, i.e. `hp_allele ==
+        // Some(0)` -- not "everything depth counted that did not vote ALT".
+        // `hp_allele` returns `None` for a read that is UNINFORMATIVE about the run's
+        // length, and uninformative is not the same as reference.
+        //
+        // The two `rflank*` reads below are exactly that case, and they are the case
+        // the depth gate cannot catch: the A-run ends at 16, so pass 1's depth gate
+        // wants reference end >= 17 while `hp_allele`'s vote gate wants
+        // >= 16 + INDEL_FLANK = 21. A read ending at 18 sits between the two -- it is
+        // in depth, but it never saw enough of the right flank to have its length
+        // read off. Counting it as REF diluted the real insertion from 0.9 to 0.75.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_hp_ref_support");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, HP_INS_SEQ, hp_ins_cigar(), i % 2 == 0));
+        }
+        // The ONLY read that observes the reference length.
+        reads.push(("rdrop", 0, CLEAN_SEQ, clean_cigar(), false));
+        // Reference end 18: past the depth gate (17), short of the vote gate (21).
+        // Strand balanced so they cannot perturb the strand-bias null.
+        reads.push(("rflank0", 0, &CLEAN_SEQ[..18], vec![Cigar::Match(18)], false));
+        reads.push(("rflank1", 0, &CLEAN_SEQ[..18], vec![Cigar::Match(18)], true));
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let (_corr, models, _stats) =
+            compute_corrections(&bam, &indel_refs(), 2, 0.01, SB_P, HOM_VAF, &indels_hp_on())
+                .unwrap();
+
+        let list = models.get(&b"chrM".to_vec()).expect("chrM must have sites");
+        let (_, model) = list.iter().find(|(p, _)| *p == 7).expect("site at 7");
+        let ins = indel::Allele::Ins(b"A".to_vec());
+        let f_ins = model.kept.iter().find(|(a, _)| *a == ins).expect("insertion kept").1;
+        assert!(
+            (f_ins - 0.9).abs() < 1e-9,
+            "9 carriers against 1 reference observer is 0.9; the two uninformative \
+             reads must not be counted as reference support, got {f_ins}"
+        );
+        let f_ref = model
+            .kept
+            .iter()
+            .find(|(a, _)| *a == indel::Allele::Ref)
+            .expect("REF is always kept")
+            .1;
+        assert!(
+            (f_ref - 0.1).abs() < 1e-9,
+            "exactly one read observes the reference length, got {f_ref}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

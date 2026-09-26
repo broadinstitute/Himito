@@ -14,6 +14,7 @@ mod minorhap;
 mod callnumts;
 mod lineage;
 mod rootblock;
+mod tracts;
 mod scite;
 mod denoise;
 mod denoise_indel;

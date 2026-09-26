@@ -490,9 +490,14 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
 /// structural, so neither can happen.
 pub enum HfFilter {
     /// A VCF was supplied. [`parse_vcf`] already applied the HF band while
-    /// building this map, so membership in it *is* the filter — including when
+    /// building `map`, so membership in it *is* the filter — including when
     /// the map is empty, which correctly keeps nothing.
-    FromVcf(HfMap),
+    ///
+    /// `min`/`max` are the same band, retained for one reason only: tract
+    /// alleles (plan 2026-09-26 T5) do not exist in the VCF, since they are
+    /// synthesised from several of its records, so they must be judged on the
+    /// matrix-derived frequency instead. No other row consults them.
+    FromVcf { map: HfMap, min: f64, max: f64 },
     /// No VCF was supplied. Recompute HF from the matrix and keep
     /// `min <= hf < max`.
     FromMatrix { min: f64, max: f64 },
@@ -501,18 +506,30 @@ pub enum HfFilter {
 impl HfFilter {
     /// Whether a variant named `vid`, observed at alt frequency `freq` among the
     /// reads that cover it, passes the heteroplasmy filter.
-    fn keeps(&self, vid: &str, freq: f64) -> bool {
+    ///
+    /// `tract_rows` holds the names of the collapsed tract-allele rows; those
+    /// are judged on `freq` against the band on both paths, because the VCF
+    /// only ever carries their constituent calls. Plan 2026-09-26 T5.
+    fn keeps(&self, vid: &str, freq: f64, tract_rows: &std::collections::HashSet<String>) -> bool {
         match self {
-            HfFilter::FromVcf(map) => map.contains_key(vid),
+            HfFilter::FromVcf { map, min, max } => {
+                if tract_rows.contains(vid) {
+                    freq >= *min && freq < *max
+                } else {
+                    map.contains_key(vid)
+                }
+            }
             HfFilter::FromMatrix { min, max } => freq >= *min && freq < *max,
         }
     }
 
     /// Whether the decision for `vid` can be made from its name alone, before
-    /// the row is parsed. True only on the VCF path, where the verdict does not
-    /// depend on the observed frequency.
-    fn rejects_by_name(&self, vid: &str) -> bool {
-        matches!(self, HfFilter::FromVcf(_)) && !self.keeps(vid, 0.0)
+    /// the row is counted. True only on the VCF path for non-tract rows, where
+    /// the verdict does not depend on the observed frequency.
+    fn rejects_by_name(&self, vid: &str, tract_rows: &std::collections::HashSet<String>) -> bool {
+        matches!(self, HfFilter::FromVcf { .. })
+            && !tract_rows.contains(vid)
+            && !self.keeps(vid, 0.0, tract_rows)
     }
 }
 
@@ -540,7 +557,7 @@ pub fn load_and_filter_matrix(
     let file = std::fs::File::open(matrix_path)
         .with_context(|| format!("Cannot read matrix CSV: {matrix_path}"))?;
     let raw = read_raw_matrix(file)?;
-    Ok(filter_matrix(&raw, hf, min_presence, min_absence))
+    Ok(filter_matrix(&raw, hf, min_presence, min_absence, &Default::default()))
 }
 
 /// Parse every row of a Himito `.matrix.csv` into a [`RawMatrix`], applying no
@@ -579,12 +596,14 @@ pub fn read_raw_matrix<R: std::io::Read>(reader: R) -> Result<RawMatrix> {
 
 /// Apply the prevalence and heteroplasmy filters to a [`RawMatrix`].
 /// Plan 2026-09-26 T5: split out of the old `parse_binary_matrix`; the order of
-/// the two filters, and their semantics, are unchanged.
+/// the two filters, and their semantics, are unchanged. `tract_rows` names the
+/// collapsed tract alleles, which [`HfFilter`] judges differently.
 pub fn filter_matrix(
     raw: &RawMatrix,
     hf: &HfFilter,
     min_presence: usize,
     min_absence: usize,
+    tract_rows: &std::collections::HashSet<String>,
 ) -> BinaryMatrix {
     let mut variants: Vec<String> = Vec::new();
     let mut data: Vec<Vec<Option<u8>>> = Vec::new();
@@ -592,7 +611,7 @@ pub fn filter_matrix(
     for (vid, row) in raw.variants.iter().zip(raw.data.iter()) {
         // On the VCF path the verdict needs only the name, so rows that cannot
         // survive are rejected before anything is counted.
-        if hf.rejects_by_name(vid) {
+        if hf.rejects_by_name(vid, tract_rows) {
             continue;
         }
 
@@ -609,7 +628,7 @@ pub fn filter_matrix(
         let covered = present + absent;
         let freq = if covered > 0 { present as f64 / covered as f64 } else { 0.0 };
 
-        if !hf.keeps(vid, freq) {
+        if !hf.keeps(vid, freq, tract_rows) {
             continue;
         }
 
@@ -618,6 +637,268 @@ pub fn filter_matrix(
     }
 
     BinaryMatrix { variants, reads: raw.reads.clone(), data }
+}
+
+/// Collapse every known homopolymer tract in `raw` into sequence-level alleles.
+///
+/// Plan 2026-09-26 T5. See [`crate::tracts`] for why: inside a hypervariable
+/// run, one read's length change can be spelled at several reference positions,
+/// so left-alignment alone cannot merge them. For each read, all of its calls
+/// inside a tract (including an interrupting SNV such as T16189C) are applied
+/// to the tract's reference sequence; reads with the same resulting sequence
+/// carry the same allele. The constituent rows are replaced by one row per
+/// distinct non-reference tract sequence, named
+/// `m.<start><ref_seq>><alt_seq>`, inserted where the first constituent row
+/// was and sorted by alt sequence. Rows outside every tract, variants that
+/// straddle a tract boundary and variants that are not a plain SNV, insertion
+/// or deletion pass through untouched.
+pub fn collapse_tracts(raw: RawMatrix, tracts: &[crate::tracts::Tract]) -> RawMatrix {
+    let spans = crate::scite::variant_spans(&raw.variants);
+    let n_reads = raw.reads.len();
+
+    // Rows inside each tract, with the edit they apply, in row order.
+    let mut members: Vec<Vec<(usize, TractOp)>> = (0..tracts.len()).map(|_| Vec::new()).collect();
+    let mut disabled = vec![false; tracts.len()];
+    for (i, vid) in raw.variants.iter().enumerate() {
+        let Some(t) = crate::tracts::containing_tract_in(tracts, &spans[i]) else {
+            continue;
+        };
+        match tract_op(vid, &tracts[t]) {
+            // A name that is not a plain SNV/insertion/deletion is treated like
+            // a straddling variant: it keeps its own row.
+            ParsedOp::NotCollapsible => {}
+            ParsedOp::RefMismatch => {
+                if !disabled[t] {
+                    warn!(
+                        "[lineage] {} REF does not match the {} tract reference ({}); \
+                         this is not rCRS, so the tract is left uncollapsed",
+                        vid, tracts[t].name, tracts[t].ref_seq
+                    );
+                }
+                disabled[t] = true;
+            }
+            ParsedOp::Op(op) => members[t].push((i, op)),
+        }
+    }
+
+    // Per tract, the sequence each read carries over the tract.
+    let mut collapsed: Vec<Option<String>> = Vec::new();
+    let mut tract_rows: Vec<Vec<(String, Vec<Option<u8>>)>> =
+        (0..tracts.len()).map(|_| Vec::new()).collect();
+    for (t, tract) in tracts.iter().enumerate() {
+        if disabled[t] || members[t].is_empty() {
+            members[t].clear();
+            continue;
+        }
+        let (mut n_partial, mut n_conflict) = (0usize, 0usize);
+        collapsed.clear();
+        for read in 0..n_reads {
+            let mut missing = 0usize;
+            let mut ops: Vec<&TractOp> = Vec::new();
+            for (row, op) in &members[t] {
+                match raw.data[*row][read] {
+                    None => missing += 1,
+                    Some(1) => ops.push(op),
+                    _ => {}
+                }
+            }
+            if missing == members[t].len() {
+                // Uncovered everywhere in the tract; nothing new is lost.
+                collapsed.push(None);
+            } else if missing > 0 {
+                n_partial += 1;
+                collapsed.push(None);
+            } else {
+                match apply_tract_ops(tract.ref_seq, &ops) {
+                    Some(seq) => collapsed.push(Some(seq)),
+                    None => {
+                        n_conflict += 1;
+                        collapsed.push(None);
+                    }
+                }
+            }
+        }
+
+        // One row per distinct non-reference sequence, sorted by that sequence.
+        let alts: std::collections::BTreeSet<&String> = collapsed
+            .iter()
+            .flatten()
+            .filter(|s| s.as_str() != tract.ref_seq)
+            .collect();
+        tract_rows[t] = alts
+            .iter()
+            .map(|alt| {
+                let row = collapsed
+                    .iter()
+                    .map(|s| s.as_ref().map(|s| u8::from(s == *alt)))
+                    .collect();
+                (crate::tracts::tract_allele_name(tract, alt), row)
+            })
+            .collect();
+
+        // Plan 2026-09-26 T5 step 6.
+        info!(
+            "[lineage] Tract {} ({}-{}): {} row(s) collapsed into {} allele(s); \
+             {} read(s) set to missing for partial coverage, {} for conflicting calls.",
+            tract.name,
+            tract.start,
+            tract.end,
+            members[t].len(),
+            tract_rows[t].len(),
+            n_partial,
+            n_conflict
+        );
+        if n_conflict > 0 {
+            warn!(
+                "[lineage] Tract {}: {} read(s) carry calls that cannot be applied together \
+                 (overlapping deletions, two insertions at one base, or contradictory \
+                 substitutions) and were set to missing.",
+                tract.name, n_conflict
+            );
+        }
+    }
+
+    // Reassemble in input order, replacing each tract's rows with its alleles
+    // at the position of the first row that went into them.
+    let owner: HashMap<usize, usize> = members
+        .iter()
+        .enumerate()
+        .flat_map(|(t, rows)| rows.iter().map(move |(row, _)| (*row, t)))
+        .collect();
+    let mut variants = Vec::with_capacity(raw.variants.len());
+    let mut data = Vec::with_capacity(raw.data.len());
+    for (i, (vid, row)) in raw.variants.iter().zip(raw.data.iter()).enumerate() {
+        match owner.get(&i) {
+            Some(&t) => {
+                if members[t][0].0 == i {
+                    for (name, cells) in &tract_rows[t] {
+                        variants.push(name.clone());
+                        data.push(cells.clone());
+                    }
+                }
+            }
+            None => {
+                variants.push(vid.clone());
+                data.push(row.clone());
+            }
+        }
+    }
+
+    RawMatrix { variants, reads: raw.reads, data }
+}
+
+/// One edit a carried variant applies to a tract's reference sequence, in
+/// offsets from the tract start. Plan 2026-09-26 T5.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TractOp {
+    /// Replace the base at `offset`.
+    Sub { offset: usize, base: u8 },
+    /// Insert `seq` after `offset`. The anchor base itself is not edited, so a
+    /// substitution at the same offset composes with this.
+    Ins { offset: usize, seq: Vec<u8> },
+    /// Delete `len` bases starting at `offset` (the base after the anchor).
+    Del { offset: usize, len: usize },
+}
+
+/// What a variant name means for a tract.
+enum ParsedOp {
+    Op(TractOp),
+    /// Not a plain SNV, insertion or deletion — left as its own row.
+    NotCollapsible,
+    /// The REF spelled in the name is not what the tract reference has there,
+    /// so this reference is not rCRS and the tract must not be collapsed.
+    RefMismatch,
+}
+
+/// Split `m.<pos><ref>><alt>` into its three fields, requiring both alleles to
+/// be plain base strings. Positions are parsed exactly as
+/// `scite::parse_variant_span` does, so spans and operations always agree.
+fn parse_variant_name(variant: &str) -> Option<(u64, &str, &str)> {
+    let rest = variant.strip_prefix("m.")?;
+    let digits_len = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+    let pos = rest[..digits_len].parse::<u64>().ok()?;
+    let (ref_allele, alt_allele) = rest[digits_len..].split_once('>')?;
+    let bases = |a: &str| !a.is_empty() && a.bytes().all(|b| b.is_ascii_alphabetic());
+    (bases(ref_allele) && bases(alt_allele)).then_some((pos, ref_allele, alt_allele))
+}
+
+/// Turn one in-tract variant name into the edit it applies to `tract.ref_seq`.
+fn tract_op(variant: &str, tract: &crate::tracts::Tract) -> ParsedOp {
+    let Some((pos, ref_allele, alt_allele)) = parse_variant_name(variant) else {
+        return ParsedOp::NotCollapsible;
+    };
+    // `containing_tract_in` already placed the whole REF span inside the tract.
+    let offset = (pos - tract.start) as usize;
+    let (r, a) = (ref_allele.as_bytes(), alt_allele.as_bytes());
+    if !tract.ref_seq.as_bytes()[offset..offset + r.len()].eq_ignore_ascii_case(r) {
+        return ParsedOp::RefMismatch;
+    }
+
+    if r.len() == 1 && a.len() == 1 {
+        ParsedOp::Op(TractOp::Sub { offset, base: a[0].to_ascii_uppercase() })
+    } else if r.len() == 1 && a.len() > 1 && a[0].eq_ignore_ascii_case(&r[0]) {
+        ParsedOp::Op(TractOp::Ins {
+            offset,
+            seq: a[1..].to_ascii_uppercase(),
+        })
+    } else if a.len() == 1 && r.len() > 1 && r[0].eq_ignore_ascii_case(&a[0]) {
+        // The anchor is kept; the bases after it go away.
+        ParsedOp::Op(TractOp::Del { offset: offset + 1, len: r.len() - 1 })
+    } else {
+        ParsedOp::NotCollapsible
+    }
+}
+
+/// Apply every operation a read carries to `ref_seq` in one left-to-right walk,
+/// or `None` if two of them contradict each other. Plan 2026-09-26 T5.
+fn apply_tract_ops(ref_seq: &str, ops: &[&TractOp]) -> Option<String> {
+    let bases = ref_seq.as_bytes();
+    let n = bases.len();
+    let mut sub: Vec<Option<u8>> = vec![None; n];
+    let mut ins: Vec<Option<&[u8]>> = vec![None; n];
+    let mut del = vec![false; n];
+
+    for op in ops {
+        match op {
+            TractOp::Sub { offset, base } => {
+                // Two *different* substitutions at one offset contradict; the
+                // same one twice is just a duplicated row.
+                if sub[*offset].is_some_and(|b| b != *base) {
+                    return None;
+                }
+                sub[*offset] = Some(*base);
+            }
+            TractOp::Ins { offset, seq } => {
+                if ins[*offset].is_some() {
+                    return None;
+                }
+                ins[*offset] = Some(seq);
+            }
+            TractOp::Del { offset, len } => {
+                for o in *offset..(*offset + *len) {
+                    if o >= n || del[o] {
+                        return None;
+                    }
+                    del[o] = true;
+                }
+            }
+        }
+    }
+    // A deletion that swallows a substituted base is a contradiction too.
+    if (0..n).any(|o| del[o] && sub[o].is_some()) {
+        return None;
+    }
+
+    let mut out: Vec<u8> = Vec::with_capacity(n + 4);
+    for o in 0..n {
+        if !del[o] {
+            out.push(sub[o].unwrap_or(bases[o]));
+        }
+        if let Some(seq) = ins[o] {
+            out.extend_from_slice(seq);
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Names of the near-fixed (homoplasmic) variants the heteroplasmy filter drops
@@ -865,7 +1146,7 @@ pub fn start(
     let hf = match vcf_file {
         Some(path) => {
             info!("[1/6] Parsing VCF: {}", path);
-            HfFilter::FromVcf(parse_vcf(path, min_hf, max_hf)?)
+            HfFilter::FromVcf { map: parse_vcf(path, min_hf, max_hf)?, min: min_hf, max: max_hf }
         }
         None => {
             info!("[1/6] No VCF provided; HF recomputed from the matrix itself.");
@@ -880,7 +1161,17 @@ pub fn start(
         File::open(matrix_file)
             .with_context(|| format!("Cannot read matrix CSV: {matrix_file}"))?,
     )?;
-    let binary = filter_matrix(&raw, &hf, min_presence, min_absence);
+    // Plan 2026-09-26 T5: merge equivalent spellings inside the known
+    // hypervariable homopolymer tracts into one allele per distinct sequence,
+    // before anything downstream counts rows.
+    let raw = collapse_tracts(raw, crate::tracts::KNOWN_TRACTS);
+    let tract_rows: std::collections::HashSet<String> = raw
+        .variants
+        .iter()
+        .filter(|v| crate::tracts::is_tract_allele(v, crate::tracts::KNOWN_TRACTS))
+        .cloned()
+        .collect();
+    let binary = filter_matrix(&raw, &hf, min_presence, min_absence, &tract_rows);
     if binary.variants.is_empty() {
         anyhow::bail!(
             "No informative variants remain after filtering. \
@@ -992,7 +1283,11 @@ mod tests {
     /// An `HfFilter::FromVcf` holding exactly `names`, as `parse_vcf` would have
     /// produced it after applying the HF band.
     fn from_vcf(names: &[&str]) -> HfFilter {
-        HfFilter::FromVcf(names.iter().map(|n| (n.to_string(), 0.5)).collect())
+        HfFilter::FromVcf {
+            map: names.iter().map(|n| (n.to_string(), 0.5)).collect(),
+            min: 0.0,
+            max: 1.0,
+        }
     }
 
     /// Parse `csv` and filter it, i.e. what the old `parse_binary_matrix` did in
@@ -1004,7 +1299,7 @@ mod tests {
         min_absence: usize,
     ) -> BinaryMatrix {
         let raw = read_raw_matrix(Cursor::new(csv.to_string())).unwrap();
-        filter_matrix(&raw, hf, min_presence, min_absence)
+        filter_matrix(&raw, hf, min_presence, min_absence, &Default::default())
     }
 
     fn hp(id: &str, profile: Vec<Option<u8>>, count: usize) -> Haplotype {
@@ -1546,6 +1841,254 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
 /// Parity checks: the with-VCF and without-VCF variant filtering must select the
 /// same variants, so a lineage run produces identical output either way (assuming
 /// a VCF whose HF matches the matrix and which applies no extra filters).
+/// Plan 2026-09-26 T5. Every case is spelled against the real `HVS1-C` tract
+/// (rCRS 16183-16193, `ACCCCCTCCCC`), so the fixtures double as a check that
+/// the tract table lines up with the variant names `call` emits.
+#[cfg(test)]
+mod tract_collapse_tests {
+    use super::*;
+    use crate::tracts::KNOWN_TRACTS;
+    use std::collections::HashSet;
+
+    /// rCRS 16183-16193: `A` + `C5` + `T` + `C4`.
+    const HVS1: &str = "ACCCCCTCCCC";
+    /// The tract with T16189C only: a single run of 10 C's.
+    const C10: &str = "ACCCCCCCCCC";
+    /// T16189C plus one extra C, spelled either side of the interrupting T.
+    const C11: &str = "ACCCCCCCCCCC";
+
+    /// `1` = alt, `0` = ref, `.` = uncovered.
+    fn cells(spec: &str) -> Vec<Option<u8>> {
+        spec.chars()
+            .map(|c| match c {
+                '1' => Some(1),
+                '0' => Some(0),
+                '.' => None,
+                other => panic!("bad cell {other:?}"),
+            })
+            .collect()
+    }
+
+    fn raw(variants: &[&str], rows: &[&str]) -> RawMatrix {
+        let n_reads = rows[0].chars().count();
+        RawMatrix {
+            variants: variants.iter().map(|v| v.to_string()).collect(),
+            reads: (1..=n_reads).map(|i| format!("r{i}")).collect(),
+            data: rows.iter().map(|r| cells(r)).collect(),
+        }
+    }
+
+    fn hvs1(alt: &str) -> String {
+        format!("m.16183{HVS1}>{alt}")
+    }
+
+    #[test]
+    fn collapse_tracts_merges_equivalent_spellings_of_one_c_run() {
+        // Case 1. r1 carries the extra C before the interrupting T, r2 after
+        // it; both are C11 once T16189C is applied. r3/r4 are plain C10.
+        let out = collapse_tracts(
+            raw(
+                &["m.16183A>AC", "m.16189T>TC", "m.16189T>C"],
+                &["1000", "0100", "1111"],
+            ),
+            KNOWN_TRACTS,
+        );
+        assert_eq!(out.variants, vec![hvs1(C10), hvs1(C11)]);
+        assert_eq!(out.data, vec![cells("0011"), cells("1100")]);
+        assert_eq!(out.reads, vec!["r1", "r2", "r3", "r4"]);
+    }
+
+    #[test]
+    fn collapse_tracts_gives_reference_reads_zero_and_emits_no_reference_row() {
+        // Case 2. r3 carries nothing inside the tract.
+        let out = collapse_tracts(
+            raw(&["m.16183A>AC", "m.16189T>C"], &["100", "010"]),
+            KNOWN_TRACTS,
+        );
+        // r1 keeps the T and gains a C; r2 is C10. Neither equals the
+        // reference, and no row is emitted for the reference sequence.
+        assert_eq!(out.variants, vec![hvs1(C10), hvs1("ACCCCCCTCCCC")]);
+        assert_eq!(out.data, vec![cells("010"), cells("100")]);
+    }
+
+    #[test]
+    fn collapse_tracts_marks_partially_covered_reads_missing() {
+        // Case 3. r2 is uncovered on one constituent row only, r3 on both.
+        let out = collapse_tracts(
+            raw(&["m.16183A>AC", "m.16189T>C"], &["1..", "01."]),
+            KNOWN_TRACTS,
+        );
+        assert_eq!(out.variants, vec![hvs1("ACCCCCCTCCCC")]);
+        assert_eq!(out.data, vec![cells("1..")]);
+    }
+
+    #[test]
+    fn collapse_tracts_sets_conflicting_reads_missing() {
+        // Case 4, all three conflict kinds. In each fixture r1 carries both
+        // rows and r2 only the second one, which must still collapse.
+
+        // Two insertions after the same offset.
+        let out = collapse_tracts(
+            raw(&["m.16183A>ACC", "m.16183A>AC"], &["10", "11"]),
+            KNOWN_TRACTS,
+        );
+        assert_eq!(out.variants, vec![hvs1("ACCCCCCTCCCC")]);
+        assert_eq!(out.data, vec![vec![None, Some(1)]]);
+
+        // A deletion whose deleted base is also substituted.
+        let out = collapse_tracts(
+            raw(&["m.16188CT>C", "m.16189T>C"], &["10", "11"]),
+            KNOWN_TRACTS,
+        );
+        assert_eq!(out.variants, vec![hvs1(C10)]);
+        assert_eq!(out.data, vec![vec![None, Some(1)]]);
+
+        // Two different substitutions at one offset.
+        let out = collapse_tracts(
+            raw(&["m.16189T>A", "m.16189T>C"], &["10", "11"]),
+            KNOWN_TRACTS,
+        );
+        assert_eq!(out.variants, vec![hvs1(C10)]);
+        assert_eq!(out.data, vec![vec![None, Some(1)]]);
+    }
+
+    #[test]
+    fn collapse_tracts_leaves_variants_straddling_the_boundary_alone() {
+        // Case 5. `m.16193CA>C` deletes 16194, one base past the tract.
+        let out = collapse_tracts(
+            raw(&["m.16189T>C", "m.16193CA>C"], &["11", "01"]),
+            KNOWN_TRACTS,
+        );
+        assert_eq!(out.variants, vec![hvs1(C10), "m.16193CA>C".to_string()]);
+        assert_eq!(out.data, vec![cells("11"), cells("01")]);
+    }
+
+    #[test]
+    fn collapse_tracts_leaves_non_indel_non_snv_names_alone() {
+        // Case 5, second half of the rule: an MNV is not collapsible, so it
+        // stays its own row while the rest of the tract still collapses.
+        let out = collapse_tracts(
+            raw(&["m.16188CT>GA", "m.16189T>C"], &["10", "11"]),
+            KNOWN_TRACTS,
+        );
+        assert_eq!(out.variants, vec!["m.16188CT>GA".to_string(), hvs1(C10)]);
+        assert_eq!(out.data, vec![cells("10"), cells("11")]);
+    }
+
+    #[test]
+    fn collapse_tracts_skips_a_tract_whose_reference_does_not_match() {
+        // Case 6. rCRS has C at 16185, so `m.16185G>A` says this is not rCRS;
+        // the whole tract passes through untouched.
+        let input = raw(&["m.16185G>A", "m.16189T>C"], &["10", "11"]);
+        let expected = input.clone();
+        assert_eq!(collapse_tracts(input, KNOWN_TRACTS), expected);
+    }
+
+    #[test]
+    fn collapse_tracts_keeps_other_rows_in_place() {
+        // Case 7. Tract rows land where the first constituent row was.
+        let out = collapse_tracts(
+            raw(
+                &["m.100A>G", "m.16189T>C", "m.200C>T", "m.16183A>AC", "m.300G>A"],
+                &["10", "11", "01", "10", "11"],
+            ),
+            KNOWN_TRACTS,
+        );
+        assert_eq!(
+            out.variants,
+            vec![
+                "m.100A>G".to_string(),
+                hvs1(C10),
+                hvs1(C11),
+                "m.200C>T".to_string(),
+                "m.300G>A".to_string(),
+            ]
+        );
+        assert_eq!(
+            out.data,
+            vec![cells("10"), cells("01"), cells("10"), cells("01"), cells("11")]
+        );
+    }
+
+    /// The rows `lineage::start` feeds the filter: three tract calls plus one
+    /// ordinary variant.
+    fn collapsed_fixture() -> (RawMatrix, HashSet<String>) {
+        let csv = "variant,r1,r2,r3,r4\n\
+                   m.16183A>AC,1,0,0,0\n\
+                   m.16189T>TC,0,1,0,0\n\
+                   m.16189T>C,1,1,1,1\n\
+                   m.3243A>G,1,1,0,0\n";
+        let raw = collapse_tracts(
+            read_raw_matrix(std::io::Cursor::new(csv)).unwrap(),
+            KNOWN_TRACTS,
+        );
+        let tract_rows = raw
+            .variants
+            .iter()
+            .filter(|v| crate::tracts::is_tract_allele(v, KNOWN_TRACTS))
+            .cloned()
+            .collect();
+        (raw, tract_rows)
+    }
+
+    #[test]
+    fn tract_rows_are_judged_on_matrix_frequency_on_the_vcf_path() {
+        // Step 5. The VCF knows `m.3243A>G` and nothing about the tract
+        // alleles, which are synthesised from three of its records.
+        let (raw, tract_rows) = collapsed_fixture();
+        assert_eq!(tract_rows.len(), 2);
+        let mut map = HfMap::new();
+        map.insert("m.3243A>G".to_string(), 0.5);
+
+        let kept = filter_matrix(
+            &raw,
+            &HfFilter::FromVcf { map: map.clone(), min: 0.2, max: 0.95 },
+            1,
+            1,
+            &tract_rows,
+        );
+        assert_eq!(
+            kept.variants,
+            vec![hvs1(C10), hvs1(C11), "m.3243A>G".to_string()]
+        );
+
+        // Both tract alleles sit at 2/4 = 0.50, so a ceiling below that drops
+        // them while the VCF-listed variant is untouched by the band.
+        let kept = filter_matrix(
+            &raw,
+            &HfFilter::FromVcf { map, min: 0.2, max: 0.4 },
+            1,
+            1,
+            &tract_rows,
+        );
+        assert_eq!(kept.variants, vec!["m.3243A>G".to_string()]);
+    }
+
+    #[test]
+    fn tract_rows_are_judged_on_matrix_frequency_on_the_no_vcf_path_too() {
+        let (raw, tract_rows) = collapsed_fixture();
+        let kept = filter_matrix(
+            &raw,
+            &HfFilter::FromMatrix { min: 0.2, max: 0.95 },
+            1,
+            1,
+            &tract_rows,
+        );
+        assert_eq!(
+            kept.variants,
+            vec![hvs1(C10), hvs1(C11), "m.3243A>G".to_string()]
+        );
+        let kept = filter_matrix(
+            &raw,
+            &HfFilter::FromMatrix { min: 0.2, max: 0.4 },
+            1,
+            1,
+            &tract_rows,
+        );
+        assert!(kept.variants.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod vcf_parity_tests {
     use super::*;
@@ -1574,7 +2117,7 @@ mod vcf_parity_tests {
         min_absence: usize,
     ) -> BinaryMatrix {
         let raw = read_raw_matrix(Cursor::new(csv.to_string())).unwrap();
-        filter_matrix(&raw, hf, min_presence, min_absence)
+        filter_matrix(&raw, hf, min_presence, min_absence, &Default::default())
     }
 
     #[test]
@@ -1605,7 +2148,7 @@ mod vcf_parity_tests {
 
         let with_vcf = filter_from_csv(
             &csv,
-            &HfFilter::FromVcf(with_vcf_hf),
+            &HfFilter::FromVcf { map: with_vcf_hf, min: min_hf, max: max_hf },
             min_presence,
             min_absence,
         );
@@ -1652,7 +2195,12 @@ mod vcf_parity_tests {
         // for, and admitting variants the VCF had excluded. `FromVcf` says
         // which mode is in play independently of how many entries it holds.
         let csv = build_csv(&[("m.100A>G", ["1", "1", "1", "0", "0", "0", "", "", "", ""])]);
-        let kept = filter_from_csv(&csv, &HfFilter::FromVcf(HfMap::new()), 1, 1);
+        let kept = filter_from_csv(
+            &csv,
+            &HfFilter::FromVcf { map: HfMap::new(), min: 0.2, max: 0.85 },
+            1,
+            1,
+        );
         assert!(
             kept.variants.is_empty(),
             "an empty VCF map must keep nothing, got {:?}",

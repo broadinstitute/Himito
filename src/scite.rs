@@ -3533,7 +3533,11 @@ mod tests {
                  to an existing file. See this test's doc comment."
             );
         }
-        let hf = lineage::HfFilter::FromVcf(lineage::parse_vcf(&vcf, 0.01, 0.95).unwrap());
+        let hf = lineage::HfFilter::FromVcf {
+            map: lineage::parse_vcf(&vcf, 0.01, 0.95).unwrap(),
+            min: 0.01,
+            max: 0.95,
+        };
         let binary = lineage::load_and_filter_matrix(&mat, &hf, 2, 1).unwrap();
         let n = binary.variants.len();
         let root = n;

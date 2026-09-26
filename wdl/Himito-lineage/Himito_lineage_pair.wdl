@@ -326,6 +326,7 @@ task Himito_lineage {
         Float min_hf
         Float max_hf
         String? extra_args
+        Boolean collapse_hp = false
 
         RuntimeAttr? runtime_attr_override
     }
@@ -338,6 +339,7 @@ task Himito_lineage {
                                               --max-hf ~{max_hf} \
                                               -d "pacbio" \
                                               -o ~{prefix}.pb \
+                                              ~{true="--collapse-hp" false="" collapse_hp} \
                                               ~{extra_args}
 
         /Himito/target/release/Himito lineage -m ~{ont_matrix} \
@@ -346,6 +348,7 @@ task Himito_lineage {
                                         --max-hf ~{max_hf} \
                                         -d "ont-denoised" \
                                         -o ~{prefix}.ont \
+                                        ~{true="--collapse-hp" false="" collapse_hp} \
                                         ~{extra_args}
 
     >>>  

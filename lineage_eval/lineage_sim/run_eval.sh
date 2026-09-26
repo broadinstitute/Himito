@@ -48,6 +48,8 @@ INTERNAL_KEEP=""
 # splits mass between siblings, so the minimum clone frequency is higher than a
 # random tree of the same --n-mutations. Empty = simulator default (random).
 TOPOLOGY=""
+# Plan 2026-09-26 T9. Off unless passed; forwarded to run_himito.sh's lineage step.
+COLLAPSE_HP=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -66,11 +68,12 @@ while [[ $# -gt 0 ]]; do
     --internal-keep) INTERNAL_KEEP="$2"; shift 2;;
     --topology) TOPOLOGY="$2"; shift 2;;
     --ref) export REF="$2"; shift 2;;
+    --collapse-hp) COLLAPSE_HP=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA]" >&2
+  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp]" >&2
   exit 1
 }
 # Resolve in simulate_reads.sh; export a sane default here for visibility.
@@ -104,6 +107,7 @@ HIMITO_ARGS=(
 [[ -n "$FN" ]] && HIMITO_ARGS+=(--fn "$FN")
 [[ -n "$FREQ_THRESHOLD" ]] && HIMITO_ARGS+=(--frequency-threshold "$FREQ_THRESHOLD")
 [[ -n "$DENOISE_VAF" ]] && HIMITO_ARGS+=(--denoise-vaf "$DENOISE_VAF")
+[[ "$COLLAPSE_HP" == 1 ]] && HIMITO_ARGS+=(--collapse-hp)
 "$HERE/run_himito.sh" "${HIMITO_ARGS[@]}"
 read -r DEFAULT_FP DEFAULT_FN < <(resolve_scite_rates "$PROFILE")
 python "$HERE/score_lineage.py" \

@@ -288,6 +288,7 @@ task Himito_lineage {
         Float max_hf
         String data_type = "pacbio"
         String? extra_args
+        Boolean collapse_hp = false
 
         RuntimeAttr? runtime_attr_override
     }
@@ -300,6 +301,7 @@ task Himito_lineage {
                                               --max-hf ~{max_hf} \
                                               -d ~{data_type} \
                                               -o ~{prefix}.pb \
+                                              ~{true="--collapse-hp" false="" collapse_hp} \
                                               ~{extra_args}
 
     >>>  

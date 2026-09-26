@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use bio::io::fasta;
 use log::{info, warn};
 use rust_htslib::bam::{self, Read, Reader};
+use rust_htslib::bam::ext::BamRecordExtensions;
 use rust_htslib::bam::record::CigarString;
 
 use crate::denoise_indel::{rewrite_read, strip_stale_tags};
@@ -306,6 +307,12 @@ pub struct DenoiseStats {
     /// either (see FIX 2). Depth already excludes both cases, so this only tracks
     /// the ALT side.
     pub indel_events_out_of_span: u64,
+    /// Review 2026-09-25 T3: votes dropped in pass 1 because the read ENDS (or
+    /// soft-clips) inside the homopolymer/repeat tract at the site, so it cannot
+    /// testify to the tract's length at all. Depth applies the identical gate, so
+    /// this only tracks the ALT side -- as with `indel_events_out_of_span`, the
+    /// two must move together or `alt_total <= depth` breaks.
+    pub indel_events_not_spanning_repeat: u64,
     /// Votes dropped in pass 1 because the SAME read already cast an ALT vote at
     /// this normalized site via a different one of its own events (see FIX 1 in
     /// the task-8 review round) -- e.g. an insertion and a nearby deletion that
@@ -412,6 +419,18 @@ fn compute_corrections(
         // travels too so a read carrying two of its OWN events that normalize to
         // the same site casts at most one vote there (see FIX 1).
         let mut col_events: Vec<(Vec<u8>, indel::Allele, bool, i64, CigarString)> = Vec::new();
+        // Review 2026-09-25 T3: the exclusive reference end a read must reach to be
+        // allowed to speak at this column at all -- the whole homopolymer/repeat tract
+        // starting right after it, PLUS one right-hand anchoring base. A read that ends
+        // (or soft-clips) inside the tract cannot show the run's length: it is evidence
+        // for neither the reference length nor any indel of it, so counting it as a
+        // plain REF observation only dilutes every real alt's VAF. Depends solely on
+        // the reference and this column, so it is hoisted out of the alignment loop.
+        let tract_need_end = if iopts.enabled {
+            indel::hp_tract_end(refseq, refpos as u32) as i64 + 1
+        } else {
+            0
+        };
 
         for a in col.alignments() {
             let rec = a.record();
@@ -421,8 +440,14 @@ fn compute_corrections(
 
             if iopts.enabled && !a.is_refskip() {
                 if let Some(q) = a.qpos() {
-                    col_depth += 1;
-                    if rec.is_reverse() { col_rev += 1 } else { col_fwd += 1 }
+                    // Review 2026-09-25 T3: `reference_end` is exclusive. Depth and the
+                    // ALT vote below MUST use this identical gate -- gating only one of
+                    // the two would let `alt_total` exceed `depth` at this column.
+                    let spans_tract = rec.reference_end() >= tract_need_end;
+                    if spans_tract {
+                        col_depth += 1;
+                        if rec.is_reverse() { col_rev += 1 } else { col_fwd += 1 }
+                    }
                     // Decide the event's allele first, WITHOUT touching the CIGAR;
                     // `rec.cigar()` re-parses and allocates the whole CIGAR from raw
                     // bytes on every call, so it must be hoisted to a single call
@@ -443,14 +468,18 @@ fn compute_corrections(
                         _ => None,
                     };
                     if let Some(allele) = ev_allele {
-                        col_events.push((
-                            rec.qname().to_vec(),
-                            allele,
-                            rec.is_reverse(),
-                            rec.pos(),
-                            rec.cigar().take(),
-                        ));
                         stats.indel_events_examined += 1;
+                        if spans_tract {
+                            col_events.push((
+                                rec.qname().to_vec(),
+                                allele,
+                                rec.is_reverse(),
+                                rec.pos(),
+                                rec.cigar().take(),
+                            ));
+                        } else {
+                            stats.indel_events_not_spanning_repeat += 1;
+                        }
                     }
                 }
             }
@@ -743,7 +772,15 @@ fn apply_corrections(
                                     // rewrite walk needs plain match context flanking whichever
                                     // coordinate it will actually touch.
                                     let far = (anchor as i64).max(s);
-                                    if s - flank < rstart || far + reach > rend {
+                                    // Review 2026-09-25 T3: `flank + max_len` past the
+                                    // site is not enough in a run LONGER than that: the
+                                    // read could be rewritten on the strength of a
+                                    // homopolymer whose length it never actually saw.
+                                    // Require the whole tract plus the usual flank of
+                                    // match context beyond it.
+                                    let tract_need =
+                                        indel::hp_tract_end(refseq, s as u32) as i64 + flank;
+                                    if s - flank < rstart || (far + reach).max(tract_need) > rend {
                                         stats.assignments_skipped_span_guard += 1;
                                         continue;
                                     }
@@ -1636,6 +1673,77 @@ mod tests {
     }
 
     #[test]
+    fn site_depth_excludes_reads_that_end_inside_the_homopolymer() {
+        // Review 2026-09-25 T3: a read that ends INSIDE the A-run (8..=15) cannot
+        // testify to the run's length -- it is evidence for neither the reference
+        // length nor any indel of it -- yet pass 1 used to count it as a plain REF
+        // observation, diluting every real alt's VAF. Here 11 such reads are added
+        // to the same 9-carrier + `rdrop` fixture as
+        // `site_depth_counts_each_spanning_read_exactly_once`; the insertion's
+        // frequency at site 7 must stay 0.9. Before the fix it fell to 0.476, which
+        // in this 8bp context is below `vaf_floor(8)` (~0.513) -- so the real
+        // insertion was not merely diluted, it lost candidacy and was annihilated.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_depth_short");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in NAMES.iter().enumerate() {
+            reads.push((n, 0, HP_INS_SEQ, hp_ins_cigar(), i % 2 == 0));
+        }
+        reads.push(("rdrop", 0, CLEAN_SEQ, clean_cigar(), false));
+        // Reference end 13: five bases into the run, so the run's true length is
+        // invisible to these reads. Strands balanced so they cannot perturb the
+        // strand-bias test either way.
+        const SHORT: [&str; 10] = ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9"];
+        for (i, n) in SHORT.iter().enumerate() {
+            reads.push((n, 0, &CLEAN_SEQ[..13], vec![Cigar::Match(13)], i % 2 == 0));
+        }
+        // One non-spanning read that also CARRIES an extra A (13M 1I 1M, reference
+        // end 14): its ALT vote must be dropped by the same gate that drops its
+        // depth, and that drop must be booked in the new counter.
+        let sins_seq: Vec<u8> = {
+            let mut s = CLEAN_SEQ[..13].to_vec();
+            s.push(b'A');
+            s.push(CLEAN_SEQ[13]);
+            s
+        };
+        reads.push((
+            "sins",
+            0,
+            sins_seq.as_slice(),
+            vec![Cigar::Match(13), Cigar::Ins(1), Cigar::Match(1)],
+            true,
+        ));
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let (_corr, models, stats) =
+            compute_corrections(&bam, &indel_refs(), 2, 0.01, SB_P, HOM_VAF, &indels_on()).unwrap();
+
+        let list = models.get(&b"chrM".to_vec()).expect("chrM must have sites");
+        let (_, model) = list.iter().find(|(p, _)| *p == 7).expect("site at 7");
+        let ins = indel::Allele::Ins(b"A".to_vec());
+        let f_ins = model
+            .kept
+            .iter()
+            .find(|(a, _)| *a == ins)
+            .unwrap_or_else(|| {
+                panic!("insertion must survive candidacy; diluted model = {model:?}")
+            })
+            .1;
+        assert!(
+            (f_ins - 0.9).abs() < 1e-9,
+            "insertion frequency should be 0.9 (only the 10 run-spanning reads count), \
+             got {f_ins} -- reads ending inside the run were counted as REF"
+        );
+        assert_eq!(model.context_len, 8, "site 7 sits in an 8bp homopolymer run");
+        assert_eq!(
+            stats.indel_events_not_spanning_repeat, 1,
+            "`sins`'s vote is the one event dropped for not spanning the run"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn models_are_sorted_by_position_within_each_contig() {
         // The record walk binary-searches this list; unsorted input silently drops
         // sites from every read's span.
@@ -2159,6 +2267,113 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // Review 2026-09-25 T3: hand-built decided site shared by the two siblings
+    // below. Site 7 sits before REF29's 8bp A-run; Ins("A") dominates 90/10 over
+    // Ref, and `obs_vaf(Ref) = 0.1` is below `protect_vaf`, so MAP assignment
+    // genuinely wants to move a Ref-observing read onto the insertion. Whether it
+    // may is then decided purely by the span guard.
+    fn hp_ins_site_model() -> indel::IndelSiteModel {
+        indel::IndelSiteModel {
+            kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
+            eps: 0.15,
+            context_len: 8,
+            strand_biased: 0,
+            obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
+            strand_rejected: vec![],
+        }
+    }
+
+    #[test]
+    fn gained_insertion_is_rejected_when_the_read_stops_short_of_the_run_plus_flank() {
+        // Review 2026-09-25 T3: `rshort` ends at reference 18 -- only 2 bases past
+        // the A-run (8..=15). The OLD guard asked only for `flank + max_len` past
+        // the site (7 + 10 = 17 <= 18), so this read was rewritten on the strength
+        // of a run it barely saw the end of and has no flank beyond. The tract
+        // bound requires the whole run plus the usual 5bp of match context
+        // (16 + 5 = 21 > 18), so it must now be skipped.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_short_of_tract");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        let seq = &CLEAN_SEQ[..18];
+        let cigar = vec![Cigar::Match(18)];
+        write_cigar_bam(&inb, "chrM", 29, &[("rshort", 0, seq, cigar.clone(), false)]);
+
+        let mut models = IndelModels::new();
+        models.entry(b"chrM".to_vec()).or_default().push((7u32, hp_ins_site_model()));
+
+        let corr: Corrections = HashMap::new();
+        let mut stats = DenoiseStats::default();
+        apply_corrections(
+            &inb, &outb, &corr, &indel_refs(), &models, &indels_on(), &mut stats,
+        )
+        .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
+        assert_eq!(proc, 1);
+        assert_eq!(
+            modified, 0,
+            "the read must not be rewritten -- it does not span the run plus flank"
+        );
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let rec = r.records().next().unwrap().unwrap();
+        assert_eq!(rec.seq().as_bytes(), seq, "SEQ must be untouched");
+        assert_eq!(rec.cigar().take(), CigarString(cigar), "CIGAR must be untouched");
+        assert_eq!(
+            stats.reads_reassigned_ref_to_ins, 0,
+            "no reassignment must be counted for a rejected edit"
+        );
+        assert!(
+            stats.assignments_skipped_span_guard >= 1,
+            "the short-of-the-tract rejection must be counted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gained_insertion_is_applied_when_the_read_spans_the_run_plus_flank() {
+        // Review 2026-09-25 T3: positive control for the sibling above -- the tract
+        // bound must block reads that stop short, not every read. `rspan` ends at
+        // reference 22 >= 16 + 5, so the SAME decided site still rewrites it.
+        // It needs its own `apply_corrections` call: put both reads in one BAM and
+        // `reads_modified` is nonzero, so the sibling's assertion could not hold.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_spans_tract");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+
+        let seq = &CLEAN_SEQ[..22];
+        let cigar = vec![Cigar::Match(22)];
+        write_cigar_bam(&inb, "chrM", 29, &[("rspan", 0, seq, cigar.clone(), false)]);
+
+        let mut models = IndelModels::new();
+        models.entry(b"chrM".to_vec()).or_default().push((7u32, hp_ins_site_model()));
+
+        let corr: Corrections = HashMap::new();
+        let mut stats = DenoiseStats::default();
+        apply_corrections(
+            &inb, &outb, &corr, &indel_refs(), &models, &indels_on(), &mut stats,
+        )
+        .unwrap();
+        let (proc, modified) = (stats.reads_processed, stats.reads_modified);
+        assert_eq!(proc, 1);
+        assert_eq!(modified, 1, "a read spanning the run plus flank must still be corrected");
+        assert_eq!(
+            stats.reads_reassigned_ref_to_ins, 1,
+            "the gained insertion must be booked once"
+        );
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let rec = r.records().next().unwrap().unwrap();
+        assert_eq!(
+            rec.seq().as_bytes().len(),
+            seq.len() + 1,
+            "one base must be inserted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn gained_deletion_needing_exactly_the_old_bound_is_now_rejected() {
         // FIX 4: the match-run bound for a gained Del(m) must be `m + flank + 1`
@@ -2300,8 +2515,18 @@ mod tests {
         let cigar = vec![Cigar::Match(30)];
         write_cigar_bam(&inb, "chrM", 40, &[("rboth", 0, seq.as_slice(), cigar.clone(), false)]);
 
+        // Review 2026-09-25 T3: this fixture used a uniform 40bp `A` reference, which
+        // is one 40bp homopolymer -- and `rboth` ends at 30, INSIDE it. The tract span
+        // guard now (correctly) refuses to rewrite a read that cannot see the end of
+        // the run it would be edited in, which would make this fixture unreachable
+        // rather than testing FIX 6. A repeating ACGT reference keeps every run 1bp
+        // long, so the tract bound is satisfied and the swallowed-site behavior under
+        // test is exercised exactly as before. (`rboth`'s SEQ deliberately stays all
+        // `A`: the rewrite walk is driven by the CIGAR, not base identity, same as the
+        // sibling fixture above.)
+        let refseq: Vec<u8> = (0..40).map(|i| b"ACGT"[i % 4]).collect();
         let mut refs = HashMap::new();
-        refs.insert(b"chrM".to_vec(), vec![b'A'; 40]);
+        refs.insert(b"chrM".to_vec(), refseq);
 
         // Site 5: Ref -> Del(3) dominates 90/10.
         let del_model = indel::IndelSiteModel {

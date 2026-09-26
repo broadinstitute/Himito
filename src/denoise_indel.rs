@@ -198,6 +198,33 @@ pub fn repeat_context(refseq: &[u8], norm_pos: u32, allele: &Allele) -> u32 {
     copies.max(1)
 }
 
+/// Review 2026-09-25 T3: exclusive reference end of the homopolymer run that starts
+/// right after `anchor` (i.e. at `anchor + 1`). Returns `anchor + 1` when there is no
+/// run, i.e. when that base does not repeat.
+///
+/// A read can only testify to a run's LENGTH if it covers the whole run: one that ends
+/// (or soft-clips) inside it looks like a shorter run, so it is evidence for neither
+/// the reference length nor any indel of it. Both denoiser passes use this to bound
+/// which reads may speak at a site.
+pub fn hp_tract_end(refseq: &[u8], anchor: u32) -> u32 {
+    let start = anchor as usize + 1;
+    let base = match refseq.get(start) {
+        Some(&b) => b,
+        None => return start as u32,
+    };
+    let mut p = start + 1;
+    while refseq.get(p) == Some(&base) {
+        p += 1;
+    }
+    // A lone base is not a run: fall back to `anchor + 1` so unique sequence imposes
+    // no extra span requirement beyond the event position itself.
+    if p - start >= 2 {
+        p as u32
+    } else {
+        start as u32
+    }
+}
+
 /// Per-junction indel error probability, growing with repeat context and capped.
 /// This is the likelihood term that base quality supplies for substitutions and that
 /// indels have no equivalent for: without it, MAP assignment degenerates to
@@ -717,6 +744,26 @@ mod indel_tests {
         // HP_REF = C AAAAAAA G -> a 1bp A event normalized to anchor 0 sits in a 7-run.
         assert_eq!(repeat_context(HP_REF, 0, &Allele::Del(1)), 7);
         assert_eq!(repeat_context(HP_REF, 0, &Allele::Ins(b"A".to_vec())), 7);
+    }
+
+    // Review 2026-09-25 T3: uses `REF29` (declared with the read_events tests
+    // below) -- the same reference the denoise wiring tests use, so the tract
+    // bound asserted here is the one those fixtures exercise end to end.
+    #[test]
+    fn hp_tract_end_spans_the_whole_run() {
+        // Anchor 7 is the base before the A-run; the run is 8..=15, so its
+        // exclusive end is 16.
+        assert_eq!(hp_tract_end(REF29, 7), 16);
+        // From inside the run the remaining tract still ends at 16.
+        assert_eq!(hp_tract_end(REF29, 11), 16);
+    }
+
+    #[test]
+    fn hp_tract_end_is_anchor_plus_one_without_a_run() {
+        // refseq[21] == 'G', refseq[22] == 'T': a lone base, not a run.
+        assert_eq!(hp_tract_end(REF29, 20), 21);
+        // Past the contig end there is nothing to span either.
+        assert_eq!(hp_tract_end(REF29, 28), 29);
     }
 
     #[test]

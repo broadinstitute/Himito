@@ -1139,6 +1139,7 @@ pub fn start(
     fp_rate: f64,
     fn_rate: f64,
     hp_rates: (f64, f64),
+    tracts: &[crate::tracts::Tract],
     mcmc_iterations: usize,
     mcmc_chains: usize,
     mcmc_seed: u64,
@@ -1176,14 +1177,19 @@ pub fn start(
         File::open(matrix_file)
             .with_context(|| format!("Cannot read matrix CSV: {matrix_file}"))?,
     )?;
-    // Plan 2026-09-26 T5: merge equivalent spellings inside the known
-    // hypervariable homopolymer tracts into one allele per distinct sequence,
-    // before anything downstream counts rows.
-    let raw = collapse_tracts(raw, crate::tracts::KNOWN_TRACTS);
+    // Plan 2026-09-26 T9: collapse is opt-in. An empty slice is the identity
+    // and leaves `tract_rows` empty, so the VCF path drops tract-looking names
+    // that are not in the map, as it did before T5.
+    if tracts.is_empty() {
+        info!("[lineage] HP tract collapse: off (pass --collapse-hp to enable)");
+    } else {
+        info!("[lineage] HP tract collapse: on ({} tracts)", tracts.len());
+    }
+    let raw = collapse_tracts(raw, tracts);
     let tract_rows: std::collections::HashSet<String> = raw
         .variants
         .iter()
-        .filter(|v| crate::tracts::is_tract_allele(v, crate::tracts::KNOWN_TRACTS))
+        .filter(|v| crate::tracts::is_tract_allele(v, tracts))
         .cloned()
         .collect();
     let binary = filter_matrix(&raw, &hf, min_presence, min_absence, &tract_rows);
@@ -1811,7 +1817,12 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
         (matrix_path.to_str().unwrap().to_string(), prefix)
     }
 
-    fn run_small_lineage(matrix: &str, prefix: &str, debug: bool) {
+    fn run_small_lineage(
+        matrix: &str,
+        prefix: &str,
+        debug: bool,
+        tracts: &[crate::tracts::Tract],
+    ) {
         start(
             matrix,
             None,
@@ -1823,6 +1834,7 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
             0.01,
             0.1,
             (0.01, 0.1),
+            tracts,
             20,
             1,
             7,
@@ -1837,7 +1849,7 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
     fn debug_false_omits_raw_files_and_cleaned_matrix() {
         // Plan 2026-09-26 T3.
         let (matrix, prefix) = prepare_debug_output_prefix("himito_t3_debug_off");
-        run_small_lineage(&matrix, &prefix, false);
+        run_small_lineage(&matrix, &prefix, false, &[]);
         for suffix in [
             ".cleaned_matrix.csv",
             ".raw_haplotype_map.tsv",
@@ -1855,7 +1867,7 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
     fn debug_true_writes_both_raw_files() {
         // Plan 2026-09-26 T3.
         let (matrix, prefix) = prepare_debug_output_prefix("himito_t3_debug_on");
-        run_small_lineage(&matrix, &prefix, true);
+        run_small_lineage(&matrix, &prefix, true, &[]);
         for suffix in [".raw_haplotype_map.tsv", ".raw_variant_cooccurrence.tsv"] {
             let path = format!("{prefix}{suffix}");
             assert!(
@@ -1863,6 +1875,131 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
                 "{path} must be written when debug is true"
             );
         }
+    }
+
+    /// Two HVS1-C rows plus one variant outside every tract. Both tract rows
+    /// are present in one read and absent in the other three (HF 0.25), so
+    /// they clear `min_presence`/`min_absence` and the default HF band.
+    fn write_hvs1_opt_in_matrix(dir_name: &str) -> (String, String) {
+        let dir = std::env::temp_dir().join(dir_name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let matrix_path = dir.join("matrix.csv");
+        std::fs::write(
+            &matrix_path,
+            "variant,r1,r2,r3,r4\n\
+             m.16183A>AC,1,0,0,0\n\
+             m.16189T>TC,0,1,0,0\n\
+             m.100A>G,1,1,0,0\n",
+        )
+        .unwrap();
+        let prefix = dir.join("out").to_str().unwrap().to_string();
+        std::fs::remove_file(format!("{prefix}.cleaned_matrix_all_variants.csv")).ok();
+        (matrix_path.to_str().unwrap().to_string(), prefix)
+    }
+
+    fn cleaned_names(prefix: &str) -> String {
+        std::fs::read_to_string(format!("{prefix}.cleaned_matrix_all_variants.csv")).unwrap()
+    }
+
+    #[test]
+    fn empty_tracts_keep_hvs1_names_and_known_tracts_collapse_them() {
+        // Plan 2026-09-26 T9.
+        let (matrix, off) = write_hvs1_opt_in_matrix("himito_t9_collapse_off");
+        run_small_lineage(&matrix, &off, false, &[]);
+        let off_csv = cleaned_names(&off);
+        assert!(
+            off_csv.contains("m.16183A>AC"),
+            "empty tracts must keep m.16183A>AC, got {off_csv}"
+        );
+        assert!(
+            off_csv.contains("m.16189T>TC"),
+            "empty tracts must keep m.16189T>TC, got {off_csv}"
+        );
+        assert!(
+            !off_csv.contains("m.16183ACCCCCTCCCC>"),
+            "empty tracts must not emit a tract allele, got {off_csv}"
+        );
+
+        let (matrix, on) = write_hvs1_opt_in_matrix("himito_t9_collapse_on");
+        run_small_lineage(&matrix, &on, false, crate::tracts::KNOWN_TRACTS);
+        let on_csv = cleaned_names(&on);
+        assert!(
+            !on_csv.contains("m.16183A>AC"),
+            "KNOWN_TRACTS must drop the constituent name m.16183A>AC, got {on_csv}"
+        );
+        assert!(
+            !on_csv.contains("m.16189T>TC"),
+            "KNOWN_TRACTS must drop the constituent name m.16189T>TC, got {on_csv}"
+        );
+        assert!(
+            on_csv.contains("m.16183ACCCCCTCCCC>"),
+            "KNOWN_TRACTS must emit an HVS1-C tract allele, got {on_csv}"
+        );
+    }
+
+    #[test]
+    fn empty_tracts_drop_a_tract_looking_row_absent_from_the_vcf() {
+        // Plan 2026-09-26 T9. With no tracts, `tract_rows` is empty, so
+        // `HfFilter::FromVcf` drops a name that is not in the VCF map — the
+        // pre-T5 behaviour — rather than judging it on the matrix band.
+        let dir = std::env::temp_dir().join("himito_t9_vcf_empty_tracts");
+        std::fs::create_dir_all(&dir).unwrap();
+        let matrix_path = dir.join("matrix.csv");
+        std::fs::write(
+            &matrix_path,
+            "variant,r1,r2,r3,r4\n\
+             m.16183A>AC,1,0,0,0\n\
+             m.100A>G,1,1,0,0\n",
+        )
+        .unwrap();
+        let vcf_path = dir.join("sample.vcf");
+        std::fs::write(
+            &vcf_path,
+            "\
+##fileformat=VCFv4.2
+##contig=<ID=chrM,length=16569>
+##HimitoNormalization=left-aligned
+##FORMAT=<ID=HF,Number=A,Type=Float,Description=\"Heteroplasmic fraction\">
+#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1
+chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.5
+",
+        )
+        .unwrap();
+        let prefix = dir.join("out").to_str().unwrap().to_string();
+        std::fs::remove_file(format!("{prefix}.cleaned_matrix_all_variants.csv")).ok();
+        start(
+            matrix_path.to_str().unwrap(),
+            Some(vcf_path.to_str().unwrap()),
+            0.01,
+            0.95,
+            1,
+            1,
+            1,
+            0.01,
+            0.1,
+            (0.01, 0.1),
+            &[],
+            20,
+            1,
+            7,
+            None,
+            false,
+            &prefix,
+        )
+        .unwrap();
+        let csv = cleaned_names(&prefix);
+        assert!(
+            csv.contains("m.100A>G"),
+            "the VCF-listed variant must be kept, got {csv}"
+        );
+        assert!(
+            !csv.contains("m.16183A>AC"),
+            "a tract-looking row absent from the VCF must be dropped, got {csv}"
+        );
+        assert!(
+            !csv.contains("m.16183ACCCCCTCCCC>"),
+            "empty tracts must not rename the dropped row, got {csv}"
+        );
     }
 }
 
@@ -1924,6 +2061,20 @@ mod tract_collapse_tests {
         assert_eq!(out.variants, vec![hvs1(C10), hvs1(C11)]);
         assert_eq!(out.data, vec![cells("0011"), cells("1100")]);
         assert_eq!(out.reads, vec!["r1", "r2", "r3", "r4"]);
+    }
+
+    #[test]
+    fn collapse_tracts_empty_slice_returns_the_input_unchanged() {
+        // Plan 2026-09-26 T9. The T5 case-1 fixture, with no tracts to collapse.
+        let input = raw(
+            &["m.16183A>AC", "m.16189T>TC", "m.16189T>C"],
+            &["1000", "0100", "1111"],
+        );
+        let expected = input.clone();
+        let out = collapse_tracts(input, &[]);
+        assert_eq!(out.variants, expected.variants);
+        assert_eq!(out.reads, expected.reads);
+        assert_eq!(out.data, expected.data);
     }
 
     #[test]

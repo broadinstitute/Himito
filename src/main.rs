@@ -611,6 +611,13 @@ enum Commands {
         #[clap(long, value_parser)]
         hp_fn_rate: Option<f64>,
 
+        /// merge equivalent spellings inside known hypervariable rCRS homopolymer
+        /// tracts (D310 302-315, HVS1-C 16183-16193, CA514 513-525) into one
+        /// sequence-level allele per distinct tract sequence (e.g. a T16189C C10 run).
+        /// Renames those variants to `m.<start><tract_ref>><tract_alt>`. Off by default.
+        #[clap(long, action)]
+        collapse_hp: bool,
+
         /// number of MCMC iterations per chain
         #[clap(long, value_parser, default_value_t = 5000)]
         mcmc_iterations: usize,
@@ -1036,6 +1043,7 @@ fn main() {
             fn_rate,
             hp_fp_rate,
             hp_fn_rate,
+            collapse_hp,
             mcmc_iterations,
             mcmc_chains,
             no_root_block,
@@ -1054,6 +1062,12 @@ fn main() {
                 lineage::resolve_error_rates(&data_type, fp_rate, fn_rate);
             // Plan 2026-09-26 T6. Factor 2 is a placeholder until the T7 sweep.
             let hp_rates = lineage::resolve_hp_rates(fp_rate, fn_rate, hp_fp_rate, hp_fn_rate);
+            // Plan 2026-09-26 T9. Empty slice: collapse is the identity.
+            let tracts = if collapse_hp {
+                crate::tracts::KNOWN_TRACTS
+            } else {
+                &[]
+            };
             let root_block = if no_root_block {
                 None
             } else {
@@ -1084,6 +1098,7 @@ fn main() {
                 fp_rate,
                 fn_rate,
                 hp_rates,
+                tracts,
                 mcmc_iterations,
                 mcmc_chains,
                 LINEAGE_MCMC_SEED,
@@ -1180,6 +1195,21 @@ mod lineage_opts_validation_tests {
     #[test]
     fn mcmc_chains_one_is_accepted() {
         assert!(validate_lineage_opts(1).is_ok());
+    }
+
+    #[test]
+    fn collapse_hp_is_off_unless_the_flag_is_passed() {
+        // Plan 2026-09-26 T9.
+        use clap::Parser;
+        let base = ["Himito", "lineage", "-m", "matrix.csv", "-o", "out"];
+        let collapse_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Commands::Lineage { collapse_hp, .. } => collapse_hp,
+            other => panic!("expected the Lineage subcommand, got {other:?}"),
+        };
+        assert!(!collapse_of(&base), "collapse must be off by default");
+        let mut on = base.to_vec();
+        on.push("--collapse-hp");
+        assert!(collapse_of(&on), "--collapse-hp must enable it");
     }
 }
 

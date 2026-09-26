@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use bio::io::fasta;
@@ -326,11 +326,12 @@ pub struct DenoiseStats {
     /// repeat. Without this cap the read would contribute two ALT votes while
     /// depth counts it once, letting `alt_total` exceed `depth`.
     pub indel_events_duplicate_site: u64,
-    /// Review 2026-09-25 T3: sites skipped because every read ended inside the
-    /// homopolymer run there, so none could show its length and the site's depth
-    /// came out zero. Only counted for columns where at least one alignment DID
-    /// have a query base and failed the run-span gate; a column no alignment
-    /// reached at all is ordinary missing coverage and is not counted here.
+    /// Review 2026-09-25 T3: normalized indel sites that had at least one ALT
+    /// event dropped by the homopolymer span gate and ended with no spanning
+    /// depth. A column no such event reached is ordinary missing coverage and
+    /// is not counted here. Booked after the pileup from keys remembered at the
+    /// gate, not from `sites`: a site is inserted there only after a vote
+    /// clears the same gate depth uses, so this state never appears in `sites`.
     pub indel_sites_dropped_no_spanning_depth: u64,
     pub reads_reassigned_ref_to_ins: u64,
     pub reads_reassigned_ref_to_del: u64,
@@ -400,12 +401,11 @@ fn compute_corrections(
     // column as well as its event at the anchor column, so counting observations
     // would count that read twice and halve every real indel's apparent frequency.
     let mut depths: HashMap<(Vec<u8>, u32), (u32, u32, u32)> = HashMap::new();
-    // Review 2026-09-25 T3: per column, how many alignments HAD a query base here but
-    // failed the run-span gate below. Only columns with a nonzero count are stored, so
-    // a column no alignment reached is simply absent. This distinguishes "no coverage"
-    // from "coverage that all died inside the homopolymer" when a site is dropped for
-    // zero depth, which would otherwise vanish without a trace.
-    let mut tract_excluded: HashMap<(Vec<u8>, u32), u32> = HashMap::new();
+    // Review 2026-09-25 T3: normalized sites where an ALT vote was dropped by the
+    // homopolymer span gate. Remembered here because `sites` only receives votes
+    // that cleared that gate, so a site whose every ALT died on it never appears
+    // there and cannot be counted from the deferred `depth == 0` branch.
+    let mut span_gated_sites: HashSet<(Vec<u8>, u32)> = HashSet::new();
 
     let mut plp = reader.pileup();
     plp.set_max_depth(1_000_000);
@@ -430,7 +430,6 @@ fn compute_corrections(
         let mut col_depth = 0u32;
         let mut col_fwd = 0u32;
         let mut col_rev = 0u32;
-        let mut col_tract_excluded = 0u32;
         // (qname, allele, reverse, read's own POS, read's own CIGAR, read's exclusive
         // reference end). Everything the ALT-vote gates need travels with the event,
         // because BOTH of those gates can only be evaluated AFTER normalization, once
@@ -478,8 +477,6 @@ fn compute_corrections(
                     if reference_end >= tract_need_end {
                         col_depth += 1;
                         if rec.is_reverse() { col_rev += 1 } else { col_fwd += 1 }
-                    } else {
-                        col_tract_excluded += 1;
                     }
                     // Decide the event's allele first, WITHOUT touching the CIGAR;
                     // `rec.cigar()` re-parses and allocates the whole CIGAR from raw
@@ -536,9 +533,6 @@ fn compute_corrections(
 
         if iopts.enabled {
             depths.insert((name.to_vec(), refpos as u32), (col_depth, col_fwd, col_rev));
-            if col_tract_excluded > 0 {
-                tract_excluded.insert((name.to_vec(), refpos as u32), col_tract_excluded);
-            }
             for (qname, allele, reverse, rpos, cigar, reference_end) in col_events {
                 let (norm_pos, norm_allele) =
                     indel::normalize_left(refseq, refpos as u32, &allele);
@@ -569,6 +563,9 @@ fn compute_corrections(
                 // unit longer than one base imposes nothing beyond `norm_pos` itself.
                 if reference_end < indel::hp_tract_end(refseq, norm_pos) as i64 + 1 {
                     stats.indel_events_not_spanning_repeat += 1;
+                    // Review 2026-09-25 T3: one entry per site, however many votes
+                    // died here. Counted after the pileup, once depth is final.
+                    span_gated_sites.insert((name.to_vec(), norm_pos));
                     continue;
                 }
                 // A read carrying two of ITS OWN events (e.g. an insertion and a
@@ -629,6 +626,16 @@ fn compute_corrections(
         }
     }
 
+    // Review 2026-09-25 T3: once per site that lost an ALT vote to the homopolymer
+    // span gate. Missing `depths` and an explicit zero are the same outcome: no
+    // read spanned the run, so the site was dropped for lack of spanning depth.
+    for key in &span_gated_sites {
+        let depth = depths.get(key).map(|(d, _, _)| *d).unwrap_or(0);
+        if depth == 0 {
+            stats.indel_sites_dropped_no_spanning_depth += 1;
+        }
+    }
+
     // ---- deferred indel site decisions ----
     let mut models: IndelModels = HashMap::new();
     if iopts.enabled {
@@ -643,15 +650,12 @@ fn compute_corrections(
                 .copied()
                 .unwrap_or((0, 0, 0));
             if depth == 0 {
-                // Review 2026-09-25 T3: distinguish the two ways depth can be zero.
-                // If alignments were present here but every one of them failed the
-                // run-span gate, the site is lost specifically because no read lived
-                // long enough to show the homopolymer's length -- worth a counter,
-                // since silently skipping it looks identical to having no coverage.
-                if tract_excluded.get(&(contig.clone(), norm_pos)).is_some_and(|&n| n > 0) {
-                    stats.indel_sites_dropped_no_spanning_depth += 1;
-                }
-                continue; // nothing spans this site; nothing to decide
+                // Nothing spans this site, so there is nothing to decide. The
+                // homopolymer-span site counter is not booked here: a site enters
+                // this map only after a vote cleared the same gate depth uses, so
+                // this branch cannot see a site whose every ALT was dropped.
+                // Review 2026-09-25 T3
+                continue;
             }
             site.depth = depth;
             site.col_fwd = fwd;
@@ -1855,6 +1859,51 @@ mod tests {
         assert!(
             !kept_ins_at_7,
             "site 7 must not keep an insertion cast only by reads that never spanned its run"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn indel_site_with_only_nonspanning_alt_votes_counts_dropped_depth() {
+        // Review 2026-09-25 T3: `15M 1I 1M` from POS 0 ends at exclusive reference
+        // coordinate 16. The inserted A left-normalizes onto site 7, and that
+        // site's A-run (REF29[8..=15]) requires end >= 17, so every vote is
+        // dropped. No read in this BAM reaches 17, so site 7 also has no spanning
+        // depth. The site counter must record that drop. It used to stay 0,
+        // because a site is inserted into `sites` only after a vote clears the
+        // same gate that depth uses, and the counter only looked there.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_site_no_span");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+
+        let pen_seq: Vec<u8> = {
+            let mut s = REF29[0..15].to_vec();
+            s.push(b'A');
+            s.push(REF29[15]);
+            s
+        };
+        let pen_cigar = vec![Cigar::Match(15), Cigar::Ins(1), Cigar::Match(1)];
+
+        const SHORT: [&str; 4] = ["p0", "p1", "p2", "p3"];
+        let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
+        for (i, n) in SHORT.iter().enumerate() {
+            reads.push((n, 0, pen_seq.as_slice(), pen_cigar.clone(), i % 2 == 0));
+        }
+        write_cigar_bam(&bam, "chrM", 29, &reads);
+
+        let (_corr, _models, stats) =
+            compute_corrections(&bam, &indel_refs(), 2, 0.01, SB_P, HOM_VAF, &indels_on()).unwrap();
+
+        assert!(
+            stats.indel_events_not_spanning_repeat >= 1,
+            "each short read's insertion must be dropped by the span gate at site 7, \
+             got {}",
+            stats.indel_events_not_spanning_repeat
+        );
+        assert!(
+            stats.indel_sites_dropped_no_spanning_depth >= 1,
+            "site 7 had ALT votes and no spanning depth, so it must be counted, got {}",
+            stats.indel_sites_dropped_no_spanning_depth
         );
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -340,7 +340,19 @@ pub struct DenoiseStats {
     pub indel_bases_inserted: u64,
     pub indel_bases_removed: u64,
     /// Index = repeat-context length L; audits how much correction fired in long runs.
+    /// An HP-length move (Plan 2026-09-26 T8d) books against its run length `R`,
+    /// which is the same number `repeat_context` reports for a 1bp allele there.
     pub reassignments_by_hp_length: Vec<u64>,
+    /// Plan 2026-09-26 T8d: substitution corrections dropped because they fell inside
+    /// a homopolymer run the HP length model rewrote wholesale. The run's query
+    /// offsets no longer mean what pass 1 recorded them against, so the only honest
+    /// options are to drop the substitution or to refuse the length move; dropping is
+    /// the conservative one. Zero unless `--indel-hp-length-model` is on.
+    ///
+    /// Like the substitution counters booked in pass 1, `bases_modified` has already
+    /// counted these at decision time -- the same known, diagnostic-only over-count
+    /// documented there, never a difference in the emitted SEQ.
+    pub subs_dropped_in_hp_rewrite: u64,
     /// (read, site) PAIRS skipped because the read lacks the match-context flank
     /// the rewrite walk needs on one side or the other of the edit.
     pub assignments_skipped_span_guard: u64,
@@ -740,6 +752,75 @@ fn compute_corrections(
     Ok((corrections, models, stats))
 }
 
+/// Book the read and base counters for ONE reassignment that was actually applied.
+///
+/// Extracted (Plan 2026-09-26 T8d) so the two write-back paths -- `rewrite_read` for
+/// event-based edits and `rewrite_hp_run` for HP-length moves -- count identically.
+/// Callers must only reach this for an edit the rewrite reports it really made; see
+/// `RewriteResult::applied` and FIX 1 in the task-9 review round.
+fn book_reassignment(stats: &mut DenoiseStats, from: &indel::Allele, to: &indel::Allele) {
+    match (from, to) {
+        (indel::Allele::Ref, indel::Allele::Ins(s)) => {
+            stats.reads_reassigned_ref_to_ins += 1;
+            stats.indel_bases_inserted += s.len() as u64;
+        }
+        (indel::Allele::Ref, indel::Allele::Del(n)) => {
+            stats.reads_reassigned_ref_to_del += 1;
+            stats.indel_bases_removed += *n as u64;
+        }
+        (indel::Allele::Ins(from_s), indel::Allele::Ref) => {
+            // Reverting a spurious insertion removes the bases it added -- the
+            // single most common correction this feature makes.
+            stats.reads_reassigned_indel_to_ref += 1;
+            stats.indel_bases_removed += from_s.len() as u64;
+        }
+        (indel::Allele::Del(from_n), indel::Allele::Ref) => {
+            // Reverting a spurious deletion restores the reference bases it dropped.
+            stats.reads_reassigned_indel_to_ref += 1;
+            stats.indel_bases_inserted += *from_n as u64;
+        }
+        (indel::Allele::Ins(from_s), indel::Allele::Ins(to_s)) => {
+            stats.reads_reassigned_indel_to_indel += 1;
+            if to_s.len() > from_s.len() {
+                stats.indel_bases_inserted += (to_s.len() - from_s.len()) as u64;
+            } else if from_s.len() > to_s.len() {
+                stats.indel_bases_removed += (from_s.len() - to_s.len()) as u64;
+            }
+        }
+        (indel::Allele::Del(from_n), indel::Allele::Del(to_n)) => {
+            stats.reads_reassigned_indel_to_indel += 1;
+            // FIX 3: shrinking a deletion splices reference bases BACK INTO the read
+            // (an insertion of read bases relative to what the read had before),
+            // e.g. Del(3) -> Del(1) restores 2 bases.
+            if to_n < from_n {
+                stats.indel_bases_inserted += (from_n - to_n) as u64;
+            } else if to_n > from_n {
+                // Plan 2026-09-26 T8d: growing a deletion used to be unreachable --
+                // `assign_allele` refused it, because `rewrite_read` cannot grow a
+                // deletion into the following CIGAR op. `rewrite_hp_run` replaces the
+                // whole run at once, so at an HP site it now happens and the freed
+                // query bases have to be counted.
+                stats.indel_bases_removed += (to_n - from_n) as u64;
+            }
+        }
+        // Plan 2026-09-26 T8d: the cross-kind transitions, likewise reachable only
+        // through `rewrite_hp_run`. Both the read's own indel and the target's are
+        // charged: Ins(1) -> Del(1) drops the inserted base AND deletes a reference
+        // base, so the read loses two.
+        (indel::Allele::Ins(from_s), indel::Allele::Del(to_n)) => {
+            stats.reads_reassigned_indel_to_indel += 1;
+            stats.indel_bases_removed += from_s.len() as u64 + *to_n as u64;
+        }
+        (indel::Allele::Del(from_n), indel::Allele::Ins(to_s)) => {
+            stats.reads_reassigned_indel_to_indel += 1;
+            stats.indel_bases_inserted += *from_n as u64 + to_s.len() as u64;
+        }
+        // Ref -> Ref: not a reassignment at all. `assign_allele` returns `Keep` when
+        // the target equals the observed allele, so no caller can produce this.
+        (indel::Allele::Ref, indel::Allele::Ref) => {}
+    }
+}
+
 fn apply_corrections(
     in_bam: &Path,
     out_bam: &Path,
@@ -788,6 +869,13 @@ fn apply_corrections(
                         // booked AFTER `rewrite_read` reports which edits it actually
                         // applied (see FIX 1 in the task-9 review round).
                         let mut edit_context_len: HashMap<(u32, indel::EditKind), usize> = HashMap::new();
+                        // Plan 2026-09-26 T8d: HP-length moves for this read, as
+                        // (anchor, run end, observed length, target length). They are
+                        // deliberately NOT `IndelEdit`s: `rewrite_read` edits one
+                        // CIGAR op in place and cannot express them, so they are
+                        // applied first, by `rewrite_hp_run`, below.
+                        let mut hp_moves: Vec<(u32, u32, indel::Allele, indel::Allele)> =
+                            Vec::new();
 
                         if iopts.enabled {
                             // `end_pos()` (exclusive alignment end on the reference) is only
@@ -850,6 +938,62 @@ fn apply_corrections(
                                     // that were never real candidates for this read.
                                     if s >= rend {
                                         break;
+                                    }
+                                    // Plan 2026-09-26 T8d: an HP site is decided as a
+                                    // LENGTH, so what this read carries there comes
+                                    // from `hp_allele` -- the same single-valued
+                                    // reading pass 1 voted with -- and not from
+                                    // `carried`, which has one entry per CIGAR op and
+                                    // is what makes the FIX 5 ambiguity possible in
+                                    // the first place. `hp_allele` already enforces
+                                    // the right-hand tract span and an aligned base at
+                                    // the anchor, so only the left-hand flank, the
+                                    // oversized neighbour and the swallowed-site
+                                    // guards remain to apply here.
+                                    if let Some((hp_e, hp_b)) = model.hp_run {
+                                        let observed_k = match indel::hp_allele(
+                                            rstart, &cigar, &seq, refseq, *pos, hp_e,
+                                        ) {
+                                            Some(k) => k,
+                                            None => {
+                                                stats.assignments_skipped_span_guard += 1;
+                                                continue;
+                                            }
+                                        };
+                                        if s - flank < rstart {
+                                            stats.assignments_skipped_span_guard += 1;
+                                            continue;
+                                        }
+                                        // An earlier gained deletion for this read
+                                        // already consumed the anchor or part of the
+                                        // run, so the two rewrites would fight over
+                                        // the same reference bases (see FIX 6).
+                                        if s <= consumed_until {
+                                            stats
+                                                .assignments_skipped_swallowed_by_gained_deletion += 1;
+                                            continue;
+                                        }
+                                        if blocked.iter().any(|b| (b - s).abs() <= reach) {
+                                            stats.assignments_skipped_oversized_neighbor += 1;
+                                            continue;
+                                        }
+                                        let observed = indel::hp_length_allele(observed_k, hp_b);
+                                        let target = match indel::assign_allele(
+                                            &observed, model, iopts,
+                                        ) {
+                                            indel::Assignment::Keep => continue,
+                                            // Unreachable at an HP site (T8c), but
+                                            // counted rather than silently dropped if
+                                            // that ever changes.
+                                            indel::Assignment::Refused => {
+                                                stats
+                                                    .assignments_skipped_unsupported_transition += 1;
+                                                continue;
+                                            }
+                                            indel::Assignment::Move(t) => t,
+                                        };
+                                        hp_moves.push((*pos, hp_e, observed, target));
+                                        continue;
                                     }
                                     // FIX 5: this read's own CIGAR carries two DIFFERENT
                                     // events that both normalize to this site, so which one
@@ -986,17 +1130,73 @@ fn apply_corrections(
                             edits.indels.sort_by_key(|e| e.ref_pos);
                         }
 
-                        if !edits.is_empty() {
+                        if !edits.is_empty() || !hp_moves.is_empty() {
                             // Extract owned parts, rewrite, rebuild (aux preserved by set()).
                             let qname = rec.qname().to_vec();
                             let cigar = rec.cigar().take();
                             let seq = rec.seq().as_bytes();
                             let qual = rec.qual().to_vec();
+
+                            // Plan 2026-09-26 T8d: HP-length moves go first, one run at
+                            // a time. Each `rewrite_hp_run` preserves reference
+                            // consumption, so the reference coordinates every later
+                            // edit is keyed by are unchanged and the runs (one per
+                            // normalized anchor) never overlap. Stats are booked from
+                            // what it actually returned, exactly as the event path
+                            // books from `RewriteResult::applied`.
+                            let mut hp_cigar: Option<CigarString> = None;
+                            let mut hp_seq: Option<Vec<u8>> = None;
+                            let mut hp_qual: Option<Vec<u8>> = None;
+                            // Half-open reference spans of the runs actually rewritten.
+                            let mut hp_runs: Vec<(u32, u32)> = Vec::new();
+                            for (a, e, from, to) in &hp_moves {
+                                let rewritten = {
+                                    let c = hp_cigar.as_ref().unwrap_or(&cigar);
+                                    let s = hp_seq.as_ref().unwrap_or(&seq);
+                                    let q = hp_qual.as_ref().unwrap_or(&qual);
+                                    indel::rewrite_hp_run(
+                                        rec.pos(), c, s, q, *a, *e, to.net_len(),
+                                    )
+                                };
+                                match rewritten {
+                                    Some((c, s, q)) => {
+                                        hp_cigar = Some(c);
+                                        hp_seq = Some(s);
+                                        hp_qual = Some(q);
+                                        hp_runs.push((*a + 1, *e));
+                                        book_reassignment(stats, from, to);
+                                        let l = (*e - *a - 1) as usize;
+                                        if stats.reassignments_by_hp_length.len() <= l {
+                                            stats.reassignments_by_hp_length.resize(l + 1, 0);
+                                        }
+                                        stats.reassignments_by_hp_length[l] += 1;
+                                    }
+                                    // Same accounting as an event edit the walk never
+                                    // reached: a harmless missed correction, honestly
+                                    // reported rather than counted as applied.
+                                    None => stats.indel_edits_emitted_but_not_applied += 1,
+                                }
+                            }
+                            if !hp_runs.is_empty() {
+                                // The run was rewritten wholesale, so a substitution
+                                // inside it no longer refers to a base that survived.
+                                let before = edits.subs.len();
+                                edits.subs.retain(|&(p, _)| {
+                                    !hp_runs.iter().any(|&(lo, hi)| p >= lo && p < hi)
+                                });
+                                stats.subs_dropped_in_hp_rewrite +=
+                                    (before - edits.subs.len()) as u64;
+                            }
+
+                            let in_cigar = hp_cigar.as_ref().unwrap_or(&cigar);
+                            let in_seq = hp_seq.as_ref().unwrap_or(&seq);
+                            let in_qual = hp_qual.as_ref().unwrap_or(&qual);
                             let out =
-                                rewrite_read(rec.pos(), &cigar, &seq, &qual, &edits, refseq);
+                                rewrite_read(rec.pos(), in_cigar, in_seq, in_qual, &edits, refseq);
                             // A non-empty edit list does not guarantee `rewrite_read`
                             // actually changed anything -- CRITICAL 1's bug is exactly a
-                            // case where it silently didn't. Compare the real output.
+                            // case where it silently didn't. Compare the real output
+                            // against the record as it came in, HP rewrites included.
                             let changed = out.seq != seq || out.cigar != cigar;
 
                             // FIX 1 (task-9 review round): the reassignment, base-count,
@@ -1026,55 +1226,7 @@ fn apply_corrections(
                                     stats.indel_edits_emitted_but_not_applied += 1;
                                     continue;
                                 }
-                                match (&edit.from, &edit.to) {
-                                    (indel::Allele::Ref, indel::Allele::Ins(s2)) => {
-                                        stats.reads_reassigned_ref_to_ins += 1;
-                                        stats.indel_bases_inserted += s2.len() as u64;
-                                    }
-                                    (indel::Allele::Ref, indel::Allele::Del(n)) => {
-                                        stats.reads_reassigned_ref_to_del += 1;
-                                        stats.indel_bases_removed += *n as u64;
-                                    }
-                                    (indel::Allele::Ins(from_s), indel::Allele::Ref) => {
-                                        // Reverting a spurious insertion removes
-                                        // the bases it added -- the single most
-                                        // common correction this feature makes.
-                                        stats.reads_reassigned_indel_to_ref += 1;
-                                        stats.indel_bases_removed += from_s.len() as u64;
-                                    }
-                                    (indel::Allele::Del(from_n), indel::Allele::Ref) => {
-                                        // Reverting a spurious deletion restores
-                                        // the reference bases it dropped.
-                                        stats.reads_reassigned_indel_to_ref += 1;
-                                        stats.indel_bases_inserted += *from_n as u64;
-                                    }
-                                    (indel::Allele::Ins(from_s), indel::Allele::Ins(to_s)) => {
-                                        stats.reads_reassigned_indel_to_indel += 1;
-                                        if to_s.len() > from_s.len() {
-                                            stats.indel_bases_inserted +=
-                                                (to_s.len() - from_s.len()) as u64;
-                                        } else if from_s.len() > to_s.len() {
-                                            stats.indel_bases_removed +=
-                                                (from_s.len() - to_s.len()) as u64;
-                                        }
-                                    }
-                                    (indel::Allele::Del(from_n), indel::Allele::Del(to_n)) => {
-                                        stats.reads_reassigned_indel_to_indel += 1;
-                                        // FIX 3: shrinking a deletion splices reference
-                                        // bases BACK INTO the read (an insertion of read
-                                        // bases relative to what the read had before),
-                                        // e.g. Del(3) -> Del(1) restores 2 bases.
-                                        if to_n < from_n {
-                                            stats.indel_bases_inserted += (from_n - to_n) as u64;
-                                        }
-                                        // to_n > from_n (growing a deletion) is
-                                        // unreachable: `assign_allele` refuses that
-                                        // transition (see `Assignment::Refused`),
-                                        // since `rewrite_read` cannot grow a deletion
-                                        // into the following CIGAR op.
-                                    }
-                                    _ => stats.reads_reassigned_indel_to_indel += 1,
-                                }
+                                book_reassignment(stats, &edit.from, &edit.to);
                                 let l = *edit_context_len.get(&key).unwrap_or(&0);
                                 if stats.reassignments_by_hp_length.len() <= l {
                                     stats.reassignments_by_hp_length.resize(l + 1, 0);
@@ -1083,7 +1235,11 @@ fn apply_corrections(
                             }
 
                             rec.set(&qname, Some(&out.cigar), &out.seq, &out.qual);
-                            if out.structure_changed {
+                            // An HP-length move shifts every query offset downstream
+                            // of the run just as an event edit does, so it invalidates
+                            // the same tags -- and `rewrite_read` cannot report it,
+                            // having never seen it.
+                            if out.structure_changed || !hp_runs.is_empty() {
                                 strip_stale_tags(&mut rec);
                             }
                             if changed {
@@ -2557,6 +2713,109 @@ mod tests {
             // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
             hp_run: None,
         }
+    }
+
+    /// Plan 2026-09-26 T8d: hand-built HP site at REF29's A-run. Del(1) dominates
+    /// 0.89/0.11 over Ref, `Ins("A")` is a lone single-stranded observation that the
+    /// per-strand gate rejected (so `protect_vaf` does not shield it), and `hp_run`
+    /// marks the site as a length. The event-based model refuses `Ins -> Del`; the
+    /// length model must move it.
+    fn hp_del_site_model() -> indel::IndelSiteModel {
+        let ins = indel::Allele::Ins(b"A".to_vec());
+        indel::IndelSiteModel {
+            kept: vec![(indel::Allele::Ref, 0.111), (indel::Allele::Del(1), 0.889)],
+            eps: indel::error_rate(8, &indels_hp_on()),
+            context_len: 8,
+            strand_biased: 0,
+            obs_vaf: vec![
+                (indel::Allele::Ref, 0.1),
+                (ins.clone(), 0.1),
+                (indel::Allele::Del(1), 0.8),
+            ],
+            strand_rejected: vec![ins],
+            hp_run: Some((16, b'A')),
+        }
+    }
+
+    #[test]
+    fn hp_site_move_rewrites_the_run_and_drops_substitutions_inside_it() {
+        // Plan 2026-09-26 T8d: an `Ins(1)` read at an HP site keeping `Del(1)`. The
+        // rewrite is done by `rewrite_hp_run` BEFORE `rewrite_read` and never enters
+        // `edits.indels`, so reference coordinates are unchanged and the read comes
+        // out as the canonical left-aligned 8M 1D 20M. A substitution correction
+        // inside the run is dropped -- the run is rewritten wholesale, so its query
+        // offsets no longer mean what pass 1 recorded them against.
+        let dir = std::env::temp_dir().join("himito_denoise_indel_hp_move");
+        std::fs::create_dir_all(&dir).unwrap();
+        let inb = dir.join("in.bam");
+        let outb = dir.join("out.bam");
+        write_cigar_bam(
+            &inb,
+            "chrM",
+            29,
+            &[("rins", 0, HP_INS_SEQ, hp_ins_cigar(), false)],
+        );
+
+        let mut models = IndelModels::new();
+        models.entry(b"chrM".to_vec()).or_default().push((7u32, hp_del_site_model()));
+
+        // One substitution inside the run (reference 10) and one outside it (20).
+        let mut corr: Corrections = HashMap::new();
+        corr.insert(
+            b"rins".to_vec(),
+            indel::ReadEdits { subs: vec![(10, b'G'), (20, b'T')], indels: vec![] },
+        );
+        let mut stats = DenoiseStats::default();
+        apply_corrections(
+            &inb, &outb, &corr, &indel_refs(), &models, &indels_hp_on(), &mut stats,
+        )
+        .unwrap();
+
+        assert_eq!(stats.reads_modified, 1);
+        assert_eq!(
+            stats.reads_reassigned_indel_to_indel, 1,
+            "Ins(1) -> Del(1) is one indel->indel reassignment"
+        );
+        assert_eq!(
+            stats.indel_bases_removed, 2,
+            "the inserted base leaves the read and one reference base becomes a deletion"
+        );
+        assert_eq!(
+            stats.reassignments_by_hp_length.get(8).copied().unwrap_or(0),
+            1,
+            "booked against the run length R = 8"
+        );
+        assert_eq!(
+            stats.subs_dropped_in_hp_rewrite, 1,
+            "only the substitution INSIDE the run is dropped"
+        );
+        assert_eq!(stats.indel_edits_emitted_but_not_applied, 0);
+
+        let mut r = Reader::from_path(&outb).unwrap();
+        let rec = r.records().next().unwrap().unwrap();
+        let cigar = rec.cigar().take();
+        assert_eq!(
+            cigar,
+            CigarString(vec![Cigar::Match(8), Cigar::Del(1), Cigar::Match(20)]),
+            "the run must come out in canonical left-aligned form"
+        );
+        // samtools-style validity: SEQ length == the CIGAR's query consumption.
+        let query: u32 = cigar
+            .iter()
+            .map(|op| match op {
+                Cigar::Match(n) | Cigar::Ins(n) | Cigar::SoftClip(n) | Cigar::Equal(n)
+                | Cigar::Diff(n) => *n,
+                _ => 0,
+            })
+            .sum();
+        let seq = rec.seq().as_bytes();
+        assert_eq!(seq.len() as u32, query, "SEQ length must match the CIGAR");
+        assert_eq!(seq.len(), rec.qual().len(), "SEQ and QUAL must agree");
+        assert_eq!(
+            seq[19], b'T',
+            "the substitution OUTSIDE the run must still be applied, at reference 20"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -2147,6 +2147,229 @@ pub fn rewrite_read(
     }
 }
 
+/// Plan 2026-09-26 T8d: replace a read's alignment over one homopolymer run with the
+/// canonical form of length `R + target_k`, where the run is `[a + 1, e)` and
+/// `R = e - a - 1`.
+///
+/// This is the rewrite primitive the generic HP length model needs and
+/// `rewrite_read` cannot provide: `rewrite_read` edits ONE CIGAR op in place, so it
+/// can neither turn an `I` into a `D` nor grow a `D`. Here the run's whole segment --
+/// every query base aligned to it, plus any `I`/`D` op inside it, plus any `I`
+/// anchored on the anchor base itself -- is discarded and re-emitted left-aligned:
+///
+/// * `target_k > 0` -> `I(target_k)` of the run base immediately after the anchor,
+///   then `M(R)`;
+/// * `target_k < 0` -> `D(-target_k)` then `M(R + target_k)`;
+/// * `target_k == 0` -> `M(R)`.
+///
+/// All three consume exactly `R` reference bases, which is what the run consumed
+/// before, so POS, reference end and coordinate-sort order are invariant -- the same
+/// guarantee `rewrite_read` gives, and the reason edits keyed by reference position
+/// elsewhere in the read still line up afterwards.
+///
+/// The surviving query bases are the read's OWN bases over the run, with the excess
+/// dropped from the LEFT (where the canonical deletion sits) or copies of the run
+/// base prepended on the left (where the canonical insertion sits). Synthesized bases
+/// take the minimum of their flanking qualities, exactly like `fill_qual`.
+///
+/// `None` (the read is left untouched) when:
+/// * `[a + 1, e)` is not a run of at least 2, or `target_k < -R`;
+/// * the read has no aligned query base at the anchor `a`, or does not cover the
+///   whole run -- it cannot testify to a length it never saw;
+/// * an `N` op crosses the run;
+/// * bases must be synthesized but the read has NO query base left in the run, so
+///   the run base cannot be read off the read (the caller does not pass `refseq`).
+///   That is only reachable when the read deletes the entire run and the target is
+///   longer, the one length transition this path declines.
+pub fn rewrite_hp_run(
+    pos: i64,
+    cigar: &CigarString,
+    seq: &[u8],
+    qual: &[u8],
+    a: u32,
+    e: u32,
+    target_k: i32,
+) -> Option<(CigarString, Vec<u8>, Vec<u8>)> {
+    if e < a + 2 {
+        return None;
+    }
+    let run_len = (e - a - 1) as i32;
+    if target_k < -run_len {
+        return None;
+    }
+    if match_run_len(pos, cigar, a) == 0 {
+        return None;
+    }
+
+    // Everything strictly before the run (through the anchor base) and everything
+    // from `e` on is copied verbatim; the run's own content is accumulated apart so
+    // it can be re-emitted canonically between the two.
+    let mut pre_ops: Vec<Cigar> = Vec::new();
+    let mut pre_seq: Vec<u8> = Vec::new();
+    let mut pre_qual: Vec<u8> = Vec::new();
+    let mut post_ops: Vec<Cigar> = Vec::new();
+    let mut post_seq: Vec<u8> = Vec::new();
+    let mut post_qual: Vec<u8> = Vec::new();
+    let mut run_seq: Vec<u8> = Vec::new();
+    let mut run_qual: Vec<u8> = Vec::new();
+    // Reference bases of the run the read actually accounts for. Must reach `run_len`
+    // or the read does not cover the whole run.
+    let mut run_ref: u32 = 0;
+
+    let mut rp = pos.max(0) as u32;
+    let mut qp = 0usize;
+    let mut last_aligned: Option<u32> = None;
+    // True once a reference position at or past `e` has been reached: the run is a
+    // contiguous reference interval, so "past" is a one-way door and query-only ops
+    // after it belong to the tail.
+    let mut past = false;
+
+    for op in cigar.iter() {
+        match *op {
+            Cigar::Match(n) | Cigar::Equal(n) | Cigar::Diff(n) => {
+                for i in 0..n {
+                    let cur = rp + i;
+                    let qi = qp + i as usize;
+                    let base = *seq.get(qi)?;
+                    let q = *qual.get(qi)?;
+                    if cur <= a {
+                        push_op(&mut pre_ops, Cigar::Match(1));
+                        pre_seq.push(base);
+                        pre_qual.push(q);
+                    } else if cur < e {
+                        run_ref += 1;
+                        run_seq.push(base);
+                        run_qual.push(q);
+                    } else {
+                        past = true;
+                        push_op(&mut post_ops, Cigar::Match(1));
+                        post_seq.push(base);
+                        post_qual.push(q);
+                    }
+                    last_aligned = Some(cur);
+                }
+                rp += n;
+                qp += n as usize;
+            }
+            Cigar::Ins(n) => {
+                let n = n as usize;
+                let bases = seq.get(qp..qp + n)?;
+                let quals = qual.get(qp..qp + n)?;
+                // Anchored on the anchor base (where left-normalization puts it) or
+                // on any base of the run: part of the run's length, so absorbed.
+                if last_aligned.is_some_and(|l| l >= a && l < e) {
+                    run_seq.extend_from_slice(bases);
+                    run_qual.extend_from_slice(quals);
+                } else if past {
+                    push_op(&mut post_ops, Cigar::Ins(n as u32));
+                    post_seq.extend_from_slice(bases);
+                    post_qual.extend_from_slice(quals);
+                } else {
+                    push_op(&mut pre_ops, Cigar::Ins(n as u32));
+                    pre_seq.extend_from_slice(bases);
+                    pre_qual.extend_from_slice(quals);
+                }
+                qp += n;
+            }
+            Cigar::Del(n) => {
+                // A deletion can straddle the run's edges; each part goes where its
+                // reference positions do.
+                let (s, t) = (rp, rp + n);
+                let head = (a + 1).min(t).saturating_sub(s);
+                let inside = overlap(s, t, a + 1, e);
+                let tail = t.saturating_sub(e.max(s));
+                push_op(&mut pre_ops, Cigar::Del(head));
+                run_ref += inside;
+                if tail > 0 {
+                    past = true;
+                    push_op(&mut post_ops, Cigar::Del(tail));
+                }
+                rp = t;
+            }
+            Cigar::RefSkip(n) => {
+                if overlap(rp, rp + n, a + 1, e) > 0 {
+                    return None;
+                }
+                if rp >= e {
+                    past = true;
+                    push_op(&mut post_ops, Cigar::RefSkip(n));
+                } else {
+                    push_op(&mut pre_ops, Cigar::RefSkip(n));
+                }
+                rp += n;
+            }
+            Cigar::SoftClip(n) => {
+                let n = n as usize;
+                let bases = seq.get(qp..qp + n)?;
+                let quals = qual.get(qp..qp + n)?;
+                if past {
+                    push_op(&mut post_ops, Cigar::SoftClip(n as u32));
+                    post_seq.extend_from_slice(bases);
+                    post_qual.extend_from_slice(quals);
+                } else {
+                    push_op(&mut pre_ops, Cigar::SoftClip(n as u32));
+                    pre_seq.extend_from_slice(bases);
+                    pre_qual.extend_from_slice(quals);
+                }
+                qp += n;
+            }
+            Cigar::HardClip(n) => {
+                let ops = if past { &mut post_ops } else { &mut pre_ops };
+                push_op(ops, Cigar::HardClip(n));
+            }
+            Cigar::Pad(n) => {
+                let ops = if past { &mut post_ops } else { &mut pre_ops };
+                push_op(ops, Cigar::Pad(n));
+            }
+        }
+    }
+
+    if run_ref != run_len as u32 {
+        return None;
+    }
+
+    // Canonical body: `run_len + target_k` query bases, adjusted on the left.
+    let target_len = (run_len + target_k) as usize;
+    let mut body_seq: Vec<u8> = Vec::with_capacity(target_len);
+    let mut body_qual: Vec<u8> = Vec::with_capacity(target_len);
+    if let Some(add) = target_len.checked_sub(run_seq.len()).filter(|n| *n > 0) {
+        let b = *run_seq.first()?;
+        let right = run_qual.first().copied().or_else(|| post_qual.first().copied());
+        let f = match (pre_qual.last().copied(), right) {
+            (Some(l), Some(r)) => l.min(r),
+            (Some(l), None) => l,
+            (None, Some(r)) => r,
+            (None, None) => 0,
+        };
+        body_seq.extend(std::iter::repeat(b).take(add));
+        body_qual.extend(std::iter::repeat(f).take(add));
+    }
+    let drop = run_seq.len().saturating_sub(target_len);
+    body_seq.extend_from_slice(&run_seq[drop..]);
+    body_qual.extend_from_slice(&run_qual[drop..]);
+
+    let mut ops = pre_ops;
+    if target_k > 0 {
+        push_op(&mut ops, Cigar::Ins(target_k as u32));
+        push_op(&mut ops, Cigar::Match(run_len as u32));
+    } else {
+        push_op(&mut ops, Cigar::Del((-target_k) as u32));
+        push_op(&mut ops, Cigar::Match((run_len + target_k) as u32));
+    }
+    for op in post_ops {
+        push_op(&mut ops, op);
+    }
+
+    let mut out_seq = pre_seq;
+    out_seq.extend_from_slice(&body_seq);
+    out_seq.extend_from_slice(&post_seq);
+    let mut out_qual = pre_qual;
+    out_qual.extend_from_slice(&body_qual);
+    out_qual.extend_from_slice(&post_qual);
+
+    Some((CigarString(ops), out_seq, out_qual))
+}
+
 /// Remove tags invalidated by a structural change.
 ///
 /// `MM`/`ML`/`MN` are base-modification tags indexed by the read's own base
@@ -2701,6 +2924,196 @@ mod rewrite_tests {
         assert_eq!(r.seq, seq);
         assert_eq!(r.qual, qual);
         assert!(!r.structure_changed);
+        assert_invariants(&c, &r);
+    }
+
+    // ---- Plan 2026-09-26 T8d: canonical homopolymer-run rewrite ----
+    // `REF`'s A-run is 4..=8, so the HP site's normalized anchor is 3, its exclusive
+    // run end is 9, R = 5 and b = b'A'.
+    const HPR_A: u32 = 3;
+    const HPR_E: u32 = 9;
+
+    /// `rewrite_hp_run` returns the same three pieces `rewrite_read` does; wrap them
+    /// so the existing `assert_invariants` can check reference consumption and
+    /// SEQ/QUAL/CIGAR length agreement for this path too.
+    fn hp_result(t: (CigarString, Vec<u8>, Vec<u8>)) -> RewriteResult {
+        RewriteResult {
+            cigar: t.0,
+            seq: t.1,
+            qual: t.2,
+            structure_changed: true,
+            applied: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn hp_rewrite_to_the_same_length_is_a_faithful_copy() {
+        let c = cig(vec![Cigar::Match(16)]);
+        let seq = REF.to_vec();
+        let qual = vec![30u8; 16];
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, 0).expect("must rewrite"),
+        );
+        assert_eq!(r.cigar, c);
+        assert_eq!(r.seq, seq);
+        assert_eq!(r.qual, qual);
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn hp_rewrite_shrinks_a_reference_length_run_to_a_deletion() {
+        // Ref -> Del(1): the canonical form is left-aligned, so the deletion comes
+        // first and the remaining 4 run bases follow as matches.
+        let c = cig(vec![Cigar::Match(16)]);
+        let seq = REF.to_vec();
+        let qual = vec![30u8; 16];
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -1).expect("must rewrite"),
+        );
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Del(1), Cigar::Match(11)]));
+        assert_eq!(r.seq.len(), 15, "one base must leave the read");
+        assert_eq!(r.seq, b"ACGTAAAACGTACGT".to_vec());
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn hp_rewrite_grows_a_run_with_a_left_aligned_insertion() {
+        let c = cig(vec![Cigar::Match(16)]);
+        let seq = REF.to_vec();
+        let qual = vec![30u8; 16];
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, 1).expect("must rewrite"),
+        );
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Ins(1), Cigar::Match(12)]));
+        assert_eq!(r.seq, b"ACGTAAAAAACGTACGT".to_vec(), "the run must grow to 6 A's");
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn hp_rewrite_absorbs_the_reads_own_insertion() {
+        // 9M 1I 6M: the extra A is anchored on REF[8], the last base of the run.
+        // Rewritten to the reference length, the insertion simply disappears and the
+        // CIGAR collapses back to a single match run.
+        let c = cig(vec![Cigar::Match(9), Cigar::Ins(1), Cigar::Match(7)]);
+        let mut seq = REF[..9].to_vec();
+        seq.push(b'A');
+        seq.extend_from_slice(&REF[9..]);
+        let qual = vec![30u8; 17];
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, 0).expect("must rewrite"),
+        );
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(16)]));
+        assert_eq!(r.seq, REF.to_vec());
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn hp_rewrite_turns_an_insertion_into_a_deletion() {
+        // The transition `rewrite_read` cannot make at all (cross-kind). The read
+        // carries a 6bp run; the target is 4bp, so two query bases leave.
+        let c = cig(vec![Cigar::Match(9), Cigar::Ins(1), Cigar::Match(7)]);
+        let mut seq = REF[..9].to_vec();
+        seq.push(b'A');
+        seq.extend_from_slice(&REF[9..]);
+        let qual = vec![30u8; 17];
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -1).expect("must rewrite"),
+        );
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Del(1), Cigar::Match(11)]));
+        assert_eq!(r.seq, b"ACGTAAAACGTACGT".to_vec());
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn hp_rewrite_grows_the_reads_own_deletion() {
+        // The other transition `rewrite_read` refuses: Del(1) -> Del(3) would consume
+        // reference from the following op there, but here the whole run is replaced.
+        let c = cig(vec![Cigar::Match(4), Cigar::Del(1), Cigar::Match(11)]);
+        let mut seq = REF[..4].to_vec();
+        seq.extend_from_slice(&REF[5..]);
+        let qual = vec![30u8; 15];
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -3).expect("must rewrite"),
+        );
+        assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Del(3), Cigar::Match(9)]));
+        assert_eq!(r.seq.len(), 13);
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn hp_rewrite_can_delete_the_whole_run() {
+        let c = cig(vec![Cigar::Match(16)]);
+        let seq = REF.to_vec();
+        let qual = vec![30u8; 16];
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -5).expect("must rewrite"),
+        );
+        assert_eq!(
+            r.cigar,
+            cig(vec![Cigar::Match(4), Cigar::Del(5), Cigar::Match(7)]),
+            "a zero-length match after the deletion must not be emitted"
+        );
+        assert_eq!(r.seq, b"ACGTCGTACGT".to_vec());
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn hp_rewrite_refuses_a_target_shorter_than_nothing() {
+        let c = cig(vec![Cigar::Match(16)]);
+        let seq = REF.to_vec();
+        let qual = vec![30u8; 16];
+        assert!(rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -6).is_none());
+    }
+
+    #[test]
+    fn hp_rewrite_refuses_a_read_that_does_not_cover_the_whole_run() {
+        // Ends at reference 6, inside the run: there is no whole run to replace.
+        let c = cig(vec![Cigar::Match(6)]);
+        let seq = REF[..6].to_vec();
+        let qual = vec![30u8; 6];
+        assert!(rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, -1).is_none());
+        // Starts at reference 5, inside the run: same, from the other side.
+        let c = cig(vec![Cigar::Match(11)]);
+        let seq = REF[5..].to_vec();
+        let qual = vec![30u8; 11];
+        assert!(rewrite_hp_run(5, &c, &seq, &qual, HPR_A, HPR_E, -1).is_none());
+    }
+
+    #[test]
+    fn hp_rewrite_keeps_soft_clips_and_absolute_coordinates() {
+        // 2S 12M from POS 2: the clip is copied verbatim and the run (4..=8) still
+        // resolves by ABSOLUTE reference coordinate, not query offset.
+        let c = cig(vec![Cigar::SoftClip(2), Cigar::Match(12)]);
+        let mut seq = b"NN".to_vec();
+        seq.extend_from_slice(&REF[2..14]);
+        let qual = vec![30u8; 14];
+        let r = hp_result(
+            rewrite_hp_run(2, &c, &seq, &qual, HPR_A, HPR_E, 1).expect("must rewrite"),
+        );
+        assert_eq!(
+            r.cigar,
+            cig(vec![Cigar::SoftClip(2), Cigar::Match(2), Cigar::Ins(1), Cigar::Match(10)])
+        );
+        assert_eq!(r.seq, b"NNGTAAAAAACGTAC".to_vec());
+        assert_invariants(&c, &r);
+    }
+
+    #[test]
+    fn hp_rewrite_gives_synthesized_bases_the_minimum_flanking_quality() {
+        // Same rule as `fill_qual`: never more confident than the neighbours. The
+        // synthesized base is left-aligned, so its neighbours are the anchor base
+        // (reference 3) and the first surviving run base (reference 4).
+        let c = cig(vec![Cigar::Match(16)]);
+        let seq = REF.to_vec();
+        let mut qual = vec![40u8; 16];
+        qual[3] = 20;
+        qual[4] = 30;
+        let r = hp_result(
+            rewrite_hp_run(0, &c, &seq, &qual, HPR_A, HPR_E, 1).expect("must rewrite"),
+        );
+        assert_eq!(r.qual[4], 20, "min(20, 30), not 40 and not an invented value");
+        assert_eq!(r.qual[3], 20, "the anchor's own quality must survive");
+        assert_eq!(r.qual[5], 30, "the original run bases keep their qualities");
         assert_invariants(&c, &r);
     }
 

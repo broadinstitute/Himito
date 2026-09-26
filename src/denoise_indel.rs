@@ -563,14 +563,22 @@ pub fn assign_allele(observed: &Allele, m: &IndelSiteModel, o: &IndelOpts) -> As
     // Restriction 1: the rewrite walk cannot turn an insertion into a deletion or
     // vice versa. Restriction 2: growing a deletion would consume reference from the
     // following CIGAR op. Both leave the read untouched, counted as Refused.
-    match (observed, target) {
-        (Allele::Ref, _) | (_, Allele::Ref) => {}
-        (a, b) if !a.kind_matches(b) => return Assignment::Refused,
-        _ => {}
-    }
-    if let (Allele::Del(n), Allele::Del(mm)) = (observed, target) {
-        if mm > n {
-            return Assignment::Refused;
+    //
+    // Plan 2026-09-26 T8c: neither restriction applies at an HP site under the length
+    // model. Both are limits of `rewrite_read`, which edits ONE op in place;
+    // `rewrite_hp_run` replaces the whole run with a canonical form, so any kept
+    // length is reachable from any other. Everything after this point -- the
+    // `protect_vaf` protection and the strand-gate carve-out from it -- is unchanged.
+    if m.hp_run.is_none() {
+        match (observed, target) {
+            (Allele::Ref, _) | (_, Allele::Ref) => {}
+            (a, b) if !a.kind_matches(b) => return Assignment::Refused,
+            _ => {}
+        }
+        if let (Allele::Del(n), Allele::Del(mm)) = (observed, target) {
+            if mm > n {
+                return Assignment::Refused;
+            }
         }
     }
     // Protection: an allele carried by a substantial fraction of reads is never
@@ -1175,6 +1183,91 @@ mod indel_tests {
         // Del(3) is a transition the rewrite walk does not support -- Refused,
         // not silently reinterpreted as Keep.
         assert_eq!(assign_allele(&d1, &m, &o), Assignment::Refused);
+    }
+
+    // ---- Plan 2026-09-26 T8c: at an HP site every kept length is reachable ----
+
+    #[test]
+    fn hp_length_model_moves_an_insertion_onto_a_kept_deletion() {
+        // Plan 2026-09-26 T8c: `HP_REF`'s A-run (1..=7) makes anchor 0 an HP site.
+        // A site that keeps Del(1) at ~0.9 with a lone Ins("A") read: the event-based
+        // model must refuse the Ins -> Del transition and leave that read carrying a
+        // length nobody else has, while the length model just moves it.
+        let ins = Allele::Ins(b"A".to_vec());
+        let del = Allele::Del(1);
+        let s = site(100, &[(del.clone(), 45, 45), (ins.clone(), 1, 1)]);
+        let mut o = IndelOpts::default();
+        o.vaf = 0.01;
+        o.floor_mult = 0.0;
+
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        assert!(m.hp_run.is_none(), "test premise: the model is off by default");
+        assert!(kept_of(&m, &del).is_some_and(|(_, f)| (*f - 0.9).abs() < 0.03));
+        assert_eq!(assign_allele(&ins, &m, &o), Assignment::Refused);
+
+        o.hp_length_model = true;
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        assert_eq!(m.hp_run, Some((8, b'A')), "anchor 0 is the A-run's HP site");
+        assert_eq!(assign_allele(&ins, &m, &o), Assignment::Move(del));
+    }
+
+    #[test]
+    fn hp_length_model_can_grow_a_deletion() {
+        // The second half of "any kept length is reachable": Del(1) -> Del(3) is the
+        // transition `rewrite_read` cannot make, because it would consume reference
+        // from the following CIGAR op. `rewrite_hp_run` rewrites the whole run at
+        // once, so at an HP site it is reachable.
+        let d1 = Allele::Del(1);
+        let d3 = Allele::Del(3);
+        let s = site(100, &[(d3.clone(), 45, 45), (d1.clone(), 1, 1)]);
+        let mut o = IndelOpts::default();
+        o.vaf = 0.01;
+        o.floor_mult = 0.0;
+
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        assert_eq!(assign_allele(&d1, &m, &o), Assignment::Refused);
+
+        o.hp_length_model = true;
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        assert_eq!(assign_allele(&d1, &m, &o), Assignment::Move(d3));
+    }
+
+    #[test]
+    fn hp_length_model_leaves_protect_vaf_and_the_strand_gates_alone() {
+        // The HP length model widens which TRANSITIONS are reachable and nothing
+        // else. A substantial observed allele is still protected, and a strand-
+        // rejected one is still not shielded -- the two rules `assign_allele` applies
+        // after the transition check.
+        let ins = Allele::Ins(b"A".to_vec());
+        let del = Allele::Del(1);
+        // 30% of the column carries the insertion, strand-balanced: above
+        // `protect_vaf`, but below the floor in this 7bp context, so it is rejected
+        // by candidacy alone and must still be shielded.
+        let s = site(100, &[(del.clone(), 30, 30), (ins.clone(), 15, 15)]);
+        let mut o = IndelOpts::default();
+        o.hp_length_model = true;
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        assert!(m.hp_run.is_some(), "test premise: this must be an HP site");
+        assert!(kept_of(&m, &ins).is_none(), "test premise: the insertion loses candidacy");
+        assert!(
+            !m.strand_rejected.contains(&ins),
+            "test premise: it must be rejected by the floor, not a strand gate"
+        );
+        assert_eq!(
+            assign_allele(&ins, &m, &o),
+            Assignment::Keep,
+            "a 30% allele must stay protected at an HP site too"
+        );
+
+        // Same allele, now single-stranded: rejected by `min_strand`, so protection
+        // must not shield it and the length model must move it.
+        let s = site(100, &[(del.clone(), 30, 30), (ins.clone(), 30, 0)]);
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        assert!(m.strand_rejected.contains(&ins), "test premise: strand-gate rejection");
+        assert!(
+            matches!(assign_allele(&ins, &m, &o), Assignment::Move(_)),
+            "a strand-rejected allele must not be shielded by protect_vaf"
+        );
     }
 
     #[test]

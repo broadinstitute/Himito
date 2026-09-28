@@ -14,7 +14,9 @@ workflow Himito_lineage_eval {
         Float min_hf
         Float max_hf
         String chromo
-        String? extra_args
+        String? call_extra_args
+        String? lineage_extra_args
+        String? merge_extra_args
         Boolean snv_only = false
     }
 
@@ -46,7 +48,7 @@ workflow Himito_lineage_eval {
             sample_id = sample_id,
             chromo = chromo,
             data_type = "pacbio",
-            extra_args = extra_args
+            extra_args = call_extra_args
 
     }
 
@@ -60,7 +62,7 @@ workflow Himito_lineage_eval {
             sample_id = sample_id,
             chromo = chromo,
             data_type = "ont-denoised",
-            extra_args = extra_args
+            extra_args = call_extra_args
 
     }
 
@@ -69,7 +71,7 @@ workflow Himito_lineage_eval {
             pacbio_vcf = PacbioCall.vcf,
             ont_vcf = OntCall.vcf,
             prefix = prefix,
-            extra_args = extra_args,
+            extra_args = merge_extra_args,
             snv_only = snv_only
 
     }
@@ -83,7 +85,7 @@ workflow Himito_lineage_eval {
             prefix = prefix,
             min_hf = min_hf,
             max_hf = max_hf,
-            extra_args = extra_args
+            extra_args = lineage_extra_args
     }
 
     output {

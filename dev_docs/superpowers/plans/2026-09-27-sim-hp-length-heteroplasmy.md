@@ -407,3 +407,26 @@ Validation ran. The local two-seed `cmp` and the miniwdl smoke run were not exec
 - `womtool validate` on `Himito_lineage_hp_sweep.wdl` printed `Success!`.
 - `womtool validate -i lineage_eval/lineage_sim/Himito_lineage_hp_sweep.inputs.json` printed `Success!` (exit 0).
 - `pytest lineage_eval/lineage_sim/tests`: 104 passed, 2 failed. The failures are the two known `assign_frequencies` tests. The five `test_pick_best_hp_rates.py` tests passed.
+
+## T9 results
+
+Not the 30-seed grid. One seed of `bench_hp.sh` defaults finished on this Mac (seed 1, about 3.4 minutes). The `--collapse-hp` and `--collapse-hp --hp-fn-rate 0.4` repeats, seeds 2–30, and `run_eval.sh --pair` were not run. `--pair` needs `ccs`, which is not installed here.
+
+The first attempt died at a depth-1 sub-clone: pbsim had exited before `sim_3.h2_rot1_0001.fq.gz` was visible. `simulate_reads.sh` now waits up to a second for that file (`cd0a6f9`). The retry then completed.
+
+Seed 1, frozen HP config, Himito defaults (no `--collapse-hp`, no rate override). n = 1, so there is no ±2 SE.
+
+| metric | value |
+|---|---|
+| hp_intrusion | 0.0000 |
+| hp_backbone_nodes | 1 |
+| hp_len_l1 | 0.6265 |
+| root_fraction | 0.4753 |
+| ad_f1 | 0.7865 |
+| hap_f1 | 0.0769 |
+| hp_var_f1 | 1.0000 |
+| var_recall | 1.0000 |
+| n_hp_unstable_called | 2 of 6 |
+
+`hp_intrusion` was 0 on this seed, and one unstable allele still had a child (`hp_backbone_nodes` = 1). `root_fraction` 0.48 is in the range the plan quotes for real ONT (34–64%). That is one seed, not a mean.
+

@@ -61,6 +61,8 @@ COLLAPSE_HP=0
 # Plan 2026-09-27 T3. Forwarded only to `Himito lineage`, not `Himito call`.
 HP_FP_RATE=""
 HP_FN_RATE=""
+# Plan 2026-09-27 T11. "call" skips Himito lineage after sim.matrix.csv and sim.vcf exist.
+STOP_AFTER=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -84,6 +86,10 @@ while [[ $# -gt 0 ]]; do
     --collapse-hp) COLLAPSE_HP=1; shift;;
     --hp-fp-rate) HP_FP_RATE="$2"; shift 2;;
     --hp-fn-rate) HP_FN_RATE="$2"; shift 2;;
+    --stop-after)
+      STOP_AFTER="$2"; shift 2
+      [[ "$STOP_AFTER" == "call" ]] || { echo "--stop-after must be call (got $STOP_AFTER)" >&2; exit 1; }
+      ;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
@@ -92,7 +98,7 @@ done
   echo "  [--minimal-ac N] [--vaf V] [--denoise-vaf V] [--frequency-threshold F]" >&2
   echo "  [--permutation-frequency-threshold F] [--strand-bias-threshold F]" >&2
   echo "  [--indel-false-threshold F] [--min-edge-reads N] [--min-hf F] [--max-hf F]" >&2
-  echo "  [--collapse-hp] [--hp-fp-rate F] [--hp-fn-rate F]" >&2
+  echo "  [--collapse-hp] [--hp-fp-rate F] [--hp-fn-rate F] [--stop-after call]" >&2
   exit 1
 }
 
@@ -184,6 +190,13 @@ CALL_ARGS=(
 )
 [[ -n "$FREQ_THRESHOLD" ]] && CALL_ARGS+=(-f "$FREQ_THRESHOLD")
 "$HIMITO" call "${CALL_ARGS[@]}"
+
+# Plan 2026-09-27 T11. The HP-rate sweep re-runs lineage itself. Leave the
+# matrix, VCF, reads, and truth in place.
+if [[ "$STOP_AFTER" == "call" ]]; then
+  echo "stop-after call: skipped Himito lineage ($HDIR/sim.matrix.csv, $HDIR/sim.vcf)" >&2
+  exit 0
+fi
 
 # quick-start also runs a NUMT/methylation filter before build and asm/methyl
 # steps after call; both are no-ops for this harness's simulated reads (no

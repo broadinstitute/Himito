@@ -63,6 +63,9 @@ BACKGROUND=""
 # Plan 2026-09-27 T8. One truth, then hifi and ont-denoised. Linux-only: hifi
 # needs ccs. Off unless passed; --profile is ignored while this is set.
 PAIR=0
+# Plan 2026-09-27 T11. "call" stops once sim.matrix.csv and sim.vcf exist.
+# Lineage and score_lineage.py are a later sweep step. Reads and truth stay.
+STOP_AFTER=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -89,11 +92,15 @@ while [[ $# -gt 0 ]]; do
     --hp-min-subclone-freq) HP_MIN_SUBCLONE_FREQ="$2"; shift 2;;
     --background) BACKGROUND="$2"; shift 2;;
     --pair) PAIR=1; shift;;
+    --stop-after)
+      STOP_AFTER="$2"; shift 2
+      [[ "$STOP_AFTER" == "call" ]] || { echo "--stop-after must be call (got $STOP_AFTER)" >&2; exit 1; }
+      ;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC] [--pair]" >&2
+  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC] [--pair] [--stop-after call]" >&2
   exit 1
 }
 # Plan 2026-09-27 T8. Fail before any simulation. An ONT-only run is not a pair.
@@ -163,6 +170,8 @@ run_one_profile() {
   # Plan 2026-09-27 T3. run_himito.sh forwards these to Himito lineage only.
   [[ -n "$HP_FP_RATE" ]] && HIMITO_ARGS+=(--hp-fp-rate "$HP_FP_RATE")
   [[ -n "$HP_FN_RATE" ]] && HIMITO_ARGS+=(--hp-fn-rate "$HP_FN_RATE")
+  # Plan 2026-09-27 T11. run_himito.sh exits after Himito call.
+  [[ -n "$STOP_AFTER" ]] && HIMITO_ARGS+=(--stop-after "$STOP_AFTER")
   "$HERE/run_himito.sh" "${HIMITO_ARGS[@]}"
   if [[ "$dest" != "himito" ]]; then
     rm -rf "$OUTDIR/$dest"
@@ -233,10 +242,21 @@ PY
   rm -f "$pair_score"
 }
 
+# Plan 2026-09-27 T11. sim.matrix.csv and sim.vcf are enough for sweep_hp_rates.sh.
+# Do not score: sim_lineage.* does not exist, and truth/ is left in place.
+stop_after_call() {
+  echo "stop-after call: skipped lineage and scoring (truth/ and himito/sim.vcf kept)" >&2
+  exit 0
+}
+
 if [[ "$PAIR" == 1 ]]; then
   # hifi first, then ont-denoised. Each reconstruction is renamed before the
   # next simulate_reads/run_himito, which both write under this same OUTDIR.
   run_one_profile hifi himito_pb
+  if [[ "$STOP_AFTER" == "call" ]]; then
+    run_one_profile ont-denoised himito_ont
+    stop_after_call
+  fi
   score_reconstruction hifi himito_pb "$OUTDIR/metrics_pb.tsv"
   run_one_profile ont-denoised himito_ont
   score_reconstruction ont-denoised himito_ont "$OUTDIR/metrics_ont.tsv"
@@ -246,6 +266,9 @@ if [[ "$PAIR" == 1 ]]; then
   echo "ONT metrics: $OUTDIR/metrics_ont.tsv"
 else
   run_one_profile "$PROFILE" himito
+  if [[ "$STOP_AFTER" == "call" ]]; then
+    stop_after_call
+  fi
   score_reconstruction "$PROFILE" himito "$OUTDIR/metrics.tsv"
   echo "=== metrics ($OUTDIR/metrics.tsv) ==="
 fi

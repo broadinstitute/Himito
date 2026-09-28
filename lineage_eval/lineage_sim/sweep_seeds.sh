@@ -43,6 +43,8 @@ HP_LINEAGE_INDELS=""
 # Plan 2026-09-27 T4. Empty = omit the flag on run_eval.sh.
 HP_UNSTABLE=""
 HP_MIN_SUBCLONE_FREQ=""
+# Plan 2026-09-27 T5. Empty = omit the flag on run_eval.sh.
+BACKGROUND=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -61,11 +63,12 @@ while [[ $# -gt 0 ]]; do
     --hp-lineage-indels) HP_LINEAGE_INDELS="$2"; shift 2;;
     --hp-unstable) HP_UNSTABLE="$2"; shift 2;;
     --hp-min-subclone-freq) HP_MIN_SUBCLONE_FREQ="$2"; shift 2;;
+    --background) BACKGROUND="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile P] [--n-mutations N] [--total-depth N] [--seeds \"1 2 3\"] [--frequency-threshold F] [--sim-min-hf F] [--denoise-vaf F] [--topology random|chain|star] [--internal-keep F] [--ref FASTA] [--keep-intermediate] [--hp-lineage-indels K] [--hp-unstable SPEC] [--hp-min-subclone-freq F]" >&2
+  echo "usage: --outdir DIR [--profile P] [--n-mutations N] [--total-depth N] [--seeds \"1 2 3\"] [--frequency-threshold F] [--sim-min-hf F] [--denoise-vaf F] [--topology random|chain|star] [--internal-keep F] [--ref FASTA] [--keep-intermediate] [--hp-lineage-indels K] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC]" >&2
   exit 1
 }
 [[ -f "$REF_ARG" ]] || { echo "missing reference FASTA: $REF_ARG (pass --ref)" >&2; exit 1; }
@@ -96,6 +99,8 @@ for s in $SEEDS; do
   # Plan 2026-09-27 T4. Empty omits the flag.
   [[ -n "$HP_UNSTABLE" ]] && EVAL_ARGS+=(--hp-unstable "$HP_UNSTABLE")
   [[ -n "$HP_MIN_SUBCLONE_FREQ" ]] && EVAL_ARGS+=(--hp-min-subclone-freq "$HP_MIN_SUBCLONE_FREQ")
+  # Plan 2026-09-27 T5. Empty omits the flag.
+  [[ -n "$BACKGROUND" ]] && EVAL_ARGS+=(--background "$BACKGROUND")
   if ! "$HERE/run_eval.sh" "${EVAL_ARGS[@]}" >"$OUTDIR/seed$s.log" 2>&1; then
     echo "  FAILED (see $OUTDIR/seed$s.log)" >&2
     FAILED="$FAILED $s"

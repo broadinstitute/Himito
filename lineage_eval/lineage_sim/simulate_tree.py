@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Simulate a clonal mitochondrial mutation tree (SCITE-style truth).
 
-Root = rCRS. Each edge introduces one heteroplasmic variant: an SNV, or, when
+Root = rCRS, plus any fixed ``--background`` homoplasmies. Each edge
+introduces one heteroplasmic variant: an SNV, or, when
 ``--hp-lineage-indels`` is set, a homopolymer length change on a catalogue
 tract. ``--hp-unstable`` additionally splits every clone, including ref, into
 sub-clones by tract length; those alleles are not tree edges. Each node
@@ -13,12 +14,13 @@ import argparse
 import itertools
 import os
 import random
+import re
 import sys
 from dataclasses import dataclass, field
 
 # Plan 2026-09-27 T1. Shared with the tract catalogue; sibling import matches
 # how this file is run from lineage_eval/lineage_sim/.
-from hp_tracts import CATALOGUE, load_reference
+from hp_tracts import CATALOGUE, apply_background, effective_tract, load_reference
 
 # Regions to avoid when placing SNVs: rCRS control-region homopolymers / the
 # 3107 'N' placeholder, where Himito's indel-prone calls would confound a
@@ -285,7 +287,8 @@ def _tract_blocks_snv(pos: int, tract) -> bool:
 
 
 def _apply_hp_lineage_indels(seq: str, nodes: list[Node], k: int,
-                             hp_rng: random.Random | None) -> None:
+                             hp_rng: random.Random | None,
+                             background_positions: set[int] | None = None) -> None:
     """Replace K SNV edges with distinct catalogue length changes.
 
     Draws come only from ``hp_rng``. Called after SNV placement so ``rng`` is
@@ -296,7 +299,9 @@ def _apply_hp_lineage_indels(seq: str, nodes: list[Node], k: int,
     if hp_rng is None:
         raise ValueError("hp_rng is required when hp_lineage_indels > 0")
     n_mutations = len(nodes) - 1
-    drawable = _drawable_tracts()
+    # Plan 2026-09-27 T5. Anchors are the run on this root, which may already
+    # include fixed background homoplasmies.
+    drawable = [effective_tract(t, seq) for t in _drawable_tracts()]
     if k > n_mutations or k > len(drawable):
         raise ValueError(
             f"hp_lineage_indels={k} exceeds n_mutations={n_mutations} "
@@ -320,6 +325,10 @@ def _apply_hp_lineage_indels(seq: str, nodes: list[Node], k: int,
         return any(_tract_blocks_snv(pos, tract) for tract in chosen)
 
     used: set[int] = set()
+    # Plan 2026-09-27 T5. Same rule as the SNV loop: only a non-empty set is
+    # occupied, and the redraw stays on hp_rng.
+    if background_positions:
+        used.update(background_positions)
     moving: list[int] = []
     for i in range(1, n_mutations + 1):
         if i in hp_ids:
@@ -347,7 +356,8 @@ TOPOLOGIES = ("random", "chain", "star")
 
 def build_tree(seq: str, n_mutations: int, rng: random.Random,
                topology: str = "random", hp_lineage_indels: int = 0,
-               hp_rng: random.Random | None = None) -> Tree:
+               hp_rng: random.Random | None = None,
+               background_positions: set[int] | None = None) -> Tree:
     """Rooted mutation tree in one of three shapes.
 
     ``random`` (default) attaches each new mutation to a uniformly chosen existing
@@ -381,6 +391,10 @@ def build_tree(seq: str, n_mutations: int, rng: random.Random,
     root = Node(id=0, variant=None, pos=None, ref=None, alt=None, parent=0)
     nodes = [root]
     used: set[int] = set()
+    # Plan 2026-09-27 T5. Occupied only when the caller passed a non-empty
+    # set, so an omitted background does not touch this RNG.
+    if background_positions:
+        used.update(background_positions)
     for i in range(1, n_mutations + 1):
         if topology == "chain":
             parent = i - 1          # extend the single path
@@ -397,8 +411,49 @@ def build_tree(seq: str, n_mutations: int, rng: random.Random,
         nodes[parent].children.append(i)
     # Plan 2026-09-27 T3. After the SNV loop so `rng` draws stay put.
     if hp_lineage_indels:
-        _apply_hp_lineage_indels(seq, nodes, hp_lineage_indels, hp_rng)
+        _apply_hp_lineage_indels(
+            seq, nodes, hp_lineage_indels, hp_rng,
+            background_positions=background_positions,
+        )
     return Tree(nodes=nodes)
+
+
+# Plan 2026-09-27 T5. Preset order is the order written to truth/background.txt.
+_BACKGROUND_TOKEN = re.compile(r"^([ACGT])(\d+)([ACGT])$")
+_BACKGROUND_PRESETS = {
+    "hvs1-polyC": ["T16189C", "A16183C"],
+}
+
+
+def parse_background(spec: str) -> list[str]:
+    """``none`` applies nothing. ``hvs1-polyC`` is ``T16189C,A16183C``.
+
+    Any other spec is a comma-separated list of ``<REF><pos><ALT>`` tokens.
+    ``apply_background`` checks each REF base against rCRS.
+    """
+    # Plan 2026-09-27 T5.
+    if spec == "none":
+        return []
+    if spec in _BACKGROUND_PRESETS:
+        return list(_BACKGROUND_PRESETS[spec])
+    tokens = spec.split(",")
+    if not tokens or any(_BACKGROUND_TOKEN.fullmatch(token) is None for token in tokens):
+        raise ValueError(
+            f"background spec {spec!r} is not none, hvs1-polyC, "
+            "or comma-separated <REF><pos><ALT> tokens"
+        )
+    return tokens
+
+
+def _background_positions(tokens: list[str]) -> set[int]:
+    return {int(_BACKGROUND_TOKEN.fullmatch(token).group(2)) for token in tokens}
+
+
+def _background_himito_name(token: str) -> str:
+    """Himito SNV name of a background token, on rCRS (the token's own REF)."""
+    match = _BACKGROUND_TOKEN.fullmatch(token)
+    ref, pos, alt = match.group(1), match.group(2), match.group(3)
+    return f"m.{pos}{ref}>{alt}"
 
 
 def deepest_chain_freq(n_mutations: int, ref_fraction: float,
@@ -689,11 +744,12 @@ def apply_unstable_deltas(seq: str, path: list, hp_state: dict) -> str:
     """Path edits first, then each non-zero δ at that tract's anchor on the result.
 
     Higher anchors are applied first so an insertion does not move a later
-    (leftward) catalogue coordinate. A zero delta adds no edit.
+    (leftward) coordinate. Anchors come from ``effective_tract`` on ``seq``.
+    A zero delta adds no edit.
     """
-    # Plan 2026-09-27 T4.
+    # Plan 2026-09-27 T4. T5: the anchor is the run on this root sequence.
     genome = apply_edits(seq, path) if path else seq
-    by_id = {t.id: t for t in CATALOGUE}
+    by_id = {t.id: effective_tract(t, seq) for t in CATALOGUE}
     pending = [(by_id[tid], delta) for tid, delta in hp_state.items() if delta]
     pending.sort(key=lambda item: item[0].anchor, reverse=True)
     for tract, delta in pending:
@@ -769,24 +825,36 @@ def _write_hp_tracts(path: str, subclones, spec, seq: str) -> None:
         )
         for tid in spec:
             tract = by_id[tid]
+            # Plan 2026-09-27 T5. ref_len stays the catalogue run. background_len
+            # and anchor follow the run on this root sequence.
+            eff = effective_tract(tract, seq)
             ref_len = tract.copies * len(tract.unit)
+            background_len = eff.copies * len(eff.unit)
             for delta in sorted(d for d in spec[tid] if d != 0):
-                name = himito_name(left_align(_raw_length_edit(seq, tract, delta), seq))
+                name = himito_name(left_align(_raw_length_edit(seq, eff, delta), seq))
                 for origin in ("unstable", "mixed"):
                     freq = mass.get((tid, delta, origin), 0.0)
                     if freq <= 0:
                         continue
                     fh.write(
-                        f"{tid}\t{tract.anchor}\t{ref_len}\t{ref_len}\t{delta:+d}\t"
+                        f"{tid}\t{eff.anchor}\t{ref_len}\t{background_len}\t{delta:+d}\t"
                         f"{freq:.6f}\t{name}\t{origin}\n"
                     )
 
 
 def write_truth(tree: Tree, seq: str, outdir: str, *, hp_spec=None,
                 min_subclone_freq: float = 0.002,
-                total_depth: int | None = None) -> None:
+                total_depth: int | None = None,
+                background: list[str] | None = None) -> None:
     tdir = os.path.join(outdir, "truth")
     os.makedirs(tdir, exist_ok=True)
+
+    # Plan 2026-09-27 T5. Omitted when the background list is empty, so a
+    # no-background run does not gain a file.
+    if background:
+        with open(os.path.join(tdir, "background.txt"), "w") as fh:
+            for token in background:
+                fh.write(_background_himito_name(token) + "\n")
 
     with open(os.path.join(tdir, "truth_mutation_tree.tsv"), "w") as fh:
         fh.write("node_id\tvariant\tparent_id\tparent_variant\n")
@@ -923,11 +991,27 @@ def main() -> None:
         "rounds to 0 when that floor would inflate scheduled reads by more "
         "than 5 percent (plan 2026-09-27 T4)",
     )
+    ap.add_argument(
+        "--background",
+        default="none",
+        help="fixed homoplasmies applied to the root before the tree: "
+        "none (default), hvs1-polyC, or comma-separated <REF><pos><ALT> "
+        "tokens such as T16189C,A16183C (plan 2026-09-27 T5)",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--outdir", required=True)
     args = ap.parse_args()
 
     _, seq = load_reference(args.reference)
+    # Plan 2026-09-27 T5. Apply before the tree and before unstable deltas.
+    # An empty list leaves the sequence and the SNV RNG alone.
+    background = parse_background(args.background)
+    if background:
+        root_seq = apply_background(seq, background)
+        occupied = _background_positions(background)
+    else:
+        root_seq = seq
+        occupied = None
     # A chain's frequencies are deterministic (no sibling split, so no rng in the
     # mass assignment), which makes the retry loop below pointless for it: 100
     # reseeds all produce the same cum_freq. Check the closed form up front and
@@ -958,8 +1042,9 @@ def main() -> None:
         # Plan 2026-09-27 T3. Not constructed at all when K is 0.
         hp_rng = random.Random(seed + 1_000_003) if hp_k else None
         tree = build_tree(
-            seq, args.n_mutations, rng, topology=args.topology,
+            root_seq, args.n_mutations, rng, topology=args.topology,
             hp_lineage_indels=hp_k, hp_rng=hp_rng,
+            background_positions=occupied,
         )
         try:
             assign_frequencies(
@@ -980,10 +1065,11 @@ def main() -> None:
     # Plan 2026-09-27 T4. --total-depth is consulted only with --hp-unstable.
     hp_spec = parse_hp_unstable(args.hp_unstable) if args.hp_unstable is not None else None
     write_truth(
-        tree, seq, args.outdir,
+        tree, root_seq, args.outdir,
         hp_spec=hp_spec,
         min_subclone_freq=args.hp_min_subclone_freq,
         total_depth=args.total_depth if hp_spec is not None else None,
+        background=background or None,
     )
     print(f"wrote truth for {args.n_mutations} mutations "
           f"(topology={args.topology}) to {args.outdir}/truth")

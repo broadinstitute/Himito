@@ -58,6 +58,8 @@ HP_FN_RATE=""
 # Plan 2026-09-27 T4. Empty = omit --hp-unstable. Depth is forwarded only with it.
 HP_UNSTABLE=""
 HP_MIN_SUBCLONE_FREQ=""
+# Plan 2026-09-27 T5. Empty = omit; simulate_tree.py defaults to none.
+BACKGROUND=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -82,11 +84,12 @@ while [[ $# -gt 0 ]]; do
     --hp-fn-rate) HP_FN_RATE="$2"; shift 2;;
     --hp-unstable) HP_UNSTABLE="$2"; shift 2;;
     --hp-min-subclone-freq) HP_MIN_SUBCLONE_FREQ="$2"; shift 2;;
+    --background) BACKGROUND="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F]" >&2
+  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC]" >&2
   exit 1
 }
 # Resolve in simulate_reads.sh; export a sane default here for visibility.
@@ -117,6 +120,8 @@ SIM_TREE_ARGS=()
 [[ -n "$HP_UNSTABLE" ]] && SIM_TREE_ARGS+=(--hp-unstable "$HP_UNSTABLE")
 [[ -n "$HP_MIN_SUBCLONE_FREQ" ]] && SIM_TREE_ARGS+=(--hp-min-subclone-freq "$HP_MIN_SUBCLONE_FREQ")
 [[ -n "$HP_UNSTABLE" ]] && SIM_TREE_ARGS+=(--total-depth "$DEPTH")
+# Plan 2026-09-27 T5. Empty omits the flag.
+[[ -n "$BACKGROUND" ]] && SIM_TREE_ARGS+=(--background "$BACKGROUND")
 python "$HERE/simulate_tree.py" --reference "$REF" --n-mutations "$NMUT" --seed "$SEED" --outdir "$OUTDIR" --min-hf "$SIM_MIN_HF" --max-hf "$SIM_MAX_HF" "${SIM_TREE_ARGS[@]+"${SIM_TREE_ARGS[@]}"}"
 "$HERE/simulate_reads.sh" --outdir "$OUTDIR" --profile "$PROFILE" --total-depth "$DEPTH" --seed "$SEED"
 HIMITO_ARGS=(

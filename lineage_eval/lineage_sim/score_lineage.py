@@ -265,7 +265,24 @@ HAP_FIELDS = ["n_truth_clones", "n_recon_haps",
 FIELDS = ["profile", "fp", "fn", "n_truth_vars", "n_detected_vars", "n_shared",
           "n_truth_pairs",
           "var_precision", "var_recall", "var_f1",
-          "ad_precision", "ad_recall", "ad_f1"] + HAP_FIELDS
+          "ad_precision", "ad_recall", "ad_f1"] + HAP_FIELDS + ["n_background_calls"]
+
+
+def load_truth_background(path: str) -> set[str]:
+    """Names in ``truth/background.txt``. Missing or empty means exclude nothing.
+
+    Plan 2026-09-27 T5. These are fixed homoplasmies. ``Himito lineage`` already
+    drops them as ``fixed``; the VCF can still report them at HF near 1.
+    """
+    if not path or not os.path.isfile(path):
+        return set()
+    names = set()
+    with open(path) as fh:
+        for line in fh:
+            name = line.strip()
+            if name:
+                names.add(name)
+    return names
 
 
 def main() -> None:
@@ -286,6 +303,12 @@ def main() -> None:
     ap.add_argument("--fp", default="NA")
     ap.add_argument("--fn", default="NA")
     ap.add_argument("--metrics-out", default="")
+    ap.add_argument(
+        "--truth-background",
+        default="",
+        help="fixed-homoplasmy names removed from detected before var_precision "
+        "(plan 2026-09-27 T5). Missing or empty leaves detected unchanged",
+    )
     args = ap.parse_args()
 
     truth_pm = parse_mutation_tree(args.truth_tree)
@@ -293,6 +316,11 @@ def main() -> None:
     truth_vars = {l.strip() for l in open(args.truth_variants) if l.strip()}
     detected_hf = detected_variants_with_hf_from_vcf(args.vcf)
     detected = set(detected_hf)
+    # Plan 2026-09-27 T5. Count hits before dropping them from the precision
+    # denominator. An empty set leaves `detected` unchanged.
+    background = load_truth_background(args.truth_background)
+    n_background_calls = len(detected & background)
+    detected -= background
 
     if bool(args.recon_matrix) != bool(args.truth_clones):
         ap.error("--recon-matrix and --truth-clones must be given together")
@@ -314,7 +342,8 @@ def main() -> None:
 
     m = score(truth_pm, recon_pm, truth_vars, detected,
               truth_haps=truth_haps, recon_haps=recon_haps)
-    row = {"profile": args.profile, "fp": args.fp, "fn": args.fn, **m}
+    row = {"profile": args.profile, "fp": args.fp, "fn": args.fn, **m,
+           "n_background_calls": n_background_calls}
 
     def fmt(x):
         return f"{x:.4f}" if isinstance(x, float) else str(x)

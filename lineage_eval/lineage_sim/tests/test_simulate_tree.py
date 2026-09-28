@@ -1204,3 +1204,271 @@ def test_sweep_seeds_forwards_hp_unstable():
     assert "unknown arg" not in r.stderr
     assert "usage:" in r.stderr
     assert r.returncode != 0
+
+
+def _run_simulate(out, *extra):
+    import subprocess
+    r = subprocess.run(
+        [sys.executable, str(_SIM_DIR / "simulate_tree.py"),
+         "--reference", REF, "--outdir", str(out), *extra],
+        capture_output=True, text=True,
+    )
+    return r
+
+
+def _variant_pos(name: str) -> int:
+    import re
+    match = re.match(r"m\.(\d+)", name)
+    assert match, name
+    return int(match.group(1))
+
+
+def test_parse_background_none_and_hvs1_preset():
+    """Plan 2026-09-27 T5. none is empty; hvs1-polyC expands in that order."""
+    assert st.parse_background("none") == []
+    assert st.parse_background("hvs1-polyC") == ["T16189C", "A16183C"]
+    assert st.parse_background("T16189C,A16183C") == ["T16189C", "A16183C"]
+
+
+def test_background_none_truth_matches_omitted_flag(tmp_path):
+    """Plan 2026-09-27 T5. none and an omitted flag leave seed-1 truth untouched."""
+    import hashlib
+    plain = tmp_path / "plain"
+    none = tmp_path / "none"
+    r0 = _run_simulate(plain, "--n-mutations", "10", "--seed", "1")
+    assert r0.returncode == 0, r0.stderr
+    r1 = _run_simulate(none, "--n-mutations", "10", "--seed", "1", "--background", "none")
+    assert r1.returncode == 0, r1.stderr
+    plain_truth = plain / "truth"
+    none_truth = none / "truth"
+    assert not (plain_truth / "background.txt").exists()
+    assert not (none_truth / "background.txt").exists()
+    assert sorted(p.name for p in plain_truth.iterdir()) == sorted(
+        p.name for p in none_truth.iterdir()
+    )
+    for name in sorted(p.name for p in plain_truth.iterdir()):
+        assert (plain_truth / name).read_bytes() == (none_truth / name).read_bytes()
+    clones = (plain_truth / "clones.tsv").read_bytes()
+    genomes = (plain_truth / "clone_genomes.fa").read_bytes()
+    assert hashlib.sha256(clones).hexdigest() == _NO_HP_CLONES_SHA256
+    assert hashlib.sha256(genomes).hexdigest() == _NO_HP_GENOMES_SHA256
+
+
+def test_background_snvs_edit_root_and_write_himito_names(tmp_path):
+    """Plan 2026-09-27 T5. Root differs from rCRS only at the background sites.
+
+    Names in truth/background.txt are Himito SNVs on rCRS, in CLI order.
+    Those sites are not tree variants. AVOID_RANGES still excludes SNVs.
+    """
+    from hp_tracts import apply_background
+
+    out = tmp_path / "bg"
+    r = _run_simulate(
+        out, "--n-mutations", "10", "--seed", "1",
+        "--background", "T16189C,A16183C",
+    )
+    assert r.returncode == 0, r.stderr
+    _, rcrs = st.load_reference(REF)
+    records = _fasta_records(out / "truth" / "clone_genomes.fa")
+    root = records["clone_ref"]
+    assert root == apply_background(rcrs, ["T16189C", "A16183C"])
+    diffs = [i + 1 for i, (a, b) in enumerate(zip(rcrs, root)) if a != b]
+    assert diffs == [16183, 16189]
+    others = [genome for name, genome in records.items() if name != "clone_ref"]
+    assert others
+    assert any(genome != root for genome in others)
+    for genome in records.values():
+        assert len(genome) == len(rcrs)
+        assert genome[16182] == "C" and genome[16188] == "C"
+    assert (out / "truth" / "background.txt").read_text() == (
+        "m.16189T>C\nm.16183A>C\n"
+    )
+    variants = (out / "truth" / "truth_variants.txt").read_text().splitlines()
+    assert "m.16189T>C" not in variants
+    assert "m.16183A>C" not in variants
+    positions = [_variant_pos(name) for name in variants]
+    assert 16183 not in positions and 16189 not in positions
+    assert all(not st._is_avoided(pos) for pos in positions)
+
+
+def test_hvs1_polyc_preset_matches_explicit_tokens(tmp_path):
+    """Plan 2026-09-27 T5. hvs1-polyC is T16189C,A16183C in that order."""
+    preset = tmp_path / "preset"
+    explicit = tmp_path / "explicit"
+    r0 = _run_simulate(
+        preset, "--n-mutations", "10", "--seed", "1",
+        "--background", "hvs1-polyC",
+    )
+    assert r0.returncode == 0, r0.stderr
+    r1 = _run_simulate(
+        explicit, "--n-mutations", "10", "--seed", "1",
+        "--background", "T16189C,A16183C",
+    )
+    assert r1.returncode == 0, r1.stderr
+    assert (preset / "truth" / "background.txt").read_text() == (
+        explicit / "truth" / "background.txt"
+    ).read_text() == "m.16189T>C\nm.16183A>C\n"
+    assert (preset / "truth" / "clone_genomes.fa").read_bytes() == (
+        explicit / "truth" / "clone_genomes.fa"
+    ).read_bytes()
+
+
+def test_background_position_outside_avoid_ranges_is_not_placed():
+    """Plan 2026-09-27 T5. Occupied sites are resampled on the same RNG.
+
+    An empty or omitted set does not change the no-background draw.
+    AVOID_RANGES still apply to the resampled positions.
+    """
+    _, seq = st.load_reference(REF)
+    pos = 1000
+    assert not st._is_avoided(pos) and seq[pos - 1] != "N"
+    hit = None
+    for seed in range(1, 20001):
+        tree = st.build_tree(seq, n_mutations=40, rng=random.Random(seed))
+        if any(n.pos == pos for n in tree.nodes[1:]):
+            hit = seed
+            break
+    assert hit is not None
+    plain = st.build_tree(seq, n_mutations=40, rng=random.Random(hit))
+    assert any(n.pos == pos for n in plain.nodes[1:])
+    blocked = st.build_tree(
+        seq, n_mutations=40, rng=random.Random(hit),
+        background_positions={pos},
+    )
+    blocked_pos = [n.pos for n in blocked.nodes[1:]]
+    assert pos not in blocked_pos
+    assert len(blocked_pos) == len(set(blocked_pos)) == 40
+    assert all(not st._is_avoided(p) for p in blocked_pos)
+    assert all(seq[p - 1] != "N" for p in blocked_pos)
+    again = st.build_tree(
+        seq, n_mutations=40, rng=random.Random(hit),
+        background_positions=None,
+    )
+    empty = st.build_tree(
+        seq, n_mutations=40, rng=random.Random(hit),
+        background_positions=set(),
+    )
+    plain_pos = [n.pos for n in plain.nodes[1:]]
+    assert [n.pos for n in again.nodes[1:]] == plain_pos
+    assert [n.pos for n in empty.nodes[1:]] == plain_pos
+
+
+def _root_only_tree():
+    root = st.Node(id=0, variant=None, pos=None, ref=None, alt=None, parent=0)
+    root.cum_freq = 1.0
+    return st.Tree(nodes=[root])
+
+
+def test_hp_tracts_use_effective_anchor_on_background(tmp_path):
+    """Plan 2026-09-27 T5. HVS1 +1 on the polyC background is m.16182A>AC.
+
+    background_len is the extended run (11 with both SNVs, 10 with T16189C).
+    ref_len stays the catalogue length. The anchor is the effective anchor.
+    """
+    from hp_tracts import apply_background
+
+    _, seq = st.load_reference(REF)
+    both = tmp_path / "both"
+    st.write_truth(
+        _root_only_tree(),
+        apply_background(seq, ["T16189C", "A16183C"]),
+        str(both),
+        hp_spec={"HVS1": {0: 0.5, 1: 0.5}},
+    )
+    rows = (both / "truth" / "hp_tracts.tsv").read_text().splitlines()
+    assert rows[1].split("\t")[:7] == [
+        "HVS1", "16182", "5", "11", "+1", "0.500000", "m.16182A>AC",
+    ]
+
+    only = tmp_path / "only"
+    st.write_truth(
+        _root_only_tree(),
+        apply_background(seq, ["T16189C"]),
+        str(only),
+        hp_spec={"HVS1": {0: 0.5, 1: 0.5}},
+    )
+    only_row = (only / "truth" / "hp_tracts.tsv").read_text().splitlines()[1].split("\t")
+    assert only_row[:7] == [
+        "HVS1", "16183", "5", "10", "+1", "0.500000", "m.16183A>AC",
+    ]
+
+
+def test_cli_background_hp_tracts_follow_effective_anchor(tmp_path):
+    """Plan 2026-09-27 T5. The CLI applies the preset before unstable deltas."""
+    out = tmp_path / "hp"
+    r = _run_simulate(
+        out, "--n-mutations", "4", "--seed", "1",
+        "--background", "hvs1-polyC",
+        "--hp-unstable", "HVS1:0=0.5,1=0.5",
+    )
+    assert r.returncode == 0, r.stderr
+    hvs = [
+        line.split("\t")
+        for line in (out / "truth" / "hp_tracts.tsv").read_text().splitlines()[1:]
+        if line.startswith("HVS1\t")
+    ]
+    assert hvs
+    assert all(row[1] == "16182" and row[2] == "5" and row[3] == "11" for row in hvs)
+    plus = [row for row in hvs if row[4] == "+1"]
+    assert plus and all(row[6] == "m.16182A>AC" for row in plus)
+    assert (out / "truth" / "background.txt").read_text() == "m.16189T>C\nm.16183A>C\n"
+
+
+def test_run_eval_forwards_background_not_truth_background(tmp_path):
+    """Plan 2026-09-27 T5. --background reaches simulate_tree.py only."""
+    import subprocess
+    script = (_SIM_DIR / "run_eval.sh").read_text()
+    assert "--truth-background" not in script
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "argv.txt"
+    py = bindir / "python"
+    py.write_text(
+        "#!/bin/bash\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        "exit 42\n"
+    )
+    py.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    r = subprocess.run(
+        ["bash", str(_SIM_DIR / "run_eval.sh"),
+         "--outdir", str(tmp_path / "out"),
+         "--background", "hvs1-polyC",
+         "--n-mutations", "6", "--seed", "1",
+         "--ref", REF],
+        capture_output=True, text=True, env=env,
+    )
+    assert r.returncode != 0
+    argv = log.read_text()
+    assert "simulate_tree.py" in argv
+    assert "--background hvs1-polyC" in argv
+    assert "--truth-background" not in argv
+
+    log.unlink()
+    r2 = subprocess.run(
+        ["bash", str(_SIM_DIR / "run_eval.sh"),
+         "--outdir", str(tmp_path / "out2"),
+         "--n-mutations", "6", "--seed", "1",
+         "--ref", REF],
+        capture_output=True, text=True, env=env,
+    )
+    assert r2.returncode != 0
+    assert "--background" not in log.read_text()
+
+
+def test_sweep_seeds_forwards_background():
+    """Plan 2026-09-27 T5. sweep_seeds.sh accepts --background and forwards it."""
+    import re
+    import subprocess
+    script = (_SIM_DIR / "sweep_seeds.sh").read_text()
+    assert "--truth-background" not in script
+    assert re.search(r"--background\)", script)
+    assert re.search(r'EVAL_ARGS\+=\(--background "\$BACKGROUND"\)', script)
+    r = subprocess.run(
+        ["bash", str(_SIM_DIR / "sweep_seeds.sh"), "--background", "hvs1-polyC"],
+        capture_output=True, text=True,
+    )
+    assert "unknown arg" not in r.stderr
+    assert "usage:" in r.stderr
+    assert r.returncode != 0

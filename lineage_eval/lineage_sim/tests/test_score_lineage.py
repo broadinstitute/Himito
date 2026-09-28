@@ -138,3 +138,137 @@ def test_truth_background_dropped_before_var_precision(tmp_path):
     assert missing.returncode == 0, missing.stderr
     assert _metrics_row(missing.stdout)["n_background_calls"] == "0"
     assert _metrics_row(missing.stdout)["var_precision"] == "0.3333"
+
+
+# Plan 2026-09-27 T6.
+# rCRS 16183-16193 is ACCCCCTCCCC. T16189C plus one inserted C is A + 11 C.
+_HVS1_CANON = "m.16183ACCCCCTCCCC>ACCCCCCCCCCC"
+# rCRS 16182-16193 is AACCCCCTCCCC. T16189C, A16183C and one inserted C
+# is A followed by 12 C.
+_HVS1_EXTENDED = "m.16182AACCCCCTCCCC>ACCCCCCCCCCCC"
+
+
+def test_canonical_name_collapses_equivalent_hvs1_spellings():
+    """Plan 2026-09-27 T6. One HVS1 allele, three spellings, two backgrounds."""
+    import hp_tracts as hp
+
+    bg = ["T16189C"]
+    assert hp.canonical_name("m.16189T>TC", bg) == _HVS1_CANON
+    assert hp.canonical_name("m.16183A>AC", bg) == _HVS1_CANON
+    extended = ["T16189C", "A16183C"]
+    assert hp.canonical_name("m.16182A>AC", extended) == _HVS1_EXTENDED
+    assert hp.canonical_name("m.16183A>AC", extended) == _HVS1_EXTENDED
+    assert hp.canonical_name("m.16189T>TC", extended) == _HVS1_EXTENDED
+
+
+def test_canonical_name_leaves_variants_outside_tracts():
+    import hp_tracts as hp
+
+    assert hp.canonical_name("m.3144A>G", ["T16189C"]) == "m.3144A>G"
+
+
+def test_canonical_name_returns_collapsed_allele_unchanged():
+    import hp_tracts as hp
+
+    assert hp.canonical_name(_HVS1_CANON, ["T16189C"]) == _HVS1_CANON
+
+
+def test_score_matches_equivalent_hp_alleles_when_background_extends_tract():
+    """Plan 2026-09-27 T6. Same insertion, two spellings: recall 1 with the background, 0 without."""
+    truth = {"m.16183A>AC"}
+    detected = {"m.16189T>TC"}
+    parents = {"ROOT": "ROOT"}
+    with_bg = sl.score(parents, parents, truth, detected, background=["T16189C"])
+    assert with_bg["var_recall"] == 1.0
+    without = sl.score(parents, parents, truth, detected)
+    assert without["var_recall"] == 0.0
+
+
+def test_parent_maps_and_root_block_use_canonical_names():
+    """Plan 2026-09-27 T6. Keys, values, and comma-joined ROOT_BLOCK members collide."""
+    bg = ["T16189C"]
+    block_truth = "m.16183A>AC,m.100A>G"
+    block_recon = "m.16189T>TC,m.100A>G"
+    truth_parent = {
+        "ROOT": "ROOT",
+        block_truth: "ROOT",
+        "m.200C>T": block_truth,
+    }
+    recon_parent = {
+        "ROOT": "ROOT",
+        block_recon: "ROOT",
+        "m.200C>T": block_recon,
+    }
+    matched = sl.score(
+        truth_parent, recon_parent,
+        {"m.200C>T"}, {"m.200C>T"},
+        background=bg,
+    )
+    assert matched["n_shared"] == 2
+    assert matched["ad_recall"] == 1.0
+    raw = sl.score(
+        truth_parent, recon_parent,
+        {"m.200C>T"}, {"m.200C>T"},
+    )
+    assert raw["n_shared"] == 1
+    assert raw["ad_recall"] == 0.0
+
+
+def test_parse_matrix_haplotypes_canonicalises_row_names(tmp_path):
+    """Plan 2026-09-27 T6. A matrix row spelled the other way still joins the keep set."""
+    import hp_tracts as hp
+
+    bg = ["T16189C"]
+    canon = hp.canonical_name("m.16189T>TC", bg)
+    path = tmp_path / "matrix.csv"
+    path.write_text(
+        "variant,r1,r2\n"
+        "m.16189T>TC,1,0\n"
+        "m.100A>G,1,1\n"
+    )
+    haps = sl.parse_matrix_haplotypes(str(path), keep={canon, "m.100A>G"}, background=bg)
+    assert frozenset({canon, "m.100A>G"}) in haps
+    assert frozenset({"m.100A>G"}) in haps
+
+
+def test_cli_background_canonicalises_truth_and_vcf(tmp_path):
+    """Plan 2026-09-27 T6. --background makes the two HVS1 spellings one variant."""
+    import subprocess
+
+    truth_tree = tmp_path / "truth_mutation_tree.tsv"
+    recon_tree = tmp_path / "recon_mutation_tree.tsv"
+    truth_body = (
+        "node_id\tvariant\tparent_id\tparent_variant\n"
+        "0\tROOT\t0\tROOT\n"
+        "1\tm.16183A>AC\t0\tROOT\n"
+    )
+    recon_body = (
+        "node_id\tvariant\tparent_id\tparent_variant\n"
+        "0\tROOT\t0\tROOT\n"
+        "1\tm.16189T>TC\t0\tROOT\n"
+    )
+    truth_tree.write_text(truth_body)
+    recon_tree.write_text(recon_body)
+    variants = tmp_path / "truth_variants.txt"
+    variants.write_text("m.16183A>AC\n")
+    vcf = tmp_path / "sim.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.2\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        "chrM\t16189\t.\tT\tTC\t.\tPASS\t.\tGT:HF\t0/1:0.40\n"
+    )
+    script = pathlib.Path(__file__).resolve().parents[1] / "score_lineage.py"
+    base = [
+        sys.executable, str(script),
+        "--truth-tree", str(truth_tree),
+        "--recon-tree", str(recon_tree),
+        "--truth-variants", str(variants),
+        "--vcf", str(vcf),
+    ]
+    hit = subprocess.run([*base, "--background", "T16189C"], capture_output=True, text=True)
+    assert hit.returncode == 0, hit.stderr
+    assert _metrics_row(hit.stdout)["var_recall"] == "1.0000"
+    assert _metrics_row(hit.stdout)["n_shared"] == "1"
+    miss = subprocess.run(base, capture_output=True, text=True)
+    assert miss.returncode == 0, miss.stderr
+    assert _metrics_row(miss.stdout)["var_recall"] == "0.0000"

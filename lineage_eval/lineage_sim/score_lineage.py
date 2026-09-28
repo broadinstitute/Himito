@@ -10,6 +10,9 @@ import csv
 import os
 import sys
 
+from hp_tracts import canonical_name
+from simulate_tree import parse_background
+
 
 def parse_mutation_tree(path: str) -> dict[str, str]:
     """variant -> parent_variant. ROOT maps to ROOT."""
@@ -111,7 +114,25 @@ def parse_clone_haplotypes(path: str) -> set[frozenset[str]]:
     return haps
 
 
-def parse_matrix_haplotypes(path: str, keep: set[str] | None = None) -> set[frozenset[str]]:
+def _canonical_variant(name: str, background: list[str]) -> str:
+    """Canonicalise one name, or each member of a comma-joined ROOT_BLOCK."""
+    if "," not in name:
+        return canonical_name(name, background)
+    return ",".join(
+        canonical_name(part, background) if part else part
+        for part in name.split(",")
+    )
+
+
+def _canonical_parent_map(parent: dict[str, str], background: list[str]) -> dict[str, str]:
+    return {
+        _canonical_variant(key, background): _canonical_variant(value, background)
+        for key, value in parent.items()
+    }
+
+
+def parse_matrix_haplotypes(path: str, keep: set[str] | None = None,
+                            background: list[str] | None = None) -> set[frozenset[str]]:
     """Reconstructed haplotypes from Himito's lineage matrix, as variant sets.
 
     The matrix is variants (rows) x reads (columns); reads sharing a genotype
@@ -130,6 +151,13 @@ def parse_matrix_haplotypes(path: str, keep: set[str] | None = None) -> set[froz
     if not rows:
         return set()
     body = rows[1:]
+    # Plan 2026-09-27 T6. Rename before the keep filter so an equivalent
+    # spelling of a mutation-tree variant is not dropped.
+    if background is not None:
+        body = [
+            [_canonical_variant(r[0], background), *r[1:]] if r else r
+            for r in body
+        ]
     if keep is not None:
         body = [r for r in body if r and r[0] in keep]
     variants = [r[0] for r in body]
@@ -184,7 +212,26 @@ def _f1(p: float, r: float) -> float:
 
 
 def score(truth_parent, recon_parent, truth_vars, detected_vars,
-          truth_haps=None, recon_haps=None) -> dict:
+          truth_haps=None, recon_haps=None, background=None) -> dict:
+    # Plan 2026-09-27 T6. None leaves names as written. A list, including an
+    # empty one, renames alleles whose REF span sits in an effective tract.
+    if background is not None:
+        background = list(background)
+        truth_parent = _canonical_parent_map(truth_parent, background)
+        recon_parent = _canonical_parent_map(recon_parent, background)
+        truth_vars = {_canonical_variant(v, background) for v in truth_vars}
+        detected_vars = {_canonical_variant(v, background) for v in detected_vars}
+        if truth_haps is not None:
+            truth_haps = {
+                frozenset(_canonical_variant(v, background) for v in hap)
+                for hap in truth_haps
+            }
+        if recon_haps is not None:
+            recon_haps = {
+                frozenset(_canonical_variant(v, background) for v in hap)
+                for hap in recon_haps
+            }
+
     # --- variant detection (tree-independent) ---
     tp = len(truth_vars & detected_vars)
     var_precision = tp / len(detected_vars) if detected_vars else 0.0
@@ -309,16 +356,39 @@ def main() -> None:
         help="fixed-homoplasmy names removed from detected before var_precision "
         "(plan 2026-09-27 T5). Missing or empty leaves detected unchanged",
     )
+    ap.add_argument(
+        "--background",
+        default="none",
+        help="fixed homoplasmies that reshape tract anchors before names are "
+        "canonicalised (plan 2026-09-27 T6): none, hvs1-polyC, or "
+        "comma-separated <REF><pos><ALT> tokens",
+    )
     args = ap.parse_args()
+    try:
+        background_tokens = parse_background(args.background)
+    except ValueError as exc:
+        ap.error(str(exc))
 
-    truth_pm = parse_mutation_tree(args.truth_tree)
-    recon_pm = parse_mutation_tree(args.recon_tree)
-    truth_vars = {l.strip() for l in open(args.truth_variants) if l.strip()}
-    detected_hf = detected_variants_with_hf_from_vcf(args.vcf)
+    # Plan 2026-09-27 T6. Both sides use the same effective tracts, so a
+    # collapsed reconstruction matches an uncollapsed truth.
+    truth_pm = _canonical_parent_map(parse_mutation_tree(args.truth_tree), background_tokens)
+    recon_pm = _canonical_parent_map(parse_mutation_tree(args.recon_tree), background_tokens)
+    truth_vars = {
+        _canonical_variant(l.strip(), background_tokens)
+        for l in open(args.truth_variants) if l.strip()
+    }
+    detected_hf: dict[str, float | None] = {}
+    for name, hf in detected_variants_with_hf_from_vcf(args.vcf).items():
+        detected_hf.setdefault(_canonical_variant(name, background_tokens), hf)
     detected = set(detected_hf)
     # Plan 2026-09-27 T5. Count hits before dropping them from the precision
-    # denominator. An empty set leaves `detected` unchanged.
-    background = load_truth_background(args.truth_background)
+    # denominator. An empty set leaves `detected` unchanged. Names are
+    # canonicalised with the same background so a tract-resident homoplasmy
+    # still matches the VCF.
+    background = {
+        _canonical_variant(name, background_tokens)
+        for name in load_truth_background(args.truth_background)
+    }
     n_background_calls = len(detected & background)
     detected -= background
 
@@ -338,10 +408,13 @@ def main() -> None:
                 keep.update(part for part in key.split(",") if part)
             else:
                 keep.add(key)
-        recon_haps = parse_matrix_haplotypes(args.recon_matrix, keep=keep)
+        recon_haps = parse_matrix_haplotypes(
+            args.recon_matrix, keep=keep, background=background_tokens,
+        )
 
     m = score(truth_pm, recon_pm, truth_vars, detected,
-              truth_haps=truth_haps, recon_haps=recon_haps)
+              truth_haps=truth_haps, recon_haps=recon_haps,
+              background=background_tokens)
     row = {"profile": args.profile, "fp": args.fp, "fn": args.fn, **m,
            "n_background_calls": n_background_calls}
 

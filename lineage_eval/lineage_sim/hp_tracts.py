@@ -4,6 +4,7 @@
 Coordinates are 1-based inclusive. ``anchor`` is the base immediately before
 the run (the position Himito uses for a left-aligned insertion).
 """
+import os
 import re
 from dataclasses import dataclass
 
@@ -116,3 +117,86 @@ def effective_tract(tract: Tract, background_seq: str) -> Tract:
         in_himito=tract.in_himito,
         simulate=tract.simulate,
     )
+
+
+_VARIANT_NAME = re.compile(r"^m\.(\d+)([ACGT]+)>([ACGT]+)$")
+_RCRS_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "rCRS.fasta")
+)
+_RCRS: str | None = None
+_BG_SEQ: dict[tuple[str, ...], str] = {}
+
+
+def _rcrs() -> str:
+    global _RCRS
+    if _RCRS is None:
+        _, _RCRS = load_reference(_RCRS_PATH)
+    return _RCRS
+
+
+def _background_sequence(background: list[str]) -> str:
+    key = tuple(background)
+    seq = _BG_SEQ.get(key)
+    if seq is None:
+        seq = apply_background(_rcrs(), list(background))
+        _BG_SEQ[key] = seq
+    return seq
+
+
+def _edited_alt(
+    tract_ref: str, bg_window: str, anchor: int, pos: int, ref: str, alt: str,
+) -> str | None:
+    """Apply one SNV, insertion, or deletion to the background window.
+
+    The REF allele has to match rCRS (``tract_ref``), which is what the name
+    was spelled against. The bases being edited are the background window.
+    """
+    offset = pos - anchor
+    if tract_ref[offset:offset + len(ref)] != ref:
+        return None
+    bases = list(bg_window)
+    if len(ref) == 1 and len(alt) == 1:
+        bases[offset] = alt
+    elif len(ref) == 1 and len(alt) > 1 and alt[0] == ref[0]:
+        bases[offset + 1:offset + 1] = list(alt[1:])
+    elif len(alt) == 1 and len(ref) > 1 and ref[0] == alt[0]:
+        del bases[offset + 1:offset + len(ref)]
+    else:
+        return None
+    return "".join(bases)
+
+
+def canonical_name(name: str, background: list[str] | None = None) -> str:
+    """Rename an in-tract allele to ``m.<anchor><rCRS>><background+edit>``.
+
+    Plan 2026-09-27 T6. ``background`` is a list of ``<REF><pos><ALT>``
+    tokens. The window is ``[anchor, end]`` of the catalogue tract's
+    ``effective_tract`` on that sequence. ``tract_ref`` is rCRS over the
+    window, not the background bases. A name that does not parse, lies
+    outside every tract, or is already ``m.<anchor><tract_ref>><alt>`` is
+    returned unchanged.
+    """
+    match = _VARIANT_NAME.fullmatch(name)
+    if match is None:
+        return name
+    pos = int(match.group(1))
+    ref, alt = match.group(2), match.group(3)
+    bg_seq = _background_sequence(list(background or []))
+    rcrs = _rcrs()
+    span_end = pos + len(ref)
+    for tract in CATALOGUE:
+        eff = effective_tract(tract, bg_seq)
+        anchor, end = eff.anchor, eff.end
+        if anchor < 1 or not (pos >= anchor and span_end <= end + 1):
+            continue
+        tract_ref = rcrs[anchor - 1:end]
+        prefix = f"m.{anchor}{tract_ref}>"
+        if name.startswith(prefix) and len(name) > len(prefix):
+            return name
+        tract_alt = _edited_alt(
+            tract_ref, bg_seq[anchor - 1:end], anchor, pos, ref, alt,
+        )
+        if tract_alt is None:
+            return name
+        return f"{prefix}{tract_alt}"
+    return name

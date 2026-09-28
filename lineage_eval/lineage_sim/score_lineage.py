@@ -8,6 +8,7 @@ Both the truth and the reconstruction use Himito's mutation_tree.tsv schema
 import argparse
 import csv
 import os
+import re
 import sys
 
 from hp_tracts import canonical_name
@@ -309,10 +310,17 @@ HAP_FIELDS = ["n_truth_clones", "n_recon_haps",
 # Three metric families, each with its own n_* denominators: variant detection,
 # ancestor-descendant tree accuracy, and clone (haplotype) recovery. Consumers
 # look columns up by header name, not by position -- see sweep_fpfn.sh.
+# Plan 2026-09-27 T6. Appended after n_background_calls. Do not reorder earlier columns.
+HP_FIELDS = ["n_hp_unstable_truth", "n_hp_unstable_called",
+             "hp_var_precision", "hp_var_recall", "hp_var_f1",
+             "hp_intrusion", "hp_backbone_nodes", "hp_len_l1", "root_fraction"]
+
 FIELDS = ["profile", "fp", "fn", "n_truth_vars", "n_detected_vars", "n_shared",
           "n_truth_pairs",
           "var_precision", "var_recall", "var_f1",
-          "ad_precision", "ad_recall", "ad_f1"] + HAP_FIELDS + ["n_background_calls"]
+          "ad_precision", "ad_recall", "ad_f1"] + HAP_FIELDS + ["n_background_calls"] + HP_FIELDS
+
+_SNV_NAME = re.compile(r"^m\.\d+([ACGT])>([ACGT])$")
 
 
 def load_truth_background(path: str) -> set[str]:
@@ -330,6 +338,158 @@ def load_truth_background(path: str) -> set[str]:
             if name:
                 names.add(name)
     return names
+
+
+def _is_snv(name: str) -> bool:
+    return _SNV_NAME.fullmatch(name) is not None
+
+
+def load_hp_tract_rows(path: str, background: list[str]) -> list[dict]:
+    """Non-zero δ rows of ``truth/hp_tracts.tsv``, names canonicalised.
+
+    Plan 2026-09-27 T6. A missing file is an empty list. δ = 0 rows are
+    not truth alleles.
+    """
+    if not path or not os.path.isfile(path):
+        return []
+    rows = []
+    with open(path) as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            if int(row["delta"]) == 0:
+                continue
+            rows.append({
+                "tract": row["tract"],
+                "truth_freq": float(row["truth_freq"]),
+                "canonical_name": _canonical_variant(
+                    row["canonical_name"].strip(), background,
+                ),
+            })
+    return rows
+
+
+def load_hp_lineage_names(path: str, background: list[str]) -> set[str] | None:
+    """Variant column of ``truth/hp_lineage.tsv``, or None if the file is missing."""
+    if not path or not os.path.isfile(path):
+        return None
+    names = set()
+    with open(path) as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            name = row.get("variant", "").strip()
+            if name:
+                names.add(_canonical_variant(name, background))
+    return names
+
+
+def _hp_detection(hp_names: set[str] | None, detected: set[str]) -> dict:
+    """Precision and recall restricted to the HP-lineage names."""
+    if hp_names is None:
+        return {field: "NA" for field in ("hp_var_precision", "hp_var_recall", "hp_var_f1")}
+    called = detected & hp_names
+    # The file is the truth list, so every call of one of its names is a true positive.
+    precision = 1.0 if called else 0.0
+    recall = len(called) / len(hp_names) if hp_names else 0.0
+    return {
+        "hp_var_precision": precision,
+        "hp_var_recall": recall,
+        "hp_var_f1": _f1(precision, recall),
+    }
+
+
+def hp_intrusion(truth_parent: dict[str, str], recon_parent: dict[str, str],
+                 unstable: set[str]) -> float:
+    """Fraction of truth SNVs in the recon tree whose ancestors include an unstable allele.
+
+    Plan 2026-09-27 T6. 0.0 when no such SNV is in the reconstruction.
+    """
+    recon_nodes = {v for v in recon_parent if v != "ROOT"}
+    snvs = [
+        v for v in truth_parent
+        if v != "ROOT" and _is_snv(v) and v in recon_nodes
+    ]
+    if not snvs:
+        return 0.0
+    ancestors = ancestor_sets(recon_parent)
+    return sum(1 for v in snvs if ancestors.get(v, set()) & unstable) / len(snvs)
+
+
+def hp_backbone_nodes(recon_parent: dict[str, str], unstable: set[str]) -> int:
+    """Unstable names that are the parent of at least one recon node."""
+    parents = set(recon_parent.values())
+    return sum(1 for name in unstable if name in parents)
+
+
+def root_fraction(path: str):
+    """ROOT ``n_reads_attached`` over the sum of that column, or ``NA``."""
+    with open(path) as fh:
+        reader = csv.DictReader(fh, delimiter="\t")
+        if not reader.fieldnames or "n_reads_attached" not in reader.fieldnames:
+            return "NA"
+        total = 0
+        root = None
+        for row in reader:
+            raw = (row.get("n_reads_attached") or "").strip()
+            if raw in ("", "NA"):
+                continue
+            n = int(raw)
+            total += n
+            if row.get("variant") == "ROOT":
+                root = n
+        if root is None or total == 0:
+            return "NA"
+        return root / total
+
+
+def _matrix_presence(path: str, background: list[str]) -> tuple[dict[str, set[int]], int]:
+    with open(path) as fh:
+        rows = list(csv.reader(fh))
+    if not rows:
+        return {}, 0
+    n_reads = max(0, len(rows[0]) - 1)
+    presence: dict[str, set[int]] = {}
+    for row in rows[1:]:
+        if not row:
+            continue
+        name = _canonical_variant(row[0], background)
+        hits = presence.setdefault(name, set())
+        for i in range(n_reads):
+            if len(row) > i + 1 and row[i + 1] == "1":
+                hits.add(i)
+    return presence, n_reads
+
+
+def hp_length_l1(rows: list[dict], matrix_path: str, background: list[str]):
+    """Mean over tracts of Σ_δ |truth_freq(δ) − recon_freq(δ)|.
+
+    Plan 2026-09-27 T6. Reads carrying none of a tract's canonical alleles are
+    δ = 0. ``NA`` when there is no non-zero δ row or no matrix to count.
+    """
+    if not rows or not matrix_path or not os.path.isfile(matrix_path):
+        return "NA"
+    presence, n_reads = _matrix_presence(matrix_path, background)
+    if n_reads == 0:
+        return "NA"
+    by_tract: dict[str, dict[str, float]] = {}
+    for row in rows:
+        alleles = by_tract.setdefault(row["tract"], {})
+        name = row["canonical_name"]
+        alleles[name] = alleles.get(name, 0.0) + row["truth_freq"]
+    total = 0.0
+    for alleles in by_tract.values():
+        truth0 = max(0.0, 1.0 - sum(alleles.values()))
+        counts = {name: 0 for name in alleles}
+        zeros = 0
+        for read in range(n_reads):
+            hit = [name for name in alleles if read in presence.get(name, ())]
+            if not hit:
+                zeros += 1
+            else:
+                for name in hit:
+                    counts[name] += 1
+        l1 = abs(truth0 - zeros / n_reads)
+        for name, freq in alleles.items():
+            l1 += abs(freq - counts[name] / n_reads)
+        total += l1
+    return total / len(by_tract)
 
 
 def main() -> None:
@@ -363,6 +523,19 @@ def main() -> None:
         "canonicalised (plan 2026-09-27 T6): none, hvs1-polyC, or "
         "comma-separated <REF><pos><ALT> tokens",
     )
+    ap.add_argument(
+        "--truth-hp-tracts",
+        default="",
+        help="truth/hp_tracts.tsv. canonical_name values, after canonicalisation, "
+        "are unstable alleles excluded from the var_precision denominator "
+        "(plan 2026-09-27 T6)",
+    )
+    ap.add_argument(
+        "--truth-hp-lineage",
+        default="",
+        help="truth/hp_lineage.tsv. hp_var_* are computed on its variant column "
+        "(plan 2026-09-27 T6)",
+    )
     args = ap.parse_args()
     try:
         background_tokens = parse_background(args.background)
@@ -381,6 +554,7 @@ def main() -> None:
     for name, hf in detected_variants_with_hf_from_vcf(args.vcf).items():
         detected_hf.setdefault(_canonical_variant(name, background_tokens), hf)
     detected = set(detected_hf)
+    vcf_names = set(detected)
     # Plan 2026-09-27 T5. Count hits before dropping them from the precision
     # denominator. An empty set leaves `detected` unchanged. Names are
     # canonicalised with the same background so a tract-resident homoplasmy
@@ -390,7 +564,17 @@ def main() -> None:
         for name in load_truth_background(args.truth_background)
     }
     n_background_calls = len(detected & background)
+    # Plan 2026-09-27 T6. Unstable length alleles are real, so they are not
+    # false positives and they are not added to truth_vars.
+    tract_rows = load_hp_tract_rows(args.truth_hp_tracts, background_tokens)
+    unstable = {row["canonical_name"] for row in tract_rows}
+    n_hp_unstable_truth = len(unstable)
+    n_hp_unstable_called = len(unstable & vcf_names)
     detected -= background
+    detected -= unstable
+    hp_det = _hp_detection(
+        load_hp_lineage_names(args.truth_hp_lineage, background_tokens), vcf_names,
+    )
 
     if bool(args.recon_matrix) != bool(args.truth_clones):
         ap.error("--recon-matrix and --truth-clones must be given together")
@@ -416,7 +600,14 @@ def main() -> None:
               truth_haps=truth_haps, recon_haps=recon_haps,
               background=background_tokens)
     row = {"profile": args.profile, "fp": args.fp, "fn": args.fn, **m,
-           "n_background_calls": n_background_calls}
+           "n_background_calls": n_background_calls,
+           "n_hp_unstable_truth": n_hp_unstable_truth,
+           "n_hp_unstable_called": n_hp_unstable_called,
+           **hp_det,
+           "hp_intrusion": hp_intrusion(truth_pm, recon_pm, unstable),
+           "hp_backbone_nodes": hp_backbone_nodes(recon_pm, unstable),
+           "hp_len_l1": hp_length_l1(tract_rows, args.recon_matrix, background_tokens),
+           "root_fraction": root_fraction(args.recon_tree)}
 
     def fmt(x):
         return f"{x:.4f}" if isinstance(x, float) else str(x)

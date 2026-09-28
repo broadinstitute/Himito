@@ -138,6 +138,15 @@ HIMITO_ARGS=(
 [[ -n "$HP_FN_RATE" ]] && HIMITO_ARGS+=(--hp-fn-rate "$HP_FN_RATE")
 "$HERE/run_himito.sh" "${HIMITO_ARGS[@]}"
 read -r DEFAULT_FP DEFAULT_FN < <(resolve_scite_rates "$PROFILE")
+# Plan 2026-09-27 T6. Pass truth files when this run wrote them, and the
+# simulator background when it is not `none`, so scoring uses the same tracts.
+SCORE_ARGS=()
+[[ -f "$OUTDIR/truth/background.txt" ]] && SCORE_ARGS+=(--truth-background "$OUTDIR/truth/background.txt")
+[[ -f "$OUTDIR/truth/hp_tracts.tsv" ]] && SCORE_ARGS+=(--truth-hp-tracts "$OUTDIR/truth/hp_tracts.tsv")
+[[ -f "$OUTDIR/truth/hp_lineage.tsv" ]] && SCORE_ARGS+=(--truth-hp-lineage "$OUTDIR/truth/hp_lineage.tsv")
+if [[ -n "$BACKGROUND" && "$BACKGROUND" != "none" ]]; then
+  SCORE_ARGS+=(--background "$BACKGROUND")
+fi
 python "$HERE/score_lineage.py" \
   --truth-tree "$OUTDIR/truth/truth_mutation_tree.tsv" \
   --recon-tree "$OUTDIR/himito/sim_lineage.mutation_tree.tsv" \
@@ -146,6 +155,7 @@ python "$HERE/score_lineage.py" \
   --recon-matrix "$OUTDIR/himito/sim_lineage.cleaned_matrix_all_variants.csv" \
   --truth-clones "$OUTDIR/truth/clones.tsv" \
   --profile "$PROFILE" --fp "${FP:-$DEFAULT_FP}" --fn "${FN:-$DEFAULT_FN}" \
+  "${SCORE_ARGS[@]+"${SCORE_ARGS[@]}"}" \
   --metrics-out "$OUTDIR/metrics.tsv"
 
 echo "=== metrics ($OUTDIR/metrics.tsv) ==="

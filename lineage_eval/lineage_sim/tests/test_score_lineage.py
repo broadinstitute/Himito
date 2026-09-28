@@ -36,15 +36,21 @@ def test_all_ones_row_outside_keep_does_not_change_score_haplotypes(tmp_path):
 
 
 def test_n_background_calls_is_appended_to_fields():
-    """Plan 2026-09-27 T5. The new column is last; earlier columns stay put."""
-    assert sl.FIELDS[-1] == "n_background_calls"
-    assert sl.FIELDS[:-1] == [
+    """Plan 2026-09-27 T5/T6. Background stays put; HP columns follow it."""
+    i = sl.FIELDS.index("n_background_calls")
+    assert sl.FIELDS[:i] == [
         "profile", "fp", "fn", "n_truth_vars", "n_detected_vars", "n_shared",
         "n_truth_pairs",
         "var_precision", "var_recall", "var_f1",
         "ad_precision", "ad_recall", "ad_f1",
         "n_truth_clones", "n_recon_haps",
         "hap_precision", "hap_recall", "hap_f1",
+    ]
+    assert sl.FIELDS[i:] == [
+        "n_background_calls",
+        "n_hp_unstable_truth", "n_hp_unstable_called",
+        "hp_var_precision", "hp_var_recall", "hp_var_f1",
+        "hp_intrusion", "hp_backbone_nodes", "hp_len_l1", "root_fraction",
     ]
 
 
@@ -272,3 +278,191 @@ def test_cli_background_canonicalises_truth_and_vcf(tmp_path):
     miss = subprocess.run(base, capture_output=True, text=True)
     assert miss.returncode == 0, miss.stderr
     assert _metrics_row(miss.stdout)["var_recall"] == "0.0000"
+
+
+def test_hp_columns_default_when_flags_omitted(tmp_path):
+    """Plan 2026-09-27 T6. No HP truth files: counts are 0 and rates are NA."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    run = _run_score(plain)
+    assert run.returncode == 0, run.stderr
+    row = _metrics_row(run.stdout)
+    assert row["n_hp_unstable_truth"] == "0"
+    assert row["n_hp_unstable_called"] == "0"
+    assert row["hp_var_precision"] == "NA"
+    assert row["hp_var_recall"] == "NA"
+    assert row["hp_var_f1"] == "NA"
+    assert row["hp_intrusion"] == "0.0000"
+    assert row["hp_backbone_nodes"] == "0"
+    assert row["hp_len_l1"] == "NA"
+    assert row["root_fraction"] == "NA"
+
+
+def _hp_score(tmp_path, *, truth_tree, recon_tree, variants, vcf, extra):
+    import subprocess
+    script = pathlib.Path(__file__).resolve().parents[1] / "score_lineage.py"
+    return subprocess.run(
+        [sys.executable, str(script),
+         "--truth-tree", str(truth_tree),
+         "--recon-tree", str(recon_tree),
+         "--truth-variants", str(variants),
+         "--vcf", str(vcf),
+         *extra],
+        capture_output=True, text=True,
+    )
+
+
+def test_unstable_calls_are_not_false_positives(tmp_path):
+    """Plan 2026-09-27 T6. Unstable and background alleles leave the precision denominator."""
+    truth_tree = tmp_path / "truth.tsv"
+    recon_tree = tmp_path / "recon.tsv"
+    header = "node_id\tvariant\tparent_id\tparent_variant\tn_reads_attached\n"
+    truth_tree.write_text(
+        header
+        + "0\tROOT\t0\tROOT\t8\n"
+        + "1\tm.100A>G\t0\tROOT\t20\n"
+        + "2\tm.300G>A\t0\tROOT\t10\n"
+    )
+    recon_tree.write_text(
+        header
+        + "0\tROOT\t0\tROOT\t8\n"
+        + "1\tm.16183A>AC\t0\tROOT\t2\n"
+        + "2\tm.100A>G\t1\tm.16183A>AC\t20\n"
+        + "3\tm.300G>A\t0\tROOT\t10\n"
+        # Keyed by variant, so this row must not reuse m.100A>G.
+        + "ROOT_BLOCK\tm.50A>G,m.200C>T\t0\tROOT\t8\n"
+    )
+    variants = tmp_path / "truth_variants.txt"
+    variants.write_text("m.100A>G\nm.300G>A\n")
+    vcf = tmp_path / "sim.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.2\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        "chrM\t100\t.\tA\tG\t.\tPASS\t.\tGT:HF\t0/1:0.40\n"
+        "chrM\t300\t.\tG\tA\t.\tPASS\t.\tGT:HF\t0/1:0.20\n"
+        "chrM\t50\t.\tA\tG\t.\tPASS\t.\tGT:HF\t0/1:0.10\n"
+        "chrM\t200\t.\tC\tT\t.\tPASS\t.\tGT:HF\t1/1:0.99\n"
+        "chrM\t16189\t.\tT\tTC\t.\tPASS\t.\tGT:HF\t0/1:0.30\n"
+    )
+    tracts = tmp_path / "hp_tracts.tsv"
+    tracts.write_text(
+        "tract\tanchor\tref_len\tbackground_len\tdelta\ttruth_freq\tcanonical_name\torigin\n"
+        "HVS1\t16183\t5\t10\t+1\t0.400000\tm.16183A>AC\tunstable\n"
+    )
+    lineage = tmp_path / "hp_lineage.tsv"
+    lineage.write_text(
+        "node_id\tvariant\ttract\tdelta\n"
+        "1\tm.300G>A\tT455\t+1\n"
+        "2\tm.400A>C\tC960\t+1\n"
+    )
+    bg = tmp_path / "background.txt"
+    bg.write_text("m.200C>T\n")
+    run = _hp_score(
+        tmp_path,
+        truth_tree=truth_tree, recon_tree=recon_tree,
+        variants=variants, vcf=vcf,
+        extra=[
+            "--background", "T16189C",
+            "--truth-background", str(bg),
+            "--truth-hp-tracts", str(tracts),
+            "--truth-hp-lineage", str(lineage),
+        ],
+    )
+    assert run.returncode == 0, run.stderr
+    row = _metrics_row(run.stdout)
+    assert row["n_truth_vars"] == "2"
+    assert row["n_detected_vars"] == "3"
+    assert row["var_precision"] == "0.6667"
+    assert row["var_recall"] == "1.0000"
+    assert row["n_background_calls"] == "1"
+    assert row["n_hp_unstable_truth"] == "1"
+    assert row["n_hp_unstable_called"] == "1"
+    assert _HVS1_CANON not in run.stderr
+    assert "m.200C>T" not in run.stderr
+    assert "m.50A>G" in run.stderr
+    assert row["hp_var_precision"] == "1.0000"
+    assert row["hp_var_recall"] == "0.5000"
+    assert row["hp_var_f1"] == "0.6667"
+    assert row["hp_intrusion"] == "0.5000"
+    assert row["hp_backbone_nodes"] == "1"
+    # ROOT 8, tract 2, m.100 20, m.300 10, ROOT_BLOCK 8. Column sum is 48.
+    assert row["root_fraction"] == "0.1667"
+    assert row["hp_len_l1"] == "NA"
+
+
+def test_hp_len_l1_is_mean_l1_over_tracts(tmp_path):
+    """Plan 2026-09-27 T6. δ=0 is the share of reads carrying none of the tract's alleles."""
+    truth_tree = tmp_path / "truth.tsv"
+    recon_tree = tmp_path / "recon.tsv"
+    tree = (
+        "node_id\tvariant\tparent_id\tparent_variant\n"
+        "0\tROOT\t0\tROOT\n"
+        "1\tm.100A>G\t0\tROOT\n"
+    )
+    truth_tree.write_text(tree)
+    recon_tree.write_text(tree)
+    variants = tmp_path / "truth_variants.txt"
+    variants.write_text("m.100A>G\n")
+    vcf = tmp_path / "sim.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.2\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        "chrM\t100\t.\tA\tG\t.\tPASS\t.\tGT:HF\t0/1:0.50\n"
+    )
+    tracts = tmp_path / "hp_tracts.tsv"
+    tracts.write_text(
+        "tract\tanchor\tref_len\tbackground_len\tdelta\ttruth_freq\tcanonical_name\torigin\n"
+        "HVS1\t16183\t5\t10\t+1\t0.200000\tm.16189T>TC\tunstable\n"
+        "HVS1\t16183\t5\t10\t+1\t0.300000\tm.16189T>TC\tmixed\n"
+        "C960\t955\t5\t5\t+1\t0.250000\tm.960A>G\tunstable\n"
+        "D310\t302\t7\t7\t0\t0.100000\tm.302A>AC\tunstable\n"
+    )
+    matrix = tmp_path / "matrix.csv"
+    matrix.write_text(
+        "variant,r1,r2,r3,r4\n"
+        "m.16189T>TC,1,0,0,0\n"
+        "m.960A>G,0,1,0,0\n"
+    )
+    clones = tmp_path / "clones.tsv"
+    clones.write_text("clone_id\tnode_variant\tvariant_path\tfrequency\nref\tROOT\t\t1.0\n")
+    run = _hp_score(
+        tmp_path,
+        truth_tree=truth_tree, recon_tree=recon_tree,
+        variants=variants, vcf=vcf,
+        extra=[
+            "--background", "T16189C",
+            "--truth-hp-tracts", str(tracts),
+            "--recon-matrix", str(matrix),
+            "--truth-clones", str(clones),
+        ],
+    )
+    assert run.returncode == 0, run.stderr
+    row = _metrics_row(run.stdout)
+    # HVS1 truth δ=+1 is 0.2+0.3=0.5, recon 1/4, L1=0.5. C960 matches, L1=0.
+    # The δ=0 row is ignored. Mean over the two tracts with a non-zero δ is 0.25.
+    assert row["n_hp_unstable_truth"] == "2"
+    assert row["hp_len_l1"] == "0.2500"
+
+    zero = tmp_path / "zero.tsv"
+    zero.write_text(
+        "tract\tanchor\tref_len\tbackground_len\tdelta\ttruth_freq\tcanonical_name\torigin\n"
+        "D310\t302\t7\t7\t0\t1.000000\tm.302A>AC\tunstable\n"
+    )
+    zero_run = _hp_score(
+        tmp_path,
+        truth_tree=truth_tree, recon_tree=recon_tree,
+        variants=variants, vcf=vcf,
+        extra=["--truth-hp-tracts", str(zero), "--recon-matrix", str(matrix),
+               "--truth-clones", str(clones)],
+    )
+    assert zero_run.returncode == 0, zero_run.stderr
+    assert _metrics_row(zero_run.stdout)["hp_len_l1"] == "NA"
+
+
+def test_sweep_fpfn_passes_hp_truth_files():
+    """Plan 2026-09-27 T6. The sweep scorer sees the same truth files as run_eval."""
+    script = (pathlib.Path(__file__).resolve().parents[1] / "sweep_fpfn.sh").read_text()
+    assert '--truth-background "$OUTDIR/truth/background.txt"' in script
+    assert '--truth-hp-tracts "$OUTDIR/truth/hp_tracts.tsv"' in script
+    assert '--truth-hp-lineage "$OUTDIR/truth/hp_lineage.tsv"' in script
+    assert 'SCORE_ARGS+=(--background "$BACKGROUND")' in script

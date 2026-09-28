@@ -1415,10 +1415,13 @@ def test_cli_background_hp_tracts_follow_effective_anchor(tmp_path):
 
 
 def test_run_eval_forwards_background_not_truth_background(tmp_path):
-    """Plan 2026-09-27 T5. --background reaches simulate_tree.py only."""
+    """Plan 2026-09-27 T6. simulate_tree gets --background; the scorer gets truth files."""
     import subprocess
     script = (_SIM_DIR / "run_eval.sh").read_text()
-    assert "--truth-background" not in script
+    assert '--truth-background "$OUTDIR/truth/background.txt"' in script
+    assert '--truth-hp-tracts "$OUTDIR/truth/hp_tracts.tsv"' in script
+    assert '--truth-hp-lineage "$OUTDIR/truth/hp_lineage.tsv"' in script
+    assert 'SCORE_ARGS+=(--background "$BACKGROUND")' in script
     bindir = tmp_path / "bin"
     bindir.mkdir()
     log = tmp_path / "argv.txt"

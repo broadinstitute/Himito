@@ -12,6 +12,7 @@ FN_GRID="0.02 0.05 0.1 0.2"
 # score_lineage.py does not band its detected-variant set, so this does not move
 # var_precision across sweep cells -- only which variants enter the SCITE matrix.
 MIN_HF=0.01 MAX_HF=0.95
+BACKGROUND=""
 # Sweeps re-run full MCMC per cell; use a lighter budget than the CLI defaults
 # (5000 iterations × 3 chains). Override for a final high-quality pass if needed.
 MCMC_ITERS="${MCMC_ITERS:-2000}"
@@ -26,11 +27,12 @@ while [[ $# -gt 0 ]]; do
     --max-hf) MAX_HF="$2"; shift 2;;
     --mcmc-iterations) MCMC_ITERS="$2"; shift 2;;
     --mcmc-chains) MCMC_CHAINS="$2"; shift 2;;
+    --background) BACKGROUND="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile P] [--fp-grid \"...\"] [--fn-grid \"...\"] [--min-hf F] [--max-hf F] [--mcmc-iterations N] [--mcmc-chains N]" >&2
+  echo "usage: --outdir DIR [--profile P] [--fp-grid \"...\"] [--fn-grid \"...\"] [--min-hf F] [--max-hf F] [--mcmc-iterations N] [--mcmc-chains N] [--background SPEC]" >&2
   exit 1
 }
 
@@ -63,12 +65,21 @@ for fp in $FP_GRID; do
         HAP_ARGS=(--recon-matrix "${pfx}.cleaned_matrix_all_variants.csv"
                   --truth-clones "$OUTDIR/truth/clones.tsv")
       fi
+      # Plan 2026-09-27 T6. Same truth-file gates as run_eval.sh.
+      SCORE_ARGS=()
+      [[ -f "$OUTDIR/truth/background.txt" ]] && SCORE_ARGS+=(--truth-background "$OUTDIR/truth/background.txt")
+      [[ -f "$OUTDIR/truth/hp_tracts.tsv" ]] && SCORE_ARGS+=(--truth-hp-tracts "$OUTDIR/truth/hp_tracts.tsv")
+      [[ -f "$OUTDIR/truth/hp_lineage.tsv" ]] && SCORE_ARGS+=(--truth-hp-lineage "$OUTDIR/truth/hp_lineage.tsv")
+      if [[ -n "$BACKGROUND" && "$BACKGROUND" != "none" ]]; then
+        SCORE_ARGS+=(--background "$BACKGROUND")
+      fi
       python "$HERE/score_lineage.py" \
         --truth-tree "$OUTDIR/truth/truth_mutation_tree.tsv" \
         --recon-tree "${pfx}.mutation_tree.tsv" \
         --truth-variants "$OUTDIR/truth/truth_variants.txt" \
         --vcf "$VCF" --profile "$PROFILE" --fp "$fp" --fn "$fn" \
         "${HAP_ARGS[@]+"${HAP_ARGS[@]}"}" \
+        "${SCORE_ARGS[@]+"${SCORE_ARGS[@]}"}" \
         --metrics-out "$SWEEP" >/dev/null
     else
       echo "lineage failed at fp=$fp fn=$fn (skipped)" >&2

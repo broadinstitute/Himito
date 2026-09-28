@@ -385,6 +385,32 @@ One `simulate_tree.py` call, then reads from that same `truth/` twice: profile `
 
 This is the in-silico twin of the real sample pairs. `--pair` needs `ccs` (HiFi) and is Linux-only for now. If `ccs` is not on `PATH`, the script exits and does not report an ONT-only run as a pair. `--profile` is ignored while `--pair` is set.
 
+### Sweep HP rates (`sweep_hp_rates.sh`)
+
+Call and the read simulation do not depend on `--hp-fp-rate` or `--hp-fn-rate`. `run_eval.sh --stop-after call` (or `sweep_seeds.sh --keep-intermediate`) writes `himito/sim.matrix.csv`, `himito/sim.vcf`, and `truth/` once per seed. `sweep_hp_rates.sh` re-runs only `Himito lineage` and `score_lineage.py` on that matrix. The global `--fp-rate` / `--fn-rate` stay at the profile default unless `--fp` / `--fn` are set. The default grid is `{1,2,4,8,16}×fp` and `{1,2,4,8,16,32}×fn`, each product capped at 0.5. For `ont-denoised` that is fp `0.0001…0.0016` and fn `0.01…0.32`.
+
+```bash
+./sweep_hp_rates.sh --outdir /tmp/hp_sweep --profile ont-denoised \
+  --seeds "1 2 3 4 5 6 7 8 9 10" --collapse-hp
+```
+
+`pick_best_hp_rates.py` writes `hp_sweep_summary.tsv` (mean and SE over seeds), `best_hp_rates.json`, and `hp_sweep_report.md`. The selection rule, in order:
+
+1. Primary objective (default `hp_intrusion`, minimised; `ad_f1`, `hap_f1`, and `hp_len_l1` are the other choices). A cell whose mean is within 2·SE of the best mean is tied with it. That is the same noise band `bench_standard.sh` uses.
+2. Among tied cells, secondary objective (default `ad_f1`, maximised), same tie rule.
+3. Among cells still tied, the one closest to the global rates: smallest `|log2(hp_fn/fn)| + |log2(hp_fp/fp)|`. Do not move a parameter the data cannot distinguish.
+4. If the primary objective's best and worst cells are themselves within 2·SE, the grid is flat. `best` is null and the report says why.
+
+A flat grid means leave the default alone. It does not mean pick the top row.
+
+The report also gives `root_fraction` at the chosen cell and at the global-rate cell. That is the PacBio/ONT symptom these rates are meant to move.
+
+### Workflows
+
+`wdl/Himito-lineage/Himito_lineage_sim.wdl` is the full simulate → call → lineage → score grid (seeds × n_mutations × depth), including the HP modes. `wdl/Himito-lineage/Himito_lineage_hp_sweep.wdl` imports that file's `ValidateConfig` and `CombineMetrics`. It runs `SimulateCell` once per seed (`--stop-after call`), then `LineageScoreCell` for every `hp_fp_grid` × `hp_fn_grid` pair, then the picker above. `n_mutations` and `depth` are scalars. `ValidateConfig` fails the sweep unless `hp_lineage_indels > 0` or `hp_unstable` is set: otherwise the rates have nothing to act on and the sweep is guaranteed flat.
+
+`lineage_eval/lineage_sim/Himito_lineage_hp_sweep.inputs.json` is the `bench_hp.sh` configuration with `collapse_hp` true and the ont-denoised default grid. It uses seeds 1–10. Thirty seeds times that 30-cell grid is too expensive for a first pass. MCMC in the sweep is 2 chains × 2000 iterations, the `sweep_fpfn.sh` budget. The image must be rebuilt after this plan so `/opt/lineage_sim` contains `pick_best_hp_rates.py` and `run_eval.sh --stop-after call`.
+
 ## Multi-seed baselines (`sweep_seeds.sh`)
 
 A single seed cannot separate "the method has a systematic weakness" from "this

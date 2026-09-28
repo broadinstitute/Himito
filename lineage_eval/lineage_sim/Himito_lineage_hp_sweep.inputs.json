@@ -1,0 +1,27 @@
+{
+  "HimitoLineageHpSweep.first_pass_note": "seeds 1-10: 30 x 30 cells is too expensive for a first pass",
+  "HimitoLineageHpSweep.seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+  "HimitoLineageHpSweep.n_mutations": 10,
+  "HimitoLineageHpSweep.depth": 1000,
+
+  "HimitoLineageHpSweep.profile": "ont-denoised",
+  "HimitoLineageHpSweep.topology": "chain",
+  "HimitoLineageHpSweep.internal_keep": 0.10,
+  "HimitoLineageHpSweep.frequency_threshold": 0.05,
+  "HimitoLineageHpSweep.denoise_vaf": 0.03,
+
+  "HimitoLineageHpSweep.background": "hvs1-polyC",
+  "HimitoLineageHpSweep.hp_lineage_indels": 2,
+  "HimitoLineageHpSweep.hp_unstable": "common",
+  "HimitoLineageHpSweep.collapse_hp": true,
+
+  "HimitoLineageHpSweep.hp_fp_grid": [0.0001, 0.0002, 0.0004, 0.0008, 0.0016],
+  "HimitoLineageHpSweep.hp_fn_grid": [0.01, 0.02, 0.04, 0.08, 0.16, 0.32],
+  "HimitoLineageHpSweep.objective": "hp_intrusion",
+  "HimitoLineageHpSweep.secondary": "ad_f1",
+  "HimitoLineageHpSweep.mcmc_iterations": 2000,
+  "HimitoLineageHpSweep.mcmc_chains": 2,
+
+  "HimitoLineageHpSweep.docker": "us.gcr.io/broad-dsp-lrma/hangsuunc/himito-lineage-sim:dev",
+  "HimitoLineageHpSweep.reference_fa": "gs://bucket/rCRS.fasta"
+}

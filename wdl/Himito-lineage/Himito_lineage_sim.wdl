@@ -230,6 +230,9 @@ task ValidateConfig {
         Boolean collapse_hp
         Boolean hp_fp_set
         Boolean hp_fn_set
+        # Plan 2026-09-27 T11. The HP-rate sweep sets this. The sim workflow
+        # leaves it false, so an SNV-only inputs JSON still validates.
+        Boolean require_hp_mode = false
         String docker
     }
 
@@ -268,6 +271,9 @@ hp_k = int("~{hp_lineage_indels}")
 collapse_hp = "~{collapse_hp}".lower() == "true"
 hp_fp_set = "~{hp_fp_set}".lower() == "true"
 hp_fn_set = "~{hp_fn_set}".lower() == "true"
+# Plan 2026-09-27 T11. Background alone, or collapse_hp alone, does not give
+# the HP rates a variant to act on. The sweep is then guaranteed flat.
+require_hp_mode = "~{require_hp_mode}".lower() == "true"
 REF_FRACTION = 0.15   # simulate_tree.py default; not exposed by run_eval.sh
 
 errors, warnings = [], []
@@ -353,6 +359,10 @@ for n in sorted(set(nmuts)):
         errors.append(
             f"hp_lineage_indels={hp_k} exceeds n_mutations={n}"
         )
+if require_hp_mode and not (hp_k > 0 or hp_unstable != ""):
+    errors.append(
+        "the rates have nothing to act on and the sweep is guaranteed flat"
+    )
 if hp_unstable and not collapse_hp:
     warnings.append(
         "hp_unstable is set and collapse_hp is false, so unstable alleles "

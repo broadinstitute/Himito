@@ -12,6 +12,8 @@
 # /opt/lineage_sim/*.py; hp_tracts.py, measure_hp_errors.py, and pysam
 # from T7 are new. ValidateConfig imports hp_tracts from that path, so an
 # image built before this plan cannot run Himito_lineage_sim.wdl.
+# Plan 2026-09-27 T11. Rebuild again so run_eval.sh --stop-after call and
+# pick_best_hp_rates.py are in the image. Himito_lineage_hp_sweep.wdl calls both.
 #
 # pbccs is linux/amd64-only, so the runtime is always amd64. Do NOT compile
 # Rust under QEMU on Apple Silicon: `rustc -vV` SIGSEGVs there. Default is to
@@ -79,7 +81,7 @@ COPY --from=himito-build /Himito/test_data/rCRS.fasta /opt/lineage_sim/rCRS.fast
 
 # The lineage_sim scripts (build context = this directory).
 COPY run_eval.sh run_himito.sh simulate_reads.sh simulate_tree.py score_lineage.py \
-     hp_tracts.py measure_hp_errors.py \
+     hp_tracts.py measure_hp_errors.py pick_best_hp_rates.py \
      /opt/lineage_sim/
 RUN chmod +x /opt/lineage_sim/*.sh
 

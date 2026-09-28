@@ -396,3 +396,14 @@ Validation ran. The miniwdl smoke run and the image rebuild were not executed he
 - `womtool validate -i lineage_eval/lineage_sim/Himito_lineage_sim.inputs.json` exited 1. The messages are warnings for the pre-existing `__comment_optional` and `__HimitoLineageSim.*` documentation keys. That file was left byte-identical.
 - `parse_hp_unstable` is `simulate_tree.parse_hp_unstable` (it checks ids against `hp_tracts.CATALOGUE`). `hp_tracts` has no `parse_hp_unstable`. ValidateConfig imports both from `/opt/lineage_sim`.
 - `pysam` was already a conda dependency in `environment.yml`, which the Dockerfile installs. The Dockerfile comment records that. `hp_tracts.py` and `measure_hp_errors.py` were added to the image `COPY`.
+
+## T11 results
+
+Validation ran. The local two-seed `cmp` and the miniwdl smoke run were not executed (no local image). No row counts are reported, because those runs did not happen.
+
+- `miniwdl check wdl/Himito-lineage/Himito_lineage_sim.wdl` exited 0. The only lint is the pre-existing unused `RunEvalCell` input `validated`.
+- `miniwdl check wdl/Himito-lineage/Himito_lineage_hp_sweep.wdl` exited 0. The same imported `RunEvalCell.validated` lint is reported. `HimitoLineageSim` is imported and not called.
+- `womtool validate` on `Himito_lineage_sim.wdl` printed `Success!`.
+- `womtool validate` on `Himito_lineage_hp_sweep.wdl` printed `Success!`.
+- `womtool validate -i lineage_eval/lineage_sim/Himito_lineage_hp_sweep.inputs.json` printed `Success!` (exit 0).
+- `pytest lineage_eval/lineage_sim/tests`: 104 passed, 2 failed. The failures are the two known `assign_frequencies` tests. The five `test_pick_best_hp_rates.py` tests passed.

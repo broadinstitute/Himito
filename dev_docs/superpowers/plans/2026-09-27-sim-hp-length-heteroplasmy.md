@@ -327,3 +327,61 @@ chrM	302	.	A	AC	.	PASS	DP=47	GT:AD:HF	1:28:0.59574467
 Name `m.302A>AC`. Python left-align was not changed after this run.
 
 Step 5 (`--n-mutations 10 --seed 1`): `cmp` identical for `truth_mutation_tree.tsv`, `truth_variants.txt`, and `clone_genomes.fa` between `/tmp/t2_before` (T1 script `b7842ab`) and `/tmp/t2_after`. `cut -f1-4` of both `clones.tsv` files is identical. The pre-T2 header still ends in `n_reads`; the post-T2 header is `clone_id	node_variant	variant_path	frequency`.
+
+## T7 results
+
+`measure_hp_errors.py` against repo-root `rCRS.fasta`, `min_len` 4, no `--tracts`. Probabilities pool strands. `n=0` means no reference run of that length kept its modal observed length at `ref_len` (rCRS has no C/G run of length 8 or 9, and no run of length 9 at all; the only L=8 run is A12418). HiFi was skipped: `ccs` is not on this Mac.
+
+Simulated cell (exit 0):
+
+```bash
+run_eval.sh --outdir /tmp/t7_ont --profile ont-denoised --n-mutations 4 --total-depth 200 --seed 1
+```
+
+Reads are pbsim3 QSHMM-ONT-HQ. BAMs: `/tmp/t7_ont/himito/aln.sorted.bam` (raw) and `aln.denoised.bam`. Real ONT: `lineage_eval/benchmark_results/HPRC_debug/HG00232.ont.bam`. No PacBio sibling there; PacBio is `test_data/HG002_chrM_100x.bam`.
+
+### pbsim ONT-HQ raw (`aln.sorted.bam`)
+
+| L | C/G P(obs=L-1) | C/G P(obs=L+1) | A/T P(obs=L-1) | A/T P(obs=L+1) |
+|---|---|---|---|---|
+| 5 | 0.0820 (n=6390) | 0.0648 | 0.0831 (n=4068) | 0.0676 |
+| 6 | 0.0932 (n=1341) | 0.0671 | 0.0921 (n=1922) | 0.0697 |
+| 7 | 0.0787 (n=89) | 0.0562 | 0.1055 (n=929) | 0.0797 |
+| 8 | — (n=0) | — | 0.1088 (n=147) | 0.0952 |
+| 9 | — (n=0) | — | — (n=0) | — |
+
+### pbsim ONT-HQ denoised (`aln.denoised.bam`)
+
+| L | C/G P(obs=L-1) | C/G P(obs=L+1) | A/T P(obs=L-1) | A/T P(obs=L+1) |
+|---|---|---|---|---|
+| 5 | 0.0001 (n=7540) | 0.0001 | 0.0002 (n=4846) | 0.0000 |
+| 6 | 0.0012 (n=1620) | 0.0006 | 0.0013 (n=2348) | 0.0004 |
+| 7 | 0.0000 (n=107) | 0.0000 | 0.0000 (n=1147) | 0.0000 |
+| 8 | — (n=0) | — | 0.0000 (n=181) | 0.0000 |
+| 9 | — (n=0) | — | — (n=0) | — |
+
+### HG00232 ONT (`HG00232.ont.bam`)
+
+| L | C/G P(obs=L-1) | C/G P(obs=L+1) | A/T P(obs=L-1) | A/T P(obs=L+1) |
+|---|---|---|---|---|
+| 5 | 0.0508 (n=798266) | 0.0072 | 0.0389 (n=555583) | 0.0092 |
+| 6 | 0.0882 (n=175684) | 0.0075 | 0.0434 (n=261473) | 0.0109 |
+| 7 | — (n=0) | — | 0.0419 (n=121566) | 0.0238 |
+| 8 | — (n=0) | — | 0.0582 (n=17009) | 0.0381 |
+| 9 | — (n=0) | — | — (n=0) | — |
+
+The sole rCRS C7 (D310, 303–309) is absent here: its modal observed length is not 7, so the run is dropped as non-reference.
+
+### HG002 PacBio (`HG002_chrM_100x.bam`)
+
+| L | C/G P(obs=L-1) | C/G P(obs=L+1) | A/T P(obs=L-1) | A/T P(obs=L+1) |
+|---|---|---|---|---|
+| 5 | 0.0193 (n=4457) | 0.0197 | 0.0156 (n=3077) | 0.0166 |
+| 6 | 0.0285 (n=982) | 0.0387 | 0.0177 (n=1415) | 0.0163 |
+| 7 | — (n=0) | — | 0.0303 (n=692) | 0.0390 |
+| 8 | — (n=0) | — | 0.0495 (n=101) | 0.0990 |
+| 9 | — (n=0) | — | — (n=0) | — |
+
+HiFi cell: not run (`ccs` missing).
+
+**Decision.** pbsim is adequate. C/G P(obs=7 | ref_len=8) is undefined on the raw pbsim BAM (n=0) and on `HG00232.ont.bam` (n=0), because rCRS has no C/G homopolymer of length 8. The injector predicate is not met, so `inject_hp_errors.py` was not built. On the lengths that do exist, raw pbsim C/G under-call is not below half the real ONT rate (L=5: 0.0820 vs 0.0508; L=6: 0.0932 vs 0.0882).

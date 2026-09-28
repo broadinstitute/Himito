@@ -10,5 +10,6 @@ dependencies:
   - samtools>=1.17
   - numpy
   - pytest
+  - pysam
   - dendropy
   - git

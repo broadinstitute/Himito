@@ -419,7 +419,12 @@ def hp_backbone_nodes(recon_parent: dict[str, str], unstable: set[str]) -> int:
 
 
 def root_fraction(path: str):
-    """ROOT ``n_reads_attached`` over the sum of that column, or ``NA``."""
+    """ROOT ``n_reads_attached`` over the per-node sum, or ``NA``.
+
+    Plan 2026-09-27 T6. ``write_mutation_tree`` repeats the root count on a
+    ``ROOT_BLOCK`` row. That row is an annotation, not another node, so it
+    is left out of the denominator. The numerator is still the ROOT row.
+    """
     with open(path) as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         if not reader.fieldnames or "n_reads_attached" not in reader.fieldnames:
@@ -427,6 +432,8 @@ def root_fraction(path: str):
         total = 0
         root = None
         for row in reader:
+            if row.get("node_id") == "ROOT_BLOCK":
+                continue
             raw = (row.get("n_reads_attached") or "").strip()
             if raw in ("", "NA"):
                 continue

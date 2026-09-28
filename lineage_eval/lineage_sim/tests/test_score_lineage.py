@@ -385,9 +385,21 @@ def test_unstable_calls_are_not_false_positives(tmp_path):
     assert row["hp_var_f1"] == "0.6667"
     assert row["hp_intrusion"] == "0.5000"
     assert row["hp_backbone_nodes"] == "1"
-    # ROOT 8, tract 2, m.100 20, m.300 10, ROOT_BLOCK 8. Column sum is 48.
-    assert row["root_fraction"] == "0.1667"
+    # ROOT 8 + tract 2 + m.100 20 + m.300 10. ROOT_BLOCK repeats the root count.
+    assert row["root_fraction"] == "0.2000"
     assert row["hp_len_l1"] == "NA"
+
+
+def test_root_fraction_skips_root_block_annotation_row(tmp_path):
+    """Plan 2026-09-27 T6. ROOT_BLOCK repeats the root's n_reads_attached."""
+    path = tmp_path / "mutation_tree.tsv"
+    path.write_text(
+        "node_id\tvariant\tparent_id\tparent_variant\tn_reads_attached\n"
+        "0\tROOT\t0\tROOT\t10\n"
+        "1\tm.100A>G\t0\tROOT\t30\n"
+        "ROOT_BLOCK\tm.100A>G\t0\tROOT\t10\n"
+    )
+    assert sl.root_fraction(str(path)) == 0.25
 
 
 def test_hp_len_l1_is_mean_l1_over_tracts(tmp_path):

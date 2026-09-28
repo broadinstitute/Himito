@@ -10,6 +10,10 @@ import os
 import random
 from dataclasses import dataclass, field
 
+# Plan 2026-09-27 T1. Shared with the tract catalogue; sibling import matches
+# how this file is run from lineage_eval/lineage_sim/.
+from hp_tracts import load_reference
+
 # Regions to avoid when placing SNVs: rCRS control-region homopolymers / the
 # 3107 'N' placeholder, where Himito's indel-prone calls would confound a
 # clean SNV benchmark.
@@ -64,18 +68,6 @@ class Tree:
 
 def variant_id(pos: int, ref: str, alt: str) -> str:
     return f"m.{pos}{ref}>{alt}"
-
-
-def load_reference(path: str) -> tuple[str, str]:
-    name, chunks = None, []
-    with open(path) as fh:
-        for line in fh:
-            line = line.rstrip("\n")
-            if line.startswith(">"):
-                name = line[1:].split()[0]
-            else:
-                chunks.append(line.strip())
-    return name, "".join(chunks).upper()
 
 
 def _is_avoided(pos: int) -> bool:

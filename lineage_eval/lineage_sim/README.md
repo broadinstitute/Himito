@@ -311,6 +311,80 @@ much noisier because a single mis-grouped clone moves it by ~0.1; treat small
 `hap_*` deltas with suspicion and raise the seed count if you need to resolve
 them.
 
+## Homopolymer length heteroplasmy
+
+`bench_standard.sh` stays SNV-only on purpose. Homopolymer length variation,
+which dominates real PacBio/ONT disagreement, is a separate frozen config:
+`bench_hp.sh`. The three simulator modes below compose. Leaving all three unset
+reproduces the SNV-only truth the standard benchmark scores.
+
+| mode | flag | what it produces | scored as |
+|------|------|------------------|-----------|
+| Background homoplasmies | `--background` | Fixed SNVs in every clone, including the reference. `none` (default) applies nothing. `hvs1-polyC` is `T16189C,A16183C`. Any other value is a comma-separated `<REF><pos><ALT>` list. | `truth/background.txt`. Dropped from the `var_*` denominators. They move tract anchors. |
+| Lineage-borne length change | `--hp-lineage-indels K` | K of the N tree edges are inherited length changes. Unset omits the flag (K = 0). | Ordinary tree nodes, under their canonical names, in `var_*` / `ad_*` / `hap_*` and in `hp_var_*`. |
+| Lineage-independent length heteroplasmy | `--hp-unstable` | Each clone is split into sub-clones by tract-length state. `common`, or `TRACT:delta=prob,...;TRACT:...`. | `truth/hp_tracts.tsv`. Not a tree edge. `hp_intrusion` and `hp_len_l1`. Dropped from `var_*`. |
+
+`common` is D310 `{0: 0.55, +1: 0.35, +2: 0.10}`, HVS1 `{0: 0.6, +1: 0.3, +2: 0.1}`, C573 `{0: 0.7, +1: 0.2, +2: 0.1}`. Deltas are relative to the catalogue run length.
+
+### Catalogue (`hp_tracts.py`)
+
+`CATALOGUE` is the rCRS tract list, 1-based inclusive. `anchor` is the base before the run: the position a left-aligned insertion uses. `in_himito` is set only for the three tracts already in `src/tracts.rs` (`D310`, `HVS1`, `CA514`). `R8281` is in the catalogue with simulation off.
+
+| id | run | unit × copies | anchor |
+|----|-----|---------------|--------|
+| D310 | 303–309 | C × 7 | 302 |
+| HVS1 | 16184–16188 | C × 5 | 16183 |
+| C573 | 568–573 | C × 6 | 567 |
+| T455 | 452–455 | T × 4 | 451 |
+| C960 | 956–960 | C × 5 | 955 |
+| C5899 | 5895–5899 | C × 5 | 5894 |
+| A12418 | 12418–12425 | A × 8 | 12417 |
+| CA514 | 514–523 | CA × 5 | 513 |
+| R8281 | 8272–8289 | CCCCCTCTA × 2 | 8271 |
+
+### Canonical names
+
+`canonical_name` in `hp_tracts.py` rewrites an allele whose REF span sits in a tract window to `m.<anchor><rCRS window>><background + edit>`. The REF side of that name is rCRS over the window, not the background bases. On a `T16189C` background, `m.16189T>TC` and `m.16183A>AC` are one name. `score_lineage.py` canonicalises both trees, the truth list, the VCF, and matrix row names before comparing, so two spellings of one allele are not a mismatch. A name outside every tract, including a typical SNV, is unchanged.
+
+### HP metrics
+
+Appended after `n_background_calls`. Read them by header name. `bench_hp.sh` averages `hp_intrusion`, `hp_backbone_nodes`, `hp_len_l1`, `root_fraction`, and `hp_var_f1` with the standard nine; `NA` cells are left out of the mean.
+
+| column | meaning |
+|--------|---------|
+| `hp_var_precision` / `hp_var_recall` / `hp_var_f1` | Detection on the `variant` column of `truth/hp_lineage.tsv` only. `NA` when that file is absent. |
+| `hp_intrusion` | Among truth SNVs that also appear in the reconstructed tree, the fraction whose reconstructed ancestors include an unstable length allele. |
+| `hp_backbone_nodes` | Count of unstable names that are the parent of at least one reconstructed node. |
+| `hp_len_l1` | Mean over tracts of Σ \|truth frequency − reconstructed frequency\| across length alleles. `NA` when there is no non-zero δ row or no matrix. |
+| `root_fraction` | ROOT `n_reads_attached` divided by the sum of that column. A `ROOT_BLOCK` row is an annotation and is left out of the sum. `NA` when the column is absent. |
+
+### Frozen HP benchmark (`bench_hp.sh`)
+
+Same driver shape as `bench_standard.sh`: `--seeds` for a smoke run (breaks comparability), `--compare FILE` to re-score an existing `seed_metrics.tsv`, `--update-baseline` to copy the result onto `baseline_hp.tsv`, and the same 2·SE verdict (`same` / `IMPROVED` / `REGRESSED`). `baseline_hp.tsv` starts with no data rows. Until it has some, compare prints `no baseline yet` and exits 0. Score HP runs against `baseline_hp.tsv`.
+
+```bash
+./bench_hp.sh --outdir /tmp/hp --ref ../../test_data/rCRS.fasta
+```
+
+Frozen on the standard call/tree settings (`ont-denoised`, 10 mutations, depth 1000, `chain`, internal-keep 0.10, `-f` 0.05, denoise-vaf 0.03, seeds 1–30):
+
+| parameter | value |
+|-----------|-------|
+| `--background` | `hvs1-polyC` |
+| `--hp-lineage-indels` | 2 |
+| `--hp-unstable` | `common` |
+
+### In-silico PacBio/ONT pair (`run_eval.sh --pair`)
+
+One `simulate_tree.py` call, then reads from that same `truth/` twice: profile `hifi`, then `ont-denoised`, same seed. Reconstructions are moved to `himito_pb/` and `himito_ont/` before the next run writes `himito/`, and scored to `metrics_pb.tsv` and `metrics_ont.tsv`. `pair_metrics.tsv` has two columns:
+
+| column | meaning |
+|--------|---------|
+| `pair_ad_f1` | `ad_f1` of the ONT mutation tree scored with the PacBio mutation tree as the truth tree. PacBio VCF calls are the truth variant set. |
+| `pair_root_fraction_delta` | ONT `root_fraction` minus PacBio `root_fraction`. |
+
+This is the in-silico twin of the real sample pairs. `--pair` needs `ccs` (HiFi) and is Linux-only for now. If `ccs` is not on `PATH`, the script exits and does not report an ONT-only run as a pair. `--profile` is ignored while `--pair` is set.
+
 ## Multi-seed baselines (`sweep_seeds.sh`)
 
 A single seed cannot separate "the method has a systematic weakness" from "this
@@ -422,8 +496,10 @@ Column order in the TSV: `profile`, `fp`, `fn`, `n_truth_vars`,
 `n_detected_vars`, `n_shared`, `n_truth_pairs`, `var_precision`, `var_recall`,
 `var_f1`,
 `ad_precision`, `ad_recall`, `ad_f1`, `n_truth_clones`, `n_recon_haps`,
-`hap_precision`, `hap_recall`, `hap_f1`. Read columns by header name, not
-position.
+`hap_precision`, `hap_recall`, `hap_f1`, then `n_background_calls` and the
+homopolymer columns. Read columns by header name, not position. Definitions
+for those columns are in
+[Homopolymer length heteroplasmy](#homopolymer-length-heteroplasmy).
 
 ### Why `ad_recall` is scored against *all* truth pairs
 
@@ -498,6 +574,8 @@ Two things that did **not** work, so you can skip them:
 - **HiFi is untested on Apple Silicon.** `pbccs 4.0.0` now installs from
   bioconda on osx-arm64, but the HiFi path has not been run end-to-end there;
   use `--profile ont-denoised` for local development on Apple Silicon.
+  `run_eval.sh --pair` uses that HiFi path, so `--pair` is Linux-only for now
+  and exits when `ccs` is missing.
 - **Three frequency gates must all sit below `--sim-min-hf`.** `call -f` (0.2),
   `denoise --vaf` (0.03) and `call -v`. The first two defaults were tuned for
   `--n-mutations 10` and break silently otherwise; no amount of depth
@@ -505,9 +583,10 @@ Two things that did **not** work, so you can skip them:
 - **`ad_*` changed definition.** `ad_recall` is now scored against all truth
   pairs, so numbers from before that change are inflated and not comparable; see
   [Why `ad_recall` is scored against *all* truth pairs](#why-ad_recall-is-scored-against-all-truth-pairs).
-- **SNV-only truth (no indels).** rCRS homopolymer/control-region positions are
-  excluded (see `AVOID_RANGES` in `simulate_tree.py`) to keep the benchmark on
-  cleanly callable sites.
+- **`bench_standard.sh` is SNV-only on purpose.** It still uses `AVOID_RANGES`
+  in `simulate_tree.py`, so the committed baseline stays on those sites.
+  Length heteroplasmy is the separate frozen config in
+  [Homopolymer length heteroplasmy](#homopolymer-length-heteroplasmy).
 - **Very low depth can yield zero HiFi reads.** Raise `--total-depth` if `ccs`
   produces empty output.
 - **Read-level truth labels** are embedded in FASTQ headers

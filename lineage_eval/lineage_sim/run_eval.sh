@@ -60,6 +60,9 @@ HP_UNSTABLE=""
 HP_MIN_SUBCLONE_FREQ=""
 # Plan 2026-09-27 T5. Empty = omit; simulate_tree.py defaults to none.
 BACKGROUND=""
+# Plan 2026-09-27 T8. One truth, then hifi and ont-denoised. Linux-only: hifi
+# needs ccs. Off unless passed; --profile is ignored while this is set.
+PAIR=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -85,13 +88,21 @@ while [[ $# -gt 0 ]]; do
     --hp-unstable) HP_UNSTABLE="$2"; shift 2;;
     --hp-min-subclone-freq) HP_MIN_SUBCLONE_FREQ="$2"; shift 2;;
     --background) BACKGROUND="$2"; shift 2;;
+    --pair) PAIR=1; shift;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC]" >&2
+  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC] [--pair]" >&2
   exit 1
 }
+# Plan 2026-09-27 T8. Fail before any simulation. An ONT-only run is not a pair.
+if [[ "$PAIR" == 1 ]]; then
+  command -v ccs >/dev/null 2>&1 || {
+    echo "--pair needs HiFi/ccs and is Linux-only for now" >&2
+    exit 1
+  }
+fi
 # Resolve in simulate_reads.sh; export a sane default here for visibility.
 if [[ -z "${PBSIM_MODEL_DIR:-}" || ! -d "${PBSIM_MODEL_DIR:-}" ]]; then
   export PBSIM_MODEL_DIR="$HERE/pbsim3_models"
@@ -123,21 +134,6 @@ SIM_TREE_ARGS=()
 # Plan 2026-09-27 T5. Empty omits the flag.
 [[ -n "$BACKGROUND" ]] && SIM_TREE_ARGS+=(--background "$BACKGROUND")
 python "$HERE/simulate_tree.py" --reference "$REF" --n-mutations "$NMUT" --seed "$SEED" --outdir "$OUTDIR" --min-hf "$SIM_MIN_HF" --max-hf "$SIM_MAX_HF" "${SIM_TREE_ARGS[@]+"${SIM_TREE_ARGS[@]}"}"
-"$HERE/simulate_reads.sh" --outdir "$OUTDIR" --profile "$PROFILE" --total-depth "$DEPTH" --seed "$SEED"
-HIMITO_ARGS=(
-  --outdir "$OUTDIR" --profile "$PROFILE" --sample SIM
-  --vaf "$MIN_HF" --min-hf "$MIN_HF" --max-hf "$MAX_HF"
-)
-[[ -n "$FP" ]] && HIMITO_ARGS+=(--fp "$FP")
-[[ -n "$FN" ]] && HIMITO_ARGS+=(--fn "$FN")
-[[ -n "$FREQ_THRESHOLD" ]] && HIMITO_ARGS+=(--frequency-threshold "$FREQ_THRESHOLD")
-[[ -n "$DENOISE_VAF" ]] && HIMITO_ARGS+=(--denoise-vaf "$DENOISE_VAF")
-[[ "$COLLAPSE_HP" == 1 ]] && HIMITO_ARGS+=(--collapse-hp)
-# Plan 2026-09-27 T3. run_himito.sh forwards these to Himito lineage only.
-[[ -n "$HP_FP_RATE" ]] && HIMITO_ARGS+=(--hp-fp-rate "$HP_FP_RATE")
-[[ -n "$HP_FN_RATE" ]] && HIMITO_ARGS+=(--hp-fn-rate "$HP_FN_RATE")
-"$HERE/run_himito.sh" "${HIMITO_ARGS[@]}"
-read -r DEFAULT_FP DEFAULT_FN < <(resolve_scite_rates "$PROFILE")
 # Plan 2026-09-27 T6. Pass truth files when this run wrote them, and the
 # simulator background when it is not `none`, so scoring uses the same tracts.
 SCORE_ARGS=()
@@ -147,15 +143,109 @@ SCORE_ARGS=()
 if [[ -n "$BACKGROUND" && "$BACKGROUND" != "none" ]]; then
   SCORE_ARGS+=(--background "$BACKGROUND")
 fi
-python "$HERE/score_lineage.py" \
-  --truth-tree "$OUTDIR/truth/truth_mutation_tree.tsv" \
-  --recon-tree "$OUTDIR/himito/sim_lineage.mutation_tree.tsv" \
-  --truth-variants "$OUTDIR/truth/truth_variants.txt" \
-  --vcf "$OUTDIR/himito/sim.vcf" \
-  --recon-matrix "$OUTDIR/himito/sim_lineage.cleaned_matrix_all_variants.csv" \
-  --truth-clones "$OUTDIR/truth/clones.tsv" \
-  --profile "$PROFILE" --fp "${FP:-$DEFAULT_FP}" --fn "${FN:-$DEFAULT_FN}" \
-  "${SCORE_ARGS[@]+"${SCORE_ARGS[@]}"}" \
-  --metrics-out "$OUTDIR/metrics.tsv"
 
-echo "=== metrics ($OUTDIR/metrics.tsv) ==="
+# $1 profile, $2 reconstruction directory name under OUTDIR.
+# "himito" is where run_himito.sh writes. Any other name is a rename so a
+# second platform (Plan 2026-09-27 T8) cannot clobber the first.
+run_one_profile() {
+  local profile="$1" dest="$2"
+  "$HERE/simulate_reads.sh" --outdir "$OUTDIR" --profile "$profile" --total-depth "$DEPTH" --seed "$SEED"
+  # Not `local -a`: macOS bash 3.2 rejects compound assignment on local.
+  HIMITO_ARGS=(
+    --outdir "$OUTDIR" --profile "$profile" --sample SIM
+    --vaf "$MIN_HF" --min-hf "$MIN_HF" --max-hf "$MAX_HF"
+  )
+  [[ -n "$FP" ]] && HIMITO_ARGS+=(--fp "$FP")
+  [[ -n "$FN" ]] && HIMITO_ARGS+=(--fn "$FN")
+  [[ -n "$FREQ_THRESHOLD" ]] && HIMITO_ARGS+=(--frequency-threshold "$FREQ_THRESHOLD")
+  [[ -n "$DENOISE_VAF" ]] && HIMITO_ARGS+=(--denoise-vaf "$DENOISE_VAF")
+  [[ "$COLLAPSE_HP" == 1 ]] && HIMITO_ARGS+=(--collapse-hp)
+  # Plan 2026-09-27 T3. run_himito.sh forwards these to Himito lineage only.
+  [[ -n "$HP_FP_RATE" ]] && HIMITO_ARGS+=(--hp-fp-rate "$HP_FP_RATE")
+  [[ -n "$HP_FN_RATE" ]] && HIMITO_ARGS+=(--hp-fn-rate "$HP_FN_RATE")
+  "$HERE/run_himito.sh" "${HIMITO_ARGS[@]}"
+  if [[ "$dest" != "himito" ]]; then
+    rm -rf "$OUTDIR/$dest"
+    mv "$OUTDIR/himito" "$OUTDIR/$dest"
+  fi
+}
+
+# $1 profile, $2 reconstruction directory, $3 metrics TSV path.
+score_reconstruction() {
+  local profile="$1" hdir="$2" metrics="$3"
+  local default_fp default_fn
+  read -r default_fp default_fn < <(resolve_scite_rates "$profile")
+  python "$HERE/score_lineage.py" \
+    --truth-tree "$OUTDIR/truth/truth_mutation_tree.tsv" \
+    --recon-tree "$OUTDIR/$hdir/sim_lineage.mutation_tree.tsv" \
+    --truth-variants "$OUTDIR/truth/truth_variants.txt" \
+    --vcf "$OUTDIR/$hdir/sim.vcf" \
+    --recon-matrix "$OUTDIR/$hdir/sim_lineage.cleaned_matrix_all_variants.csv" \
+    --truth-clones "$OUTDIR/truth/clones.tsv" \
+    --profile "$profile" --fp "${FP:-$default_fp}" --fn "${FN:-$default_fn}" \
+    "${SCORE_ARGS[@]+"${SCORE_ARGS[@]}"}" \
+    --metrics-out "$metrics"
+}
+
+# Plan 2026-09-27 T8. ONT tree scored with the PacBio tree as truth.
+# pair_ad_f1 is that run's ad_f1. pair_root_fraction_delta is ONT minus PacBio.
+write_pair_metrics() {
+  local pb_vars="$OUTDIR/himito_pb/called_variants.txt"
+  local pair_score="$OUTDIR/.pair_tree_score.tsv"
+  python - "$HERE" "$OUTDIR/himito_pb/sim.vcf" "$pb_vars" <<'PY'
+import sys
+sys.path.insert(0, sys.argv[1])
+from score_lineage import detected_variants_with_hf_from_vcf
+names = sorted(detected_variants_with_hf_from_vcf(sys.argv[2]))
+with open(sys.argv[3], "w") as fh:
+    for name in names:
+        fh.write(name + "\n")
+PY
+  rm -f "$pair_score"
+  python "$HERE/score_lineage.py" \
+    --truth-tree "$OUTDIR/himito_pb/sim_lineage.mutation_tree.tsv" \
+    --recon-tree "$OUTDIR/himito_ont/sim_lineage.mutation_tree.tsv" \
+    --truth-variants "$pb_vars" \
+    --vcf "$OUTDIR/himito_ont/sim.vcf" \
+    --profile pair \
+    "${SCORE_ARGS[@]+"${SCORE_ARGS[@]}"}" \
+    --metrics-out "$pair_score"
+  python - "$OUTDIR/metrics_ont.tsv" "$OUTDIR/metrics_pb.tsv" "$pair_score" "$OUTDIR/pair_metrics.tsv" <<'PY'
+import csv, sys
+ont_f, pb_f, pair_f, out_f = sys.argv[1:]
+
+def last(path):
+    rows = list(csv.DictReader(open(path), delimiter="\t"))
+    if not rows:
+        raise SystemExit(f"no data rows in {path}")
+    return rows[-1]
+
+ont, pb, pair = last(ont_f), last(pb_f), last(pair_f)
+ont_rf, pb_rf = ont["root_fraction"], pb["root_fraction"]
+if ont_rf in ("", "NA") or pb_rf in ("", "NA"):
+    delta = "NA"
+else:
+    delta = f"{float(ont_rf) - float(pb_rf):.4f}"
+with open(out_f, "w") as fh:
+    fh.write("pair_ad_f1\tpair_root_fraction_delta\n")
+    fh.write(f"{pair['ad_f1']}\t{delta}\n")
+PY
+  rm -f "$pair_score"
+}
+
+if [[ "$PAIR" == 1 ]]; then
+  # hifi first, then ont-denoised. Each reconstruction is renamed before the
+  # next simulate_reads/run_himito, which both write under this same OUTDIR.
+  run_one_profile hifi himito_pb
+  score_reconstruction hifi himito_pb "$OUTDIR/metrics_pb.tsv"
+  run_one_profile ont-denoised himito_ont
+  score_reconstruction ont-denoised himito_ont "$OUTDIR/metrics_ont.tsv"
+  write_pair_metrics
+  echo "=== pair metrics ($OUTDIR/pair_metrics.tsv) ==="
+  echo "PacBio metrics: $OUTDIR/metrics_pb.tsv"
+  echo "ONT metrics: $OUTDIR/metrics_ont.tsv"
+else
+  run_one_profile "$PROFILE" himito
+  score_reconstruction "$PROFILE" himito "$OUTDIR/metrics.tsv"
+  echo "=== metrics ($OUTDIR/metrics.tsv) ==="
+fi

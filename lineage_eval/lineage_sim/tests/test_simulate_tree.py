@@ -1475,3 +1475,107 @@ def test_sweep_seeds_forwards_background():
     assert "unknown arg" not in r.stderr
     assert "usage:" in r.stderr
     assert r.returncode != 0
+
+
+_HP_FOCUS = [
+    "var_precision", "var_recall", "var_f1",
+    "ad_precision", "ad_recall", "ad_f1",
+    "hap_precision", "hap_recall", "hap_f1",
+    "hp_intrusion", "hp_backbone_nodes", "hp_len_l1",
+    "root_fraction", "hp_var_f1",
+]
+
+
+def _hp_metrics_tsv(path, rows):
+    path.write_text(
+        "\t".join(_HP_FOCUS) + "\n"
+        + "".join("\t".join(row) + "\n" for row in rows)
+    )
+
+
+def test_bench_hp_frozen_config_and_empty_baseline(tmp_path):
+    """Plan 2026-09-27 T8. Frozen flags, and compare with no data rows exits 0."""
+    import subprocess
+    script = (_SIM_DIR / "bench_hp.sh").read_text()
+    for flag in (
+        "--background", "hvs1-polyC",
+        "--hp-lineage-indels", "2",
+        "--hp-unstable", "common",
+        "baseline_hp.tsv",
+        "hp_intrusion", "hp_backbone_nodes", "hp_len_l1",
+        "root_fraction", "hp_var_f1",
+        "no baseline yet",
+    ):
+        assert flag in script
+    cur = tmp_path / "seed_metrics.tsv"
+    _hp_metrics_tsv(cur, [[
+        "1", "1", "1", "1", "1", "1", "1", "1", "1",
+        "0", "1", "NA", "0.2000", "1",
+    ]])
+    missing = tmp_path / "no_such_baseline.tsv"
+    r = subprocess.run(
+        ["bash", str(_SIM_DIR / "bench_hp.sh"),
+         "--compare", str(cur), "--baseline", str(missing)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "no baseline yet" in r.stdout
+    hp_line = next(line for line in r.stdout.splitlines() if line.startswith("hp_len_l1"))
+    assert "NA" in hp_line
+    header_only = tmp_path / "header_only.tsv"
+    header_only.write_text("\t".join(_HP_FOCUS) + "\n")
+    r2 = subprocess.run(
+        ["bash", str(_SIM_DIR / "bench_hp.sh"),
+         "--compare", str(cur), "--baseline", str(header_only)],
+        capture_output=True, text=True,
+    )
+    assert r2.returncode == 0, r2.stderr
+    assert "no baseline yet" in r2.stdout
+
+
+def test_bench_hp_compare_uses_two_se_verdict(tmp_path):
+    """Plan 2026-09-27 T8. Identical means are 'same'; a drop past 2·SE regresses."""
+    import subprocess
+    base = tmp_path / "baseline.tsv"
+    cur = tmp_path / "current.tsv"
+    same = ["1", "1", "1", "1", "1", "1", "1", "1", "1", "0", "1", "0.5", "0.2", "1"]
+    _hp_metrics_tsv(base, [same, same])
+    _hp_metrics_tsv(cur, [same, same])
+    r = subprocess.run(
+        ["bash", str(_SIM_DIR / "bench_hp.sh"),
+         "--compare", str(cur), "--baseline", str(base)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "REGRESSED" not in r.stdout
+    assert "same" in r.stdout
+    low = ["0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"]
+    _hp_metrics_tsv(cur, [low, low])
+    r2 = subprocess.run(
+        ["bash", str(_SIM_DIR / "bench_hp.sh"),
+         "--compare", str(cur), "--baseline", str(base)],
+        capture_output=True, text=True,
+    )
+    assert r2.returncode == 0, r2.stderr
+    assert "REGRESSED" in r2.stdout
+
+
+def test_run_eval_pair_requires_ccs(tmp_path):
+    """Plan 2026-09-27 T8. Missing ccs exits before any ONT-only substitute."""
+    import subprocess
+    script = (_SIM_DIR / "run_eval.sh").read_text()
+    assert "himito_pb" in script and "himito_ont" in script
+    assert "pair_ad_f1" in script and "pair_root_fraction_delta" in script
+    assert "metrics_pb.tsv" in script and "metrics_ont.tsv" in script
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    out = tmp_path / "out"
+    r = subprocess.run(
+        ["/bin/bash", str(_SIM_DIR / "run_eval.sh"),
+         "--outdir", str(out), "--pair", "--ref", REF],
+        capture_output=True, text=True,
+        env={"PATH": str(empty), "HOME": os.environ.get("HOME", "")},
+    )
+    assert r.returncode != 0
+    assert "--pair needs HiFi/ccs and is Linux-only for now" in r.stderr
+    assert not out.exists()

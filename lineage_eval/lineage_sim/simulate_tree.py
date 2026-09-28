@@ -49,16 +49,86 @@ AVOID_RANGES = [(1, 40), (295, 320), (3105, 3110), (16180, 16200), (16560, 16569
 DEFAULT_INTERNAL_KEEP = 0.20
 
 
-@dataclass
+# Plan 2026-09-27 T2. 1-based VCF POS: the changed base for a SNV, the anchor
+# base for an indel. ref/alt include that anchor, matching Himito's VCF alleles.
+@dataclass(frozen=True)
+class Edit:
+    pos: int
+    ref: str
+    alt: str
+
+    def is_indel(self) -> bool:
+        return len(self.ref) != len(self.alt)
+
+
+@dataclass(init=False)
 class Node:
+    """Mutation-tree node. ``pos``/``ref``/``alt`` mirror ``edit`` for callers
+    that still pass the SNV kwargs."""
+
     id: int
     variant: str | None
-    pos: int | None
-    ref: str | None
-    alt: str | None
     parent: int
     children: list[int] = field(default_factory=list)
     cum_freq: float = 0.0
+    edit: Edit | None = None
+
+    def __init__(
+        self,
+        id: int,
+        variant: str | None,
+        parent: int,
+        pos: int | None = None,
+        ref: str | None = None,
+        alt: str | None = None,
+        children: list[int] | None = None,
+        cum_freq: float = 0.0,
+        edit: Edit | None = None,
+    ) -> None:
+        self.id = id
+        self.variant = variant
+        self.parent = parent
+        self.children = [] if children is None else list(children)
+        self.cum_freq = cum_freq
+        if edit is not None:
+            self.edit = edit
+        elif pos is None:
+            self.edit = None
+        else:
+            self.edit = Edit(pos, ref, alt)
+
+    @property
+    def pos(self) -> int | None:
+        return None if self.edit is None else self.edit.pos
+
+    @pos.setter
+    def pos(self, value: int | None) -> None:
+        if value is None:
+            self.edit = None
+            return
+        ref = None if self.edit is None else self.edit.ref
+        alt = None if self.edit is None else self.edit.alt
+        self.edit = Edit(value, ref, alt)
+
+    @property
+    def ref(self) -> str | None:
+        return None if self.edit is None else self.edit.ref
+
+    @ref.setter
+    def ref(self, value: str | None) -> None:
+        if self.edit is None:
+            return
+        self.edit = Edit(self.edit.pos, value, self.edit.alt)
+
+    @property
+    def alt(self) -> str | None:
+        return None if self.edit is None else self.edit.alt
+
+    @alt.setter
+    def alt(self, value: str | None) -> None:
+        if self.edit is None:
+            return
+        self.edit = Edit(self.edit.pos, self.edit.ref, value)
 
 
 @dataclass
@@ -66,8 +136,82 @@ class Tree:
     nodes: list[Node]
 
 
+def himito_name(edit: Edit) -> str:
+    """``m.{pos}{ref}>{alt}`` in 1-based VCF coordinates.
+
+    Matches ``call::generate_variant_name`` once a SNP's 0-based ``pos+1`` and
+    an indel's already-1-based anchor are both expressed as VCF POS.
+    """
+    return f"m.{edit.pos}{edit.ref}>{edit.alt}"
+
+
 def variant_id(pos: int, ref: str, alt: str) -> str:
-    return f"m.{pos}{ref}>{alt}"
+    return himito_name(Edit(pos, ref, alt))
+
+
+def _coerce_edit(item: Edit | tuple[int, str, str]) -> Edit:
+    if isinstance(item, Edit):
+        return item
+    pos, ref, alt = item
+    return Edit(pos, ref, alt)
+
+
+def apply_edits(seq: str, edits: list[Edit | tuple[int, str, str]]) -> str:
+    """Apply SNVs and indels, highest anchor first.
+
+    An upstream insertion then cannot shift a later coordinate. The result
+    matches applying the edits in ascending position order while shifting each
+    later edit by the net length change of the edits already applied.
+    """
+    ordered = sorted((_coerce_edit(e) for e in edits), key=lambda e: e.pos, reverse=True)
+    g = list(seq)
+    for edit in ordered:
+        i = edit.pos - 1
+        got = "".join(g[i:i + len(edit.ref)])
+        assert got == edit.ref, f"ref mismatch at {edit.pos}: {got} != {edit.ref}"
+        g[i:i + len(edit.ref)] = list(edit.alt)
+    return "".join(g)
+
+
+def left_align(edit: Edit, seq: str) -> Edit:
+    """Python twin of ``call::left_align_variant`` + ``normalize_left``.
+
+    Walk the anchor left while the inserted or deleted base equals the
+    reference base at the anchor, then rebuild both alleles from the reference
+    at the new anchor. SNVs are unchanged. ``edit.pos`` is already 1-based.
+    """
+    if (
+        edit.pos < 1
+        or not edit.ref
+        or not edit.alt
+        or len(edit.ref) == len(edit.alt)
+    ):
+        return edit
+
+    if len(edit.ref) == 1 and len(edit.alt) > 1:
+        a = edit.pos - 1
+        inserted = list(edit.alt[1:])
+        while a > 0 and inserted and seq[a] == inserted[-1]:
+            inserted = [inserted[-1]] + inserted[:-1]
+            a -= 1
+        if a >= len(seq):
+            return edit
+        anchor = seq[a]
+        return Edit(a + 1, anchor, anchor + "".join(inserted))
+
+    if len(edit.alt) == 1 and len(edit.ref) > 1:
+        n = len(edit.ref) - 1
+        a = edit.pos - 1
+        if a + n >= len(seq):
+            return edit
+        while a > 0 and a + n < len(seq) and seq[a] == seq[a + n]:
+            a -= 1
+        if a + n >= len(seq):
+            return edit
+        anchor = seq[a]
+        return Edit(a + 1, seq[a:a + 1 + n], anchor)
+
+    return edit
 
 
 def _is_avoided(pos: int) -> bool:
@@ -196,24 +340,21 @@ def assign_frequencies(
             )
 
 
-def path_to_root(tree: Tree, node_id: int) -> list[tuple[int, str, str]]:
-    """Ordered (pos, ref, alt) SNVs from root down to `node_id`."""
+def path_to_root(tree: Tree, node_id: int) -> list[Edit]:
+    """Edits from root down to ``node_id`` (root excluded)."""
     chain = []
     cur = node_id
     while cur != 0:
         n = tree.nodes[cur]
-        chain.append((n.pos, n.ref, n.alt))
+        chain.append(n.edit)
         cur = n.parent
     chain.reverse()
     return chain
 
 
-def clone_genome(seq: str, path: list[tuple[int, str, str]]) -> str:
-    g = list(seq)
-    for pos, ref, alt in path:
-        assert g[pos - 1] == ref, f"ref mismatch at {pos}: {g[pos-1]} != {ref}"
-        g[pos - 1] = alt
-    return "".join(g)
+def clone_genome(seq: str, path: list[Edit | tuple[int, str, str]]) -> str:
+    """Apply a root-to-node path. Tuples stay accepted for SNV callers."""
+    return apply_edits(seq, path)
 
 
 def write_truth(tree: Tree, seq: str, outdir: str) -> None:
@@ -237,16 +378,18 @@ def write_truth(tree: Tree, seq: str, outdir: str) -> None:
     # and read simulation depth blows up (especially costly for HiFi/ccs).
     with open(os.path.join(tdir, "clones.tsv"), "w") as fh, \
          open(os.path.join(tdir, "clone_genomes.fa"), "w") as fa:
-        fh.write("clone_id\tnode_variant\tvariant_path\tfrequency\tn_reads\n")
+        fh.write("clone_id\tnode_variant\tvariant_path\tfrequency\n")
         # reference clone (mutation-free)
-        fh.write(f"ref\tROOT\t\t{_terminal_freq(tree, 0):.6f}\t0\n")
+        fh.write(f"ref\tROOT\t\t{_terminal_freq(tree, 0):.6f}\n")
         fa.write(">clone_ref\n")
         _write_fasta_seq(fa, seq)
         for n in tree.nodes[1:]:
             path = path_to_root(tree, n.id)
             genome = clone_genome(seq, path)
-            vpath = ",".join(variant_id(p, r, a) for p, r, a in path)
-            fh.write(f"{n.id}\t{n.variant}\t{vpath}\t{_terminal_freq(tree, n.id):.6f}\t0\n")
+            # Left-aligned Himito names. Canonicalisation of HP alleles is T6;
+            # until then this is the name `Himito call` writes for the same edit.
+            vpath = ",".join(himito_name(left_align(e, seq)) for e in path)
+            fh.write(f"{n.id}\t{n.variant}\t{vpath}\t{_terminal_freq(tree, n.id):.6f}\n")
             fa.write(f">clone_{n.id}\n")
             _write_fasta_seq(fa, genome)
 

@@ -173,7 +173,13 @@ PY
       append_fq_gz "${pfx}.hifi.fastq.gz" "$clone_id" "$rotidx" "$pbsim_log"
     else
       # Single-pass ONT: pbsim emits <pfx>_0001.fq.gz directly.
+      # pbsim3 has been observed to exit before that fq.gz is visible
+      # (plan 2026-09-27 T9 smoke, depth-1 sub-clone).
       fq="${pfx}_0001.fq.gz"
+      for _try in 1 2 3 4 5; do
+        [[ -f "$fq" ]] && break
+        sleep 0.2
+      done
       [[ -f "$fq" ]] || { echo "no pbsim fq.gz: $fq" >&2; exit 1; }
       append_fq_gz "$fq" "$clone_id" "$rotidx" "$pbsim_log"
     fi

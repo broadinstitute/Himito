@@ -385,3 +385,14 @@ The sole rCRS C7 (D310, 303–309) is absent here: its modal observed length is 
 HiFi cell: not run (`ccs` missing).
 
 **Decision.** pbsim is adequate. C/G P(obs=7 | ref_len=8) is undefined on the raw pbsim BAM (n=0) and on `HG00232.ont.bam` (n=0), because rCRS has no C/G homopolymer of length 8. The injector predicate is not met, so `inject_hp_errors.py` was not built. On the lengths that do exist, raw pbsim C/G under-call is not below half the real ONT rate (L=5: 0.0820 vs 0.0508; L=6: 0.0932 vs 0.0882).
+
+## T10 results
+
+Validation ran. The miniwdl smoke run and the image rebuild were not executed here (no local image). No `metrics.tsv` headers are pasted, because those runs did not happen.
+
+- `miniwdl check wdl/Himito-lineage/Himito_lineage_sim.wdl` exited 0. It reported one pre-existing lint: `RunEvalCell` input `validated` is an unused declaration (the ValidateConfig sentinel).
+- `womtool validate` on the WDL alone printed `Success!`.
+- `womtool validate -i lineage_eval/lineage_sim/Himito_lineage_sim.hp.inputs.json` printed `Success!` (exit 0).
+- `womtool validate -i lineage_eval/lineage_sim/Himito_lineage_sim.inputs.json` exited 1. The messages are warnings for the pre-existing `__comment_optional` and `__HimitoLineageSim.*` documentation keys. That file was left byte-identical.
+- `parse_hp_unstable` is `simulate_tree.parse_hp_unstable` (it checks ids against `hp_tracts.CATALOGUE`). `hp_tracts` has no `parse_hp_unstable`. ValidateConfig imports both from `/opt/lineage_sim`.
+- `pysam` was already a conda dependency in `environment.yml`, which the Dockerfile installs. The Dockerfile comment records that. `hp_tracts.py` and `measure_hp_errors.py` were added to the image `COPY`.

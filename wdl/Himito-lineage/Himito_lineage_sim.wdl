@@ -33,8 +33,9 @@ version 1.0
 #   sim_min_hf           0.01 -> 0.05             (0.01 sits under the gates)
 #   sim_max_hf           0.95 -> 0.99             (matches run_eval.sh)
 #
-# NOTE: topology/denoise_vaf require an image built from the current
-# lineage_sim/ scripts. Rebuild the docker image before using them.
+# NOTE: topology/denoise_vaf and the HP modes (plan 2026-09-27 T10) require
+# an image built from the current lineage_sim/ scripts, including
+# hp_tracts.py. Rebuild the docker image before using them.
 
 workflow HimitoLineageSim {
     input {
@@ -81,6 +82,16 @@ workflow HimitoLineageSim {
         # ordering call hard; lower is harder, and it costs no detection.
         Float internal_keep = 0.20
 
+        # Plan 2026-09-27 T10. Homopolymer length heteroplasmy; all off by default so an
+        # unchanged inputs JSON reproduces the SNV-only benchmark.
+        String background = "none"          # none | hvs1-polyC | comma list e.g. "T16189C,A16183C"
+        Int hp_lineage_indels = 0           # K of the n_mutations edges are HP length changes
+        String hp_unstable = ""             # "" | common | "D310:0=0.5,1=0.5;C573:..."
+        Float hp_min_subclone_freq = 0.002
+        Boolean collapse_hp = false         # Himito lineage --collapse-hp
+        Float? hp_fp_rate                   # Himito lineage --hp-fp-rate (unset = 2x fp)
+        Float? hp_fn_rate                   # Himito lineage --hp-fn-rate (unset = 2x fn)
+
         String docker = "us.gcr.io/broad-dsp-lrma/hangsuunc/himito-lineage-sim:dev"
         RuntimeAttr? runtime_attr_override
     }
@@ -88,6 +99,18 @@ workflow HimitoLineageSim {
     String fp_arg = if defined(fp) then "--fp " + select_first([fp]) else ""
     String fn_arg = if defined(fn) then "--fn " + select_first([fn]) else ""
     String denoise_vaf_arg = if defined(denoise_vaf) then "--denoise-vaf " + select_first([denoise_vaf]) else ""
+    # Plan 2026-09-27 T10. Empty when the mode is off, same pattern as fp_arg.
+    # Quote specs that may contain ';' so the shell does not split them.
+    String background_arg = if background == "none" then "" else "--background \"" + background + "\""
+    String hp_lineage_arg = if hp_lineage_indels > 0 then "--hp-lineage-indels " + hp_lineage_indels else ""
+    String hp_unstable_arg = if hp_unstable != "" then "--hp-unstable \"" + hp_unstable + "\"" else ""
+    String hp_min_subclone_arg = if hp_unstable != "" then "--hp-min-subclone-freq " + hp_min_subclone_freq else ""
+    String collapse_hp_arg = if collapse_hp then "--collapse-hp" else ""
+    String hp_fp_arg = if defined(hp_fp_rate) then "--hp-fp-rate " + select_first([hp_fp_rate]) else ""
+    String hp_fn_arg = if defined(hp_fn_rate) then "--hp-fn-rate " + select_first([hp_fn_rate]) else ""
+    String hp_unstable_txt = if hp_unstable == "" then "NA" else hp_unstable
+    String hp_fp_txt = if defined(hp_fp_rate) then "" + select_first([hp_fp_rate]) else "NA"
+    String hp_fn_txt = if defined(hp_fn_rate) then "" + select_first([hp_fn_rate]) else "NA"
     RuntimeAttr runtime_attr = select_first([runtime_attr_override, object {}])
 
     # Fail the whole workflow on a misconfigured gate before any cell burns a VM.
@@ -101,6 +124,12 @@ workflow HimitoLineageSim {
             topology = topology,
             internal_keep = internal_keep,
             n_mutations = n_mutations,
+            background = background,
+            hp_unstable = hp_unstable,
+            hp_lineage_indels = hp_lineage_indels,
+            collapse_hp = collapse_hp,
+            hp_fp_set = defined(hp_fp_rate),
+            hp_fn_set = defined(hp_fn_rate),
             docker = docker
     }
 
@@ -123,6 +152,20 @@ workflow HimitoLineageSim {
                         sim_max_hf = sim_max_hf,
                         topology = topology,
                         internal_keep = internal_keep,
+                        background = background,
+                        hp_lineage_indels = hp_lineage_indels,
+                        hp_unstable = hp_unstable,
+                        collapse_hp = collapse_hp,
+                        hp_unstable_txt = hp_unstable_txt,
+                        hp_fp_txt = hp_fp_txt,
+                        hp_fn_txt = hp_fn_txt,
+                        background_arg = background_arg,
+                        hp_lineage_arg = hp_lineage_arg,
+                        hp_unstable_arg = hp_unstable_arg,
+                        hp_min_subclone_arg = hp_min_subclone_arg,
+                        collapse_hp_arg = collapse_hp_arg,
+                        hp_fp_arg = hp_fp_arg,
+                        hp_fn_arg = hp_fn_arg,
                         reference_fa = reference_fa,
                         validated = ValidateConfig.ok,
                         docker = docker,
@@ -134,6 +177,10 @@ workflow HimitoLineageSim {
 
     Array[File] cell_metrics = flatten(flatten(RunEvalCell.cell_metrics))
     Array[File] cell_bundles = flatten(flatten(RunEvalCell.cell_bundle))
+    Array[File] cell_truth = flatten(flatten(RunEvalCell.truth_dir_tar))
+    Array[File] cell_matrices = flatten(flatten(RunEvalCell.matrix))
+    Array[File] cell_vcfs = flatten(flatten(RunEvalCell.vcf))
+    Array[File] cell_cleaned = flatten(flatten(RunEvalCell.cleaned_matrix))
 
     call CombineMetrics {
         input:
@@ -145,6 +192,10 @@ workflow HimitoLineageSim {
         File metrics = CombineMetrics.combined
         Array[File] per_cell_metrics = cell_metrics
         Array[File] per_cell_bundles = cell_bundles
+        Array[File] per_cell_truth = cell_truth
+        Array[File] per_cell_matrix = cell_matrices
+        Array[File] per_cell_vcf = cell_vcfs
+        Array[File] per_cell_cleaned_matrix = cell_cleaned
     }
 }
 
@@ -173,6 +224,12 @@ task ValidateConfig {
         String topology
         Float internal_keep
         Array[Int] n_mutations
+        String background
+        String hp_unstable
+        Int hp_lineage_indels
+        Boolean collapse_hp
+        Boolean hp_fp_set
+        Boolean hp_fn_set
         String docker
     }
 
@@ -183,6 +240,17 @@ task ValidateConfig {
         set -euo pipefail
         python3 <<'PY'
 import sys
+sys.path.insert(0, "/opt/lineage_sim")
+try:
+    import hp_tracts
+    import simulate_tree
+except ImportError as exc:
+    print(
+        "ERROR: cannot import hp_tracts/simulate_tree from /opt/lineage_sim "
+        f"({exc}). Rebuild the himito-lineage-sim image (plan 2026-09-27 T10).",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 profile   = "~{profile}"
 freq      = float("~{frequency_threshold}")
@@ -192,6 +260,14 @@ sim_min   = float("~{sim_min_hf}")
 topology  = "~{topology}"
 keep      = float("~{internal_keep}")
 nmuts     = [int(x) for x in "~{sep=' ' n_mutations}".split()]
+# Plan 2026-09-27 T10. parse_hp_unstable is simulate_tree.parse_hp_unstable;
+# it checks tract ids against hp_tracts.CATALOGUE.
+background = "~{background}"
+hp_unstable = "~{hp_unstable}"
+hp_k = int("~{hp_lineage_indels}")
+collapse_hp = "~{collapse_hp}".lower() == "true"
+hp_fp_set = "~{hp_fp_set}".lower() == "true"
+hp_fn_set = "~{hp_fn_set}".lower() == "true"
 REF_FRACTION = 0.15   # simulate_tree.py default; not exposed by run_eval.sh
 
 errors, warnings = [], []
@@ -246,6 +322,48 @@ if topology == "chain":
 else:
     check_gates(sim_min, False, "")
 
+# --- homopolymer modes (plan 2026-09-27 T10) ---------------------------------
+try:
+    bg_tokens = simulate_tree.parse_background(background)
+except ValueError as exc:
+    errors.append(str(exc))
+    bg_tokens = None
+if bg_tokens:
+    ref_path = "/opt/lineage_sim/rCRS.fasta"
+    try:
+        _, rcrs = hp_tracts.load_reference(ref_path)
+        hp_tracts.apply_background(rcrs, bg_tokens)
+    except Exception as exc:
+        errors.append(f"background {background!r} does not match rCRS: {exc}")
+if hp_unstable:
+    try:
+        simulate_tree.parse_hp_unstable(hp_unstable)
+    except ValueError as exc:
+        errors.append(f"hp_unstable: {exc}")
+n_drawable = sum(1 for tract in hp_tracts.CATALOGUE if tract.simulate)
+if hp_k < 0:
+    errors.append(f"hp_lineage_indels={hp_k} is negative")
+if hp_k > n_drawable:
+    errors.append(
+        f"hp_lineage_indels={hp_k} exceeds the {n_drawable} simulate=True "
+        "tracts (draws are without replacement)"
+    )
+for n in sorted(set(nmuts)):
+    if hp_k > n:
+        errors.append(
+            f"hp_lineage_indels={hp_k} exceeds n_mutations={n}"
+        )
+if hp_unstable and not collapse_hp:
+    warnings.append(
+        "hp_unstable is set and collapse_hp is false, so unstable alleles "
+        "enter the tree under several spellings"
+    )
+hp_mode = background != "none" or hp_k > 0 or bool(hp_unstable) or collapse_hp
+if (hp_fp_set or hp_fn_set) and not hp_mode:
+    warnings.append(
+        "hp_fp_rate/hp_fn_rate are set and no HP mode is on; they have nothing to act on"
+    )
+
 # --- non-fatal ----------------------------------------------------------------
 if profile == "ont-r10":
     warnings.append(
@@ -260,7 +378,7 @@ if topology == "star":
     )
 
 for w in warnings:
-    print(f"WARNING: {w}")
+    print(f"WARNING: {w}", file=sys.stderr)
 if errors:
     print()
     for e in errors:
@@ -311,6 +429,20 @@ task RunEvalCell {
         sim_min_hf:    "floor for the SIMULATED truth frequencies -- distinct from min_hf, which filters what was called"
         topology:      "truth tree shape: random | chain | star. chain raises ordering difficulty without costing detection"
         internal_keep: "terminal mass kept by each internal node; lower is harder to order and costs no detection"
+        background:    "fixed homoplasmies: none | hvs1-polyC | comma-separated <REF><pos><ALT>"
+        hp_lineage_indels: "K of the n_mutations edges replaced by HP length changes; 0 leaves the tree SNV-only"
+        hp_unstable:   "lineage-independent tract-length spec; empty omits --hp-unstable"
+        collapse_hp:   "forward Himito lineage --collapse-hp when true"
+        hp_unstable_txt: "hp_unstable written into cell_metrics; NA when unset"
+        hp_fp_txt:     "hp_fp_rate written into cell_metrics; NA when unset"
+        hp_fn_txt:     "hp_fn_rate written into cell_metrics; NA when unset"
+        background_arg: "optional '--background <spec>'; empty when background is none"
+        hp_lineage_arg: "optional '--hp-lineage-indels K'; empty when K is 0"
+        hp_unstable_arg: "optional '--hp-unstable <spec>'; empty when unset. Quoted because specs contain ';'"
+        hp_min_subclone_arg: "optional '--hp-min-subclone-freq F'; empty unless hp_unstable is set"
+        collapse_hp_arg: "optional '--collapse-hp'; empty when false"
+        hp_fp_arg:     "optional '--hp-fp-rate <rate>'; empty uses Himito's 2x fp default"
+        hp_fn_arg:     "optional '--hp-fn-rate <rate>'; empty uses Himito's 2x fn default"
         reference_fa:  "mitochondrial reference FASTA (required)"
         validated:     "sentinel from ValidateConfig; forces gate validation to run before any cell"
     }
@@ -334,13 +466,28 @@ task RunEvalCell {
         String topology
         Float internal_keep
 
+        String background
+        Int hp_lineage_indels
+        String hp_unstable
+        Boolean collapse_hp
+        String hp_unstable_txt
+        String hp_fp_txt
+        String hp_fn_txt
+        String background_arg
+        String hp_lineage_arg
+        String hp_unstable_arg
+        String hp_min_subclone_arg
+        String collapse_hp_arg
+        String hp_fp_arg
+        String hp_fn_arg
+
         String validated
 
         String docker
         RuntimeAttr? runtime_attr_override
     }
 
-    String cell = "seed~{seed}_mut~{n_mutations}_depth~{total_depth}"
+    String cell = "seed~{seed}_mut~{n_mutations}_depth~{total_depth}" + (if hp_lineage_indels > 0 || hp_unstable != "" then "_hp" else "")
     command <<<
         set -euxo pipefail
 
@@ -366,7 +513,14 @@ task RunEvalCell {
             --frequency-threshold ~{frequency_threshold} \
             ~{fp_arg} \
             ~{fn_arg} \
-            ~{denoise_vaf_arg}
+            ~{denoise_vaf_arg} \
+            ~{background_arg} \
+            ~{hp_lineage_arg} \
+            ~{hp_unstable_arg} \
+            ~{hp_min_subclone_arg} \
+            ~{collapse_hp_arg} \
+            ~{hp_fp_arg} \
+            ~{hp_fn_arg}
 
         # Prepend the identifying columns run_simulation.sh adds to the combined
         # table. Read the header from the file rather than assuming a column
@@ -375,17 +529,27 @@ task RunEvalCell {
         metrics="~{cell}/metrics.tsv"
         header=$(head -n 1 "$metrics")
         row=$(tail -n 1 "$metrics")
-        printf 'seed\tn_mutations\ttotal_depth\ttopology\tinternal_keep\t%s\n' "$header" > cell_metrics.tsv
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "~{seed}" "~{n_mutations}" "~{total_depth}" "~{topology}" "~{internal_keep}" "$row" >> cell_metrics.tsv
+        # Plan 2026-09-27 T10. Identifying columns after internal_keep. NA for
+        # unset hp_unstable / hp_fp_rate / hp_fn_rate.
+        printf 'seed\tn_mutations\ttotal_depth\ttopology\tinternal_keep\tbackground\thp_lineage_indels\thp_unstable\tcollapse_hp\thp_fp_rate\thp_fn_rate\t%s\n' "$header" > cell_metrics.tsv
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "~{seed}" "~{n_mutations}" "~{total_depth}" "~{topology}" "~{internal_keep}" \
+            "~{background}" "~{hp_lineage_indels}" "~{hp_unstable_txt}" "~{collapse_hp}" \
+            "~{hp_fp_txt}" "~{hp_fn_txt}" "$row" >> cell_metrics.tsv
 
         # Bundle the full cell (truth/, reads/, himito/) for debugging/inspection.
         tar czf "~{cell}.tar.gz" "~{cell}"
+        # truth/ alone, including hp_tracts.tsv, hp_lineage.tsv, background.txt.
+        tar czf "~{cell}_truth.tar.gz" -C "~{cell}" truth
     >>>
 
     output {
         File cell_metrics = "cell_metrics.tsv"
         File cell_bundle = "~{cell}.tar.gz"
+        File truth_dir_tar = "~{cell}_truth.tar.gz"
+        File matrix = "~{cell}/himito/sim.matrix.csv"
+        File vcf = "~{cell}/himito/sim.vcf"
+        File cleaned_matrix = "~{cell}/himito/sim_lineage.cleaned_matrix_all_variants.csv"
     }
 
     RuntimeAttr default_attr = object {
@@ -423,13 +587,21 @@ task CombineMetrics {
     command <<<
         set -euxo pipefail
         first=1
+        expected=""
         : > metrics.tsv
         for f in ~{sep=' ' cell_metrics}; do
             [[ -s "$f" ]] || continue
+            header=$(head -n 1 "$f")
             if [[ $first -eq 1 ]]; then
+                expected="$header"
                 cat "$f" >> metrics.tsv
                 first=0
             else
+                # Plan 2026-09-27 T10. Position-wise concat misaligns mixed schemas.
+                if [[ "$header" != "$expected" ]]; then
+                    echo "ERROR: header mismatch: $f" >&2
+                    exit 1
+                fi
                 tail -n +2 "$f" >> metrics.tsv
             fi
         done

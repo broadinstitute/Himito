@@ -1,0 +1,18 @@
+{
+  "HimitoLineageSim.seeds": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
+  "HimitoLineageSim.n_mutations": [10],
+  "HimitoLineageSim.depths": [1000],
+
+  "HimitoLineageSim.profile": "ont-denoised",
+  "HimitoLineageSim.topology": "chain",
+  "HimitoLineageSim.internal_keep": 0.10,
+  "HimitoLineageSim.frequency_threshold": 0.05,
+  "HimitoLineageSim.denoise_vaf": 0.03,
+
+  "HimitoLineageSim.background": "hvs1-polyC",
+  "HimitoLineageSim.hp_lineage_indels": 2,
+  "HimitoLineageSim.hp_unstable": "common",
+
+  "HimitoLineageSim.docker": "us.gcr.io/broad-dsp-lrma/hangsuunc/himito-lineage-sim:dev",
+  "HimitoLineageSim.reference_fa": "gs://bucket/rCRS.fasta"
+}

@@ -4,9 +4,14 @@
 # run_himito.sh, score_lineage.py} needs:
 #   - the Himito release binary
 #   - the read-simulation toolchain (pbsim3, pbccs, minimap2, samtools)
-#   - Python + numpy/dendropy
+#   - Python + numpy/dendropy/pysam
 #   - the pbsim3 error models
 #   - the lineage_sim scripts and rCRS.fasta
+#
+# Plan 2026-09-27 T10. Rebuild this image after the HP plan. It bakes
+# /opt/lineage_sim/*.py; hp_tracts.py, measure_hp_errors.py, and pysam
+# from T7 are new. ValidateConfig imports hp_tracts from that path, so an
+# image built before this plan cannot run Himito_lineage_sim.wdl.
 #
 # pbccs is linux/amd64-only, so the runtime is always amd64. Do NOT compile
 # Rust under QEMU on Apple Silicon: `rustc -vV` SIGSEGVs there. Default is to
@@ -53,6 +58,8 @@ USER root
 ENV MAMBA_ROOT_PREFIX=/opt/conda
 
 # Simulation/reconstruction toolchain (pbsim3, pbccs, minimap2, samtools, python).
+# Plan 2026-09-27 T10. pysam (T7, measure_hp_errors.py) is installed by this
+# conda env: environment.yml lists `- pysam`.
 COPY environment.yml /tmp/environment.yml
 RUN micromamba install -y -n base -f /tmp/environment.yml \
     && micromamba clean --all --yes
@@ -72,6 +79,7 @@ COPY --from=himito-build /Himito/test_data/rCRS.fasta /opt/lineage_sim/rCRS.fast
 
 # The lineage_sim scripts (build context = this directory).
 COPY run_eval.sh run_himito.sh simulate_reads.sh simulate_tree.py score_lineage.py \
+     hp_tracts.py measure_hp_errors.py \
      /opt/lineage_sim/
 RUN chmod +x /opt/lineage_sim/*.sh
 

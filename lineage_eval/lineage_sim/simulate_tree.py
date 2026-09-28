@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Simulate a clonal mitochondrial mutation tree (SCITE-style truth).
 
-Root = rCRS. Each edge introduces one heteroplasmic SNV. Each node carries a
-cumulative heteroplasmy frequency (fraction of molecules whose lineage passes
-through it), and that determines how many reads the clone contributes.
+Root = rCRS. Each edge introduces one heteroplasmic variant: an SNV, or, when
+``--hp-lineage-indels`` is set, a homopolymer length change on a catalogue
+tract. Each node carries a cumulative heteroplasmy frequency (fraction of
+molecules whose lineage passes through it), and that determines how many
+reads the clone contributes.
 """
 import argparse
 import os
@@ -12,7 +14,7 @@ from dataclasses import dataclass, field
 
 # Plan 2026-09-27 T1. Shared with the tract catalogue; sibling import matches
 # how this file is run from lineage_eval/lineage_sim/.
-from hp_tracts import load_reference
+from hp_tracts import CATALOGUE, load_reference
 
 # Regions to avoid when placing SNVs: rCRS control-region homopolymers / the
 # 3107 'N' placeholder, where Himito's indel-prone calls would confound a
@@ -84,12 +86,17 @@ class Node:
         children: list[int] | None = None,
         cum_freq: float = 0.0,
         edit: Edit | None = None,
+        tract_id: str | None = None,
+        hp_delta: int | None = None,
     ) -> None:
         self.id = id
         self.variant = variant
         self.parent = parent
         self.children = [] if children is None else list(children)
         self.cum_freq = cum_freq
+        # Plan 2026-09-27 T3. None on SNVs and on ROOT.
+        self.tract_id = tract_id
+        self.hp_delta = hp_delta
         if edit is not None:
             self.edit = edit
         elif pos is None:
@@ -232,11 +239,111 @@ def _sample_position(seq: str, used: set[int], rng: random.Random) -> int:
         return pos
 
 
+def _drawable_tracts():
+    # Plan 2026-09-27 T3. simulate=True is the drawable set (everything but R8281).
+    return [t for t in CATALOGUE if t.simulate]
+
+
+def _draw_hp_delta(tract, hp_rng: random.Random) -> int:
+    """Signed repeat-unit change. Homopolymers +1/+2/-1; CA514 ±1 unit."""
+    # Plan 2026-09-27 T3.
+    if len(tract.unit) == 1:
+        roll = hp_rng.random()
+        if roll < 0.6:
+            return 1
+        if roll < 0.8:
+            return 2
+        return -1
+    if tract.id == "CA514":
+        return 1 if hp_rng.random() < 0.5 else -1
+    raise ValueError(f"no length distribution for tract {tract.id}")
+
+
+def _raw_length_edit(seq: str, tract, delta: int) -> Edit:
+    """Anchor-based length change of ``abs(delta)`` repeat units, before left-align."""
+    anchor = tract.anchor
+    base = seq[anchor - 1]
+    n_units = abs(delta)
+    if delta > 0:
+        return Edit(anchor, base, base + tract.unit * n_units)
+    n_bp = n_units * len(tract.unit)
+    deleted = seq[anchor:anchor + n_bp]
+    if deleted != tract.unit * n_units:
+        raise ValueError(
+            f"{tract.id}: expected {tract.unit * n_units!r} after {anchor}, got {deleted!r}"
+        )
+    return Edit(anchor, base + deleted, base)
+
+
+def _tract_blocks_snv(pos: int, tract) -> bool:
+    """True when ``pos`` is inside the run or is the anchor the indel consumes."""
+    return tract.anchor <= pos <= tract.end
+
+
+def _apply_hp_lineage_indels(seq: str, nodes: list[Node], k: int,
+                             hp_rng: random.Random | None) -> None:
+    """Replace K SNV edges with distinct catalogue length changes.
+
+    Draws come only from ``hp_rng``. Called after SNV placement so ``rng`` is
+    untouched. A surviving SNV that landed in a chosen tract (or on its
+    anchor) is redrawn from ``hp_rng``.
+    """
+    # Plan 2026-09-27 T3.
+    if hp_rng is None:
+        raise ValueError("hp_rng is required when hp_lineage_indels > 0")
+    n_mutations = len(nodes) - 1
+    drawable = _drawable_tracts()
+    if k > n_mutations or k > len(drawable):
+        raise ValueError(
+            f"hp_lineage_indels={k} exceeds n_mutations={n_mutations} "
+            f"or the {len(drawable)} simulate=True tracts"
+        )
+    node_ids = hp_rng.sample(range(1, n_mutations + 1), k)
+    tracts = hp_rng.sample(drawable, k)
+    chosen = []
+    hp_ids = set(node_ids)
+    for nid, tract in zip(node_ids, tracts):
+        delta = _draw_hp_delta(tract, hp_rng)
+        edit = left_align(_raw_length_edit(seq, tract, delta), seq)
+        node = nodes[nid]
+        node.edit = edit
+        node.variant = himito_name(edit)
+        node.tract_id = tract.id
+        node.hp_delta = delta
+        chosen.append(tract)
+
+    def blocked(pos: int) -> bool:
+        return any(_tract_blocks_snv(pos, tract) for tract in chosen)
+
+    used: set[int] = set()
+    moving: list[int] = []
+    for i in range(1, n_mutations + 1):
+        if i in hp_ids:
+            continue
+        if blocked(nodes[i].pos):
+            moving.append(i)
+        else:
+            used.add(nodes[i].pos)
+    for i in moving:
+        while True:
+            pos = hp_rng.randint(1, len(seq))
+            if pos in used or _is_avoided(pos) or seq[pos - 1] == "N" or blocked(pos):
+                continue
+            break
+        ref, alt = pick_snv(seq, pos, hp_rng)
+        nodes[i].edit = Edit(pos, ref, alt)
+        nodes[i].variant = himito_name(nodes[i].edit)
+        nodes[i].tract_id = None
+        nodes[i].hp_delta = None
+        used.add(pos)
+
+
 TOPOLOGIES = ("random", "chain", "star")
 
 
 def build_tree(seq: str, n_mutations: int, rng: random.Random,
-               topology: str = "random") -> Tree:
+               topology: str = "random", hp_lineage_indels: int = 0,
+               hp_rng: random.Random | None = None) -> Tree:
     """Rooted mutation tree in one of three shapes.
 
     ``random`` (default) attaches each new mutation to a uniformly chosen existing
@@ -260,6 +367,10 @@ def build_tree(seq: str, n_mutations: int, rng: random.Random,
 
     Only the ``random`` branch draws from `rng` for parent choice, so existing
     seeds reproduce byte-identically.
+
+    ``hp_lineage_indels`` (plan 2026-09-27 T3) then replaces that many edges
+    with catalogue length changes drawn from ``hp_rng``. Zero leaves the SNV
+    tree alone and does not draw from ``hp_rng``.
     """
     if topology not in TOPOLOGIES:
         raise ValueError(f"unknown topology {topology!r}; expected one of {TOPOLOGIES}")
@@ -280,6 +391,9 @@ def build_tree(seq: str, n_mutations: int, rng: random.Random,
                     ref=ref, alt=alt, parent=parent)
         nodes.append(node)
         nodes[parent].children.append(i)
+    # Plan 2026-09-27 T3. After the SNV loop so `rng` draws stay put.
+    if hp_lineage_indels:
+        _apply_hp_lineage_indels(seq, nodes, hp_lineage_indels, hp_rng)
     return Tree(nodes=nodes)
 
 
@@ -393,6 +507,16 @@ def write_truth(tree: Tree, seq: str, outdir: str) -> None:
             fa.write(f">clone_{n.id}\n")
             _write_fasta_seq(fa, genome)
 
+    # Plan 2026-09-27 T3. Omitted when no lineage HP indel was placed (K=0).
+    hp_nodes = [n for n in tree.nodes if n.tract_id]
+    if hp_nodes:
+        with open(os.path.join(tdir, "hp_lineage.tsv"), "w") as fh:
+            fh.write("node_id\tvariant\ttract\tdelta\n")
+            for n in hp_nodes:
+                fh.write(
+                    f"{n.id}\t{n.variant}\t{n.tract_id}\t{n.hp_delta:+d}\n"
+                )
+
 
 def _terminal_freq(tree: Tree, node_id: int) -> float:
     """Mass kept at `node_id` (not passed to children). Sums to 1 over all nodes."""
@@ -431,6 +555,13 @@ def main() -> None:
     )
     ap.add_argument("--min-hf", type=float, default=0.01)
     ap.add_argument("--max-hf", type=float, default=0.99)
+    ap.add_argument(
+        "--hp-lineage-indels",
+        type=int,
+        default=0,
+        help="replace K mutation edges with homopolymer length changes "
+        "drawn from a separate RNG (plan 2026-09-27 T3)",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--outdir", required=True)
     args = ap.parse_args()
@@ -459,9 +590,16 @@ def main() -> None:
             )
 
     max_attempts = 100
+    hp_k = args.hp_lineage_indels
     for attempt in range(max_attempts):
-        rng = random.Random(args.seed + attempt)
-        tree = build_tree(seq, args.n_mutations, rng, topology=args.topology)
+        seed = args.seed + attempt
+        rng = random.Random(seed)
+        # Plan 2026-09-27 T3. Not constructed at all when K is 0.
+        hp_rng = random.Random(seed + 1_000_003) if hp_k else None
+        tree = build_tree(
+            seq, args.n_mutations, rng, topology=args.topology,
+            hp_lineage_indels=hp_k, hp_rng=hp_rng,
+        )
         try:
             assign_frequencies(
                 tree,

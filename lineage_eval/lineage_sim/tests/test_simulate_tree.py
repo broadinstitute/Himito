@@ -321,3 +321,477 @@ def test_write_truth_emits_expected_files_and_headers(tmp_path):
     assert len(headers) == n_mutations + 1, (
         f"expected {n_mutations + 1} FASTA records, got {len(headers)}"
     )
+
+
+# Plan 2026-09-27 T3. Frozen truth_mutation_tree.tsv for build_tree(n=10)
+# before --hp-lineage-indels existed. Seeds 1..5.
+_SNV_ONLY_TRUTH = {
+    1: (
+        "node_id\tvariant\tparent_id\tparent_variant\n"
+        "0\tROOT\t0\tROOT\n"
+        "1\tm.2068C>G\t0\tROOT\n"
+        "2\tm.16235A>G\t0\tROOT\n"
+        "3\tm.12440A>C\t1\tm.2068C>G\n"
+        "4\tm.15987C>A\t0\tROOT\n"
+        "5\tm.14181A>T\t3\tm.12440A>C\n"
+        "6\tm.14595A>G\t0\tROOT\n"
+        "7\tm.7497G>T\t5\tm.14181A>T\n"
+        "8\tm.10402A>C\t1\tm.2068C>G\n"
+        "9\tm.834G>T\t0\tROOT\n"
+        "10\tm.12492A>T\t8\tm.10402A>C\n"
+    ),
+    2: (
+        "node_id\tvariant\tparent_id\tparent_variant\n"
+        "0\tROOT\t0\tROOT\n"
+        "1\tm.3002G>A\t0\tROOT\n"
+        "2\tm.5541C>T\t1\tm.3002G>A\n"
+        "3\tm.10098G>C\t2\tm.5541C>T\n"
+        "4\tm.1171A>T\t1\tm.3002G>A\n"
+        "5\tm.14113T>G\t1\tm.3002G>A\n"
+        "6\tm.12192G>T\t3\tm.10098G>C\n"
+        "7\tm.16452T>C\t3\tm.10098G>C\n"
+        "8\tm.900C>G\t0\tROOT\n"
+        "9\tm.10436C>G\t7\tm.16452T>C\n"
+        "10\tm.5390A>T\t6\tm.12192G>T\n"
+    ),
+    3: (
+        "node_id\tvariant\tparent_id\tparent_variant\n"
+        "0\tROOT\t0\tROOT\n"
+        "1\tm.4274T>C\t0\tROOT\n"
+        "2\tm.2148A>T\t1\tm.4274T>C\n"
+        "3\tm.15376A>G\t0\tROOT\n"
+        "4\tm.6284A>T\t1\tm.4274T>C\n"
+        "5\tm.15610A>G\t3\tm.15376A>G\n"
+        "6\tm.4936C>A\t5\tm.15610A>G\n"
+        "7\tm.4969G>T\t5\tm.15610A>G\n"
+        "8\tm.497C>T\t6\tm.4936C>A\n"
+        "9\tm.5224G>T\t1\tm.4274T>C\n"
+        "10\tm.9872A>C\t0\tROOT\n"
+    ),
+    4: (
+        "node_id\tvariant\tparent_id\tparent_variant\n"
+        "0\tROOT\t0\tROOT\n"
+        "1\tm.9939G>A\t0\tROOT\n"
+        "2\tm.15692A>C\t1\tm.9939G>A\n"
+        "3\tm.2180A>C\t0\tROOT\n"
+        "4\tm.9483T>A\t3\tm.2180A>C\n"
+        "5\tm.11805A>G\t1\tm.9939G>A\n"
+        "6\tm.3480A>G\t1\tm.9939G>A\n"
+        "7\tm.841A>T\t1\tm.9939G>A\n"
+        "8\tm.8905C>A\t4\tm.9483T>A\n"
+        "9\tm.10154A>G\t2\tm.15692A>C\n"
+        "10\tm.2842C>T\t5\tm.11805A>G\n"
+    ),
+    5: (
+        "node_id\tvariant\tparent_id\tparent_variant\n"
+        "0\tROOT\t0\tROOT\n"
+        "1\tm.11749A>T\t0\tROOT\n"
+        "2\tm.15258A>C\t0\tROOT\n"
+        "3\tm.1700T>A\t2\tm.15258A>C\n"
+        "4\tm.12183G>C\t0\tROOT\n"
+        "5\tm.12477T>G\t1\tm.11749A>T\n"
+        "6\tm.8171T>A\t0\tROOT\n"
+        "7\tm.7102T>C\t5\tm.12477T>G\n"
+        "8\tm.5967T>C\t4\tm.12183G>C\n"
+        "9\tm.2358A>C\t2\tm.15258A>C\n"
+        "10\tm.14577T>A\t9\tm.2358A>C\n"
+    ),
+}
+
+_SIM_DIR = pathlib.Path(__file__).resolve().parents[1]
+
+
+def _catalogue():
+    from hp_tracts import CATALOGUE
+    return CATALOGUE
+
+
+def _drawable():
+    return [t for t in _catalogue() if t.simulate]
+
+
+def _tract_blocks_snv(pos, tract) -> bool:
+    """Run interval plus the anchor base the indel edit consumes."""
+    return tract.anchor <= pos <= tract.end
+
+
+def _unit_delta(edit, tract) -> int:
+    bp = len(edit.alt) - len(edit.ref)
+    assert bp % len(tract.unit) == 0
+    return bp // len(tract.unit)
+
+
+def _expected_length_edit(seq, tract, delta):
+    anchor = tract.anchor
+    base = seq[anchor - 1]
+    if delta > 0:
+        raw = st.Edit(anchor, base, base + tract.unit * delta)
+    else:
+        n_bp = abs(delta) * len(tract.unit)
+        deleted = seq[anchor:anchor + n_bp]
+        raw = st.Edit(anchor, base + deleted, base)
+    return st.left_align(raw, seq)
+
+
+def test_build_tree_hp_lineage_indels_are_distinct_tract_edits():
+    """Plan 2026-09-27 T3. K edges become length changes on distinct tracts."""
+    _, seq = st.load_reference(REF)
+    by_id = {t.id: t for t in _drawable()}
+    assert "R8281" not in by_id
+    tree = st.build_tree(
+        seq, n_mutations=10, rng=random.Random(11),
+        hp_lineage_indels=3, hp_rng=random.Random(99),
+    )
+    assert len(tree.nodes) == 11
+    indels = [n for n in tree.nodes[1:] if n.edit.is_indel()]
+    snvs = [n for n in tree.nodes[1:] if not n.edit.is_indel()]
+    assert len(indels) == 3
+    assert len(snvs) == 7
+    assert len({n.tract_id for n in indels}) == 3
+    for n in indels:
+        tract = by_id[n.tract_id]
+        assert tract.simulate
+        delta = _unit_delta(n.edit, tract)
+        if len(tract.unit) == 1:
+            assert delta in (1, 2, -1)
+        else:
+            assert tract.id == "CA514"
+            assert delta in (1, -1)
+        assert n.edit == _expected_length_edit(seq, tract, delta)
+        assert n.variant == st.himito_name(n.edit)
+        assert seq[n.pos - 1:n.pos - 1 + len(n.ref)] == n.ref
+        genome = st.clone_genome(seq, st.path_to_root(tree, n.id))
+        assert isinstance(genome, str) and genome
+    for n in snvs:
+        assert n.tract_id is None
+        assert not st._is_avoided(n.pos)
+        assert seq[n.pos - 1] != "N"
+        for indel in indels:
+            assert not _tract_blocks_snv(n.pos, by_id[indel.tract_id])
+
+    # Without replacement: K equal to the drawable set uses each tract once.
+    k_all = len(by_id)
+    for seed in range(5):
+        full = st.build_tree(
+            seq, n_mutations=k_all, rng=random.Random(seed),
+            hp_lineage_indels=k_all, hp_rng=random.Random(1_000 + seed),
+        )
+        got = [n.tract_id for n in full.nodes[1:] if n.edit.is_indel()]
+        assert sorted(got) == sorted(by_id)
+
+
+def test_d310_length_spellings_are_left_aligned_on_rcrs():
+    """Plan 2026-09-27 T3. +1 m.302A>AC, -1 m.302AC>A, +2 m.302A>ACC."""
+    _, seq = st.load_reference(REF)
+    d310 = next(t for t in _catalogue() if t.id == "D310")
+    assert st.himito_name(_expected_length_edit(seq, d310, 1)) == "m.302A>AC"
+    assert st.himito_name(_expected_length_edit(seq, d310, -1)) == "m.302AC>A"
+    assert st.himito_name(_expected_length_edit(seq, d310, 2)) == "m.302A>ACC"
+    # The tree must actually be able to emit each of those three.
+    seen = set()
+    for seed in range(400):
+        tree = st.build_tree(
+            seq, n_mutations=8, rng=random.Random(seed),
+            hp_lineage_indels=1, hp_rng=random.Random(50_000 + seed),
+        )
+        node = next(n for n in tree.nodes[1:] if n.edit.is_indel())
+        if node.tract_id == "D310":
+            seen.add(node.variant)
+    assert {"m.302A>AC", "m.302AC>A", "m.302A>ACC"} <= seen
+
+
+def test_hp_lineage_snvs_avoid_ranges_and_chosen_tracts():
+    """Plan 2026-09-27 T3. Surviving SNVs stay out of AVOID_RANGES and HP tracts.
+
+    A SNV that the SNV-only placement put inside a chosen tract (or on its
+    anchor) is redrawn from hp_rng. Every other SNV keeps the SNV-only allele,
+    which is how K=0 stays byte-identical: hp_rng is never mixed into rng.
+    """
+    _, seq = st.load_reference(REF)
+    by_id = {t.id: t for t in _drawable()}
+    moved = 0
+    for seed in range(400):
+        rng_hp = random.Random(seed)
+        tree = st.build_tree(
+            seq, n_mutations=40, rng=rng_hp,
+            hp_lineage_indels=6, hp_rng=random.Random(seed + 1_000_003),
+        )
+        rng_plain = random.Random(seed)
+        plain = st.build_tree(seq, n_mutations=40, rng=rng_plain)
+        assert [n.parent for n in tree.nodes] == [n.parent for n in plain.nodes]
+        chosen = {
+            n.tract_id: by_id[n.tract_id]
+            for n in tree.nodes[1:] if n.edit.is_indel()
+        }
+        assert len(chosen) == 6
+        snv_pos = []
+        for node, orig in zip(tree.nodes[1:], plain.nodes[1:]):
+            if node.edit.is_indel():
+                continue
+            assert not node.edit.is_indel()
+            assert not st._is_avoided(node.pos)
+            assert seq[node.pos - 1] != "N"
+            assert node.tract_id is None
+            for tract in chosen.values():
+                assert not _tract_blocks_snv(node.pos, tract)
+            hit = any(_tract_blocks_snv(orig.pos, t) for t in chosen.values())
+            if hit:
+                assert (node.pos, node.ref, node.alt) != (orig.pos, orig.ref, orig.alt)
+                moved += 1
+            else:
+                assert (node.pos, node.ref, node.alt, node.variant) == (
+                    orig.pos, orig.ref, orig.alt, orig.variant,
+                )
+            snv_pos.append(node.pos)
+        assert len(snv_pos) == len(set(snv_pos))
+    assert moved > 0
+
+
+def test_hp_delta_distribution_matches_catalogue():
+    """Plan 2026-09-27 T3. HP tracts {+1: 0.6, +2: 0.2, -1: 0.2}; CA514 ±1 unit."""
+    _, seq = st.load_reference(REF)
+    by_id = {t.id: t for t in _drawable()}
+    hp_counts = {1: 0, 2: 0, -1: 0}
+    ca_counts = {1: 0, -1: 0}
+    for seed in range(600):
+        tree = st.build_tree(
+            seq, n_mutations=4, rng=random.Random(seed),
+            hp_lineage_indels=1, hp_rng=random.Random(70_000 + seed),
+        )
+        node = next(n for n in tree.nodes[1:] if n.edit.is_indel())
+        tract = by_id[node.tract_id]
+        delta = _unit_delta(node.edit, tract)
+        if tract.id == "CA514":
+            assert delta in ca_counts
+            assert abs(len(node.edit.alt) - len(node.edit.ref)) == 2
+            ca_counts[delta] += 1
+        else:
+            assert len(tract.unit) == 1
+            assert delta in hp_counts
+            hp_counts[delta] += 1
+    hp_n = sum(hp_counts.values())
+    assert hp_n > 400
+    assert 0.50 <= hp_counts[1] / hp_n <= 0.70
+    assert 0.10 <= hp_counts[2] / hp_n <= 0.32
+    assert 0.10 <= hp_counts[-1] / hp_n <= 0.32
+    assert ca_counts[1] > 0 and ca_counts[-1] > 0
+    ca_n = sum(ca_counts.values())
+    assert abs(ca_counts[1] / ca_n - 0.5) < 0.25
+
+
+def test_hp_lineage_indels_zero_matches_snv_only_truth(tmp_path):
+    """Plan 2026-09-27 T3. K=0 does not draw from hp_rng and matches today's trees."""
+    _, seq = st.load_reference(REF)
+    for seed, expected in _SNV_ONLY_TRUTH.items():
+        rng = random.Random(seed)
+        hp_rng = random.Random(seed + 1_000_003)
+        hp_state = hp_rng.getstate()
+        tree = st.build_tree(
+            seq, n_mutations=10, rng=rng,
+            hp_lineage_indels=0, hp_rng=hp_rng,
+        )
+        assert hp_rng.getstate() == hp_state
+        st.write_truth(tree, seq, str(tmp_path / f"k0_{seed}"))
+        got = (tmp_path / f"k0_{seed}" / "truth" / "truth_mutation_tree.tsv").read_text()
+        assert got == expected
+        assert not (tmp_path / f"k0_{seed}" / "truth" / "hp_lineage.tsv").exists()
+
+        rng_default = random.Random(seed)
+        default = st.build_tree(seq, n_mutations=10, rng=rng_default)
+        st.write_truth(default, seq, str(tmp_path / f"default_{seed}"))
+        default_txt = (
+            tmp_path / f"default_{seed}" / "truth" / "truth_mutation_tree.tsv"
+        ).read_text()
+        assert default_txt == expected
+        # The SNV generator is consumed exactly as far as the default call.
+        rng_again = random.Random(seed)
+        st.build_tree(seq, n_mutations=10, rng=rng_again, hp_lineage_indels=0)
+        assert rng_again.getstate() == rng_default.getstate()
+
+
+def test_hvs1_plus1_with_background_snvs_named_on_background():
+    """Plan 2026-09-27 T3. Direct call, not the CLI.
+
+    An HVS1 +1 C together with T16189C and A16183C is named by left_align on
+    apply_background output. Default write_truth still left-aligns on plain
+    rCRS (no --background until T5), so the same edit stays m.16183A>AC there.
+    """
+    from hp_tracts import apply_background
+
+    _, seq = st.load_reference(REF)
+    ins = st.Edit(16183, "A", "AC")
+    assert st.himito_name(st.left_align(ins, seq)) == "m.16183A>AC"
+    bg = apply_background(seq, ["T16189C", "A16183C"])
+    named = st.himito_name(st.left_align(ins, bg))
+    assert named == "m.16182A>AC"
+
+
+def test_write_truth_hp_lineage_tsv_one_row_per_indel(tmp_path):
+    """Plan 2026-09-27 T3. truth/hp_lineage.tsv is node_id, variant, tract, delta."""
+    _, seq = st.load_reference(REF)
+    by_id = {t.id: t for t in _drawable()}
+    tree = st.build_tree(
+        seq, n_mutations=10, rng=random.Random(3),
+        hp_lineage_indels=3, hp_rng=random.Random(4),
+    )
+    st.write_truth(tree, seq, str(tmp_path))
+    text = (tmp_path / "truth" / "hp_lineage.tsv").read_text()
+    rows = text.splitlines()
+    assert rows[0] == "node_id\tvariant\ttract\tdelta"
+    assert len(rows) == 4
+    indels = [n for n in tree.nodes[1:] if n.edit.is_indel()]
+    assert [int(r.split("\t")[0]) for r in rows[1:]] == [n.id for n in indels]
+    for line, node in zip(rows[1:], indels):
+        node_id, variant, tract_id, delta_s = line.split("\t")
+        tract = by_id[tract_id]
+        delta = _unit_delta(node.edit, tract)
+        assert node_id == str(node.id)
+        assert variant == node.variant == st.himito_name(node.edit)
+        assert tract_id == node.tract_id
+        assert delta_s == f"{delta:+d}"
+        assert delta_s in {"+1", "+2", "-1"}
+    # clones.tsv gains no column.
+    header = (tmp_path / "truth" / "clones.tsv").read_text().splitlines()[0]
+    assert header == "clone_id\tnode_variant\tvariant_path\tfrequency"
+
+
+def test_cli_hp_lineage_indels_writes_hp_lineage_tsv(tmp_path):
+    """Plan 2026-09-27 T3. --hp-lineage-indels K; K=0 omits hp_lineage.tsv."""
+    import subprocess
+    script = _SIM_DIR / "simulate_tree.py"
+    py = sys.executable
+    zero = tmp_path / "zero"
+    r0 = subprocess.run(
+        [py, str(script), "--reference", REF, "--n-mutations", "8",
+         "--seed", "1", "--hp-lineage-indels", "0", "--outdir", str(zero)],
+        capture_output=True, text=True,
+    )
+    assert r0.returncode == 0, r0.stderr
+    assert not (zero / "truth" / "hp_lineage.tsv").exists()
+    plain = tmp_path / "plain"
+    rp = subprocess.run(
+        [py, str(script), "--reference", REF, "--n-mutations", "8",
+         "--seed", "1", "--outdir", str(plain)],
+        capture_output=True, text=True,
+    )
+    assert rp.returncode == 0, rp.stderr
+    assert (zero / "truth" / "truth_mutation_tree.tsv").read_text() == (
+        plain / "truth" / "truth_mutation_tree.tsv"
+    ).read_text()
+
+    out = tmp_path / "k2"
+    r = subprocess.run(
+        [py, str(script), "--reference", REF, "--n-mutations", "8",
+         "--seed", "1", "--hp-lineage-indels", "2", "--outdir", str(out)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    rows = (out / "truth" / "hp_lineage.tsv").read_text().splitlines()
+    assert rows[0] == "node_id\tvariant\ttract\tdelta"
+    assert len(rows) == 3
+
+
+def test_run_eval_forwards_hp_lineage_indels_not_rates(tmp_path):
+    """Plan 2026-09-27 T3. Empty omits the flag; rates are not for simulate_tree."""
+    import subprocess
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "argv.txt"
+    py = bindir / "python"
+    py.write_text(
+        "#!/bin/bash\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        "exit 42\n"
+    )
+    py.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    r = subprocess.run(
+        ["bash", str(_SIM_DIR / "run_eval.sh"),
+         "--outdir", str(tmp_path / "out"),
+         "--hp-lineage-indels", "3",
+         "--hp-fp-rate", "0.2",
+         "--hp-fn-rate", "0.4",
+         "--n-mutations", "6", "--seed", "1",
+         "--ref", REF],
+        capture_output=True, text=True, env=env,
+    )
+    assert r.returncode != 0
+    argv = log.read_text()
+    assert "simulate_tree.py" in argv
+    assert "--hp-lineage-indels 3" in argv
+    assert "--hp-fp-rate" not in argv
+    assert "--hp-fn-rate" not in argv
+
+
+def test_run_himito_forwards_hp_rates_only_to_lineage(tmp_path):
+    """Plan 2026-09-27 T3. --hp-fp-rate / --hp-fn-rate reach Himito lineage only."""
+    import subprocess
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "calls.txt"
+    minimap = bindir / "minimap2"
+    minimap.write_text("#!/bin/bash\nexit 0\n")
+    samtools = bindir / "samtools"
+    samtools.write_text(
+        "#!/bin/bash\n"
+        f'echo "samtools $*" >> "{log}"\n'
+        "if [[ \"$1\" == \"sort\" ]]; then\n"
+        "  prev=\n"
+        "  for a in \"$@\"; do\n"
+        "    if [[ \"$prev\" == \"-o\" ]]; then : > \"$a\"; fi\n"
+        "    prev=\"$a\"\n"
+        "  done\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    himito = tmp_path / "Himito"
+    himito.write_text(
+        "#!/bin/bash\n"
+        f'echo "himito $*" >> "{log}"\n'
+        "exit 0\n"
+    )
+    for path in (minimap, samtools, himito):
+        path.chmod(0o755)
+    out = tmp_path / "cell"
+    (out / "reads").mkdir(parents=True)
+    (out / "reads" / "reads.fastq.gz").write_bytes(b"@r\nACGT\n+\n!!!!\n")
+    env = os.environ.copy()
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    r = subprocess.run(
+        ["bash", str(_SIM_DIR / "run_himito.sh"),
+         "--outdir", str(out), "--profile", "hifi",
+         "--hp-fp-rate", "0.25", "--hp-fn-rate", "0.5",
+         "--himito", str(himito), "--ref", REF],
+        capture_output=True, text=True, env=env,
+    )
+    assert r.returncode == 0, r.stderr + r.stdout
+    himito_lines = [
+        ln for ln in log.read_text().splitlines() if ln.startswith("himito ")
+    ]
+    call = [ln for ln in himito_lines if ln.split()[1] == "call"]
+    lineage = [ln for ln in himito_lines if ln.split()[1] == "lineage"]
+    build = [ln for ln in himito_lines if ln.split()[1] == "build"]
+    assert len(call) == 1 and len(lineage) == 1 and len(build) == 1
+    assert "--hp-fp-rate" not in call[0] and "--hp-fn-rate" not in call[0]
+    assert "--hp-fp-rate" not in build[0] and "--hp-fn-rate" not in build[0]
+    assert "--hp-fp-rate 0.25" in lineage[0]
+    assert "--hp-fn-rate 0.5" in lineage[0]
+
+
+def test_sweep_seeds_forwards_hp_lineage_indels():
+    """Plan 2026-09-27 T3. sweep_seeds.sh accepts the flag and forwards it."""
+    import re
+    import subprocess
+    script = (_SIM_DIR / "sweep_seeds.sh").read_text()
+    assert re.search(r"--hp-lineage-indels\)", script)
+    assert re.search(
+        r'EVAL_ARGS\+=\(--hp-lineage-indels "\$HP_LINEAGE_INDELS"\)', script,
+    )
+    r = subprocess.run(
+        ["bash", str(_SIM_DIR / "sweep_seeds.sh"), "--hp-lineage-indels", "2"],
+        capture_output=True, text=True,
+    )
+    assert "unknown arg" not in r.stderr
+    assert "usage:" in r.stderr
+    assert r.returncode != 0

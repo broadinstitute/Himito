@@ -38,6 +38,8 @@ TOPOLOGY=""
 # Lowering it passes more mass downward, so it raises ordering difficulty without
 # costing detection. Empty = simulator default (0.20).
 INTERNAL_KEEP=""
+# Plan 2026-09-27 T3. Empty = omit the flag on run_eval.sh.
+HP_LINEAGE_INDELS=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -53,11 +55,12 @@ while [[ $# -gt 0 ]]; do
     --internal-keep) INTERNAL_KEEP="$2"; shift 2;;
     --ref) REF_ARG="$2"; shift 2;;
     --keep-intermediate) KEEP_INTERMEDIATE=1; shift;;
+    --hp-lineage-indels) HP_LINEAGE_INDELS="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile P] [--n-mutations N] [--total-depth N] [--seeds \"1 2 3\"] [--frequency-threshold F] [--sim-min-hf F] [--denoise-vaf F] [--topology random|chain|star] [--internal-keep F] [--ref FASTA] [--keep-intermediate]" >&2
+  echo "usage: --outdir DIR [--profile P] [--n-mutations N] [--total-depth N] [--seeds \"1 2 3\"] [--frequency-threshold F] [--sim-min-hf F] [--denoise-vaf F] [--topology random|chain|star] [--internal-keep F] [--ref FASTA] [--keep-intermediate] [--hp-lineage-indels K]" >&2
   exit 1
 }
 [[ -f "$REF_ARG" ]] || { echo "missing reference FASTA: $REF_ARG (pass --ref)" >&2; exit 1; }
@@ -83,6 +86,8 @@ for s in $SEEDS; do
   [[ -n "$DENOISE_VAF" ]] && EVAL_ARGS+=(--denoise-vaf "$DENOISE_VAF")
   [[ -n "$TOPOLOGY" ]] && EVAL_ARGS+=(--topology "$TOPOLOGY")
   [[ -n "$INTERNAL_KEEP" ]] && EVAL_ARGS+=(--internal-keep "$INTERNAL_KEEP")
+  # Plan 2026-09-27 T3. Empty omits the flag.
+  [[ -n "$HP_LINEAGE_INDELS" ]] && EVAL_ARGS+=(--hp-lineage-indels "$HP_LINEAGE_INDELS")
   if ! "$HERE/run_eval.sh" "${EVAL_ARGS[@]}" >"$OUTDIR/seed$s.log" 2>&1; then
     echo "  FAILED (see $OUTDIR/seed$s.log)" >&2
     FAILED="$FAILED $s"

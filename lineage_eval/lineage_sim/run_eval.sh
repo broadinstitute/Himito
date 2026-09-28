@@ -50,6 +50,11 @@ INTERNAL_KEEP=""
 TOPOLOGY=""
 # Plan 2026-09-26 T9. Off unless passed; forwarded to run_himito.sh's lineage step.
 COLLAPSE_HP=0
+# Plan 2026-09-27 T3. Empty = omit the flag (simulate_tree.py default is 0).
+HP_LINEAGE_INDELS=""
+# Plan 2026-09-27 T3. Forwarded only to Himito lineage, via run_himito.sh.
+HP_FP_RATE=""
+HP_FN_RATE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -69,11 +74,14 @@ while [[ $# -gt 0 ]]; do
     --topology) TOPOLOGY="$2"; shift 2;;
     --ref) export REF="$2"; shift 2;;
     --collapse-hp) COLLAPSE_HP=1; shift;;
+    --hp-lineage-indels) HP_LINEAGE_INDELS="$2"; shift 2;;
+    --hp-fp-rate) HP_FP_RATE="$2"; shift 2;;
+    --hp-fn-rate) HP_FN_RATE="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp]" >&2
+  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F]" >&2
   exit 1
 }
 # Resolve in simulate_reads.sh; export a sane default here for visibility.
@@ -97,6 +105,8 @@ echo "$OUTDIR"
 SIM_TREE_ARGS=()
 [[ -n "$INTERNAL_KEEP" ]] && SIM_TREE_ARGS+=(--internal-keep "$INTERNAL_KEEP")
 [[ -n "$TOPOLOGY" ]] && SIM_TREE_ARGS+=(--topology "$TOPOLOGY")
+# Plan 2026-09-27 T3. Empty omits the flag.
+[[ -n "$HP_LINEAGE_INDELS" ]] && SIM_TREE_ARGS+=(--hp-lineage-indels "$HP_LINEAGE_INDELS")
 python "$HERE/simulate_tree.py" --reference "$REF" --n-mutations "$NMUT" --seed "$SEED" --outdir "$OUTDIR" --min-hf "$SIM_MIN_HF" --max-hf "$SIM_MAX_HF" "${SIM_TREE_ARGS[@]+"${SIM_TREE_ARGS[@]}"}"
 "$HERE/simulate_reads.sh" --outdir "$OUTDIR" --profile "$PROFILE" --total-depth "$DEPTH" --seed "$SEED"
 HIMITO_ARGS=(
@@ -108,6 +118,9 @@ HIMITO_ARGS=(
 [[ -n "$FREQ_THRESHOLD" ]] && HIMITO_ARGS+=(--frequency-threshold "$FREQ_THRESHOLD")
 [[ -n "$DENOISE_VAF" ]] && HIMITO_ARGS+=(--denoise-vaf "$DENOISE_VAF")
 [[ "$COLLAPSE_HP" == 1 ]] && HIMITO_ARGS+=(--collapse-hp)
+# Plan 2026-09-27 T3. run_himito.sh forwards these to Himito lineage only.
+[[ -n "$HP_FP_RATE" ]] && HIMITO_ARGS+=(--hp-fp-rate "$HP_FP_RATE")
+[[ -n "$HP_FN_RATE" ]] && HIMITO_ARGS+=(--hp-fn-rate "$HP_FN_RATE")
 "$HERE/run_himito.sh" "${HIMITO_ARGS[@]}"
 read -r DEFAULT_FP DEFAULT_FN < <(resolve_scite_rates "$PROFILE")
 python "$HERE/score_lineage.py" \

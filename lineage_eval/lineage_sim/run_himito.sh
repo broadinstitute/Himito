@@ -58,6 +58,9 @@ MIN_EDGE_READS=2
 MIN_HF=0.01 MAX_HF=0.95
 # Plan 2026-09-26 T9. Off unless passed; forwarded only to `Himito lineage`.
 COLLAPSE_HP=0
+# Plan 2026-09-27 T3. Forwarded only to `Himito lineage`, not `Himito call`.
+HP_FP_RATE=""
+HP_FN_RATE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -79,6 +82,8 @@ while [[ $# -gt 0 ]]; do
     --min-hf) MIN_HF="$2"; shift 2;;
     --max-hf) MAX_HF="$2"; shift 2;;
     --collapse-hp) COLLAPSE_HP=1; shift;;
+    --hp-fp-rate) HP_FP_RATE="$2"; shift 2;;
+    --hp-fn-rate) HP_FN_RATE="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
@@ -87,7 +92,7 @@ done
   echo "  [--minimal-ac N] [--vaf V] [--denoise-vaf V] [--frequency-threshold F]" >&2
   echo "  [--permutation-frequency-threshold F] [--strand-bias-threshold F]" >&2
   echo "  [--indel-false-threshold F] [--min-edge-reads N] [--min-hf F] [--max-hf F]" >&2
-  echo "  [--collapse-hp]" >&2
+  echo "  [--collapse-hp] [--hp-fp-rate F] [--hp-fn-rate F]" >&2
   exit 1
 }
 
@@ -199,6 +204,9 @@ LINEAGE_ARGS=(
 [[ -n "$FN" ]] && LINEAGE_ARGS+=(--fn-rate "$FN")
 # Plan 2026-09-26 T9. Not forwarded to `Himito call`.
 [[ "$COLLAPSE_HP" == 1 ]] && LINEAGE_ARGS+=(--collapse-hp)
+# Plan 2026-09-27 T3. Not forwarded to `Himito call`.
+[[ -n "$HP_FP_RATE" ]] && LINEAGE_ARGS+=(--hp-fp-rate "$HP_FP_RATE")
+[[ -n "$HP_FN_RATE" ]] && LINEAGE_ARGS+=(--hp-fn-rate "$HP_FN_RATE")
 "$HIMITO" lineage "${LINEAGE_ARGS[@]}"
 
 echo "himito done: $HDIR/sim_lineage.mutation_tree.tsv"

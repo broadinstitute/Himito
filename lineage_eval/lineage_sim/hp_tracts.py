@@ -119,6 +119,14 @@ def effective_tract(tract: Tract, background_seq: str) -> Tract:
     )
 
 
+# Inclusive windows from src/tracts.rs KNOWN_TRACTS. The anchor is the start
+# base. Used only for catalogue entries with in_himito=True.
+_HIMITO_WINDOW = {
+    "D310": (302, 315),
+    "HVS1": (16183, 16193),
+    "CA514": (513, 525),
+}
+
 _VARIANT_NAME = re.compile(r"^m\.(\d+)([ACGT]+)>([ACGT]+)$")
 _RCRS_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "rCRS.fasta")
@@ -166,15 +174,38 @@ def _edited_alt(
     return "".join(bases)
 
 
+def _containing_window(
+    tract: Tract, bg_seq: str, pos: int, span_end: int,
+) -> tuple[int, int] | None:
+    """Inclusive ``[anchor, end]`` that contains the half-open REF span.
+
+    Plan 2026-09-27 T6. An ``in_himito`` tract uses the fixed Rust window when
+    the span lies inside it, so an uncollapsed spelling matches ``--collapse-hp``.
+    A background run that extends past that window still uses ``effective_tract``
+    for a span that falls in the extension. Other tracts use the effective
+    homopolymer window only.
+    """
+    if tract.in_himito:
+        fixed = _HIMITO_WINDOW.get(tract.id)
+        if fixed is not None:
+            start, end = fixed
+            if pos >= start and span_end <= end + 1:
+                return start, end
+    eff = effective_tract(tract, bg_seq)
+    anchor, end = eff.anchor, eff.end
+    if anchor >= 1 and pos >= anchor and span_end <= end + 1:
+        return anchor, end
+    return None
+
+
 def canonical_name(name: str, background: list[str] | None = None) -> str:
     """Rename an in-tract allele to ``m.<anchor><rCRS>><background+edit>``.
 
     Plan 2026-09-27 T6. ``background`` is a list of ``<REF><pos><ALT>``
-    tokens. The window is ``[anchor, end]`` of the catalogue tract's
-    ``effective_tract`` on that sequence. ``tract_ref`` is rCRS over the
-    window, not the background bases. A name that does not parse, lies
-    outside every tract, or is already ``m.<anchor><tract_ref>><alt>`` is
-    returned unchanged.
+    tokens. ``tract_ref`` is rCRS over the window, not the background bases.
+    A name that does not parse, lies outside every tract, or is already
+    ``m.<anchor><tract_ref>><alt>`` for the window just chosen is returned
+    unchanged. A longer REF is not itself a reason to skip the edit.
     """
     match = _VARIANT_NAME.fullmatch(name)
     if match is None:
@@ -185,10 +216,10 @@ def canonical_name(name: str, background: list[str] | None = None) -> str:
     rcrs = _rcrs()
     span_end = pos + len(ref)
     for tract in CATALOGUE:
-        eff = effective_tract(tract, bg_seq)
-        anchor, end = eff.anchor, eff.end
-        if anchor < 1 or not (pos >= anchor and span_end <= end + 1):
+        window = _containing_window(tract, bg_seq, pos, span_end)
+        if window is None:
             continue
+        anchor, end = window
         tract_ref = rcrs[anchor - 1:end]
         prefix = f"m.{anchor}{tract_ref}>"
         if name.startswith(prefix) and len(name) > len(prefix):

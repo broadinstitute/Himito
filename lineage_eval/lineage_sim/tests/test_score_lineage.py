@@ -163,8 +163,22 @@ def test_canonical_name_collapses_equivalent_hvs1_spellings():
     assert hp.canonical_name("m.16183A>AC", bg) == _HVS1_CANON
     extended = ["T16189C", "A16183C"]
     assert hp.canonical_name("m.16182A>AC", extended) == _HVS1_EXTENDED
-    assert hp.canonical_name("m.16183A>AC", extended) == _HVS1_EXTENDED
-    assert hp.canonical_name("m.16189T>TC", extended) == _HVS1_EXTENDED
+    # 16183 and 16189 sit inside Himito's fixed 16183–16193 window, so the
+    # anchor stays 16183 even when the run extends to 16182.
+    fixed_on_extended = "m.16183ACCCCCTCCCC>CCCCCCCCCCCC"
+    assert hp.canonical_name("m.16183A>AC", extended) == fixed_on_extended
+    assert hp.canonical_name("m.16189T>TC", extended) == fixed_on_extended
+
+
+def test_canonical_name_matches_himito_window_on_plain_rcrs():
+    """Plan 2026-09-27 T6. Uncollapsed and --collapse-hp spellings share the fixed window."""
+    import hp_tracts as hp
+
+    collapsed = "m.16183ACCCCCTCCCC>ACCCCCCTCCCC"
+    assert hp.canonical_name("m.16183A>AC", []) == collapsed
+    assert hp.canonical_name(collapsed, []) == collapsed
+    # REF longer than one base, and outside the bare C-run, still collapses.
+    assert hp.canonical_name("m.16190CC>C", []) == "m.16183ACCCCCTCCCC>ACCCCCTCCC"
 
 
 def test_canonical_name_leaves_variants_outside_tracts():
@@ -402,6 +416,42 @@ def test_root_fraction_skips_root_block_annotation_row(tmp_path):
     assert sl.root_fraction(str(path)) == 0.25
 
 
+def test_lineage_allele_listed_in_hp_tracts_stays_in_var_recall(tmp_path):
+    """Plan 2026-09-27 T6. A name in both truth and hp_tracts.tsv is still a true positive."""
+    header = "node_id\tvariant\tparent_id\tparent_variant\n"
+    tree = header + "0\tROOT\t0\tROOT\n1\tm.16183A>AC\t0\tROOT\n"
+    truth_tree = tmp_path / "truth.tsv"
+    recon_tree = tmp_path / "recon.tsv"
+    truth_tree.write_text(tree)
+    recon_tree.write_text(
+        header + "0\tROOT\t0\tROOT\n1\tm.16189T>TC\t0\tROOT\n"
+    )
+    variants = tmp_path / "truth_variants.txt"
+    variants.write_text("m.16183A>AC\n")
+    vcf = tmp_path / "sim.vcf"
+    vcf.write_text(
+        "##fileformat=VCFv4.2\n"
+        "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tSAMPLE\n"
+        "chrM\t16189\t.\tT\tTC\t.\tPASS\t.\tGT:HF\t0/1:0.40\n"
+    )
+    tracts = tmp_path / "hp_tracts.tsv"
+    tracts.write_text(
+        "tract\tanchor\tref_len\tbackground_len\tdelta\ttruth_freq\tcanonical_name\torigin\n"
+        "HVS1\t16183\t5\t10\t+1\t0.400000\tm.16183A>AC\tunstable\n"
+    )
+    run = _hp_score(
+        tmp_path,
+        truth_tree=truth_tree, recon_tree=recon_tree,
+        variants=variants, vcf=vcf,
+        extra=["--background", "T16189C", "--truth-hp-tracts", str(tracts)],
+    )
+    assert run.returncode == 0, run.stderr
+    row = _metrics_row(run.stdout)
+    assert row["var_recall"] == "1.0000"
+    assert row["var_precision"] == "1.0000"
+    assert row["n_detected_vars"] == "1"
+
+
 def test_hp_len_l1_is_mean_l1_over_tracts(tmp_path):
     """Plan 2026-09-27 T6. δ=0 is the share of reads carrying none of the tract's alleles."""
     truth_tree = tmp_path / "truth.tsv"
@@ -469,6 +519,29 @@ def test_hp_len_l1_is_mean_l1_over_tracts(tmp_path):
     )
     assert zero_run.returncode == 0, zero_run.stderr
     assert _metrics_row(zero_run.stdout)["hp_len_l1"] == "NA"
+
+
+def test_sweep_rebuilds_background_tokens_from_truth_file(tmp_path):
+    """Plan 2026-09-27 T6. A sweep that omits --background still canonicalises from background.txt."""
+    import subprocess
+
+    bg = tmp_path / "background.txt"
+    bg.write_text("m.16189T>C\nm.16183A>C\n")
+    script = pathlib.Path(__file__).resolve().parents[1] / "sweep_fpfn.sh"
+    # macOS bash 3.2 drops functions defined via `source <(...)`.
+    fn = tmp_path / "fn.sh"
+    lines = script.read_text().splitlines()
+    start = next(i for i, line in enumerate(lines) if line.startswith("background_spec_from_truth()"))
+    end = next(i for i, line in enumerate(lines[start:], start) if line == "}")
+    fn.write_text("\n".join(lines[start:end + 1]) + "\n")
+    proc = subprocess.run(
+        ["bash", "-c", f"source '{fn}'; background_spec_from_truth '{bg}'"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "T16189C,A16183C"
+    text = script.read_text()
+    assert 'background_spec_from_truth "$OUTDIR/truth/background.txt"' in text
 
 
 def test_sweep_fpfn_passes_hp_truth_files():

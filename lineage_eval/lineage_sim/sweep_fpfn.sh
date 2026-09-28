@@ -5,6 +5,21 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 
+# Plan 2026-09-27 T6. truth/background.txt stores Himito SNV names. The scorer
+# wants the <REF><pos><ALT> tokens those names came from.
+background_spec_from_truth() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  local tokens=() line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^m\.([0-9]+)([ACGT])\>([ACGT])$ ]]; then
+      tokens+=("${BASH_REMATCH[2]}${BASH_REMATCH[1]}${BASH_REMATCH[3]}")
+    fi
+  done < "$file"
+  (IFS=,; echo "${tokens[*]}")
+}
+
 OUTDIR="" PROFILE="ont-r10"
 FP_GRID="0.0005 0.001 0.005 0.01"
 FN_GRID="0.02 0.05 0.1 0.2"
@@ -42,6 +57,13 @@ SWEEP="$OUTDIR/sweep_metrics.tsv"
 [[ -f "$MATRIX" && -f "$VCF" ]] || { echo "run run_eval.sh first (missing matrix/vcf)" >&2; exit 1; }
 [[ -x "$HIMITO" ]] || { echo "missing Himito binary: $HIMITO (cargo build --release)" >&2; exit 1; }
 : > "$SWEEP"
+
+# A sweep invocation often does not repeat the simulator's --background.
+# Recover it from the simple SNV lines in truth/background.txt.
+if [[ -z "$BACKGROUND" || "$BACKGROUND" == "none" ]]; then
+  derived="$(background_spec_from_truth "$OUTDIR/truth/background.txt")"
+  [[ -n "$derived" ]] && BACKGROUND="$derived"
+fi
 
 n_fp=$(wc -w <<<"$FP_GRID"); n_fn=$(wc -w <<<"$FN_GRID")
 n_cells=$((n_fp * n_fn))

@@ -577,8 +577,10 @@ def main() -> None:
     unstable = {row["canonical_name"] for row in tract_rows}
     n_hp_unstable_truth = len(unstable)
     n_hp_unstable_called = len(unstable & vcf_names)
-    detected -= background
-    detected -= unstable
+    # A lineage allele can share its canonical name with an hp_tracts row.
+    # Those calls are true positives, so they stay in the precision denominator.
+    detected -= (background - truth_vars)
+    detected -= (unstable - truth_vars)
     hp_det = _hp_detection(
         load_hp_lineage_names(args.truth_hp_lineage, background_tokens), vcf_names,
     )

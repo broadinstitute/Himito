@@ -3,13 +3,17 @@
 
 Root = rCRS. Each edge introduces one heteroplasmic variant: an SNV, or, when
 ``--hp-lineage-indels`` is set, a homopolymer length change on a catalogue
-tract. Each node carries a cumulative heteroplasmy frequency (fraction of
-molecules whose lineage passes through it), and that determines how many
-reads the clone contributes.
+tract. ``--hp-unstable`` additionally splits every clone, including ref, into
+sub-clones by tract length; those alleles are not tree edges. Each node
+carries a cumulative heteroplasmy frequency (fraction of molecules whose
+lineage passes through it), and that determines how many reads the clone
+contributes.
 """
 import argparse
+import itertools
 import os
 import random
+import sys
 from dataclasses import dataclass, field
 
 # Plan 2026-09-27 T1. Shared with the tract catalogue; sibling import matches
@@ -471,7 +475,316 @@ def clone_genome(seq: str, path: list[Edit | tuple[int, str, str]]) -> str:
     return apply_edits(seq, path)
 
 
-def write_truth(tree: Tree, seq: str, outdir: str) -> None:
+# Plan 2026-09-27 T4. Deltas are relative to the catalogue run. "common" is the
+# only preset; an empty string is not a spec (the CLI omits the flag).
+_COMMON_HP_UNSTABLE: dict[str, dict[int, float]] = {
+    "D310": {0: 0.55, 1: 0.35, 2: 0.10},
+    "HVS1": {0: 0.6, 1: 0.3, 2: 0.1},
+    "C573": {0: 0.7, 1: 0.2, 2: 0.1},
+}
+
+
+def parse_hp_unstable(spec: str) -> dict[str, dict[int, float]]:
+    """Parse ``common`` or ``TRACT:delta=prob,delta=prob;TRACT:...``.
+
+    Every tract id must be in ``CATALOGUE``. Each distribution must sum to
+    1 within 1e-9. Deltas are integers.
+    """
+    # Plan 2026-09-27 T4.
+    if spec == "common":
+        return {tid: dict(dist) for tid, dist in _COMMON_HP_UNSTABLE.items()}
+    if not spec:
+        raise ValueError("empty --hp-unstable spec; omit the flag instead")
+    known = {t.id for t in CATALOGUE}
+    out: dict[str, dict[int, float]] = {}
+    for chunk in spec.split(";"):
+        if ":" not in chunk:
+            raise ValueError(f"hp-unstable term {chunk!r} is not TRACT:delta=prob")
+        tid, body = chunk.split(":", 1)
+        if tid not in known:
+            raise ValueError(f"hp-unstable tract {tid!r} is not in CATALOGUE")
+        if tid in out:
+            raise ValueError(f"hp-unstable tract {tid!r} is repeated")
+        if not body:
+            raise ValueError(f"hp-unstable tract {tid} has no distribution")
+        dist: dict[int, float] = {}
+        for pair in body.split(","):
+            if "=" not in pair:
+                raise ValueError(f"hp-unstable pair {pair!r} is not delta=prob")
+            delta_s, prob_s = pair.split("=", 1)
+            try:
+                delta = int(delta_s)
+                prob = float(prob_s)
+            except ValueError as exc:
+                raise ValueError(f"hp-unstable pair {pair!r} is not delta=prob") from exc
+            if prob < 0 or prob != prob:
+                raise ValueError(f"hp-unstable probability {prob} for {tid} is negative")
+            if delta in dist:
+                raise ValueError(f"hp-unstable delta {delta} repeated for {tid}")
+            dist[delta] = prob
+        total = sum(dist.values())
+        if abs(total - 1.0) > 1e-9:
+            raise ValueError(
+                f"hp-unstable distribution for {tid} sums to {total}, not 1"
+            )
+        out[tid] = dist
+    if not out:
+        raise ValueError("empty --hp-unstable spec; omit the flag instead")
+    return out
+
+
+@dataclass
+class SubClone:
+    """One terminal clone, or one length-state of a terminal clone."""
+
+    id: str
+    frequency: float
+    hp_state: dict = field(default_factory=dict)
+    node_variant: str = ""
+    variant_path: str = ""
+    edits: list = field(default_factory=list)
+    lineage_tracts: frozenset = field(default_factory=frozenset)
+
+
+def _clone_field(clone, name: str, default=None):
+    if isinstance(clone, dict):
+        return clone.get(name, default)
+    return getattr(clone, name, default)
+
+
+def _hp_product(spec: dict[str, dict[int, float]]):
+    """Cartesian product. Tracts stay in spec order; deltas ascend."""
+    tracts = list(spec)
+    delta_lists = [sorted(spec[tid]) for tid in tracts]
+    for index, deltas in enumerate(itertools.product(*delta_lists)):
+        state = {tid: delta for tid, delta in zip(tracts, deltas)}
+        prob = 1.0
+        for tid, delta in zip(tracts, deltas):
+            prob *= spec[tid][delta]
+        yield index, state, prob
+
+
+def _expand_one(clone, spec, min_freq: float, depth_drop=None):
+    """Split one clone. ``depth_drop(raw_freq)`` removes combos before renormalising.
+
+    Returns ``(subclones, depth_dropped_mass)``. Mass removed only by
+    ``min_freq`` is not included in the dropped total. If every combination
+    is removed, the modal state (lowest product index on a tie) is kept at
+    the parent's frequency so that mass is not lost.
+    """
+    # Plan 2026-09-27 T4.
+    parent_id = str(_clone_field(clone, "id"))
+    parent_freq = float(_clone_field(clone, "frequency"))
+    node_variant = _clone_field(clone, "node_variant", "") or ""
+    variant_path = _clone_field(clone, "variant_path", "") or ""
+    edits = list(_clone_field(clone, "edits", []) or [])
+    lineage = _clone_field(clone, "lineage_tracts", ()) or ()
+    raw = []
+    for index, state, prob in _hp_product(spec):
+        raw.append((index, dict(state), parent_freq * prob))
+    depth_dropped = 0.0
+    kept = []
+    for index, state, freq in raw:
+        if depth_drop is not None and depth_drop(freq):
+            depth_dropped += freq
+            continue
+        if freq < min_freq:
+            continue
+        kept.append((index, state, freq))
+    if not kept and raw and parent_freq > 0:
+        best = max(raw, key=lambda item: (item[2], -item[0]))
+        kept = [best]
+        if depth_drop is not None and depth_drop(best[2]):
+            depth_dropped -= best[2]
+    kept_sum = sum(freq for _, _, freq in kept)
+    if kept_sum <= 0:
+        return [], depth_dropped
+    scale = parent_freq / kept_sum
+    out = []
+    for index, state, freq in kept:
+        out.append(SubClone(
+            id=f"{parent_id}.h{index}",
+            frequency=freq * scale,
+            hp_state=state,
+            node_variant=node_variant,
+            variant_path=variant_path,
+            edits=list(edits),
+            lineage_tracts=frozenset(lineage),
+        ))
+    return out, depth_dropped
+
+
+def expand_unstable(clones, spec, min_freq: float) -> list:
+    """Split each clone across tract-length states. Depth is not consulted.
+
+    Combinations with frequency < ``min_freq`` are dropped, then the survivors
+    are rescaled so the parent clone's mass is unchanged. Output ids are
+    ``{clone_id}.h{i}`` with ``i`` the cartesian-product index.
+    """
+    # Plan 2026-09-27 T4.
+    out = []
+    for clone in clones:
+        subs, _dropped = _expand_one(clone, spec, min_freq, depth_drop=None)
+        out.extend(subs)
+    return out
+
+
+def scheduled_read_count(frequencies, total_depth: int) -> int:
+    """Reads ``simulate_reads.sh`` would schedule, including the per-rotation floor.
+
+    Frequencies are formatted to 6 decimals first, matching ``clones.tsv``.
+    """
+    # Plan 2026-09-27 T4.
+    total = 0
+    for freq in frequencies:
+        shown = float(f"{freq:.6f}")
+        per_rotation = max(1, int(round(total_depth * shown / 2)))
+        total += per_rotation * 2
+    return total
+
+
+def _per_rotation_rounds_to_zero(freq: float, total_depth: int) -> bool:
+    return round(total_depth * freq / 2) == 0
+
+
+def resolve_hp_subclones(parents, spec, min_freq: float, total_depth: int | None):
+    """Expand, and apply the depth floor only when it would inflate reads by >5%.
+
+    Returns ``(subclones, dropped_mass_or_None)``. ``dropped_mass`` is the raw
+    frequency removed by the round-to-zero rule before renormalising. ``None``
+    means that rule was not applied. ``expand_unstable`` itself stays depth-free.
+    """
+    # Plan 2026-09-27 T4.
+    subs = expand_unstable(parents, spec, min_freq)
+    if total_depth is None:
+        return subs, None
+    no_hp = scheduled_read_count((p.frequency for p in parents), total_depth)
+    with_hp = scheduled_read_count((s.frequency for s in subs), total_depth)
+    if not with_hp > no_hp * 1.05:
+        return subs, None
+    kept = []
+    dropped = 0.0
+
+    def drop(freq, depth=total_depth):
+        return _per_rotation_rounds_to_zero(freq, depth)
+
+    for parent in parents:
+        part, mass = _expand_one(parent, spec, min_freq, depth_drop=drop)
+        kept.extend(part)
+        dropped += mass
+    return kept, dropped
+
+
+def format_hp_state(hp_state: dict, tract_order) -> str:
+    """``D310:+1;C573:0``. Positive deltas carry a sign; zero does not."""
+    parts = []
+    for tid in tract_order:
+        delta = hp_state[tid]
+        text = f"+{delta}" if delta > 0 else str(int(delta))
+        parts.append(f"{tid}:{text}")
+    return ";".join(parts)
+
+
+def apply_unstable_deltas(seq: str, path: list, hp_state: dict) -> str:
+    """Path edits first, then each non-zero δ at that tract's anchor on the result.
+
+    Higher anchors are applied first so an insertion does not move a later
+    (leftward) catalogue coordinate. A zero delta adds no edit.
+    """
+    # Plan 2026-09-27 T4.
+    genome = apply_edits(seq, path) if path else seq
+    by_id = {t.id: t for t in CATALOGUE}
+    pending = [(by_id[tid], delta) for tid, delta in hp_state.items() if delta]
+    pending.sort(key=lambda item: item[0].anchor, reverse=True)
+    for tract, delta in pending:
+        shift = 0
+        for edit in path:
+            if edit.pos < tract.anchor:
+                shift += len(edit.alt) - len(edit.ref)
+        anchor = tract.anchor + shift
+        base = genome[anchor - 1]
+        n_units = abs(delta)
+        if delta > 0:
+            raw = Edit(anchor, base, base + tract.unit * n_units)
+        else:
+            n_bp = n_units * len(tract.unit)
+            deleted = genome[anchor:anchor + n_bp]
+            if deleted != tract.unit * n_units:
+                raise ValueError(
+                    f"{tract.id}: expected {tract.unit * n_units!r} after {anchor}, "
+                    f"got {deleted!r}"
+                )
+            raw = Edit(anchor, base + deleted, base)
+        genome = apply_edits(genome, [left_align(raw, genome)])
+    return genome
+
+
+def _parents_from_tree(tree: Tree, seq: str) -> list:
+    parents = [SubClone(
+        id="ref",
+        frequency=_terminal_freq(tree, 0),
+        node_variant="ROOT",
+        variant_path="",
+        edits=[],
+        lineage_tracts=frozenset(),
+    )]
+    for n in tree.nodes[1:]:
+        path = path_to_root(tree, n.id)
+        vpath = ",".join(himito_name(left_align(e, seq)) for e in path)
+        tracts = []
+        cur = n.id
+        while cur != 0:
+            node = tree.nodes[cur]
+            if node.tract_id:
+                tracts.append(node.tract_id)
+            cur = node.parent
+        parents.append(SubClone(
+            id=str(n.id),
+            frequency=_terminal_freq(tree, n.id),
+            node_variant=n.variant or "",
+            variant_path=vpath,
+            edits=list(path),
+            lineage_tracts=frozenset(tracts),
+        ))
+    return parents
+
+
+def _write_hp_tracts(path: str, subclones, spec, seq: str) -> None:
+    """One row per (tract, δ ≠ 0, origin). ``origin`` is ``mixed`` when the
+    lineage path already carries an indel in that tract."""
+    # Plan 2026-09-27 T4.
+    by_id = {t.id: t for t in CATALOGUE}
+    mass: dict[tuple, float] = {}
+    for sub in subclones:
+        for tid, delta in sub.hp_state.items():
+            if delta == 0:
+                continue
+            origin = "mixed" if tid in sub.lineage_tracts else "unstable"
+            key = (tid, delta, origin)
+            mass[key] = mass.get(key, 0.0) + sub.frequency
+    with open(path, "w") as fh:
+        fh.write(
+            "tract\tanchor\tref_len\tbackground_len\tdelta\ttruth_freq\t"
+            "canonical_name\torigin\n"
+        )
+        for tid in spec:
+            tract = by_id[tid]
+            ref_len = tract.copies * len(tract.unit)
+            for delta in sorted(d for d in spec[tid] if d != 0):
+                name = himito_name(left_align(_raw_length_edit(seq, tract, delta), seq))
+                for origin in ("unstable", "mixed"):
+                    freq = mass.get((tid, delta, origin), 0.0)
+                    if freq <= 0:
+                        continue
+                    fh.write(
+                        f"{tid}\t{tract.anchor}\t{ref_len}\t{ref_len}\t{delta:+d}\t"
+                        f"{freq:.6f}\t{name}\t{origin}\n"
+                    )
+
+
+def write_truth(tree: Tree, seq: str, outdir: str, *, hp_spec=None,
+                min_subclone_freq: float = 0.002,
+                total_depth: int | None = None) -> None:
     tdir = os.path.join(outdir, "truth")
     os.makedirs(tdir, exist_ok=True)
 
@@ -490,22 +803,49 @@ def write_truth(tree: Tree, seq: str, outdir: str) -> None:
     # Frequency must be *terminal* mass (molecules that stop at this node), not
     # cum_freq — otherwise ancestral mass is double-counted into parent clones
     # and read simulation depth blows up (especially costly for HiFi/ccs).
+    # Plan 2026-09-27 T4. The hp_state column and sub-clone ids exist only when
+    # --hp-unstable is set, so a run without the flag stays byte-identical.
     with open(os.path.join(tdir, "clones.tsv"), "w") as fh, \
          open(os.path.join(tdir, "clone_genomes.fa"), "w") as fa:
-        fh.write("clone_id\tnode_variant\tvariant_path\tfrequency\n")
-        # reference clone (mutation-free)
-        fh.write(f"ref\tROOT\t\t{_terminal_freq(tree, 0):.6f}\n")
-        fa.write(">clone_ref\n")
-        _write_fasta_seq(fa, seq)
-        for n in tree.nodes[1:]:
-            path = path_to_root(tree, n.id)
-            genome = clone_genome(seq, path)
-            # Left-aligned Himito names. Canonicalisation of HP alleles is T6;
-            # until then this is the name `Himito call` writes for the same edit.
-            vpath = ",".join(himito_name(left_align(e, seq)) for e in path)
-            fh.write(f"{n.id}\t{n.variant}\t{vpath}\t{_terminal_freq(tree, n.id):.6f}\n")
-            fa.write(f">clone_{n.id}\n")
-            _write_fasta_seq(fa, genome)
+        if hp_spec is None:
+            fh.write("clone_id\tnode_variant\tvariant_path\tfrequency\n")
+            # reference clone (mutation-free)
+            fh.write(f"ref\tROOT\t\t{_terminal_freq(tree, 0):.6f}\n")
+            fa.write(">clone_ref\n")
+            _write_fasta_seq(fa, seq)
+            for n in tree.nodes[1:]:
+                path = path_to_root(tree, n.id)
+                genome = clone_genome(seq, path)
+                # Left-aligned Himito names. Canonicalisation of HP alleles is T6;
+                # until then this is the name `Himito call` writes for the same edit.
+                vpath = ",".join(himito_name(left_align(e, seq)) for e in path)
+                fh.write(f"{n.id}\t{n.variant}\t{vpath}\t{_terminal_freq(tree, n.id):.6f}\n")
+                fa.write(f">clone_{n.id}\n")
+                _write_fasta_seq(fa, genome)
+        else:
+            parents = _parents_from_tree(tree, seq)
+            subclones, dropped = resolve_hp_subclones(
+                parents, hp_spec, min_subclone_freq, total_depth,
+            )
+            if dropped is not None:
+                print(
+                    f"hp-unstable: dropped {dropped:.6f} mass with per-rotation "
+                    "depth rounding to 0 before renormalising",
+                    file=sys.stderr,
+                )
+            fh.write("clone_id\tnode_variant\tvariant_path\tfrequency\thp_state\n")
+            order = list(hp_spec)
+            for sub in subclones:
+                state = format_hp_state(sub.hp_state, order)
+                fh.write(
+                    f"{sub.id}\t{sub.node_variant}\t{sub.variant_path}\t"
+                    f"{sub.frequency:.6f}\t{state}\n"
+                )
+                fa.write(f">clone_{sub.id}\n")
+                _write_fasta_seq(fa, apply_unstable_deltas(seq, sub.edits, sub.hp_state))
+            _write_hp_tracts(
+                os.path.join(tdir, "hp_tracts.tsv"), subclones, hp_spec, seq,
+            )
 
     # Plan 2026-09-27 T3. Omitted when no lineage HP indel was placed (K=0).
     hp_nodes = [n for n in tree.nodes if n.tract_id]
@@ -562,6 +902,27 @@ def main() -> None:
         help="replace K mutation edges with homopolymer length changes "
         "drawn from a separate RNG (plan 2026-09-27 T3)",
     )
+    ap.add_argument(
+        "--hp-unstable",
+        default=None,
+        help="lineage-independent tract-length distribution: 'common' or "
+        "TRACT:delta=prob,delta=prob;TRACT:... (plan 2026-09-27 T4)",
+    )
+    ap.add_argument(
+        "--hp-min-subclone-freq",
+        type=float,
+        default=0.002,
+        help="drop unstable sub-clones below this frequency and renormalise "
+        "within the parent clone (default 0.002)",
+    )
+    ap.add_argument(
+        "--total-depth",
+        type=int,
+        default=None,
+        help="with --hp-unstable, drop sub-clones whose per-rotation depth "
+        "rounds to 0 when that floor would inflate scheduled reads by more "
+        "than 5 percent (plan 2026-09-27 T4)",
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--outdir", required=True)
     args = ap.parse_args()
@@ -616,7 +977,14 @@ def main() -> None:
                     f"Could not find valid frequency assignment after {max_attempts} attempts. "
                     "Try a smaller --n-mutations or a different --seed."
                 ) from exc
-    write_truth(tree, seq, args.outdir)
+    # Plan 2026-09-27 T4. --total-depth is consulted only with --hp-unstable.
+    hp_spec = parse_hp_unstable(args.hp_unstable) if args.hp_unstable is not None else None
+    write_truth(
+        tree, seq, args.outdir,
+        hp_spec=hp_spec,
+        min_subclone_freq=args.hp_min_subclone_freq,
+        total_depth=args.total_depth if hp_spec is not None else None,
+    )
     print(f"wrote truth for {args.n_mutations} mutations "
           f"(topology={args.topology}) to {args.outdir}/truth")
 

@@ -55,6 +55,9 @@ HP_LINEAGE_INDELS=""
 # Plan 2026-09-27 T3. Forwarded only to Himito lineage, via run_himito.sh.
 HP_FP_RATE=""
 HP_FN_RATE=""
+# Plan 2026-09-27 T4. Empty = omit --hp-unstable. Depth is forwarded only with it.
+HP_UNSTABLE=""
+HP_MIN_SUBCLONE_FREQ=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -77,11 +80,13 @@ while [[ $# -gt 0 ]]; do
     --hp-lineage-indels) HP_LINEAGE_INDELS="$2"; shift 2;;
     --hp-fp-rate) HP_FP_RATE="$2"; shift 2;;
     --hp-fn-rate) HP_FN_RATE="$2"; shift 2;;
+    --hp-unstable) HP_UNSTABLE="$2"; shift 2;;
+    --hp-min-subclone-freq) HP_MIN_SUBCLONE_FREQ="$2"; shift 2;;
     *) echo "unknown arg: $1" >&2; exit 1;;
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F]" >&2
+  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F]" >&2
   exit 1
 }
 # Resolve in simulate_reads.sh; export a sane default here for visibility.
@@ -107,6 +112,11 @@ SIM_TREE_ARGS=()
 [[ -n "$TOPOLOGY" ]] && SIM_TREE_ARGS+=(--topology "$TOPOLOGY")
 # Plan 2026-09-27 T3. Empty omits the flag.
 [[ -n "$HP_LINEAGE_INDELS" ]] && SIM_TREE_ARGS+=(--hp-lineage-indels "$HP_LINEAGE_INDELS")
+# Plan 2026-09-27 T4. Empty SPEC omits --hp-unstable. --total-depth reaches
+# simulate_tree.py only together with that flag.
+[[ -n "$HP_UNSTABLE" ]] && SIM_TREE_ARGS+=(--hp-unstable "$HP_UNSTABLE")
+[[ -n "$HP_MIN_SUBCLONE_FREQ" ]] && SIM_TREE_ARGS+=(--hp-min-subclone-freq "$HP_MIN_SUBCLONE_FREQ")
+[[ -n "$HP_UNSTABLE" ]] && SIM_TREE_ARGS+=(--total-depth "$DEPTH")
 python "$HERE/simulate_tree.py" --reference "$REF" --n-mutations "$NMUT" --seed "$SEED" --outdir "$OUTDIR" --min-hf "$SIM_MIN_HF" --max-hf "$SIM_MAX_HF" "${SIM_TREE_ARGS[@]+"${SIM_TREE_ARGS[@]}"}"
 "$HERE/simulate_reads.sh" --outdir "$OUTDIR" --profile "$PROFILE" --total-depth "$DEPTH" --seed "$SEED"
 HIMITO_ARGS=(

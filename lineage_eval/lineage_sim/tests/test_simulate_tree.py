@@ -795,3 +795,412 @@ def test_sweep_seeds_forwards_hp_lineage_indels():
     assert "unknown arg" not in r.stderr
     assert "usage:" in r.stderr
     assert r.returncode != 0
+
+
+# Plan 2026-09-27 T4. sha256 of clones.tsv and clone_genomes.fa from
+# simulate_tree.py --n-mutations 10 --seed 1 at HEAD 8f649cd (no --hp-unstable).
+_NO_HP_CLONES_SHA256 = "f1032170b13619779c2d39aaaf389c6aa0fee3ab11aa6d16c16be019a7ca900a"
+_NO_HP_GENOMES_SHA256 = "7d066368b703d783dd3fb8e492fd8c21a54b2bdc45b2c8981a89bc4d3a4b1c39"
+
+
+class _FreqClone:
+    def __init__(self, id, frequency):
+        self.id = id
+        self.frequency = frequency
+
+
+def _fasta_records(path):
+    records = {}
+    header, chunks = None, []
+    for line in pathlib.Path(path).read_text().splitlines():
+        if line.startswith(">"):
+            if header is not None:
+                records[header] = "".join(chunks)
+            header, chunks = line[1:], []
+        else:
+            chunks.append(line.strip())
+    if header is not None:
+        records[header] = "".join(chunks)
+    return records
+
+
+def _scheduled_reads(freq_fields, total_depth):
+    """Per clone, per rotation max(1, round(total_depth * freq / 2)), times 2.
+
+    ``freq_fields`` are the clones.tsv strings simulate_reads.sh parses.
+    """
+    total = 0
+    for field in freq_fields:
+        per_rotation = max(1, int(round(total_depth * float(field) / 2)))
+        total += per_rotation * 2
+    return total
+
+
+def _clone_freq_fields(clones_tsv):
+    lines = pathlib.Path(clones_tsv).read_text().splitlines()[1:]
+    return [line.split("\t")[3] for line in lines if line]
+
+
+def test_parse_hp_unstable_common_and_explicit():
+    """Plan 2026-09-27 T4. Preset and TRACT:delta=prob lists; sums are 1."""
+    common = st.parse_hp_unstable("common")
+    assert common == {
+        "D310": {0: 0.55, 1: 0.35, 2: 0.10},
+        "HVS1": {0: 0.6, 1: 0.3, 2: 0.1},
+        "C573": {0: 0.7, 1: 0.2, 2: 0.1},
+    }
+    explicit = st.parse_hp_unstable("D310:0=0.5,1=0.5;C573:0=0.8,-1=0.2")
+    assert explicit == {
+        "D310": {0: 0.5, 1: 0.5},
+        "C573": {0: 0.8, -1: 0.2},
+    }
+    catalogue_ids = {t.id for t in _catalogue()}
+    for spec in (common, explicit):
+        assert set(spec) <= catalogue_ids
+        for dist in spec.values():
+            assert abs(sum(dist.values()) - 1.0) <= 1e-9
+            assert all(isinstance(delta, int) for delta in dist)
+
+
+def test_parse_hp_unstable_rejects_unknown_sum_and_empty():
+    """Plan 2026-09-27 T4. Unknown ids, sums off by >1e-9, and '' are errors."""
+    for spec in ("", "NOT_A_TRACT:0=1", "D310:0=0.5,1=0.4", "D310:0=1;D310:0=1"):
+        try:
+            st.parse_hp_unstable(spec)
+        except ValueError:
+            continue
+        raise AssertionError(f"expected ValueError for {spec!r}")
+
+
+def test_expand_unstable_splits_clones_by_tract_state():
+    """Plan 2026-09-27 T4. One tract, two clones, no drops. Product index in the id."""
+    spec = {"D310": {0: 0.5, 1: 0.5}}
+    out = st.expand_unstable(
+        [_FreqClone("1", 0.6), _FreqClone("2", 0.4)], spec, 0.002,
+    )
+    assert [s.id for s in out] == ["1.h0", "1.h1", "2.h0", "2.h1"]
+    assert [s.hp_state for s in out] == [
+        {"D310": 0}, {"D310": 1}, {"D310": 0}, {"D310": 1},
+    ]
+    got = [s.frequency for s in out]
+    for freq, want in zip(got, (0.3, 0.3, 0.2, 0.2)):
+        assert abs(freq - want) <= 1e-9
+    assert abs(sum(got) - 1.0) <= 1e-9
+
+
+def test_expand_unstable_product_order_and_min_freq_renormalise():
+    """Plan 2026-09-27 T4. Spec order, deltas ascending; drop then renormalise."""
+    spec = {"C573": {-1: 0.2, 0: 0.8}, "D310": {1: 0.5, 0: 0.5}}
+    out = st.expand_unstable([{"id": "1", "frequency": 1.0}], spec, 0)
+    assert [s.id for s in out] == ["1.h0", "1.h1", "1.h2", "1.h3"]
+    assert [s.hp_state for s in out] == [
+        {"C573": -1, "D310": 0},
+        {"C573": -1, "D310": 1},
+        {"C573": 0, "D310": 0},
+        {"C573": 0, "D310": 1},
+    ]
+    # 0.6 * 0.01 = 0.006 is below 0.01; index 0 is dropped, index 1 kept.
+    dropped = st.expand_unstable(
+        [{"id": "1", "frequency": 0.6}], {"D310": {0: 0.01, 1: 0.99}}, 0.01,
+    )
+    assert len(dropped) == 1
+    assert dropped[0].id == "1.h1"
+    assert dropped[0].hp_state == {"D310": 1}
+    assert abs(dropped[0].frequency - 0.6) <= 1e-9
+
+
+def test_expand_unstable_keeps_modal_state_when_filter_empties_clone():
+    """Plan 2026-09-27 T4. Mass stays with the clone when every combo is below the floor."""
+    out = st.expand_unstable(
+        [{"id": "1", "frequency": 0.005}], {"D310": {0: 0.2, 1: 0.8}}, 0.01,
+    )
+    assert len(out) == 1
+    assert out[0].id == "1.h1"
+    assert out[0].hp_state == {"D310": 1}
+    assert abs(out[0].frequency - 0.005) <= 1e-12
+    tied = st.expand_unstable(
+        [{"id": "1", "frequency": 0.005}], {"D310": {0: 0.5, 1: 0.5}}, 0.003,
+    )
+    assert len(tied) == 1
+    assert tied[0].id == "1.h0"
+    assert tied[0].hp_state == {"D310": 0}
+    assert abs(tied[0].frequency - 0.005) <= 1e-12
+
+
+def test_expand_unstable_is_depth_free():
+    """Plan 2026-09-27 T4. round-to-zero combinations stay; depth filtering is not here."""
+    out = st.expand_unstable(
+        [{"id": "1", "frequency": 1.0}], {"D310": {0: 0.999, 1: 0.001}}, 0,
+    )
+    assert len(out) == 2
+    assert abs(out[1].frequency - 0.001) <= 1e-12
+    assert round(1000 * out[1].frequency / 2) == 0
+
+
+def test_subclone_h1_genome_is_parent_plus_one_c(tmp_path):
+    """Plan 2026-09-27 T4. Unstable +1 is one extra C at the D310 anchor, after path edits."""
+    _, seq = st.load_reference(REF)
+    alt = "A" if seq[999] != "A" else "C"
+    root = st.Node(id=0, variant=None, pos=None, ref=None, alt=None, parent=0)
+    node = st.Node(
+        id=1, variant=st.variant_id(1000, seq[999], alt),
+        pos=1000, ref=seq[999], alt=alt, parent=0,
+    )
+    root.children.append(1)
+    root.cum_freq = 1.0
+    node.cum_freq = 0.5
+    st.write_truth(
+        st.Tree(nodes=[root, node]), seq, str(tmp_path),
+        hp_spec={"D310": {0: 0.5, 1: 0.5}},
+    )
+    clones = (tmp_path / "truth" / "clones.tsv").read_text().splitlines()
+    assert clones[0] == "clone_id\tnode_variant\tvariant_path\tfrequency\thp_state"
+    by_id = {row.split("\t")[0]: row.split("\t") for row in clones[1:]}
+    assert by_id["1.h0"][4] == "D310:0"
+    assert by_id["1.h1"][4] == "D310:+1"
+    assert by_id["1.h1"][2] == st.variant_id(1000, seq[999], alt)
+    records = _fasta_records(tmp_path / "truth" / "clone_genomes.fa")
+    parent = st.clone_genome(seq, st.path_to_root(st.Tree(nodes=[root, node]), 1))
+    assert records["clone_1.h0"] == parent
+    extra = st.left_align(st.Edit(302, "A", "AC"), parent)
+    assert records["clone_1.h1"] == st.apply_edits(parent, [extra])
+    assert len(records["clone_1.h1"]) == len(parent) + 1
+
+
+def test_mixed_origin_when_lineage_indel_in_same_tract(tmp_path):
+    """Plan 2026-09-27 T4. Lineage indel stays; unstable δ stacks; origin is mixed."""
+    _, seq = st.load_reference(REF)
+    d310 = next(t for t in _catalogue() if t.id == "D310")
+    edit = _expected_length_edit(seq, d310, 1)
+    root = st.Node(id=0, variant=None, pos=None, ref=None, alt=None, parent=0)
+    node = st.Node(
+        id=1, variant=st.himito_name(edit), parent=0, edit=edit,
+        tract_id="D310", hp_delta=1,
+    )
+    root.children.append(1)
+    root.cum_freq = 1.0
+    node.cum_freq = 0.5
+    tree = st.Tree(nodes=[root, node])
+    st.write_truth(tree, seq, str(tmp_path), hp_spec={"D310": {0: 0.5, 1: 0.5}})
+    lineage = st.clone_genome(seq, st.path_to_root(tree, 1))
+    records = _fasta_records(tmp_path / "truth" / "clone_genomes.fa")
+    assert records["clone_1.h0"] == lineage
+    stacked = st.apply_edits(lineage, [st.left_align(st.Edit(302, "A", "AC"), lineage)])
+    assert records["clone_1.h1"] == stacked
+    assert len(stacked) == len(seq) + 2
+
+    hp_rows = (tmp_path / "truth" / "hp_tracts.tsv").read_text().splitlines()
+    assert hp_rows[0] == (
+        "tract\tanchor\tref_len\tbackground_len\tdelta\ttruth_freq\tcanonical_name\torigin"
+    )
+    parsed = [line.split("\t") for line in hp_rows[1:]]
+    assert parsed
+    assert all(row[4] != "0" and row[4] != "+0" for row in parsed)
+    by_origin = {row[7]: row for row in parsed}
+    assert set(by_origin) == {"unstable", "mixed"}
+    for origin, freq in (("unstable", 0.25), ("mixed", 0.25)):
+        row = by_origin[origin]
+        assert row[0] == "D310"
+        assert row[1] == "302"
+        assert row[2] == str(d310.copies * len(d310.unit))
+        assert row[3] == row[2]
+        assert row[4] == "+1"
+        assert abs(float(row[5]) - freq) <= 1e-9
+        assert row[6] == "m.302A>AC"
+    variants = (tmp_path / "truth" / "truth_variants.txt").read_text().splitlines()
+    assert variants == [st.himito_name(edit)]
+    tree_rows = (tmp_path / "truth" / "truth_mutation_tree.tsv").read_text().splitlines()
+    assert len(tree_rows) == 3
+    assert "h0" not in (tmp_path / "truth" / "truth_mutation_tree.tsv").read_text()
+
+
+def test_no_hp_unstable_clones_match_head_bytes(tmp_path):
+    """Plan 2026-09-27 T4. No flag: clones.tsv and clone_genomes.fa match HEAD 8f649cd."""
+    import hashlib
+    import subprocess
+    out = tmp_path / "plain"
+    r = subprocess.run(
+        [sys.executable, str(_SIM_DIR / "simulate_tree.py"),
+         "--reference", REF, "--n-mutations", "10", "--seed", "1",
+         "--outdir", str(out)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    clones = (out / "truth" / "clones.tsv").read_bytes()
+    genomes = (out / "truth" / "clone_genomes.fa").read_bytes()
+    assert hashlib.sha256(clones).hexdigest() == _NO_HP_CLONES_SHA256
+    assert hashlib.sha256(genomes).hexdigest() == _NO_HP_GENOMES_SHA256
+    assert clones.splitlines()[0] == b"clone_id\tnode_variant\tvariant_path\tfrequency"
+    assert not (out / "truth" / "hp_tracts.tsv").exists()
+
+
+def test_awk_split_keeps_dotted_subclone_id(tmp_path):
+    """Plan 2026-09-27 T4. simulate_reads.sh splits >clone_3.h2 into clone_3.h2.fa."""
+    import subprocess
+    script = (_SIM_DIR / "simulate_reads.sh").read_text()
+    awk_prog = '/^>/{id=substr($0,8); f=dir"/clone_"id".fa"; print > f; next}{print >> f}'
+    assert awk_prog in script
+    genomes = tmp_path / "clone_genomes.fa"
+    genomes.write_text(">clone_3.h2\nACGTACGT\nTTTTAAAA\n")
+    work = tmp_path / "work"
+    work.mkdir()
+    r = subprocess.run(
+        ["awk", "-v", f"dir={work}", awk_prog, str(genomes)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    out = work / "clone_3.h2.fa"
+    assert out.is_file()
+    assert out.read_text().splitlines()[0] == ">clone_3.h2"
+
+
+def test_simulate_reads_frequency_field_stays_column_four():
+    """Plan 2026-09-27 T4. $1 is the clone id and $4 is the frequency."""
+    script = (_SIM_DIR / "simulate_reads.sh").read_text()
+    assert """awk -F'\\t' '{print $1 \"\\t\" $4}'""" in script
+
+
+def test_hp_unstable_common_scheduled_depth_within_5_percent(tmp_path):
+    """Plan 2026-09-27 T4. common at depth 1000 stays within 5% of the no-HP schedule."""
+    import subprocess
+    script = str(_SIM_DIR / "simulate_tree.py")
+    py = sys.executable
+    plain = tmp_path / "plain"
+    hp = tmp_path / "hp"
+    base = [py, script, "--reference", REF, "--n-mutations", "10", "--seed", "1"]
+    r0 = subprocess.run(base + ["--outdir", str(plain)], capture_output=True, text=True)
+    assert r0.returncode == 0, r0.stderr
+    r1 = subprocess.run(
+        base + ["--total-depth", "1000", "--hp-unstable", "common", "--outdir", str(hp)],
+        capture_output=True, text=True,
+    )
+    assert r1.returncode == 0, r1.stderr
+    no_hp = _scheduled_reads(_clone_freq_fields(plain / "truth" / "clones.tsv"), 1000)
+    with_hp = _scheduled_reads(_clone_freq_fields(hp / "truth" / "clones.tsv"), 1000)
+    assert with_hp <= no_hp * 1.05, f"scheduled {with_hp} vs no-HP {no_hp}"
+    assert "hp-unstable: dropped" not in r1.stderr
+    header = (hp / "truth" / "clones.tsv").read_text().splitlines()[0]
+    assert header == "clone_id\tnode_variant\tvariant_path\tfrequency\thp_state"
+    assert (hp / "truth" / "hp_tracts.tsv").is_file()
+
+
+def test_hp_unstable_depth_floor_when_min_freq_would_inflate(tmp_path):
+    """Plan 2026-09-27 T4. Drop round-to-zero sub-clones before renormalising."""
+    import subprocess
+    hp = tmp_path / "hp"
+    r = subprocess.run(
+        [sys.executable, str(_SIM_DIR / "simulate_tree.py"),
+         "--reference", REF, "--n-mutations", "10", "--seed", "1",
+         "--total-depth", "1000", "--hp-unstable", "common",
+         "--hp-min-subclone-freq", "0", "--outdir", str(hp)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "hp-unstable: dropped" in r.stderr
+    plain = tmp_path / "plain"
+    r0 = subprocess.run(
+        [sys.executable, str(_SIM_DIR / "simulate_tree.py"),
+         "--reference", REF, "--n-mutations", "10", "--seed", "1",
+         "--outdir", str(plain)],
+        capture_output=True, text=True,
+    )
+    assert r0.returncode == 0, r0.stderr
+    no_hp = _scheduled_reads(_clone_freq_fields(plain / "truth" / "clones.tsv"), 1000)
+    with_hp = _scheduled_reads(_clone_freq_fields(hp / "truth" / "clones.tsv"), 1000)
+    assert with_hp <= no_hp * 1.05, f"scheduled {with_hp} vs no-HP {no_hp}"
+    # Parent mass is unchanged: written frequencies still partition 1.
+    freqs = [float(f) for f in _clone_freq_fields(hp / "truth" / "clones.tsv")]
+    assert abs(sum(freqs) - 1.0) < 1e-4
+
+
+def test_unstable_alleles_omitted_from_mutation_truth(tmp_path):
+    """Plan 2026-09-27 T4. hp_tracts names are not tree variants."""
+    import subprocess
+    out = tmp_path / "hp"
+    r = subprocess.run(
+        [sys.executable, str(_SIM_DIR / "simulate_tree.py"),
+         "--reference", REF, "--n-mutations", "10", "--seed", "1",
+         "--hp-unstable", "common", "--outdir", str(out)],
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    variants = (out / "truth" / "truth_variants.txt").read_text()
+    tree = (out / "truth" / "truth_mutation_tree.tsv").read_text()
+    names = []
+    for line in (out / "truth" / "hp_tracts.tsv").read_text().splitlines()[1:]:
+        names.append(line.split("\t")[6])
+    assert names
+    for name in names:
+        assert name not in variants
+        assert name not in tree
+
+
+def test_run_eval_forwards_hp_unstable(tmp_path):
+    """Plan 2026-09-27 T4. SPEC and min freq reach simulate_tree; empty SPEC does not."""
+    import subprocess
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    log = tmp_path / "argv.txt"
+    py = bindir / "python"
+    py.write_text(
+        "#!/bin/bash\n"
+        f'printf "%s\\n" "$*" >> "{log}"\n'
+        "exit 42\n"
+    )
+    py.chmod(0o755)
+    env = os.environ.copy()
+    env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
+    r = subprocess.run(
+        ["bash", str(_SIM_DIR / "run_eval.sh"),
+         "--outdir", str(tmp_path / "out"),
+         "--hp-unstable", "common",
+         "--hp-min-subclone-freq", "0.01",
+         "--total-depth", "1000",
+         "--n-mutations", "6", "--seed", "1",
+         "--ref", REF],
+        capture_output=True, text=True, env=env,
+    )
+    assert r.returncode != 0
+    argv = log.read_text()
+    assert "simulate_tree.py" in argv
+    assert "--hp-unstable common" in argv
+    assert "--hp-min-subclone-freq 0.01" in argv
+    assert "--total-depth 1000" in argv
+
+    log.unlink()
+    r2 = subprocess.run(
+        ["bash", str(_SIM_DIR / "run_eval.sh"),
+         "--outdir", str(tmp_path / "out2"),
+         "--n-mutations", "6", "--seed", "1",
+         "--ref", REF],
+        capture_output=True, text=True, env=env,
+    )
+    assert r2.returncode != 0
+    argv2 = log.read_text()
+    assert "--hp-unstable" not in argv2
+    assert "--hp-min-subclone-freq" not in argv2
+    assert "--total-depth" not in argv2
+
+
+def test_sweep_seeds_forwards_hp_unstable():
+    """Plan 2026-09-27 T4. sweep_seeds.sh accepts both flags and forwards them."""
+    import re
+    import subprocess
+    script = (_SIM_DIR / "sweep_seeds.sh").read_text()
+    assert re.search(r"--hp-unstable\)", script)
+    assert re.search(r"--hp-min-subclone-freq\)", script)
+    assert re.search(
+        r'EVAL_ARGS\+=\(--hp-unstable "\$HP_UNSTABLE"\)', script,
+    )
+    assert re.search(
+        r'EVAL_ARGS\+=\(--hp-min-subclone-freq "\$HP_MIN_SUBCLONE_FREQ"\)', script,
+    )
+    r = subprocess.run(
+        ["bash", str(_SIM_DIR / "sweep_seeds.sh"),
+         "--hp-unstable", "D310:0=0.5,1=0.5",
+         "--hp-min-subclone-freq", "0.01"],
+        capture_output=True, text=True,
+    )
+    assert "unknown arg" not in r.stderr
+    assert "usage:" in r.stderr
+    assert r.returncode != 0

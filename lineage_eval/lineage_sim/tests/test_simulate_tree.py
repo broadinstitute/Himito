@@ -1533,14 +1533,20 @@ def test_bench_hp_frozen_config_and_empty_baseline(tmp_path):
     assert "no baseline yet" in r2.stdout
 
 
+def _bench_hp_verdict(stdout, metric):
+    line = next(ln for ln in stdout.splitlines() if ln.startswith(metric))
+    return line.split()[-1]
+
+
 def test_bench_hp_compare_uses_two_se_verdict(tmp_path):
-    """Plan 2026-09-27 T8. Identical means are 'same'; a drop past 2·SE regresses."""
+    """Plan 2026-09-27 T8. Lower hp_intrusion is IMPROVED; a higher var_f1 is IMPROVED."""
     import subprocess
     base = tmp_path / "baseline.tsv"
     cur = tmp_path / "current.tsv"
-    same = ["1", "1", "1", "1", "1", "1", "1", "1", "1", "0", "1", "0.5", "0.2", "1"]
-    _hp_metrics_tsv(base, [same, same])
-    _hp_metrics_tsv(cur, [same, same])
+    # hp_intrusion is column 10. Two identical rows make the 2·SE band 0.
+    held = ["1", "1", "1", "1", "1", "1", "1", "1", "1", "0.8", "1", "0.5", "0.2", "1"]
+    _hp_metrics_tsv(base, [held, held])
+    _hp_metrics_tsv(cur, [held, held])
     r = subprocess.run(
         ["bash", str(_SIM_DIR / "bench_hp.sh"),
          "--compare", str(cur), "--baseline", str(base)],
@@ -1549,15 +1555,43 @@ def test_bench_hp_compare_uses_two_se_verdict(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "REGRESSED" not in r.stdout
     assert "same" in r.stdout
-    low = ["0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0", "0"]
-    _hp_metrics_tsv(cur, [low, low])
-    r2 = subprocess.run(
+
+    dropped = list(held)
+    dropped[9] = "0.2"
+    _hp_metrics_tsv(cur, [dropped, dropped])
+    r_drop = subprocess.run(
         ["bash", str(_SIM_DIR / "bench_hp.sh"),
          "--compare", str(cur), "--baseline", str(base)],
         capture_output=True, text=True,
     )
-    assert r2.returncode == 0, r2.stderr
-    assert "REGRESSED" in r2.stdout
+    assert r_drop.returncode == 0, r_drop.stderr
+    assert _bench_hp_verdict(r_drop.stdout, "hp_intrusion") == "IMPROVED"
+    assert _bench_hp_verdict(r_drop.stdout, "var_f1") == "same"
+    assert _bench_hp_verdict(r_drop.stdout, "hp_var_f1") == "same"
+
+    raised = list(held)
+    raised[9] = "1"
+    _hp_metrics_tsv(cur, [raised, raised])
+    r_rise = subprocess.run(
+        ["bash", str(_SIM_DIR / "bench_hp.sh"),
+         "--compare", str(cur), "--baseline", str(base)],
+        capture_output=True, text=True,
+    )
+    assert r_rise.returncode == 0, r_rise.stderr
+    assert _bench_hp_verdict(r_rise.stdout, "hp_intrusion") == "REGRESSED"
+
+    # A drop in a higher-is-better metric is still a regression.
+    worse_f1 = list(held)
+    worse_f1[2] = "0"
+    _hp_metrics_tsv(cur, [worse_f1, worse_f1])
+    r_f1 = subprocess.run(
+        ["bash", str(_SIM_DIR / "bench_hp.sh"),
+         "--compare", str(cur), "--baseline", str(base)],
+        capture_output=True, text=True,
+    )
+    assert r_f1.returncode == 0, r_f1.stderr
+    assert _bench_hp_verdict(r_f1.stdout, "var_f1") == "REGRESSED"
+    assert _bench_hp_verdict(r_f1.stdout, "hp_intrusion") == "same"
 
 
 def test_run_eval_pair_requires_ccs(tmp_path):

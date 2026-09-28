@@ -96,6 +96,9 @@ FOCUS = ["var_precision","var_recall","var_f1",
          "hap_precision","hap_recall","hap_f1",
          "hp_intrusion","hp_backbone_nodes","hp_len_l1",
          "root_fraction","hp_var_f1"]
+# Plan 2026-09-27 T8. These are error counts: a smaller mean is the improvement.
+# var_*, ad_*, hap_*, and hp_var_f1 still treat a larger mean as IMPROVED.
+LOWER_IS_BETTER = {"hp_intrusion", "hp_backbone_nodes", "hp_len_l1", "root_fraction"}
 
 def load(f):
     with open(f) as fh:
@@ -152,7 +155,7 @@ for k in FOCUS:
     band = 2*se
     if abs(d) <= band or band == 0 and d == 0:
         verdict = "same"
-    elif d > 0:
+    elif (d < 0) if k in LOWER_IS_BETTER else (d > 0):
         verdict = "IMPROVED"
     else:
         verdict = "REGRESSED"; regressed += 1

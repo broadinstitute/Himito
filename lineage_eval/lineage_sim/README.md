@@ -360,7 +360,7 @@ Appended after `n_background_calls`. Read them by header name. `bench_hp.sh` ave
 
 ### Frozen HP benchmark (`bench_hp.sh`)
 
-Same driver shape as `bench_standard.sh`: `--seeds` for a smoke run (breaks comparability), `--compare FILE` to re-score an existing `seed_metrics.tsv`, `--update-baseline` to copy the result onto `baseline_hp.tsv`, and the same 2·SE verdict (`same` / `IMPROVED` / `REGRESSED`). `baseline_hp.tsv` starts with no data rows. Until it has some, compare prints `no baseline yet` and exits 0. Score HP runs against `baseline_hp.tsv`.
+Same driver shape as `bench_standard.sh`: `--seeds` for a smoke run (breaks comparability), `--compare FILE` to re-score an existing `seed_metrics.tsv`, and `--update-baseline` to copy the result onto `baseline_hp.tsv`. A delta inside the 2·SE band is `same`. A higher `var_*`, `ad_*`, `hap_*`, or `hp_var_f1` is `IMPROVED`. A lower `hp_intrusion`, `hp_backbone_nodes`, `hp_len_l1`, or `root_fraction` is `IMPROVED`. `baseline_hp.tsv` starts with no data rows. Until it has some, compare prints `no baseline yet` and exits 0. Score HP runs against `baseline_hp.tsv`.
 
 ```bash
 ./bench_hp.sh --outdir /tmp/hp --ref ../../test_data/rCRS.fasta

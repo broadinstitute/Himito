@@ -1,16 +1,6 @@
 version 1.0
 
-# Plan 2026-09-27 T11. Sweep --hp-fp-rate x --hp-fn-rate.
-#
-# Simulation, alignment, denoise, build, and call do not depend on the HP
-# rates, so each seed runs once (SimulateCell = run_eval.sh --stop-after call).
-# Himito lineage and score_lineage.py re-run per grid cell. pick_best_hp_rates.py
-# applies the same 2·SE noise band as bench_standard.sh and refuses a flat grid.
-#
-# Import ValidateConfig and CombineMetrics from the simulation workflow. A sweep
-# is over rates and seeds: n_mutations and depth are scalars, not arrays.
-
-import "Himito_lineage_sim.wdl" as sim
+import "https://raw.githubusercontent.com/broadinstitute/Himito/hs_lineage_posterio/wdl/Himito-lineage/Himito_lineage_sim.wdl" as sim
 
 workflow HimitoLineageHpSweep {
     input {

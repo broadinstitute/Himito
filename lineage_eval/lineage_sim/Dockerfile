@@ -39,7 +39,7 @@ ARG HIMITO_SOURCE=prebuilt
 FROM rust:1.84.0 AS himito-from-source
 ARG DEBIAN_FRONTEND=noninteractive
 ARG HIMITO_REPO=https://github.com/broadinstitute/Himito.git
-ARG HIMITO_REF=hs_lineage_
+ARG HIMITO_REF=hs_lineage_posterio
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         git ssh build-essential make cmake zlib1g-dev libclang-dev wget util-linux bsdextrautils \

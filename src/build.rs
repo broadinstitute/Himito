@@ -916,6 +916,60 @@ fn circularized_edge_reads(tail: &HashSet<String>, head: &[String]) -> HashSet<S
         .collect()
 }
 
+/// Plan 2026-10-11 T0: one full-read SEQ per qname from BAM input.
+///
+/// Skip secondary/supplementary (and empty SEQ). The primary's soft-clipped SEQ
+/// is the full read under default minimap2; a later hard- or soft-clipped
+/// supplementary must not overwrite it.
+pub fn read_sequences_from_bam(path: &std::path::Path) -> HashMap<String, String> {
+    let mut read_dictionary: HashMap<String, String> = HashMap::new();
+    let mut hardclipped_primaries = 0u64;
+    let mut bam = bam::Reader::from_path(path).expect("Failed to open BAM/SAM");
+    for record in bam.records() {
+        let r = record.expect("Failed to read BAM record");
+        if r.is_secondary() || r.is_supplementary() {
+            continue;
+        }
+        if r.seq_len() == 0 {
+            continue;
+        }
+        // Guard the out-of-scope assumption: a hard-clipped primary's SEQ is not
+        // the full read. callnumts.rs tracks the same condition as hardclip_only.
+        if !r.is_unmapped() {
+            let cigar = r.cigar();
+            if cigar
+                .iter()
+                .any(|op| matches!(op, rust_htslib::bam::record::Cigar::HardClip(_)))
+            {
+                hardclipped_primaries += 1;
+            }
+        }
+        let contig = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
+        let contig_name = String::from_utf8_lossy(r.qname()).to_string();
+        match read_dictionary.get(&contig_name) {
+            Some(existing) if existing.len() >= contig.len() => {}
+            Some(_) => {
+                eprintln!(
+                    "[warn] build: multiple primary SEQ for {}; keeping longer",
+                    contig_name
+                );
+                read_dictionary.insert(contig_name, contig);
+            }
+            None => {
+                read_dictionary.insert(contig_name, contig);
+            }
+        }
+    }
+    if hardclipped_primaries > 0 {
+        eprintln!(
+            "[warn] build: {} primary record(s) contain hard clips (H); \
+             their SEQ may not be the full read",
+            hardclipped_primaries
+        );
+    }
+    read_dictionary
+}
+
 pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &PathBuf, maxlength: usize, min_edge_reads: usize) {
     // Read reference records into a vector
     let ref_reader = Reader::from_file(reference_path).unwrap();
@@ -944,16 +998,10 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
                 read_dictionary.insert(contig_name, contig);
             }
         }
-        Some("bam") => {
-            // Handle BAM files
+        Some("bam") | Some("sam") => {
+            // Handle BAM/SAM files (Plan 2026-10-11 T0)
             println!("Processing BAM file");
-            let mut bam = bam::Reader::from_path(read_path).unwrap();
-            for record in bam.records(){
-                let r = record.expect("Failed to read BAM record");
-                let contig = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
-                let contig_name = String::from_utf8_lossy(&r.qname()).to_string();
-                read_dictionary.insert(contig_name, contig);
-            }
+            read_dictionary = read_sequences_from_bam(read_path);
         },
         _ => {
             // Handle unknown file types
@@ -1061,6 +1109,74 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+    use std::path::Path;
+
+    /// Plan 2026-10-11 T0: write a tiny SAM the BAM reader can open.
+    fn write_sam(path: &Path, body_lines: &[&str]) {
+        let mut f = File::create(path).unwrap();
+        writeln!(f, "@HD\tVN:1.6\tSO:coordinate").unwrap();
+        writeln!(f, "@SQ\tSN:chrM\tLN:100").unwrap();
+        for line in body_lines {
+            writeln!(f, "{}", line).unwrap();
+        }
+    }
+
+    /// Plan 2026-10-11 T0: primary full SEQ wins over hard-/soft-clipped
+    /// supplementary overwrite; secondary `*` SEQ is ignored.
+    #[test]
+    fn read_sequences_from_bam_keeps_primary_full_seq() {
+        let dir = std::env::temp_dir().join("himito_build_t0_bam_seq");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sam = dir.join("reads.sam");
+
+        // Full primary SEQ for r_hard (soft-clipped), then hard-clipped supp
+        // at a higher coordinate (would win under last-write-wins).
+        // r_soft: soft-clipped supp with a one-base SEQ difference (raw vs
+        // denoised stand-in) — primary must still win.
+        // r_lone: primary only.
+        // r_sec: secondary with SEQ * must be ignored (and not wipe anything).
+        let primary_hard = "ACGTACGTAA"; // 10 bp full
+        let supp_hard = "ACGT"; // 4 bp hard-clipped fragment
+        let primary_soft = "GGGGCCCCAA"; // "denoised"
+        let supp_soft = "GGGGCCCCAT"; // "raw" — differs at last base
+        let lone = "TTTTAAAA";
+
+        write_sam(
+            &sam,
+            &[
+                // qname flag rname pos mapq cigar rnext pnext tlen seq qual
+                &format!(
+                    "r_hard\t0\tchrM\t1\t60\t6S4M\t*\t0\t0\t{}\t*",
+                    primary_hard
+                ),
+                &format!(
+                    "r_hard\t2048\tchrM\t50\t60\t8H4M\t*\t0\t0\t{}\t*",
+                    supp_hard
+                ),
+                &format!(
+                    "r_soft\t0\tchrM\t2\t60\t6S4M\t*\t0\t0\t{}\t*",
+                    primary_soft
+                ),
+                &format!(
+                    "r_soft\t2048\tchrM\t60\t60\t6S4M\t*\t0\t0\t{}\t*",
+                    supp_soft
+                ),
+                &format!("r_lone\t0\tchrM\t3\t60\t8M\t*\t0\t0\t{}\t*", lone),
+                "r_sec\t256\tchrM\t4\t0\t4M\t*\t0\t0\t*\t*",
+            ],
+        );
+
+        let got = read_sequences_from_bam(&sam);
+        assert_eq!(got.get("r_hard").map(String::as_str), Some(primary_hard));
+        assert_eq!(got.get("r_soft").map(String::as_str), Some(primary_soft));
+        assert_eq!(got.get("r_lone").map(String::as_str), Some(lone));
+        assert!(!got.contains_key("r_sec"));
+        assert_eq!(got.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Reconstructs the alt sequence a CIGAR implies, given the same ref_seq
     /// and alt_seq the CIGAR was computed from, so tests can prove a

@@ -820,6 +820,47 @@ fn genotype_window(
     }
 }
 
+/// Plan 2026-10-11 T2. Mirrors `group_sites` in the oracle: indices into
+/// `variants`, grouped into genotyping sites. Alleles group only within the same
+/// CLASS: SNPs with SNPs whose REF base overlaps, indels with overlapping
+/// indels. A SNP and an overlapping indel are deliberately scored apart: on ONT
+/// the indel is usually the deletion ERROR of the SNP base itself (e.g.
+/// `m.8170AT>A` over `m.8171T>A`), and scoring them jointly hands every read
+/// whose SNP base was deleted to the artifact, a false 0 for the SNP.
+/// SNP sites come first, then indel sites, each ordered by start.
+fn group_sites(variants: &[Variant]) -> Vec<Vec<usize>> {
+    let mut sites: Vec<Vec<usize>> = Vec::new();
+    for want_indel in [false, true] {
+        let mut idx: Vec<usize> = (0..variants.len())
+            .filter(|&i| {
+                let (_, r, a) = allele_span(&variants[i]);
+                (r.len() != a.len()) == want_indel
+            })
+            .collect();
+        idx.sort_by_key(|&i| allele_span(&variants[i]).0); // stable, like Python
+        let mut cur: Vec<usize> = Vec::new();
+        let mut cur_end = 0usize;
+        for i in idx {
+            let (start, r, _) = allele_span(&variants[i]);
+            let end = start + r.len();
+            if !cur.is_empty() && start < cur_end {
+                cur.push(i);
+                cur_end = cur_end.max(end);
+            } else {
+                if !cur.is_empty() {
+                    sites.push(std::mem::take(&mut cur));
+                }
+                cur.push(i);
+                cur_end = end;
+            }
+        }
+        if !cur.is_empty() {
+            sites.push(cur);
+        }
+    }
+    sites
+}
+
 
 
 fn write_matrix_to_csv<P: AsRef<Path>>(
@@ -2474,5 +2515,71 @@ mod tests {
         let refseq: Vec<u8> = b"ACGT".iter().cycle().take(40).copied().collect();
         assert_eq!(genotype_window(&refseq, (3, 4), 10), None);
         assert_eq!(genotype_window(&refseq, (36, 37), 10), None);
+    }
+
+    // Plan 2026-10-11 T2
+    fn sites_as_names(vs: &[Variant], sites: &[Vec<usize>]) -> Vec<Vec<String>> {
+        sites
+            .iter()
+            .map(|s| s.iter().map(|&i| generate_variant_name(&vs[i])).collect())
+            .collect()
+    }
+
+    // Plan 2026-10-11 T2
+    #[test]
+    fn group_sites_merges_snps_at_the_same_base() {
+        let vs = vec![snp(100, "A", 5), snp(100, "C", 4)];
+        let sites = group_sites(&vs);
+        assert_eq!(sites, vec![vec![0, 1]]);
+    }
+
+    // Plan 2026-10-11 T2
+    #[test]
+    fn group_sites_merges_overlapping_indels() {
+        // m.302A>AC and m.302A>ACC: both anchored on base 302.
+        let a = Variant {
+            pos: 302, ref_allele: "A".into(), alt_allele: "AC".into(),
+            variant_type: "INS".into(), allele_count: 3, filter: None,
+        };
+        let b = Variant { alt_allele: "ACC".into(), ..a.clone() };
+        let sites = group_sites(&[a, b]);
+        assert_eq!(sites, vec![vec![0, 1]]);
+    }
+
+    // Plan 2026-10-11 T2
+    #[test]
+    fn group_sites_never_groups_a_snp_with_an_overlapping_indel() {
+        // The real ONT case: m.8170AT>A is the deletion ERROR of the very T in
+        // m.8171T>A. They must be scored apart.
+        let del = Variant {
+            pos: 8170, ref_allele: "AT".into(), alt_allele: "A".into(),
+            variant_type: "DEL".into(), allele_count: 9, filter: None,
+        };
+        let sub = Variant {
+            pos: 8170, ref_allele: "T".into(), alt_allele: "A".into(),
+            variant_type: "SNP".into(), allele_count: 7, filter: None,
+        };
+        let vs = vec![del, sub];
+        assert_eq!(sites_as_names(&vs, &[vec![0], vec![1]]), vec![vec!["m.8170AT>A"], vec!["m.8171T>A"]]);
+        let sites = group_sites(&vs);
+        assert_eq!(sites.len(), 2, "SNP and indel must be separate sites: {sites:?}");
+        assert!(sites.contains(&vec![0]) && sites.contains(&vec![1]));
+    }
+
+    // Plan 2026-10-11 T2
+    #[test]
+    fn group_sites_keeps_adjacent_non_overlapping_variants_apart() {
+        let vs = vec![snp(100, "A", 5), snp(101, "A", 5)];
+        assert_eq!(group_sites(&vs), vec![vec![0], vec![1]]);
+        // Two indels whose REF spans merely touch are also separate.
+        let d1 = Variant {
+            pos: 10, ref_allele: "CA".into(), alt_allele: "C".into(),
+            variant_type: "DEL".into(), allele_count: 3, filter: None,
+        }; // span [9, 11)
+        let d2 = Variant {
+            pos: 12, ref_allele: "GT".into(), alt_allele: "G".into(),
+            variant_type: "DEL".into(), allele_count: 3, filter: None,
+        }; // span [11, 13)
+        assert_eq!(group_sites(&[d1, d2]), vec![vec![0], vec![1]]);
     }
 }

@@ -783,6 +783,43 @@ pub fn construct_matrix(
     (matrix, var_vec, read_vec)
 }
 
+// ---- BAM genotyping (Plan 2026-10-11) ----
+
+/// Plan 2026-10-11 T1. `(start0, ref, alt)` where `start0` is the 0-based index
+/// of REF's first base on the reference. SNP: `v.pos`. INS/DEL: `v.pos - 1`,
+/// because REF carries the anchor base. Mirrors `parse_name` in the oracle
+/// (`m.{start0 + 1}...`, see `generate_variant_name`).
+fn allele_span(v: &Variant) -> (usize, &str, &str) {
+    let start0 = if v.variant_type == "SNP" { v.pos } else { v.pos - 1 };
+    (start0, v.ref_allele.as_str(), v.alt_allele.as_str())
+}
+
+/// Plan 2026-10-11 T1. Mirrors `site_window` in the oracle. Expands the site
+/// span `[lo, hi)` by `flank`, pushes each boundary out of any homopolymer it
+/// lands in, then pads by 2. `None` if the window leaves `[0, refseq.len())`
+/// (it crosses the circular origin; left NaN in phase 1).
+fn genotype_window(
+    refseq: &[u8],
+    sites_span: (usize, usize),
+    flank: usize,
+) -> Option<(usize, usize)> {
+    let len = refseq.len() as isize;
+    let mut left = sites_span.0 as isize - flank as isize;
+    let mut right = sites_span.1 as isize + flank as isize;
+    while 0 < left && left < len && refseq[left as usize] == refseq[left as usize - 1] {
+        left -= 1;
+    }
+    while 0 < right && right < len && refseq[right as usize] == refseq[right as usize - 1] {
+        right += 1;
+    }
+    let (left, right) = (left - 2, right + 2);
+    if left < 0 || right > len {
+        None
+    } else {
+        Some((left as usize, right as usize))
+    }
+}
+
 
 
 fn write_matrix_to_csv<P: AsRef<Path>>(
@@ -2376,5 +2413,66 @@ mod tests {
             resolve_strand_bias_action("ont-denoised", Some(StrandBiasAction::Flag)),
             StrandBiasAction::Flag
         );
+    }
+
+    // ===================================================================
+    // BAM genotyping (Plan 2026-10-11)
+    // ===================================================================
+
+    // Plan 2026-10-11 T1
+    #[test]
+    fn allele_span_snp_uses_pos_as_start() {
+        let v = snp(100, "A", 5);
+        assert_eq!(allele_span(&v), (100, "T", "A"));
+        // Invariant the Python oracle relies on: `m.<start0 + 1>`.
+        assert!(generate_variant_name(&v).starts_with(&format!("m.{}", 100 + 1)));
+    }
+
+    // Plan 2026-10-11 T1
+    #[test]
+    fn allele_span_del_starts_at_anchor() {
+        let v = del_at(HOMOPOLYMER_REF, 5, 1, 3);
+        let (start0, r, a) = allele_span(&v);
+        assert_eq!((start0, r, a), (4, "AA", "A"));
+        assert!(generate_variant_name(&v).starts_with(&format!("m.{}", start0 + 1)));
+    }
+
+    // Plan 2026-10-11 T1
+    #[test]
+    fn allele_span_ins_starts_at_anchor() {
+        let v = ins_at(HOMOPOLYMER_REF, 6, "A", 3);
+        let (start0, r, a) = allele_span(&v);
+        assert_eq!((start0, r, a), (5, "A", "AA"));
+        assert!(generate_variant_name(&v).starts_with(&format!("m.{}", start0 + 1)));
+    }
+
+    // Plan 2026-10-11 T1
+    #[test]
+    fn genotype_window_in_unique_sequence_is_flank_plus_two() {
+        // 40 distinct-neighbour bases: no homopolymer anywhere.
+        let refseq: Vec<u8> = b"ACGT".iter().cycle().take(40).copied().collect();
+        // SNP at 20: span (20, 21), flank 3 -> [17, 24) then +-2 -> (15, 26).
+        assert_eq!(genotype_window(&refseq, (20, 21), 3), Some((15, 26)));
+    }
+
+    // Plan 2026-10-11 T1
+    #[test]
+    fn genotype_window_pushes_out_of_homopolymer_then_pads() {
+        // DEL span (4, 6), flank 1: left starts at 3 inside the A-run (2..6),
+        // is pushed to 2, then 2 more are subtracted -> 0. right = 7 sits on C.
+        let v = del_at(HOMOPOLYMER_REF, 5, 1, 3);
+        let (start0, r, _) = allele_span(&v);
+        assert_eq!(
+            genotype_window(HOMOPOLYMER_REF, (start0, start0 + r.len()), 1),
+            Some((0, 9))
+        );
+    }
+
+    // Plan 2026-10-11 T1
+    #[test]
+    fn genotype_window_outside_reference_is_none() {
+        let refseq: Vec<u8> = b"ACGT".iter().cycle().take(40).copied().collect();
+        assert_eq!(genotype_window(&refseq, (3, 4), 10), None);
+        assert_eq!(genotype_window(&refseq, (36, 37), 10), None);
     }
 }

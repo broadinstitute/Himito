@@ -1669,6 +1669,10 @@ pub fn start(
     strand_bias_action: Option<StrandBiasAction>,
     strand_bias_drop_max_hf: f64,
     left_align: bool,
+    // Plan 2026-10-11 T5: when Some, `<out>.matrix.csv` is rebuilt by re-genotyping
+    // the final variants in this BAM (the graph matrix moves to `.graph_matrix.csv`).
+    genotype_bam: Option<&PathBuf>,
+    genotype_opts: GenotypeOpts,
 ) {
     if data_type != "pacbio" && data_type != "ont-r9" && data_type != "ont-r10" && data_type != "ont-denoised" {
         eprintln!("Error: data type must be pacbio or ont-r9 or ont-r10 or ont-denoised");
@@ -1755,8 +1759,67 @@ pub fn start(
         left_align,
     );
     // write matrix
+    // Plan 2026-10-11 T5: VCF, raw_matrix, strand-bias and permutation inputs above
+    // are untouched; only the final lineage matrix may come from the BAM.
+    let genotype_src = genotype_bam.map(|bam| GenotypeSource {
+        bam: bam.as_path(),
+        refseq: ref_seq.as_bytes(),
+        ref_name: &ref_header,
+        opts: genotype_opts,
+    });
+    if let Err(e) = write_final_matrix(
+        output_file,
+        &filtered_matrix,
+        &permu_filtered_var,
+        &read_set,
+        genotype_src.as_ref(),
+    ) {
+        eprintln!("Error writing matrix: {e}");
+    }
+}
+
+/// Plan 2026-10-11 T5. Where to re-genotype the final variants from.
+pub struct GenotypeSource<'a> {
+    pub bam: &'a Path,
+    pub refseq: &'a [u8],
+    pub ref_name: &'a str,
+    pub opts: GenotypeOpts,
+}
+
+/// Plan 2026-10-11 T5. Writes `<output>.matrix.csv`. Without a genotyping source
+/// that is the graph matrix, exactly as before. With one, the matrix comes from
+/// `genotype_from_bam(variants)` through the unchanged `construct_matrix`, and
+/// the graph matrix is kept in `<output>.graph_matrix.csv`.
+fn write_final_matrix(
+    output_file: &Path,
+    graph_matrix: &Array2<f64>,
+    variants: &[Variant],
+    graph_reads: &[String],
+    genotype: Option<&GenotypeSource>,
+) -> Result<(), Box<dyn Error>> {
     let matrix_output = output_file.with_extension("matrix.csv");
-    let _ = write_matrix_to_csv(&filtered_matrix, &permu_filtered_var, &read_set, matrix_output);
+    match genotype {
+        None => write_matrix_to_csv(graph_matrix, variants, graph_reads, matrix_output),
+        Some(src) => {
+            write_matrix_to_csv(
+                graph_matrix,
+                variants,
+                graph_reads,
+                output_file.with_extension("graph_matrix.csv"),
+            )?;
+            let (read_record, cover_record) =
+                genotype_from_bam(src.bam, src.refseq, src.ref_name, variants, &src.opts);
+            let (matrix, var_record, read_set) =
+                construct_matrix(&read_record, &cover_record, variants);
+            println!(
+                "Genotyped {} variants x {} reads from {}",
+                var_record.len(),
+                read_set.len(),
+                src.bam.display()
+            );
+            write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3036,5 +3099,53 @@ mod tests {
         let (rr, cr) = run_geno("reads.sam", &[v]);
         assert!(alt_reads(&rr, &name).is_empty());
         assert_eq!(cr[&name], ["chrM".to_string()].into_iter().collect());
+    }
+
+    // Plan 2026-10-11 T5
+    fn tmp_out(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("himito_geno_{}_{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.join("out.vcf")
+    }
+
+    /// A stand-in for the graph matrix `start` has in hand after the permutation test.
+    fn graph_matrix_fixture(v: &Variant) -> (Array2<f64>, Vec<Variant>, Vec<String>) {
+        let m = Array2::from_shape_vec((1, 2), vec![1.0, f64::NAN]).unwrap();
+        (m, vec![v.clone()], vec!["g1".to_string(), "g2".to_string()])
+    }
+
+    // Plan 2026-10-11 T5
+    #[test]
+    fn write_final_matrix_without_genotype_bam_is_unchanged() {
+        let out = tmp_out("none");
+        let v = geno_snp();
+        let (m, vars, reads) = graph_matrix_fixture(&v);
+        write_final_matrix(&out, &m, &vars, &reads, None).unwrap();
+
+        let text = std::fs::read_to_string(out.with_extension("matrix.csv")).unwrap();
+        assert_eq!(text, "variant,g1,g2\nm.31A>T,1,\n");
+        assert!(!out.with_extension("graph_matrix.csv").exists());
+    }
+
+    // Plan 2026-10-11 T5
+    #[test]
+    fn write_final_matrix_with_genotype_bam_swaps_matrix_and_keeps_graph_copy() {
+        let out = tmp_out("swap");
+        let v = geno_snp();
+        let (m, vars, reads) = graph_matrix_fixture(&v);
+        let bam = geno_path("reads.sam");
+        let src = GenotypeSource {
+            bam: &bam, refseq: GENO_REF.as_bytes(), ref_name: "chrM", opts: GenotypeOpts::default(),
+        };
+        write_final_matrix(&out, &m, &vars, &reads, Some(&src)).unwrap();
+
+        // matrix.csv is BAM-genotyped: reads sorted by name, ref pseudo-read all 0,
+        // r_del / r_short missing (they are not in the matrix at all: never covered).
+        let text = std::fs::read_to_string(out.with_extension("matrix.csv")).unwrap();
+        assert_eq!(text, "variant,chrM,r_alt,r_ref,r_split\nm.31A>T,0,1,0,1\n");
+        // The graph matrix is preserved next to it, untouched.
+        let g = std::fs::read_to_string(out.with_extension("graph_matrix.csv")).unwrap();
+        assert_eq!(g, "variant,g1,g2\nm.31A>T,1,\n");
     }
 }

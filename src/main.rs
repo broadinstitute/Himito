@@ -217,6 +217,15 @@ enum Commands {
         #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat")]
         no_left_align: bool,
 
+        /// Plan 2026-10-11 T5: build the variant x read matrix (`<prefix>.matrix.csv`) by
+        /// re-genotyping every called variant in the reads of the NUMT-filtered,
+        /// pre-denoise BAM (`<prefix>.mt.bam`) with local realignment, instead of
+        /// reading it off the graph. Variant discovery, the VCF and all filtering
+        /// still use the graph; the graph matrix is kept as `<prefix>.graph_matrix.csv`.
+        /// Windows within ~12 bp of the circular origin cannot be scored and stay missing.
+        #[clap(long = "genotype-from-bam", action)]
+        genotype_from_bam: bool,
+
     },
 
     /// Filter reads derived from Numts
@@ -445,6 +454,26 @@ enum Commands {
         /// disable indel left-alignment (reproduces pre-2026-09 variant names)
         #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat")]
         no_left_align: bool,
+
+        /// Plan 2026-10-11 T5: re-genotype every called variant in this BAM and use that as
+        /// `<output>.matrix.csv` (the lineage input); the graph matrix moves to
+        /// `<output>.graph_matrix.csv`. The VCF and all filtering still use the graph. The
+        /// BAM should be the PRE-denoise alignment of the same reads (denoising turns
+        /// uncertain ALT bases into REF). Windows within ~12 bp of the circular origin
+        /// (position 0 / reference length) cannot be scored and stay missing.
+        #[clap(long, value_parser)]
+        genotype_bam: Option<PathBuf>,
+
+        /// Plan 2026-10-11 T5: with --genotype-bam, leave a read missing at a site when its
+        /// best local edit distance exceeds this (default: no gate). Trades recall for fewer
+        /// false calls from very noisy reads.
+        #[clap(long, value_parser)]
+        genotype_max_ed: Option<u32>,
+
+        /// Plan 2026-10-11 T5: with --genotype-bam, reference bases on each side of a site
+        /// scored against the read (before homopolymer push-out and +-2 padding).
+        #[clap(long, value_parser, default_value_t = 10)]
+        genotype_flank: usize,
     },
 
     /// Extract Major Haplotype as Fasta file from Graph
@@ -742,6 +771,7 @@ fn main() {
             strand_bias_drop_max_hf,
             no_left_align,
             left_align_compat: _,
+            genotype_from_bam,
         } => {
             // Plan 2026-09-26 T4
             let left_align = !no_left_align;
@@ -832,6 +862,9 @@ fn main() {
                 strand_bias_action,
                 strand_bias_drop_max_hf,
                 left_align,
+                // Plan 2026-10-11 T5: pre-denoise BAM (mt_output), NOT build_bam.
+                if genotype_from_bam { Some(&mt_output) } else { None },
+                call::GenotypeOpts::default(),
             );
             let annotated_graph_output = output_prefix.with_extension("gfa");
             let methyl_output = output_prefix.with_extension("bed");
@@ -940,6 +973,9 @@ fn main() {
             strand_bias_drop_max_hf,
             no_left_align,
             left_align_compat: _,
+            genotype_bam,
+            genotype_max_ed,
+            genotype_flank,
         } => {
             // Plan 2026-09-26 T4
             let left_align = !no_left_align;
@@ -964,6 +1000,13 @@ fn main() {
                 strand_bias_action,
                 strand_bias_drop_max_hf,
                 left_align,
+                // Plan 2026-10-11 T5
+                genotype_bam.as_ref(),
+                call::GenotypeOpts {
+                    flank: genotype_flank,
+                    max_ed: genotype_max_ed.unwrap_or(u32::MAX),
+                    ..call::GenotypeOpts::default()
+                },
             );
         }
 

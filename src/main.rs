@@ -291,9 +291,12 @@ enum Commands {
         /// minimal reads on a graph edge before it is aligned into a CIGAR.
         /// Variants are read only from CIGAR-bearing edges, and reads reaching a
         /// bubble solely through an un-CIGARed edge are not counted as covering it
-        /// (their genotype stays missing rather than ref). The default of 1 aligns
-        /// every read-supported edge; raise it to trade recall of low-frequency
-        /// variants for fewer false positives on noisy long reads.
+        /// (their genotype stays missing rather than ref). The default of 2 skips
+        /// edges carried by a single read: on noisy long reads those are mostly private
+        /// errors (about 93% of edges on a typical ONT run) and aligning them is the
+        /// bulk of the cost; QuickStart uses 2 as well. Set 1 to align every
+        /// read-supported edge (more recall of low-frequency variants, more false
+        /// positives and a slower build); raise it to be stricter than the default.
         #[clap(long, value_parser, default_value_t = 2)]
         min_edge_reads: usize,
 

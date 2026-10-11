@@ -19,7 +19,8 @@ use regex::Regex;
 use adjustp::{adjust, Procedure};
 use bio::io::fasta::{Reader, Record};
 use crate::denoise_indel::{normalize_left, Allele};
-use rust_htslib::bam::{Read as HtsRead, Reader as BamReader};
+use rust_htslib::bam::{Read as HtsRead, Reader as BamReader, Record as BamRecord};
+use rust_htslib::bam::ext::BamRecordExtensions;
 
 #[derive(Debug, Clone)]
 pub struct Variant {
@@ -911,6 +912,225 @@ fn score_segment(haps: &[(String, Vec<u8>)], seg: &[u8], margin: u32, max_ed: u3
             .map(|(i, _)| i)
             .collect(),
     )
+}
+
+/// Plan 2026-10-11 T4. Knobs of BAM genotyping (oracle: `--flank/--slack/--margin/--max-ed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenotypeOpts {
+    /// Bases added on each side of a site before the homopolymer push-out.
+    pub flank: usize,
+    /// Extra read bases kept on each side of the aligned window.
+    pub slack: usize,
+    /// A haplotype is "best" when within `margin` edits of the minimum.
+    pub margin: u32,
+    /// Noise gate: a segment whose best distance exceeds this is unusable.
+    pub max_ed: u32,
+}
+
+impl Default for GenotypeOpts {
+    fn default() -> Self {
+        GenotypeOpts { flank: 10, slack: 4, margin: 1, max_ed: u32::MAX }
+    }
+}
+
+/// One genotyping site: a window on the reference and the haplotypes scored
+/// inside it. `haps[0]` is REF; `haps[1 + j]` is the allele of `members[j]`.
+struct GenoSite {
+    left: usize,
+    right: usize,
+    members: Vec<usize>,
+    haps: Vec<(String, Vec<u8>)>,
+}
+
+/// Plan 2026-10-11 T4. Per (site, read) evidence merged over all of the read's
+/// alignments (primary + supplementary pieces).
+#[derive(Default)]
+struct SiteAcc {
+    any_usable: bool,
+    /// Hap indices that were the unique best of some alignment.
+    winners: BTreeSet<usize>,
+    /// Union of the best sets of all usable alignments.
+    any_best: BTreeSet<usize>,
+}
+
+fn build_geno_sites(refseq: &[u8], variants: &[Variant], opts: &GenotypeOpts) -> Vec<GenoSite> {
+    let mut sites = Vec::new();
+    for members in group_sites(variants) {
+        let spans: Vec<(usize, &str, &str)> =
+            members.iter().map(|&i| allele_span(&variants[i])).collect();
+        let lo = spans.iter().map(|s| s.0).min().unwrap();
+        let hi = spans.iter().map(|s| s.0 + s.1.len()).max().unwrap();
+        let (left, right) = match genotype_window(refseq, (lo, hi), opts.flank) {
+            Some(w) => w,
+            None => continue, // crosses the circular origin: left NaN (plan decision 5)
+        };
+        let mut haps: Vec<(String, Vec<u8>)> = vec![("REF".to_string(), refseq[left..right].to_vec())];
+        for (&i, &(s, r, a)) in members.iter().zip(&spans) {
+            let mut h = refseq[left..s].to_vec();
+            h.extend_from_slice(a.as_bytes());
+            h.extend_from_slice(&refseq[s + r.len()..right]);
+            haps.push((generate_variant_name(&variants[i]), h));
+        }
+        sites.push(GenoSite { left, right, members, haps });
+    }
+    sites.sort_by_key(|s| s.left);
+    sites
+}
+
+/// Score one alignment against every site whose window it fully spans.
+fn score_record_at_sites(
+    rec: &BamRecord,
+    sites: &[GenoSite],
+    lefts: &[usize],
+    opts: &GenotypeOpts,
+) -> Vec<(usize, SegCall)> {
+    let mut out = Vec::new();
+    let rs = rec.pos().max(0) as usize;
+    let re = rec.reference_end().max(0) as usize;
+    let k0 = lefts.partition_point(|&l| l < rs);
+    if k0 >= sites.len() || sites[k0].left >= re {
+        return out;
+    }
+    let pairs: Vec<[i64; 2]> = rec.aligned_pairs().collect(); // matches only: [qpos, rpos]
+    if pairs.is_empty() {
+        return out;
+    }
+    let seq = rec.seq().as_bytes().to_ascii_uppercase();
+    for k in k0..sites.len() {
+        let site = &sites[k];
+        if site.left >= re {
+            break;
+        }
+        if site.right > re {
+            continue;
+        }
+        let a = pairs.partition_point(|p| (p[1] as usize) < site.left);
+        let b = pairs.partition_point(|p| (p[1] as usize) < site.right);
+        if b <= a {
+            continue;
+        }
+        let q_lo = pairs[a..b].iter().map(|p| p[0]).min().unwrap() as usize;
+        let q_hi = pairs[a..b].iter().map(|p| p[0]).max().unwrap() as usize;
+        let qa = q_lo.saturating_sub(opts.slack);
+        let qb = (q_hi + 1 + opts.slack).min(seq.len());
+        out.push((k, score_segment(&site.haps, &seq[qa..qb], opts.margin, opts.max_ed)));
+    }
+    out
+}
+
+/// Plan 2026-10-11 T4. Re-genotype `variants` in every read of `bam` by local
+/// realignment against the REF and allele haplotypes of each site (see
+/// `bam_genotype_matrix.py`, the oracle). Returns `(read_record, cover_record)`
+/// keyed by `generate_variant_name`: the shapes `construct_matrix` consumes.
+/// cover = reads with a decisive call (1 or 0) plus `ref_name`, the reference
+/// pseudo-read (an all-0 column); alt (`read_record`) = reads called 1.
+///
+/// Skips unmapped, secondary and empty-SEQ records, and records on a contig
+/// other than the first (oracle: `references[0]`). Supplementary records are
+/// kept: they are mostly pieces of reads that cross the origin.
+pub fn genotype_from_bam(
+    bam: &Path,
+    refseq: &[u8],
+    ref_name: &str,
+    variants: &[Variant],
+    opts: &GenotypeOpts,
+) -> (HashMap<String, Vec<serde_json::Value>>, HashMap<String, HashSet<String>>) {
+    const BATCH: usize = 4096;
+    let sites = build_geno_sites(refseq, variants, opts);
+    let lefts: Vec<usize> = sites.iter().map(|s| s.left).collect();
+
+    let mut qname_ids: HashMap<String, u32> = HashMap::new();
+    let mut qnames: Vec<String> = Vec::new();
+    let mut acc: HashMap<(u32, u32), SiteAcc> = HashMap::new();
+
+    let mut reader = BamReader::from_path(bam).unwrap_or_else(|e| {
+        eprintln!("Error: cannot open genotyping BAM {}: {}", bam.display(), e);
+        std::process::exit(1);
+    });
+
+    let mut flush = |batch: &mut Vec<BamRecord>| {
+        let scored: Vec<(String, Vec<(usize, SegCall)>)> = batch
+            .par_iter()
+            .map(|rec| {
+                (
+                    String::from_utf8_lossy(rec.qname()).to_string(),
+                    score_record_at_sites(rec, &sites, &lefts, opts),
+                )
+            })
+            .collect();
+        batch.clear();
+        for (qname, calls) in scored {
+            if calls.is_empty() {
+                continue;
+            }
+            let qid = *qname_ids.entry(qname.clone()).or_insert_with(|| {
+                qnames.push(qname.clone());
+                (qnames.len() - 1) as u32
+            });
+            for (k, call) in calls {
+                if let SegCall::Best(set) = call {
+                    let e = acc.entry((k as u32, qid)).or_default();
+                    e.any_usable = true;
+                    if set.len() == 1 {
+                        e.winners.extend(set.iter().copied());
+                    }
+                    e.any_best.extend(set);
+                }
+            }
+        }
+    };
+
+    let mut batch: Vec<BamRecord> = Vec::with_capacity(BATCH);
+    for rec in reader.records() {
+        let rec = rec.expect("failed to read genotyping BAM record");
+        if rec.is_unmapped() || rec.is_secondary() || rec.seq_len() == 0 || rec.tid() != 0 {
+            continue;
+        }
+        batch.push(rec);
+        if batch.len() >= BATCH {
+            flush(&mut batch);
+        }
+    }
+    flush(&mut batch);
+
+    // Merge per (site, qname): decisive calls that disagree -> NaN; with none
+    // decisive, a 0 only for alleles outside every best set.
+    let mut read_record: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut cover_record: HashMap<String, HashSet<String>> = HashMap::new();
+    for v in variants {
+        let name = generate_variant_name(v);
+        read_record.entry(name.clone()).or_default();
+        cover_record.entry(name).or_default().insert(ref_name.to_string());
+    }
+    let mut keys: Vec<(u32, u32)> = acc.keys().copied().collect();
+    keys.sort_unstable(); // deterministic output order
+    for key in keys {
+        let a = &acc[&key];
+        if !a.any_usable {
+            continue;
+        }
+        let site = &sites[key.0 as usize];
+        let qname = &qnames[key.1 as usize];
+        let call_for = |j: usize| -> Option<bool> {
+            if a.winners.is_empty() {
+                if a.any_best.contains(&(j + 1)) { None } else { Some(false) }
+            } else if a.winners.len() > 1 {
+                None
+            } else {
+                Some(a.winners.contains(&(j + 1)))
+            }
+        };
+        for (j, &vi) in site.members.iter().enumerate() {
+            if let Some(is_alt) = call_for(j) {
+                let name = generate_variant_name(&variants[vi]);
+                cover_record.get_mut(&name).unwrap().insert(qname.clone());
+                if is_alt {
+                    read_record.get_mut(&name).unwrap().push(serde_json::json!(qname));
+                }
+            }
+        }
+    }
+    (read_record, cover_record)
 }
 
 
@@ -2717,5 +2937,104 @@ mod tests {
             score_segment(&haps, &seg, 2, u32::MAX),
             SegCall::Best([0usize, 1].into_iter().collect())
         );
+    }
+
+    // Plan 2026-10-11 T4
+    const GENO_REF: &str = "GCTAGACATACATACATACACGTCAGCACGACTGTGCAGTGTGATCGCTAGTAGTAGTGT";
+
+    fn geno_snp() -> Variant {
+        // GENO_REF[30] == 'A'; m.31A>T
+        Variant {
+            pos: 30, ref_allele: "A".into(), alt_allele: "T".into(),
+            variant_type: "SNP".into(), allele_count: 5, filter: None,
+        }
+    }
+
+    fn geno_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/genotype").join(name)
+    }
+
+    fn run_geno(
+        sam: &str,
+        variants: &[Variant],
+    ) -> (HashMap<String, Vec<serde_json::Value>>, HashMap<String, HashSet<String>>) {
+        genotype_from_bam(
+            &geno_path(sam), GENO_REF.as_bytes(), "chrM", variants, &GenotypeOpts::default(),
+        )
+    }
+
+    fn alt_reads(rr: &HashMap<String, Vec<serde_json::Value>>, name: &str) -> HashSet<String> {
+        rr.get(name).map(|v| v.iter().map(|x| x.as_str().unwrap().to_string()).collect()).unwrap_or_default()
+    }
+
+    // Plan 2026-10-11 T4
+    #[test]
+    fn genotype_from_bam_calls_ref_alt_and_leaves_ambiguous_reads_missing() {
+        let v = geno_snp();
+        let name = generate_variant_name(&v);
+        assert_eq!(name, "m.31A>T");
+        let (rr, cr) = run_geno("reads.sam", &[v]);
+        let alt = alt_reads(&rr, &name);
+        let cover = &cr[&name];
+
+        assert!(cover.contains("r_ref") && !alt.contains("r_ref"), "r_ref is a decisive 0");
+        assert!(cover.contains("r_alt") && alt.contains("r_alt"), "r_alt is a decisive 1");
+        assert!(!cover.contains("r_del"), "SNP base deleted: REF/ALT tie -> NaN, not 0");
+        assert!(!cover.contains("r_short"), "read ends inside the window -> not covered");
+        // Primary + supplementary agree (both ALT): one call.
+        assert!(cover.contains("r_split") && alt.contains("r_split"));
+        // Reference pseudo-read: covered, never alt (an all-0 column).
+        assert!(cover.contains("chrM") && !alt.contains("chrM"));
+    }
+
+    // Plan 2026-10-11 T4
+    #[test]
+    fn genotype_from_bam_disagreeing_alignments_of_one_read_are_missing() {
+        let v = geno_snp();
+        let name = generate_variant_name(&v);
+        let (rr, cr) = run_geno("split_disagree.sam", &[v]);
+        assert!(!cr[&name].contains("r_split"));
+        assert!(!alt_reads(&rr, &name).contains("r_split"));
+        assert!(cr[&name].contains("chrM"));
+    }
+
+    // Plan 2026-10-11 T4
+    #[test]
+    fn genotype_from_bam_scores_an_indel_site_and_feeds_construct_matrix() {
+        let refb = GENO_REF.as_bytes();
+        let snp_v = geno_snp();
+        let del = del_at(refb, 30, 1, 4); // m.30CA>C ; r_del carries it
+        let dname = generate_variant_name(&del);
+        let sname = generate_variant_name(&snp_v);
+        let variants = vec![snp_v, del];
+        let (rr, cr) = run_geno("reads.sam", &variants);
+
+        assert!(alt_reads(&rr, &dname).contains("r_del"));
+        assert!(cr[&dname].contains("r_ref") && !alt_reads(&rr, &dname).contains("r_ref"));
+
+        // Same shapes construct_matrix already consumes.
+        let (m, vars, reads) = construct_matrix(&rr, &cr, &variants);
+        let col = |n: &str| reads.iter().position(|r| r == n).unwrap();
+        let row = |n: &str| vars.iter().position(|v| generate_variant_name(v) == n).unwrap();
+        assert_eq!(m[[row(&sname), col("r_alt")]], 1.0);
+        assert_eq!(m[[row(&sname), col("r_ref")]], 0.0);
+        assert!(m[[row(&sname), col("r_del")]].is_nan());
+        assert_eq!(m[[row(&dname), col("r_del")]], 1.0);
+        assert_eq!(m[[row(&sname), col("chrM")]], 0.0);
+        assert_eq!(m[[row(&dname), col("chrM")]], 0.0);
+    }
+
+    // Plan 2026-10-11 T4
+    #[test]
+    fn genotype_from_bam_variant_without_a_window_is_only_the_ref_column() {
+        // Window would cross the origin: no read can call it.
+        let v = Variant {
+            pos: 3, ref_allele: "A".into(), alt_allele: "T".into(),
+            variant_type: "SNP".into(), allele_count: 5, filter: None,
+        };
+        let name = generate_variant_name(&v);
+        let (rr, cr) = run_geno("reads.sam", &[v]);
+        assert!(alt_reads(&rr, &name).is_empty());
+        assert_eq!(cr[&name], ["chrM".to_string()].into_iter().collect());
     }
 }

@@ -4,7 +4,7 @@ use rayon::iter::WhileSome;
 use crate::build;
 use indicatif::ProgressBar;
 use rayon::prelude::*;
-use std::collections::{HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -859,6 +859,58 @@ fn group_sites(variants: &[Variant]) -> Vec<Vec<usize>> {
         }
     }
     sites
+}
+
+/// Plan 2026-10-11 T3. Outcome of scoring one read segment at one site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SegCall {
+    /// Best distance exceeds `max_ed`: the read is too noisy here to say.
+    TooNoisy,
+    /// Indices into the site's haplotype list within `margin` of the minimum.
+    Best(BTreeSet<usize>),
+}
+
+fn unit_edit_cost(a: u8, b: u8) -> i32 {
+    if a == b { 0 } else { -1 }
+}
+
+type EditAligner = bio::alignment::pairwise::Aligner<fn(u8, u8) -> i32>;
+
+thread_local! {
+    // One aligner per rayon worker thread (its DP buffers are reused).
+    static EDIT_ALIGNER: std::cell::RefCell<EditAligner> = std::cell::RefCell::new(
+        bio::alignment::pairwise::Aligner::with_capacity(
+            64, 64, 0, -1, unit_edit_cost as fn(u8, u8) -> i32,
+        )
+    );
+}
+
+/// Plan 2026-10-11 T3. Infix edit distance of each haplotype against `seg`: the
+/// haplotype is aligned end to end, the segment's leading/trailing bases are
+/// free (`semiglobal(hap, seg)`; unit costs, gap open 0 / extend -1, so the
+/// distance is `-score`). Mirrors the edlib `HW` call in the oracle.
+fn score_segment(haps: &[(String, Vec<u8>)], seg: &[u8], margin: u32, max_ed: u32) -> SegCall {
+    if haps.is_empty() {
+        return SegCall::TooNoisy;
+    }
+    let dists: Vec<u32> = EDIT_ALIGNER.with(|al| {
+        let mut al = al.borrow_mut();
+        haps.iter()
+            .map(|(_, h)| (-al.semiglobal(h, seg).score).max(0) as u32)
+            .collect()
+    });
+    let best = *dists.iter().min().unwrap();
+    if best > max_ed {
+        return SegCall::TooNoisy;
+    }
+    SegCall::Best(
+        dists
+            .iter()
+            .enumerate()
+            .filter(|(_, &d)| d - best < margin)
+            .map(|(i, _)| i)
+            .collect(),
+    )
 }
 
 
@@ -2581,5 +2633,89 @@ mod tests {
             variant_type: "DEL".into(), allele_count: 3, filter: None,
         }; // span [11, 13)
         assert_eq!(group_sites(&[d1, d2]), vec![vec![0], vec![1]]);
+    }
+
+    // Plan 2026-10-11 T3
+    const SCORE_REF: &[u8] = b"GATCCTAGGCATTGCAAGTCCGATAC";
+
+    /// (REF, ALT) haplotypes: ALT carries a SNP at index 12 (T -> A).
+    fn score_haps() -> Vec<(String, Vec<u8>)> {
+        let mut alt = SCORE_REF.to_vec();
+        assert_eq!(alt[12], b'T');
+        alt[12] = b'A';
+        vec![
+            ("REF".to_string(), SCORE_REF.to_vec()),
+            ("m.13T>A".to_string(), alt),
+        ]
+    }
+
+    fn with_junk(core: &[u8]) -> Vec<u8> {
+        let mut v = b"GGAC".to_vec();
+        v.extend_from_slice(core);
+        v.extend_from_slice(b"CATT");
+        v
+    }
+
+    // Plan 2026-10-11 T3
+    #[test]
+    fn score_segment_exact_ref_with_junk_ends_is_ref_only() {
+        let haps = score_haps();
+        let seg = with_junk(SCORE_REF);
+        assert_eq!(
+            score_segment(&haps, &seg, 1, u32::MAX),
+            SegCall::Best([0usize].into_iter().collect())
+        );
+    }
+
+    // Plan 2026-10-11 T3
+    #[test]
+    fn score_segment_alt_segment_is_alt_only() {
+        let haps = score_haps();
+        let seg = with_junk(&haps[1].1);
+        assert_eq!(
+            score_segment(&haps, &seg, 1, u32::MAX),
+            SegCall::Best([1usize].into_iter().collect())
+        );
+    }
+
+    // Plan 2026-10-11 T3
+    #[test]
+    fn score_segment_deleted_snp_base_ties_ref_and_alt() {
+        let haps = score_haps();
+        let mut core = SCORE_REF.to_vec();
+        core.remove(12); // the SNP base is deleted from the read
+        let seg = with_junk(&core);
+        // A tie must come back as both indices: NaN downstream, not 0.
+        assert_eq!(
+            score_segment(&haps, &seg, 1, u32::MAX),
+            SegCall::Best([0usize, 1].into_iter().collect())
+        );
+    }
+
+    // Plan 2026-10-11 T3
+    #[test]
+    fn score_segment_gates_on_max_ed() {
+        let haps = score_haps();
+        // 6 substitutions away from REF (and 6 or 7 from ALT).
+        let mut core = SCORE_REF.to_vec();
+        for i in [0usize, 3, 6, 9, 15, 18] {
+            core[i] = if core[i] == b'A' { b'C' } else { b'A' };
+        }
+        let seg = with_junk(&core);
+        assert_eq!(score_segment(&haps, &seg, 1, 4), SegCall::TooNoisy);
+        // The same read is decisive-or-tied, not noisy, when the gate is off.
+        assert!(matches!(score_segment(&haps, &seg, 1, u32::MAX), SegCall::Best(_)));
+    }
+
+    // Plan 2026-10-11 T3
+    #[test]
+    fn score_segment_margin_widens_the_best_set() {
+        let haps = score_haps();
+        let seg = with_junk(SCORE_REF);
+        // ALT is 1 edit worse than REF; margin 2 keeps it in the best set.
+        assert_eq!(
+            score_segment(&haps, &seg, 2, u32::MAX),
+            SegCall::Best([0usize, 1].into_iter().collect())
+        );
     }
 }

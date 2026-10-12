@@ -2002,6 +2002,15 @@ pub fn resolve_thresholds(
     )
 }
 
+/// Resolve `--indel-false-threshold`: an explicit value always wins; otherwise ONT data
+/// types default to 0.015 and everything else (pacbio) to 0.1. // ONT-recall T5
+pub fn resolve_indel_false_threshold(data_type: &str, explicit: Option<f64>) -> f64 {
+    explicit.unwrap_or(match data_type {
+        "ont-r9" | "ont-r10" | "ont-denoised" => 0.015,
+        _ => 0.1,
+    })
+}
+
 pub fn start(
     graph_file: &PathBuf,
     fasta_reference: &PathBuf,
@@ -3888,5 +3897,31 @@ mod tests {
         // The graph matrix is preserved next to it, untouched.
         let g = std::fs::read_to_string(out.with_extension("graph_matrix.csv")).unwrap();
         assert_eq!(g, "variant,g1,g2\nm.31A>T,1,\n");
+    }
+
+    // ONT-recall T5
+    #[test]
+    fn indel_false_threshold_preset_by_data_type() {
+        for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
+            assert_eq!(resolve_indel_false_threshold(dt, None), 0.015, "{dt}");
+        }
+        assert_eq!(resolve_indel_false_threshold("pacbio", None), 0.1);
+        // Explicit CLI value always wins, for every data type.
+        for dt in ["ont-r9", "ont-r10", "ont-denoised", "pacbio"] {
+            assert_eq!(resolve_indel_false_threshold(dt, Some(0.05)), 0.05, "{dt}");
+        }
+    }
+
+    // ONT-recall T5
+    #[test]
+    fn small_indel_at_ont_threshold_passes_above_and_is_artifact_below() {
+        let del = indel(100, "GA", "G", 18);
+        let cov: HashMap<usize, usize> = [(100usize, 1000usize)].into_iter().collect();
+        let rec = format_vcf_record(&del, cov.clone(), 0.015);
+        assert!(rec.contains("\tPASS\t"), "HF 0.018 should pass at 0.015: {rec}");
+
+        let low = indel(100, "GA", "G", 11);
+        let rec = format_vcf_record(&low, cov, 0.015);
+        assert!(rec.contains("Potential_Artifact"), "HF 0.011 should be flagged: {rec}");
     }
 }

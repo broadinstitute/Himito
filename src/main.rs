@@ -233,9 +233,11 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.05)]
         strand_bias_threshold: f64,
 
-        /// indel false threshold for filtering variants
-        #[clap(long, value_parser, default_value_t = 0.1)]
-        indel_false_threshold: f64,
+        /// indels below this HF are flagged Potential_Artifact (optional, preset by data-type:
+        /// ONT 0.015 because small indels under 20% HF must already pass the co-occurrence test;
+        /// pacbio 0.1). ONT-recall T5
+        #[clap(long, value_parser)]
+        indel_false_threshold: Option<f64>,
 
         /// heteroplasmic frequency threshold for permutation test
         #[clap(long, value_parser )]
@@ -478,9 +480,11 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.01)]
         strand_bias_threshold: f64,
 
-        /// indel false threshold for filtering variants
-        #[clap(long, value_parser, default_value_t = 0.1)]
-        indel_false_threshold: f64,
+        /// indels below this HF are flagged Potential_Artifact (optional, preset by data-type:
+        /// ONT 0.015 because small indels under 20% HF must already pass the co-occurrence test;
+        /// pacbio 0.1). ONT-recall T5
+        #[clap(long, value_parser)]
+        indel_false_threshold: Option<f64>,
 
         /// heteroplasmic frequency threshold for permutation test (optional, preset by data-type)
         #[clap(long, value_parser)]
@@ -842,6 +846,8 @@ fn main() {
             let left_align = !no_left_align;
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold_) =
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold, permutation_frequency_threshold);
+            // ONT-recall T5: preset by the *requested* data type (ont-denoised -> ONT value).
+            let indel_false_threshold = call::resolve_indel_false_threshold(&data_type, indel_false_threshold);
             let mt_output = output_prefix.with_extension("mt.bam");
             let numts_output = output_prefix.with_extension("numts.bam");
             let _ = filter::start(
@@ -1048,6 +1054,8 @@ fn main() {
             let left_align = !no_left_align;
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, frequency_threshold, permutation_frequency_threshold);
+            // ONT-recall T5
+            let indel_false_threshold = call::resolve_indel_false_threshold(&data_type, indel_false_threshold);
             call::start(
                 &graphfile,
                 &reference_fasta,

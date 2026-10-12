@@ -217,6 +217,8 @@ HG002's private alleles (~2%, 4–12 reads) get sum-Jaccard q 0.09–0.34, becau
 | `indel_alt_alleles_kept` | 6 | **8** |
 | 8271AC>A | erased | **PASS** |
 
+`bench_standard.sh` (30 seeds, vs T2 ont-denoised baseline): **no regression** (all focus metrics delta 0 within seed noise). Outdir: `lineage_eval/lineage_sim/results/2026-10-12-phase2-t6-full/`.
+
 ---
 
 ## Needs a decision (don't implement without sign-off)

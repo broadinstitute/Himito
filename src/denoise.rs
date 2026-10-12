@@ -138,10 +138,14 @@ fn fit_site(
         } else {
             (fwd + rev) as f64 / col_total as f64
         };
+        // ONT-recall R3-T4: at ~5000x a small skew is significant, so the p-value alone
+        // erases real alleles; require call's effect size as well.
         if strand_bias_p > 0.0
             && prop < homoplasmic_vaf
             && crate::call::strand_bias_pvalue(fwd as usize, rev as usize, expected_fwd_frac)
                 < strand_bias_p
+            && (fwd as f64 / (fwd + rev) as f64 - expected_fwd_frac).abs()
+                >= crate::STRAND_BIAS_MIN_EFFECT
         {
             strand_biased_alts += 1;
             continue;
@@ -1565,14 +1569,14 @@ mod tests {
 
     #[test]
     fn near_homoplasmic_allele_is_exempt_from_strand_bias_test() {
-        // ref A(0) 2fwd/18rev; alt G(2) 75fwd/5rev -> alt is 80% of the column. Against
-        // the column composition (77/100 fwd) that split gives p = 1.2e-4, but an allele
-        // in 80% of reads cannot be a single-strand artifact, so it is kept untested.
+        // ref A(0) 0fwd/25rev; alt G(2) 73fwd/2rev -> alt is 75% of the column. Against
+        // the column composition (73/100 fwd) that split is significant with an effect
+        // of 0.24 (>= STRAND_BIAS_MIN_EFFECT, ONT-recall R3-T4), but an allele in 75% of
+        // reads cannot be a single-strand artifact, so it is kept untested.
         let mut obs = vec![];
-        for _ in 0..2 { obs.push((0usize, q(30), false)); }
-        for _ in 0..18 { obs.push((0usize, q(30), true)); }
-        for _ in 0..75 { obs.push((2usize, q(30), false)); }
-        for _ in 0..5 { obs.push((2usize, q(30), true)); }
+        for _ in 0..25 { obs.push((0usize, q(30), true)); }
+        for _ in 0..73 { obs.push((2usize, q(30), false)); }
+        for _ in 0..2 { obs.push((2usize, q(30), true)); }
         let c = column(0, &obs);
 
         let m = fit_site(&c, 2, 0.01, SB_P, 0.7);
@@ -1585,6 +1589,44 @@ mod tests {
         let m_strict = fit_site(&c, 2, 0.01, SB_P, 0.95);
         assert!(!m_strict.kept[2]);
         assert_eq!(m_strict.strand_biased_alts, 1);
+    }
+
+    // ONT-recall R3-T4: build a column with `ref_f/ref_r` reference and `alt_f/alt_r`
+    // G(2) observations, all Q30.
+    fn strand_column(ref_f: u32, ref_r: u32, alt_f: u32, alt_r: u32) -> ColumnCounts {
+        let mut obs = vec![];
+        for _ in 0..ref_f { obs.push((0usize, q(30), false)); }
+        for _ in 0..ref_r { obs.push((0usize, q(30), true)); }
+        for _ in 0..alt_f { obs.push((2usize, q(30), false)); }
+        for _ in 0..alt_r { obs.push((2usize, q(30), true)); }
+        column(0, &obs)
+    }
+
+    #[test]
+    fn deep_allele_with_small_strand_skew_stays_eligible() {
+        // ONT-recall R3-T4: 7805A in merge215k. Alt 328/196 at 10% in a column whose
+        // forward fraction is 2693/5240 = 0.514. At ~5000x that is p ~ 3e-7, but the
+        // effect is only 0.626 - 0.514 = 0.11 < STRAND_BIAS_MIN_EFFECT.
+        let c = strand_column(2365, 2351, 328, 196);
+        assert!(
+            crate::call::strand_bias_pvalue(328, 196, 2693.0 / 5240.0) < SB_P,
+            "test premise: the p-value alone would reject this allele"
+        );
+        let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
+        assert!(m.kept[2], "a 0.11 strand effect must not erase a real allele");
+        assert_eq!(m.strand_biased_alts, 0);
+        assert_eq!(map_allele(2, q(30), &m), 2);
+    }
+
+    #[test]
+    fn deep_single_strand_artifact_is_still_rejected() {
+        // ONT-recall R3-T4: the 1598G>A artifact. Alt 449/15 in a column whose forward
+        // fraction is 2171/4640 = 0.468, so the effect is 0.968 - 0.468 = 0.50.
+        let c = strand_column(1722, 2454, 449, 15);
+        let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
+        assert!(!m.kept[2], "a 0.50 strand effect is still an artifact");
+        assert_eq!(m.strand_biased_alts, 1);
+        assert_eq!(map_allele(2, q(30), &m), 0);
     }
 
     #[test]

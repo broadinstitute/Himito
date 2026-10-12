@@ -516,10 +516,14 @@ pub fn fit_indel_site(
         // Near-homoplasmic exemption: a single-strand artifact is absent from the
         // other strand's reads, so it can never reach a high apparent frequency.
         // Testing an allele carried by most reads would correct away a real variant.
+        // ONT-recall R3-T4: at ~5000x a small skew is significant, so the p-value alone
+        // erases real alleles; require call's effect size as well.
         if strand_bias_p > 0.0
             && vaf < homoplasmic_vaf
             && crate::call::strand_bias_pvalue(fwd as usize, rev as usize, expected_fwd_frac)
                 < strand_bias_p
+            && (fwd as f64 / (fwd + rev) as f64 - expected_fwd_frac).abs()
+                >= crate::STRAND_BIAS_MIN_EFFECT
         {
             strand_biased += 1;
             strand_rejected.push(allele.clone());
@@ -1109,6 +1113,38 @@ mod indel_tests {
         let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
         assert!(kept_of(&m, &del).is_some(), "near-homoplasmic allele must survive");
         assert_eq!(m.strand_biased, 0);
+    }
+
+    #[test]
+    fn deep_indel_with_small_strand_skew_is_kept() {
+        // ONT-recall R3-T4: the 7805A strand counts (328/196, 10%) against a column
+        // forward fraction of 2693/5240 = 0.514. p ~ 3e-7, effect only 0.11.
+        let del = Allele::Del(1);
+        let mut s = site(5240, &[(del.clone(), 328, 196)]);
+        s.col_fwd = 2693;
+        s.col_rev = 2547;
+        assert!(
+            crate::call::strand_bias_pvalue(328, 196, 2693.0 / 5240.0) < SB_P,
+            "test premise: the p-value alone would reject this allele"
+        );
+        let o = IndelOpts::default();
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        assert!(kept_of(&m, &del).is_some(), "a 0.11 strand effect must not erase a real indel");
+        assert_eq!(m.strand_biased, 0);
+    }
+
+    #[test]
+    fn deep_single_strand_indel_artifact_is_still_rejected() {
+        // ONT-recall R3-T4: the 1598G>A artifact's counts (449/15) against a column
+        // forward fraction of 2171/4640 = 0.468, so the effect is 0.50.
+        let del = Allele::Del(1);
+        let mut s = site(4640, &[(del.clone(), 449, 15)]);
+        s.col_fwd = 2171;
+        s.col_rev = 2469;
+        let o = IndelOpts::default();
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        assert!(kept_of(&m, &del).is_none(), "a 0.50 strand effect is still an artifact");
+        assert_eq!(m.strand_biased, 1);
     }
 
     #[test]

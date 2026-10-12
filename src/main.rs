@@ -322,6 +322,10 @@ enum Commands {
         #[clap(long, value_enum, default_value_t = call::PermutationMode::Adaptive)]
         permutation_mode: call::PermutationMode,
 
+        /// co-occurrence statistic of the permutation test (experiment, ONT-recall Phase2 T8)
+        #[clap(long, value_enum, default_value_t = call::CooccurrenceStat::SumJaccard, hide = true)]
+        cooccurrence_stat: call::CooccurrenceStat,
+
         /// what to do with strand-skewed variants: flag them in FILTER, or additionally
         /// drop low-VAF SNPs outright (default: drop for ont-denoised, flag otherwise)
         #[clap(long, value_enum)]
@@ -585,6 +589,10 @@ enum Commands {
         /// early) or fixed (exactly --permutation-rounds per variant)
         #[clap(long, value_enum, default_value_t = call::PermutationMode::Adaptive)]
         permutation_mode: call::PermutationMode,
+
+        /// co-occurrence statistic of the permutation test (experiment, ONT-recall Phase2 T8)
+        #[clap(long, value_enum, default_value_t = call::CooccurrenceStat::SumJaccard, hide = true)]
+        cooccurrence_stat: call::CooccurrenceStat,
 
         /// what to do with strand-skewed variants: flag them in FILTER, or additionally
         /// drop low-VAF SNPs outright (default: drop for ont-denoised, flag otherwise)
@@ -936,6 +944,7 @@ fn main() {
             permutation_frequency_threshold,
             permutation_rounds,
             permutation_mode,
+            cooccurrence_stat,
             strand_bias_action,
             strand_bias_drop_max_hf,
             no_left_align,
@@ -1034,6 +1043,7 @@ fn main() {
                 permutation_frequency_threshold_,
                 permutation_rounds,
                 permutation_mode,
+                cooccurrence_stat,
                 strand_bias_action,
                 strand_bias_drop_max_hf,
                 left_align,
@@ -1147,6 +1157,7 @@ fn main() {
             permutation_frequency_threshold,
             permutation_rounds,
             permutation_mode,
+            cooccurrence_stat,
             strand_bias_action,
             strand_bias_drop_max_hf,
             no_left_align,
@@ -1179,6 +1190,7 @@ fn main() {
                 permutation_frequency_threshold,
                 permutation_rounds,
                 permutation_mode,
+                cooccurrence_stat,
                 strand_bias_action,
                 strand_bias_drop_max_hf,
                 left_align,

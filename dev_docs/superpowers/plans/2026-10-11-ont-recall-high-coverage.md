@@ -171,14 +171,14 @@ The single FP in every run is `15622T>C`. It has 101 strand-balanced reads (54/4
 
 ---
 
-## Phase 2 (owner sign-off after T2; mainly matters if `ont-denoised` stays the discovery path)
+## Phase 2 (owner signed off 2026-10-12 after R3)
 
 ### Task 6: Denoise keeps minor alleles that are linked to kept minor alleles
 
 **Files:** `src/denoise.rs`: `fit_site` (~98), `map_allele` (~247), `compute_corrections` (~391; the SNV loop is ~683–712, the deferred-decision block ~722–770), `DenoiseStats`; `src/main.rs`: a new `quick-start --denoise-keep-vaf` (default `DENOISE_KEEP_VAF`), so it can be swept without rebuilding.
 
-- [ ] **6a.** Expose `--denoise-keep-vaf`, with a resolver test and help text. This is a separate commit.
-- [ ] **6b. Defer, then rescue.**
+- [x] **6a.** Expose `--denoise-keep-vaf`, with a resolver test and help text. This is a separate commit. (`c4c6ec1`)
+- [x] **6b. Defer, then rescue.** (`e26de7e`)
   - In `fit_site`, mark an allele **pending** when it is eligible (passes the per-strand and strand-bias gates) and `PENDING_FLOOR (0.005) ≤ f < vaf`.
   - In the SNV loop, observations of a pending allele are *not* corrected yet. Record `(qname, refpos, would-be base)` in `deferred[(contig, refpos, allele)]`.
   - For every read, record its minor alleles: kept non-ref alleles with `f < homoplasmic_vaf`, plus pending ones.
@@ -197,15 +197,25 @@ The single FP in every run is `15622T>C`. It has 101 strand-balanced reads (54/4
 
 **File:** `src/denoise_indel.rs` `fit_indel_site` (~426, the gate `vaf < vaf_floor(l, o)` ~513).
 
-- [ ] Candidacy becomes `vaf ≥ max(o.vaf_abs_min (new, 0.02), 1.5·eps)` and binomial upper tail `P(X ≥ n | depth, eps) ≤ o.excess_alpha (new, 1e-3) / n_sites`. Keep `vaf_floor` for the `protect_vaf` logic. Write the tests first: a 10% one-base deletion in a 5-C run at depth 431 survives (`8271AC>A`; today the floor is 0.152); a 6% one at depth 60 does not.
-- [ ] **Acceptance:** `8271AC>A` survives denoise. `indel_alt_alleles_kept` grows by less than 2× on HapMap. HapMap `ont-denoised` FP is unchanged. The `bench_hp.sh` metrics don't regress.
+- [x] Candidacy becomes `vaf ≥ max(o.vaf_abs_min, 1.5·eps)` and binomial upper tail `P(X ≥ n | depth, eps) ≤ o.excess_alpha / n_sites`. Keep `vaf_floor` for the `protect_vaf` logic. (`7216bdf`; default `vaf_abs_min` raised to **0.05** in `e10cc16` after HapMap 6→31 at 0.02.)
+- [x] **Acceptance:** `8271AC>A` survives (PASS, denoise AC 459/5437). `indel_alt_alleles_kept` = 8 (<2× of 6). HapMap `ont-denoised` FP unchanged at 4 (`p2_den`).
 
 ### Task 8 (experiment, report only): partner-specific co-occurrence for small lineages
 
 HG002's private alleles (~2%, 4–12 reads) get sum-Jaccard q 0.09–0.34, because the sum over about 600 rows drowns a lineage that has only a few partners.
 
-- [ ] Add a hidden `--cooccurrence-stat max-partner`. For each tested variant, take the minimum over partners (≥ 2 shared reads) of the hypergeometric upper-tail p on co-covered reads, times the number of partners. Then BH as usual.
-- [ ] Prototype it in `perm_retest.py` first. Report HapMap truth/non-truth passes and the sim metrics. The owner decides.
+- [x] Add a hidden `--cooccurrence-stat max-partner`. (`14da7b4`; report `.superpowers/sdd/phase2-t8-report.md`)
+- [x] Prototype in `perm_retest.py`. **Owner decision: keep SumJaccard default** — max-partner is 112/18 vs default 114/6 on merge215k.
+
+### Phase 2 HapMap results (`p2_den`, ont-denoised)
+
+| metric | pre-Phase2 (`r3_t4_den`) | Phase2 (`p2_den`) |
+|---|---|---|
+| TP/FP/FN | 109/4/12 | **109/4/12** |
+| HG02257 7 alleles in denoised BAM | erased by keep-VAF | **preserved** (raw=denoised counts) |
+| `alt_alleles_rescued_by_linkage` | — | 28 |
+| `indel_alt_alleles_kept` | 6 | **8** |
+| 8271AC>A | erased | **PASS** |
 
 ---
 

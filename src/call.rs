@@ -1025,8 +1025,9 @@ fn score_record_at_sites(
 /// cover = reads with a decisive call (1 or 0) plus `ref_name`, the reference
 /// pseudo-read (an all-0 column); alt (`read_record`) = reads called 1.
 ///
-/// Skips unmapped, secondary and empty-SEQ records, and records on a contig
-/// other than the first (oracle: `references[0]`). Supplementary records are
+/// Skips unmapped, secondary and empty-SEQ records, and records whose contig
+/// is not `ref_name` (the FASTA header id). WGS-header BAMs often put chrM at
+/// tid ≠ 0; matching by name keeps those reads. Supplementary records are
 /// kept: they are mostly pieces of reads that cross the origin.
 pub fn genotype_from_bam(
     bam: &Path,
@@ -1047,6 +1048,19 @@ pub fn genotype_from_bam(
         eprintln!("Error: cannot open genotyping BAM {}: {}", bam.display(), e);
         std::process::exit(1);
     });
+    // ONT-recall R3-T1: resolve contig by name (GRCh38 BAMs put chrM at tid ≠ 0).
+    // Unknown name → empty genotype maps (ref pseudo-read only), no exit.
+    let target_tid: Option<i32> = match reader.header().tid(ref_name.as_bytes()) {
+        Some(t) => Some(t as i32),
+        None => {
+            eprintln!(
+                "Warning: reference contig '{}' not found in genotyping BAM {}; skipping all reads",
+                ref_name,
+                bam.display()
+            );
+            None
+        }
+    };
 
     let mut flush = |batch: &mut Vec<BamRecord>| {
         let scored: Vec<(String, Vec<(usize, SegCall)>)> = batch
@@ -1083,7 +1097,8 @@ pub fn genotype_from_bam(
     let mut batch: Vec<BamRecord> = Vec::with_capacity(BATCH);
     for rec in reader.records() {
         let rec = rec.expect("failed to read genotyping BAM record");
-        if rec.is_unmapped() || rec.is_secondary() || rec.seq_len() == 0 || rec.tid() != 0 {
+        let Some(tid) = target_tid else { continue };
+        if rec.is_unmapped() || rec.is_secondary() || rec.seq_len() == 0 || rec.tid() != tid {
             continue;
         }
         batch.push(rec);
@@ -3852,6 +3867,40 @@ mod tests {
         let (rr, cr) = run_geno("reads.sam", &[v]);
         assert!(alt_reads(&rr, &name).is_empty());
         assert_eq!(cr[&name], ["chrM".to_string()].into_iter().collect());
+    }
+
+    // ONT-recall R3-T1: WGS-header BAMs put chrM after nuclear contigs (tid != 0).
+    #[test]
+    fn genotype_from_bam_matches_ref_name_when_chrm_is_not_tid_zero() {
+        let v = geno_snp();
+        let name = generate_variant_name(&v);
+        let (rr, cr) = run_geno("reads_second_contig.sam", &[v.clone()]);
+        let alt = alt_reads(&rr, &name);
+        let cover = &cr[&name];
+        assert!(cover.contains("r_ref") && !alt.contains("r_ref"));
+        assert!(cover.contains("r_alt") && alt.contains("r_alt"));
+        assert!(cover.contains("r_split") && alt.contains("r_split"));
+        assert!(cover.contains("chrM") && !alt.contains("chrM"));
+        // Same decisive calls as the tid-0 fixture.
+        let (rr0, cr0) = run_geno("reads.sam", &[v]);
+        assert_eq!(alt_reads(&rr, &name), alt_reads(&rr0, &name));
+        assert_eq!(cr[&name], cr0[&name]);
+    }
+
+    // ONT-recall R3-T1: unknown contig → ref pseudo-read only, no exit.
+    #[test]
+    fn genotype_from_bam_unknown_ref_name_returns_ref_column_only() {
+        let v = geno_snp();
+        let name = generate_variant_name(&v);
+        let (rr, cr) = genotype_from_bam(
+            &geno_path("reads_second_contig.sam"),
+            GENO_REF.as_bytes(),
+            "not_a_contig",
+            &[v],
+            &GenotypeOpts::default(),
+        );
+        assert!(alt_reads(&rr, &name).is_empty());
+        assert_eq!(cr[&name], ["not_a_contig".to_string()].into_iter().collect());
     }
 
     // Plan 2026-10-11 T5

@@ -133,9 +133,15 @@ frozen standard config (30 seeds, Himito at `adaa96a`):
 
 `simulate_reads.sh` simulates both profiles identically, so `ont-denoised`
 changes only the Himito path, not the data. Keep `ont-denoised` as the
-simulation default; see also Needs-a-decision #1 in
+simulation default for lineage metrics; see also Needs-a-decision #1 in
 `dev_docs/superpowers/plans/2026-10-11-ont-recall-high-coverage.md`. The
 committed benchmarks were produced under `ont-denoised`.
+
+With read-linkage rescue on (ONT-recall R3-T2, default for ONT quick-start),
+`ont-r10` is the recommended discovery profile for real ONT data: on the
+full-depth HapMap merge it recovers low-HF private alleles that denoise
+erases, without needing Phase 2 denoise linkage. Keep `ont-denoised` for
+simulation lineage work (T2 table above).
 
 ### Low `var_recall` is usually a gate, not the graph
 

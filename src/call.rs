@@ -2873,9 +2873,12 @@ mod tests {
         let tested: Vec<usize> = (0..variants.len()).collect();
         let names: Vec<String> = variants.iter().map(generate_variant_name).collect();
         let res = adaptive_permutation(&rows, &tested, &names, 1000, 0.01);
+        // ONT-recall T1 tune: R_target = ceil(PERM_HEADROOM * m / (alpha * k0))
+        let expected =
+            (crate::PERM_HEADROOM * 130.0 / (0.01 * 10.0)).ceil() as usize;
         assert!(
-            res.r_target >= 13000,
-            "10 * 130 / (0.01 * 10) = 13000 rounds needed, reported {}",
+            res.r_target >= expected,
+            "PERM_HEADROOM * 130 / (0.01 * 10) = {expected} rounds needed, reported {}",
             res.r_target
         );
     }

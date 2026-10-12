@@ -37,17 +37,21 @@ pub const DENOISE_KEEP_VAF: f64 = 0.03;
 /// that has collected this many null exceedances has a p-value well above any BH
 /// threshold, so its remaining draws are wasted.
 ///
-/// 20 was chosen with `scripts/ont_recall/perm_retest.py --mode adaptive` on the
-/// HapMap ONT r10 raw matrix (base_r10): it keeps all 54 truth rows and 0 non-truth
-/// while skipping most of the draws a fixed 10k-round run spends on clear nulls.
-pub const PERM_STOP_AFTER: u32 = 20;
+/// Tuned to 10 (from plan default 20) after the post-T5 HapMap A/B: oracle truth
+/// pass is identical across stop ∈ {5,10,20,40}, and end-to-end TP/FP match
+/// (92/2). 10 cuts stage-1 noise draws without making early-stopped p-values as
+/// noisy as stop=5.
+pub const PERM_STOP_AFTER: u32 = 10;
 
 /// Headroom factor of the adaptive permutation floor target (ONT-recall T1).
 /// Variants still at zero exceedances are extended to
 /// `ceil(PERM_HEADROOM * m / (alpha * k0))` rounds, so the floor p-value
 /// `1/(R+1)` sits `PERM_HEADROOM` times below the BH bar `alpha * k0 / m`.
-/// 10 resolved the HapMap ONT r10 floor (54 truth, 0 non-truth) in the oracle.
-pub const PERM_HEADROOM: f64 = 10.0;
+/// Tuned to 5 (from plan default 10) after the post-T5 HapMap A/B on
+/// `t5_r10.raw_matrix.csv`: every (stop,head) candidate kept oracle truth 54 /
+/// non-truth 0; (10,5) matched end-to-end TP 92 / FP 2 while cutting floor
+/// draws ~46% (666k → 359k). Headroom 5 still puts min_q ≈ 0.002 ≪ alpha 0.01.
+pub const PERM_HEADROOM: f64 = 5.0;
 
 /// Hard cap on per-variant permutation rounds in the adaptive test (ONT-recall T1).
 pub const PERM_MAX_ROUNDS: usize = 100_000;

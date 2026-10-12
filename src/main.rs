@@ -34,6 +34,18 @@ mod linkage;
 /// 0.04 recall starts falling (0.965) as real low-frequency heteroplasmies drop out.
 pub const DENOISE_KEEP_VAF: f64 = 0.03;
 
+/// ONT-recall Phase2 T6b: lower edge of denoise's "pending" band. An eligible allele
+/// with `PENDING_FLOOR <= f < DENOISE_KEEP_VAF` is not corrected outright; it is kept
+/// if it rides on the same reads as a kept minor allele (linkage rescue), else
+/// corrected as before.
+///
+/// Evidence: HapMap `ont-denoised` erased 7 of 34 real HG02257 heteroplasmies (3439,
+/// 3552, 4715, 9545, 10873, 13263, 15043) that sit right on the 0.03 line, because
+/// sites are decided independently: 13/13 reads carrying the kept `9540C` also carry
+/// `9545G`, yet `9545G` was rewritten on 12 of them. The floor only bounds how many
+/// eligible error alleles enter the linkage test; rescue itself needs linkage.
+pub const PENDING_FLOOR: f64 = 0.005;
+
 /// Stage-1 early stop of the adaptive permutation test (ONT-recall T1): a variant
 /// that has collected this many null exceedances has a p-value well above any BH
 /// threshold, so its remaining draws are wasted.

@@ -82,6 +82,10 @@ impl ColumnCounts {
 pub(crate) struct SiteModel {
     freq: [f64; 4],
     kept: [bool; 4],
+    /// ONT-recall Phase2 T6b: eligible non-ref alleles with `PENDING_FLOOR <= f < vaf`.
+    /// Not kept (map_allele still corrects them), but `compute_corrections` defers
+    /// their corrections until linkage to a kept minor allele has been tested.
+    pending: [bool; 4],
     /// Non-ref alleles that cleared the per-strand count gate but were rejected as
     /// strand-biased; surfaced in DenoiseStats so the gate's impact is auditable.
     strand_biased_alts: usize,
@@ -225,11 +229,15 @@ fn fit_site(
 
     // Keep rule: reference always kept; a non-ref eligible allele kept iff f >= vaf.
     let mut kept = [false; 4];
+    let mut pending = [false; 4];
     for a in 0..4 {
         if Some(a) == c.ref_idx {
             kept[a] = true;
         } else if eligible[a] && f[a] >= vaf {
             kept[a] = true;
+        } else if eligible[a] && f[a] >= crate::PENDING_FLOOR {
+            // ONT-recall Phase2 T6b
+            pending[a] = true;
         }
     }
     // Renormalize freq over kept alleles (guards map_allele against dropped mass).
@@ -245,7 +253,7 @@ fn fit_site(
         freq[r] = 1.0;
     }
 
-    SiteModel { freq, kept, strand_biased_alts }
+    SiteModel { freq, kept, pending, strand_biased_alts }
 }
 
 fn map_allele(observed: usize, q: u8, m: &SiteModel) -> usize {
@@ -295,6 +303,9 @@ pub struct DenoiseStats {
     pub columns_skipped: u64,
     pub alt_sites_preserved: u64,
     pub alt_alleles_strand_biased: u64,
+    /// ONT-recall Phase2 T6b: pending alleles kept because they co-occur with a kept
+    /// minor allele more than 20 bp away.
+    pub alt_alleles_rescued_by_linkage: u64,
     pub substitution_matrix: [[u64; 4]; 4], // [from][to]
     // --- indel denoising (all zero unless --indels is enabled) ---
     pub indel_sites_examined: u64,
@@ -423,6 +434,20 @@ fn compute_corrections(
     // there and cannot be counted from the deferred `depth == 0` branch.
     let mut span_gated_sites: HashSet<(Vec<u8>, u32)> = HashSet::new();
 
+    // ONT-recall Phase2 T6b: alleles are keyed (tid, refpos, allele) and reads by a
+    // dense index assigned in pileup order, so the rescue below is deterministic.
+    // `deferred` holds each pending allele's would-be corrections (qname, refpos,
+    // base); `carriers` maps every minor allele (kept below homoplasmic_vaf, or
+    // pending) to the reads observing it; `spans` is each read's (tid, min, max)
+    // refpos over the columns where it has a base.
+    type AlleleKey = (u32, u32, usize);
+    let mut deferred: HashMap<AlleleKey, Vec<(Vec<u8>, u32, u8)>> = HashMap::new();
+    let mut carriers: HashMap<AlleleKey, HashSet<usize>> = HashMap::new();
+    let mut kept_minors: HashSet<AlleleKey> = HashSet::new();
+    let mut read_idx: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut spans: Vec<(u32, u32, u32)> = Vec::new();
+    let mut corrected_cols: HashSet<(u32, u32)> = HashSet::new();
+
     let mut plp = reader.pileup();
     plp.set_max_depth(1_000_000);
     for p in plp {
@@ -437,7 +462,8 @@ fn compute_corrections(
 
         let mut counts = ColumnCounts::new(ref_idx);
         // Remember each usable observation to correct after the fit.
-        let mut obs: Vec<(Vec<u8>, usize, u8)> = Vec::new(); // (qname, allele, qual)
+        let mut obs: Vec<(Vec<u8>, usize, u8, usize)> = Vec::new(); // (qname, allele, qual, read idx)
+        let tid = col.tid();
 
         // Indel collection MUST happen here, before the `non_ref() == 0` skip below:
         // that gate is about non-reference SUBSTITUTIONS, and a column with a
@@ -590,7 +616,23 @@ fn compute_corrections(
             };
             let qual = rec.qual()[qpos];
             counts.add(allele, qual, rec.is_reverse());
-            obs.push((rec.qname().to_vec(), allele, qual));
+            let rp = refpos as u32;
+            let ri = match read_idx.get(rec.qname()) {
+                Some(&i) => {
+                    let s = &mut spans[i];
+                    if s.0 == tid {
+                        s.1 = s.1.min(rp);
+                        s.2 = s.2.max(rp);
+                    }
+                    i
+                }
+                None => {
+                    read_idx.insert(rec.qname().to_vec(), spans.len());
+                    spans.push((tid, rp, rp));
+                    spans.len() - 1
+                }
+            };
+            obs.push((rec.qname().to_vec(), allele, qual, ri));
         }
 
         if iopts.enabled {
@@ -688,9 +730,24 @@ fn compute_corrections(
         stats.alt_sites_preserved += model.kept_alt_count(ref_idx) as u64;
         stats.alt_alleles_strand_biased += model.strand_biased_alts as u64;
 
+        for a in 0..4 {
+            if model.kept[a] && Some(a) != ref_idx && model.freq[a] < homoplasmic_vaf {
+                kept_minors.insert((tid, refpos as u32, a));
+            }
+        }
+
         let mut changed = false;
-        for (qname, allele, qual) in obs {
+        for (qname, allele, qual, ri) in obs {
             let corr = map_allele(allele, qual, &model);
+            let key = (tid, refpos as u32, allele);
+            if model.pending[allele] || kept_minors.contains(&key) {
+                carriers.entry(key).or_default().insert(ri);
+            }
+            if model.pending[allele] {
+                // ONT-recall Phase2 T6b: decided after the pileup by linkage rescue.
+                deferred.entry(key).or_default().push((qname, refpos as u32, idx_to_base(corr)));
+                continue;
+            }
             if corr != allele {
                 corrections
                     .entry(qname)
@@ -714,8 +771,34 @@ fn compute_corrections(
             }
         }
         if changed {
-            stats.columns_corrected += 1;
+            corrected_cols.insert((tid, refpos as u32));
         }
+    }
+
+    // ---- ONT-recall Phase2 T6b: linkage rescue of pending alleles ----
+    let rescued = rescue_linked_pending(&deferred, &carriers, &kept_minors, &spans);
+    stats.alt_alleles_rescued_by_linkage = rescued.len() as u64;
+    let mut pending_keys: Vec<&AlleleKey> = deferred.keys().collect();
+    pending_keys.sort();
+    for key in pending_keys {
+        if rescued.contains(key) {
+            continue;
+        }
+        let (tid, pos, allele) = *key;
+        for (qname, refpos, base) in &deferred[key] {
+            corrections.entry(qname.clone()).or_default().subs.push((*refpos, *base));
+            stats.bases_modified += 1;
+            stats.substitution_matrix[allele][base_to_idx(*base).unwrap()] += 1;
+        }
+        if !deferred[key].is_empty() {
+            corrected_cols.insert((tid, pos));
+        }
+    }
+    stats.columns_corrected = corrected_cols.len() as u64;
+    // Deferred substitutions land after the pileup, so subs must be re-sorted
+    // whether or not indels are enabled.
+    for edits in corrections.values_mut() {
+        edits.subs.sort_by_key(|&(p, _)| p);
     }
 
     // Review 2026-09-25 T3: once per site that lost an ALT vote to the homopolymer
@@ -767,12 +850,91 @@ fn compute_corrections(
         for list in models.values_mut() {
             list.sort_by_key(|(p, _)| *p);
         }
-        for edits in corrections.values_mut() {
-            edits.subs.sort_by_key(|&(p, _)| p);
-        }
     }
 
     Ok((corrections, models, stats))
+}
+
+/// ONT-recall Phase2 T6b: minimum distance (bp) between a pending allele and a
+/// partner whose co-occurrence can rescue it; closer pairs can share one error event.
+const RESCUE_MIN_DIST: u32 = 20;
+const RESCUE_MIN_SHARED: u32 = 3;
+const RESCUE_ALPHA: f64 = 1e-4;
+const RESCUE_ROUNDS: usize = 3;
+
+/// ONT-recall Phase2 T6b: pending alleles whose carriers are enriched for some
+/// partner's carriers. Partners start as the kept minor alleles; each round adds
+/// what the previous one rescued. For a pending P and partner M more than
+/// `RESCUE_MIN_DIST` away, the population is the reads spanning both, and P is
+/// rescued if `a = |P ∧ M| >= RESCUE_MIN_SHARED` and the hypergeometric upper tail
+/// `P(X >= a)`, Bonferroni'd over the partners tested, is `<= RESCUE_ALPHA`.
+fn rescue_linked_pending<V>(
+    pending: &HashMap<(u32, u32, usize), V>,
+    carriers: &HashMap<(u32, u32, usize), HashSet<usize>>,
+    kept_minors: &HashSet<(u32, u32, usize)>,
+    spans: &[(u32, u32, u32)],
+) -> HashSet<(u32, u32, usize)> {
+    let empty = HashSet::new();
+    let mut partners: Vec<(u32, u32, usize)> = kept_minors.iter().copied().collect();
+    partners.sort();
+    let mut open: Vec<(u32, u32, usize)> = pending.keys().copied().collect();
+    open.sort();
+    let mut rescued = HashSet::new();
+
+    for _ in 0..RESCUE_ROUNDS {
+        let mut newly = Vec::new();
+        for &p in &open {
+            let (ptid, ppos, _) = p;
+            let pc = carriers.get(&p).unwrap_or(&empty);
+            let over_p: Vec<usize> = (0..spans.len())
+                .filter(|&r| spans[r].0 == ptid && spans[r].1 <= ppos && spans[r].2 >= ppos)
+                .collect();
+            let mut n_partners = 0u32;
+            let mut min_log10_p = f64::INFINITY;
+            for &m in &partners {
+                let (mtid, mpos, _) = m;
+                if mtid != ptid || mpos.abs_diff(ppos) <= RESCUE_MIN_DIST {
+                    continue;
+                }
+                let mc = carriers.get(&m).unwrap_or(&empty);
+                let (lo, hi) = (ppos.min(mpos), ppos.max(mpos));
+                let (mut n, mut k_p, mut k_m, mut a) = (0u32, 0u32, 0u32, 0u32);
+                for &r in &over_p {
+                    if spans[r].1 > lo || spans[r].2 < hi {
+                        continue;
+                    }
+                    n += 1;
+                    let (in_p, in_m) = (pc.contains(&r), mc.contains(&r));
+                    k_p += in_p as u32;
+                    k_m += in_m as u32;
+                    a += (in_p && in_m) as u32;
+                }
+                if n == 0 {
+                    continue;
+                }
+                n_partners += 1;
+                if a >= RESCUE_MIN_SHARED {
+                    let lp = crate::linkage::log10_hyper_sf(a, n, k_p, k_m);
+                    min_log10_p = min_log10_p.min(lp);
+                }
+            }
+            if n_partners > 0
+                && min_log10_p + (n_partners as f64).log10() <= RESCUE_ALPHA.log10()
+            {
+                newly.push(p);
+            }
+        }
+        if newly.is_empty() {
+            break;
+        }
+        open.retain(|p| !newly.contains(p));
+        for p in newly {
+            rescued.insert(p);
+            partners.push(p);
+        }
+        partners.sort();
+    }
+    rescued
 }
 
 /// Book the read and base counters for ONE reassignment that was actually applied.
@@ -1638,6 +1800,157 @@ mod tests {
         assert!(m.kept[0]);
         assert_eq!(m.kept_alt_count(Some(0)), 0);
         assert!((m.freq[0] - 1.0).abs() < 1e-12);
+    }
+
+    // ONT-recall Phase2 T6b: an eligible allele in [PENDING_FLOOR, vaf) is pending,
+    // not kept; kept, sub-floor and strand-biased alleles are never pending.
+    #[test]
+    fn eligible_allele_between_floor_and_keep_vaf_is_pending() {
+        let c = strand_column(486, 486, 14, 14); // 2.8%
+        let m = fit_site(&c, 2, 0.03, SB_P, HOM_VAF);
+        assert!(!m.kept[2]);
+        assert!(m.pending[2]);
+        assert!(!m.pending[0], "reference is never pending");
+
+        let kept = fit_site(&strand_column(482, 482, 18, 18), 2, 0.03, SB_P, HOM_VAF);
+        assert!(kept.kept[2] && !kept.pending[2]);
+
+        let below = fit_site(&strand_column(998, 998, 2, 2), 2, 0.03, SB_P, HOM_VAF); // 0.2%
+        assert!(!below.kept[2] && !below.pending[2]);
+
+        let biased = fit_site(&strand_column(486, 486, 26, 2), 2, 0.03, SB_P, HOM_VAF);
+        assert_eq!(biased.strand_biased_alts, 1);
+        assert!(!biased.pending[2]);
+    }
+
+    // ONT-recall Phase2 T6b: 400 full-length reads over a 100 bp all-A reference.
+    // Reads in `m_reads` carry C at `m_pos`, reads in `p_reads` carry G at `p_pos`;
+    // `extra` adds (read index, pos, base) substitutions. Strands alternate.
+    fn linkage_bam(
+        path: &Path,
+        m_pos: usize,
+        m_reads: std::ops::Range<usize>,
+        p_pos: usize,
+        p_reads: std::ops::Range<usize>,
+        extra: &[(usize, usize, u8)],
+    ) {
+        let names: Vec<String> = (0..400).map(|i| format!("r{i:03}")).collect();
+        let seqs: Vec<Vec<u8>> = (0..400)
+            .map(|i| {
+                let mut s = vec![b'A'; 100];
+                if m_reads.contains(&i) { s[m_pos] = b'C'; }
+                if p_reads.contains(&i) { s[p_pos] = b'G'; }
+                for &(r, pos, b) in extra {
+                    if r == i { s[pos] = b; }
+                }
+                s
+            })
+            .collect();
+        let reads: Vec<(&str, i64, &[u8], bool)> = (0..400)
+            .map(|i| (names[i].as_str(), 0i64, seqs[i].as_slice(), i % 2 == 1))
+            .collect();
+        write_test_bam(path, "chrM", 100, &reads);
+    }
+
+    fn linkage_refs() -> HashMap<Vec<u8>, Vec<u8>> {
+        HashMap::from([(b"chrM".to_vec(), vec![b'A'; 100])])
+    }
+
+    fn subs_of(corr: &Corrections, name: &str) -> Vec<(u32, u8)> {
+        corr.get(name.as_bytes()).map(|e| e.subs.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn pending_allele_riding_on_a_kept_minor_is_preserved() {
+        // ONT-recall Phase2 T6b: the 9540/9545 shape. 3.5% C at 10 is kept; 2.75% G at
+        // 60 sits on a subset of the same reads and is rescued by linkage.
+        let dir = std::env::temp_dir().join("himito_denoise_t6b_linked");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        linkage_bam(&bam, 10, 0..14, 60, 0..11, &[]);
+        let (corr, _, stats) = compute_corrections(
+            &bam, &linkage_refs(), 2, 0.03, SB_P, HOM_VAF, &indel::IndelOpts::default(),
+        )
+        .unwrap();
+        for i in 0..14 {
+            assert!(subs_of(&corr, &format!("r{i:03}")).is_empty(), "r{i:03} was corrected");
+        }
+        assert_eq!(stats.alt_alleles_rescued_by_linkage, 1);
+        assert_eq!(stats.bases_modified, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unlinked_pending_allele_is_still_corrected_and_subs_stay_sorted() {
+        // ONT-recall Phase2 T6b: the same 2.75% G on reads that do NOT carry the kept C.
+        // r100 also has a fwd-only error at 80 that is corrected inside the pileup loop,
+        // before the deferred 60 substitution is applied.
+        let dir = std::env::temp_dir().join("himito_denoise_t6b_unlinked");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        linkage_bam(&bam, 10, 0..14, 60, 100..111, &[(100, 80, b'T')]);
+        let (corr, _, stats) = compute_corrections(
+            &bam, &linkage_refs(), 2, 0.03, SB_P, HOM_VAF, &indel::IndelOpts::default(),
+        )
+        .unwrap();
+        assert_eq!(subs_of(&corr, "r100"), vec![(60, b'A'), (80, b'A')]);
+        for i in 101..111 {
+            assert_eq!(subs_of(&corr, &format!("r{i:03}")), vec![(60, b'A')]);
+        }
+        for i in 0..14 {
+            assert!(subs_of(&corr, &format!("r{i:03}")).is_empty());
+        }
+        assert_eq!(stats.alt_alleles_rescued_by_linkage, 0);
+        assert_eq!(stats.bases_modified, 12);
+        assert_eq!(stats.substitution_matrix[2][0], 11);
+        assert_eq!(stats.columns_corrected, 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn linked_partner_within_20bp_does_not_rescue() {
+        // ONT-recall Phase2 T6b: a partner 15 bp away can share reads through a single
+        // error process, so it is not evidence.
+        let dir = std::env::temp_dir().join("himito_denoise_t6b_near");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        linkage_bam(&bam, 10, 0..14, 25, 0..11, &[]);
+        let (corr, _, stats) = compute_corrections(
+            &bam, &linkage_refs(), 2, 0.03, SB_P, HOM_VAF, &indel::IndelOpts::default(),
+        )
+        .unwrap();
+        for i in 0..11 {
+            assert_eq!(subs_of(&corr, &format!("r{i:03}")), vec![(25, b'A')]);
+        }
+        assert_eq!(stats.alt_alleles_rescued_by_linkage, 0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn linkage_rescue_is_deterministic() {
+        // ONT-recall Phase2 T6b: one linked pending (G@60) and one unlinked (T@85).
+        let dir = std::env::temp_dir().join("himito_denoise_t6b_det");
+        std::fs::create_dir_all(&dir).unwrap();
+        let bam = dir.join("in.bam");
+        let extra: Vec<(usize, usize, u8)> = (200..211).map(|r| (r, 85, b'T')).collect();
+        linkage_bam(&bam, 10, 0..14, 60, 0..11, &extra);
+        let run = || {
+            let (corr, _, stats) = compute_corrections(
+                &bam, &linkage_refs(), 2, 0.03, SB_P, HOM_VAF, &indel::IndelOpts::default(),
+            )
+            .unwrap();
+            let mut v: Vec<(Vec<u8>, Vec<(u32, u8)>)> =
+                corr.into_iter().map(|(k, e)| (k, e.subs)).collect();
+            v.sort();
+            (v, serde_json::to_string(&stats).unwrap())
+        };
+        let (a, sa) = run();
+        let (b, sb) = run();
+        assert_eq!(a, b);
+        assert_eq!(sa, sb);
+        assert_eq!(a.len(), 11, "only the unlinked T@85 carriers are corrected");
+        assert!(a.iter().all(|(_, s)| s == &vec![(85u32, b'A')]));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // Build a tiny coordinate-sorted BAM. Reads are full-length matches at `pos`.

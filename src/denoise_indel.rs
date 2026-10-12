@@ -90,6 +90,11 @@ pub struct IndelOpts {
     pub protect_vaf: f64,
     /// ONT-recall Phase2 T7: absolute VAF minimum for candidacy; the effective
     /// minimum is `max(vaf_abs_min, 1.5 * eps)`.
+    ///
+    /// Plan default was 0.02, but on HapMap merge (~5,000×) that kept 31 indel
+    /// alts vs 6 before (>2× acceptance fail): mostly 2–4% one-base deletions
+    /// that are hugely "significant" at depth. 0.05 still keeps 8271AC>A (~8%)
+    /// while cutting the systematic ONT short-run noise.
     pub vaf_abs_min: f64,
     /// ONT-recall Phase2 T7: family-wise level of the binomial excess test
     /// `P(X >= n | depth, eps)`, Bonferroni-split over the sites fitted in a pass.
@@ -109,7 +114,7 @@ impl Default for IndelOpts {
             floor_mult: 3.0,
             delta: 0.3,
             protect_vaf: 0.2,
-            vaf_abs_min: 0.02,
+            vaf_abs_min: 0.05,
             excess_alpha: 1e-3,
         }
     }

@@ -88,6 +88,12 @@ pub struct IndelOpts {
     /// symmetrically: a substantial REF allele is equally protected from being
     /// converted to an indel.
     pub protect_vaf: f64,
+    /// ONT-recall Phase2 T7: absolute VAF minimum for candidacy; the effective
+    /// minimum is `max(vaf_abs_min, 1.5 * eps)`.
+    pub vaf_abs_min: f64,
+    /// ONT-recall Phase2 T7: family-wise level of the binomial excess test
+    /// `P(X >= n | depth, eps)`, Bonferroni-split over the sites fitted in a pass.
+    pub excess_alpha: f64,
 }
 
 impl Default for IndelOpts {
@@ -103,6 +109,8 @@ impl Default for IndelOpts {
             floor_mult: 3.0,
             delta: 0.3,
             protect_vaf: 0.2,
+            vaf_abs_min: 0.02,
+            excess_alpha: 1e-3,
         }
     }
 }
@@ -278,10 +286,26 @@ pub fn error_rate(l: u32, o: &IndelOpts) -> f64 {
     (o.err0 * o.err_scale.powi(exp)).min(o.err_cap)
 }
 
-/// Candidacy VAF floor for an allele in context `L`: an absolute minimum, raised to a
-/// multiple of the local error rate wherever that is higher.
+/// VAF floor for an allele in context `L`: an absolute minimum, raised to a
+/// multiple of the local error rate wherever that is higher. ONT-recall Phase2 T7:
+/// no longer the candidacy gate (see `fit_indel_site`); kept as the reference
+/// point `protect_vaf` is documented against.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn vaf_floor(l: u32, o: &IndelOpts) -> f64 {
     o.vaf.max(o.floor_mult * error_rate(l, o))
+}
+
+/// ONT-recall Phase2 T7: `P(X >= n)` for `X ~ Binomial(depth, eps)`, the chance
+/// that context error alone puts `n` of `depth` reads on one allele.
+fn indel_excess_pvalue(n: u32, depth: u32, eps: f64) -> f64 {
+    if n == 0 {
+        return 1.0;
+    }
+    let p = eps.clamp(1e-9, 1.0 - 1e-9);
+    match statrs::distribution::Binomial::new(p, depth as u64) {
+        Ok(b) => statrs::distribution::DiscreteCDF::sf(&b, (n - 1) as u64),
+        Err(_) => 1.0,
+    }
 }
 
 /// Accumulated observations at one left-normalized indel site.
@@ -421,8 +445,12 @@ pub struct IndelSiteModel {
 ///
 /// REF is always kept, mirroring "the reference allele is always eligible" in the
 /// substitution model. A non-reference allele must clear three gates: per-strand
-/// counts, the context-scaled VAF floor, and the strand-bias binomial test (with the
+/// counts, depth-aware context candidacy, and the strand-bias binomial test (with the
 /// same near-homoplasmic exemption the SNV model and `call::filter_strand_bias` use).
+///
+/// ONT-recall Phase2 T7: candidacy is `vaf >= max(vaf_abs_min, 1.5 * eps)` and
+/// `P(X >= n | depth, eps) <= excess_alpha / n_sites`, where `n_sites` is the number
+/// of sites fitted in this pass (the Bonferroni family).
 pub fn fit_indel_site(
     site: &IndelSite,
     refseq: &[u8],
@@ -430,6 +458,7 @@ pub fn fit_indel_site(
     min_strand: u32,
     strand_bias_p: f64,
     homoplasmic_vaf: f64,
+    n_sites: usize,
     o: &IndelOpts,
 ) -> IndelSiteModel {
     let depth = site.depth.max(1);
@@ -441,9 +470,8 @@ pub fn fit_indel_site(
     };
 
     // One eps per site. Alleles at the same site can in principle sit in different
-    // repeat contexts; take the deepest. This is conservative for CANDIDACY (it
-    // raises `vaf_floor`, so fewer alleles clear the gate) but anti-conservative
-    // for ASSIGNMENT: the crossover threshold `eps/(1-eps)` grows with eps, so a
+    // repeat contexts; take the deepest. Candidacy uses each allele's own context
+    // (ONT-recall Phase2 T7); this site eps is anti-conservative for ASSIGNMENT: the crossover threshold `eps/(1-eps)` grows with eps, so a
     // higher eps makes MAP assignment MORE willing to move reads, not less.
     let context_len = site
         .obs
@@ -510,7 +538,12 @@ pub fn fit_indel_site(
         }
         let l = repeat_context(refseq, norm_pos, allele);
         let vaf = (n as f64 / depth as f64).min(1.0);
-        if vaf < vaf_floor(l, o) {
+        // ONT-recall Phase2 T7: a fixed multiple of eps erased real 8-10% alleles in
+        // 5-C runs at ~400x; demand an effect size AND a significant excess over eps.
+        let eps_l = error_rate(l, o);
+        if vaf < o.vaf_abs_min.max(1.5 * eps_l)
+            || indel_excess_pvalue(n, depth, eps_l) > o.excess_alpha / n_sites.max(1) as f64
+        {
             continue;
         }
         // Near-homoplasmic exemption: a single-strand artifact is absent from the
@@ -1075,7 +1108,7 @@ mod indel_tests {
         let del = Allele::Del(1);
         let s = site(100, &[(del.clone(), 10, 10)]);
         let o = IndelOpts::default();
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_some(), "balanced 20% del in unique seq must be kept");
         assert!(kept_of(&m, &Allele::Ref).is_some(), "REF is always kept");
     }
@@ -1088,7 +1121,7 @@ mod indel_tests {
         let s = site(100, &[(del.clone(), 10, 10)]);
         let o = IndelOpts::default();
         assert!(vaf_floor(7, &o) > 0.20, "test premise: floor must exceed the 20% VAF");
-        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_none(), "20% del in a 7-mer run must be rejected");
     }
 
@@ -1098,7 +1131,7 @@ mod indel_tests {
         let del = Allele::Del(1);
         let s = site(100, &[(del.clone(), 18, 2)]);
         let o = IndelOpts::default();
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_none());
         assert_eq!(m.strand_biased, 1);
     }
@@ -1110,7 +1143,7 @@ mod indel_tests {
         let del = Allele::Del(1);
         let s = site(100, &[(del.clone(), 75, 5)]);
         let o = IndelOpts::default();
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_some(), "near-homoplasmic allele must survive");
         assert_eq!(m.strand_biased, 0);
     }
@@ -1128,7 +1161,7 @@ mod indel_tests {
             "test premise: the p-value alone would reject this allele"
         );
         let o = IndelOpts::default();
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_some(), "a 0.11 strand effect must not erase a real indel");
         assert_eq!(m.strand_biased, 0);
     }
@@ -1142,7 +1175,7 @@ mod indel_tests {
         s.col_fwd = 2171;
         s.col_rev = 2469;
         let o = IndelOpts::default();
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_none(), "a 0.50 strand effect is still an artifact");
         assert_eq!(m.strand_biased, 1);
     }
@@ -1153,8 +1186,73 @@ mod indel_tests {
         let ins = Allele::Ins(b"T".to_vec());
         let s = site(100, &[(ins.clone(), 19, 1)]);
         let o = IndelOpts::default();
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &ins).is_none());
+    }
+
+    // ONT-recall Phase2 T7: anchor A at index 1, then a 5-C run (rCRS 8271 context),
+    // so a 1bp deletion there sits in L=5: eps 0.0506, vaf_floor 0.152.
+    const C5_REF: &[u8] = b"TACCCCCTCTA";
+
+    #[test]
+    fn ten_percent_deletion_in_c5_run_at_depth_431_survives() {
+        // ONT-recall Phase2 T7: 8271AC>A. 43/431 is below the old 0.152 floor but
+        // far in excess of the ~22 reads eps(5) predicts.
+        let del = Allele::Del(1);
+        assert_eq!(repeat_context(C5_REF, 1, &del), 5, "test premise: L=5");
+        let o = IndelOpts::default();
+        assert!(vaf_floor(5, &o) > 0.15, "test premise: the old floor rejects 10%");
+        let s = site(431, &[(del.clone(), 22, 21)]);
+        let m = fit_indel_site(&s, C5_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
+        assert!(kept_of(&m, &del).is_some(), "10% at depth 431 in a 5-C run must survive");
+    }
+
+    #[test]
+    fn six_percent_deletion_in_c5_run_at_depth_60_is_rejected() {
+        // ONT-recall Phase2 T7: 4/60 is under 1.5 * eps(5) = 0.076.
+        let del = Allele::Del(1);
+        let s = site(60, &[(del.clone(), 2, 2)]);
+        let o = IndelOpts::default();
+        let m = fit_indel_site(&s, C5_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
+        assert!(kept_of(&m, &del).is_none(), "6% at depth 60 in a 5-C run must be rejected");
+    }
+
+    #[test]
+    fn ten_percent_deletion_in_c5_run_at_depth_60_is_not_in_excess() {
+        // ONT-recall Phase2 T7: same 10% VAF as the depth-431 case, but 6 reads where
+        // eps(5) expects ~3 is not significant (P ~ 0.08).
+        let del = Allele::Del(1);
+        let s = site(60, &[(del.clone(), 3, 3)]);
+        let o = IndelOpts::default();
+        let m = fit_indel_site(&s, C5_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
+        assert!(kept_of(&m, &del).is_none(), "a non-significant excess must be rejected");
+    }
+
+    #[test]
+    fn six_percent_deletion_in_unique_sequence_at_depth_60_is_rejected() {
+        // ONT-recall Phase2 T7: the old 0.05 floor kept 4/60, but P(X >= 4 | 60, 0.01)
+        // ~ 3e-3 is above excess_alpha.
+        let del = Allele::Del(1);
+        let s = site(60, &[(del.clone(), 2, 2)]);
+        let o = IndelOpts::default();
+        assert!(4.0 / 60.0 >= vaf_floor(1, &o), "test premise: the old floor kept it");
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
+        assert!(kept_of(&m, &del).is_none(), "6% at depth 60 must be rejected");
+    }
+
+    #[test]
+    fn excess_test_is_bonferroni_corrected_over_n_sites() {
+        // ONT-recall Phase2 T7: 43/431 (P ~ 2.3e-5) clears 1e-3 / 1 but not
+        // 1e-3 / 16569 (one test per mito position). The real HG00097 8271 pileup,
+        // 419/5334, clears either.
+        let del = Allele::Del(1);
+        let o = IndelOpts::default();
+        let s = site(431, &[(del.clone(), 22, 21)]);
+        let m = fit_indel_site(&s, C5_REF, 1, 2, SB_P, HOM_VAF, 16569, &o);
+        assert!(kept_of(&m, &del).is_none(), "43/431 must not survive 16569 tests");
+        let s = site(5334, &[(del.clone(), 210, 209)]);
+        let m = fit_indel_site(&s, C5_REF, 1, 2, SB_P, HOM_VAF, 16569, &o);
+        assert!(kept_of(&m, &del).is_some(), "419/5334 must survive 16569 tests");
     }
 
     #[test]
@@ -1168,7 +1266,7 @@ mod indel_tests {
         let del = Allele::Del(1);
         let s = site(100, &[(ins.clone(), 10, 10), (del.clone(), 10, 10)]);
         let o = IndelOpts::default();
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert_eq!(m.kept.len(), 3, "REF, Ins, and Del must all survive candidacy here");
         // Assert the EXACT expected sequence rather than comparing the list to a
         // sorted copy of itself: `Ref` is always pushed first and is always the
@@ -1199,7 +1297,7 @@ mod indel_tests {
         let mut o = IndelOpts::default();
         o.vaf = 0.01;
         o.floor_mult = 0.0; // isolate assignment from the gate for this test
-        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &ins).is_some() && kept_of(&m, &Allele::Ref).is_some());
         assert_eq!(assign_allele(&ins, &m, &o), Assignment::Keep, "40% allele must not flip");
         assert_eq!(assign_allele(&Allele::Ref, &m, &o), Assignment::Keep, "60% allele must not flip");
@@ -1213,7 +1311,7 @@ mod indel_tests {
         let mut o = IndelOpts::default();
         o.vaf = 0.01;
         o.floor_mult = 0.0;
-        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert!(m.eps > 0.1, "test premise: long homopolymer must have a large eps");
         assert_eq!(assign_allele(&Allele::Ref, &m, &o), Assignment::Move(ins.clone()));
         assert_eq!(assign_allele(&ins, &m, &o), Assignment::Keep);
@@ -1230,7 +1328,7 @@ mod indel_tests {
         let d2 = Allele::Del(2);
         let s = site(100, &[(d1.clone(), 40, 40), (d2.clone(), 1, 1)]);
         let o = IndelOpts::default();
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &d1).is_some());
         assert!(kept_of(&m, &d2).is_none());
         assert_eq!(assign_allele(&d2, &m, &o), Assignment::Move(d1.clone()));
@@ -1246,7 +1344,7 @@ mod indel_tests {
         let mut o = IndelOpts::default();
         o.vaf = 0.01;
         o.floor_mult = 0.0;
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_none());
         // The MAP target here is Ins (it dominates the site), which is a cross-kind
         // transition the rewrite walk does not support, so it must be Refused --
@@ -1264,7 +1362,7 @@ mod indel_tests {
         let mut o = IndelOpts::default();
         o.vaf = 0.01;
         o.floor_mult = 0.0;
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         // d3 dominates the site and is the MAP target, but growing Del(1) into
         // Del(3) is a transition the rewrite walk does not support -- Refused,
         // not silently reinterpreted as Keep.
@@ -1286,13 +1384,13 @@ mod indel_tests {
         o.vaf = 0.01;
         o.floor_mult = 0.0;
 
-        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert!(m.hp_run.is_none(), "test premise: the model is off by default");
         assert!(kept_of(&m, &del).is_some_and(|(_, f)| (*f - 0.9).abs() < 0.03));
         assert_eq!(assign_allele(&ins, &m, &o), Assignment::Refused);
 
         o.hp_length_model = true;
-        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert_eq!(m.hp_run, Some((8, b'A')), "anchor 0 is the A-run's HP site");
         assert_eq!(assign_allele(&ins, &m, &o), Assignment::Move(del));
     }
@@ -1310,11 +1408,11 @@ mod indel_tests {
         o.vaf = 0.01;
         o.floor_mult = 0.0;
 
-        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert_eq!(assign_allele(&d1, &m, &o), Assignment::Refused);
 
         o.hp_length_model = true;
-        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert_eq!(assign_allele(&d1, &m, &o), Assignment::Move(d3));
     }
 
@@ -1327,12 +1425,13 @@ mod indel_tests {
         let ins = Allele::Ins(b"A".to_vec());
         let del = Allele::Del(1);
         // 30% of the column carries the insertion, strand-balanced: above
-        // `protect_vaf`, but below the floor in this 7bp context, so it is rejected
+        // `protect_vaf`, but below 1.5 * eps = 0.6 in this 12bp context (ONT-recall
+        // Phase2 T7: the 7bp run's 0.171 no longer rejects 30%), so it is rejected
         // by candidacy alone and must still be shielded.
         let s = site(100, &[(del.clone(), 30, 30), (ins.clone(), 15, 15)]);
         let mut o = IndelOpts::default();
         o.hp_length_model = true;
-        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert!(m.hp_run.is_some(), "test premise: this must be an HP site");
         assert!(kept_of(&m, &ins).is_none(), "test premise: the insertion loses candidacy");
         assert!(
@@ -1348,7 +1447,7 @@ mod indel_tests {
         // Same allele, now single-stranded: rejected by `min_strand`, so protection
         // must not shield it and the length model must move it.
         let s = site(100, &[(del.clone(), 30, 30), (ins.clone(), 30, 0)]);
-        let m = fit_indel_site(&s, HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert!(m.strand_rejected.contains(&ins), "test premise: strand-gate rejection");
         assert!(
             matches!(assign_allele(&ins, &m, &o), Assignment::Move(_)),
@@ -1366,7 +1465,7 @@ mod indel_tests {
         let del = Allele::Del(1);
         let s = site(100, &[(del.clone(), 1, 1)]);
         let o = IndelOpts::default();
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert_eq!(m.kept.len(), 1, "only REF should survive");
         // A read already carrying the sole kept allele is untouched...
         assert_eq!(assign_allele(&Allele::Ref, &m, &o), Assignment::Keep);
@@ -1396,7 +1495,7 @@ mod indel_tests {
         let o = IndelOpts::default();
         assert!(vaf_floor(12, &o) > 1.0, "test premise: floor must exceed 1.0 at L=12");
         let s = site(100, &[(del.clone(), 25, 25)]);
-        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_none(), "candidacy must genuinely reject the allele");
         assert_eq!(
             assign_allele(&del, &m, &o),
@@ -1414,7 +1513,7 @@ mod indel_tests {
         let del = Allele::Del(1);
         let o = IndelOpts::default();
         let s = site(100, &[(del.clone(), 3, 2)]); // 5/100 = 0.05 < protect_vaf 0.2
-        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_none(), "candidacy must reject the allele");
         assert_eq!(
             assign_allele(&del, &m, &o),
@@ -1433,7 +1532,7 @@ mod indel_tests {
         let ins = Allele::Ins(b"T".to_vec());
         let s = site(100, &[(ins.clone(), 30, 0)]);
         let o = IndelOpts::default();
-        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &ins).is_none(), "candidacy must reject the strand-skewed allele");
         assert!(
             m.strand_rejected.contains(&ins),
@@ -1456,7 +1555,7 @@ mod indel_tests {
         let o = IndelOpts::default();
         assert!(vaf_floor(12, &o) > 1.0, "test premise: floor must exceed 1.0 at L=12");
         let s = site(100, &[(del.clone(), 15, 15)]);
-        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, &o);
+        let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_none(), "candidacy must reject the allele on the floor gate");
         assert!(
             !m.strand_rejected.contains(&del),

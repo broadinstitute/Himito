@@ -814,6 +814,8 @@ fn compute_corrections(
     // ---- deferred indel site decisions ----
     let mut models: IndelModels = HashMap::new();
     if iopts.enabled {
+        // ONT-recall Phase2 T7: Bonferroni family for the indel excess test.
+        let n_sites = sites.len();
         for ((contig, norm_pos), mut site) in sites.into_iter() {
             let refseq = match refs.get(&contig) {
                 Some(s) => s,
@@ -838,7 +840,8 @@ fn compute_corrections(
 
             stats.indel_sites_examined += 1;
             let model = indel::fit_indel_site(
-                &site, refseq, norm_pos, min_strand, strand_bias_p, homoplasmic_vaf, iopts,
+                &site, refseq, norm_pos, min_strand, strand_bias_p, homoplasmic_vaf, n_sites,
+                iopts,
             );
             stats.indel_alt_alleles_strand_biased += model.strand_biased as u64;
             // `kept` includes REF; count only surviving non-reference alleles.
@@ -4240,22 +4243,26 @@ mod tests {
         // insertion genuinely enters `kept`, mirroring the design's own
         // worked example (design doc, section 3.5: "40% INS / 60% REF...
         // nothing flips", here as 60% INS / 40% REF).
+        //
+        // ONT-recall Phase2 T7: candidacy also needs a significant excess over
+        // eps(8). 6 of 10 gives P ~ 2.8e-3 > excess_alpha, so the same 60% is
+        // built from 12 of 20 reads (P ~ 2e-5).
         let dir = std::env::temp_dir().join("himito_denoise_e2e_genuine_heteroplasmy");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
         let outb = dir.join("out.bam");
 
-        let names10: [&str; 10] = ["r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9"];
+        let names20: Vec<String> = (0..20).map(|i| format!("r{i:02}")).collect();
         let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
-        // 6 reads carrying the insertion (3 forward / 3 reverse) plus 4
-        // clean reads (2 forward / 2 reverse) -- both groups individually
+        // 12 reads carrying the insertion (6 forward / 6 reverse) plus 8
+        // clean reads (4 forward / 4 reverse) -- both groups individually
         // strand-balanced so neither can be rejected by a strand gate,
         // isolating exactly the context-floor arithmetic this test checks.
-        for i in 0..6 {
-            reads.push((names10[i], 0, HP_INS_SEQ, hp_ins_cigar(), i % 2 == 0));
+        for i in 0..12 {
+            reads.push((&names20[i], 0, HP_INS_SEQ, hp_ins_cigar(), i % 2 == 0));
         }
-        for i in 6..10 {
-            reads.push((names10[i], 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
+        for i in 12..20 {
+            reads.push((&names20[i], 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
         }
         write_cigar_bam(&bam, "chrM", 29, &reads);
 
@@ -4289,7 +4296,7 @@ mod tests {
         let mut seen = 0;
         for (i, rec) in r.records().enumerate() {
             let rec = rec.unwrap();
-            let (expected_seq, expected_cigar): (&[u8], Vec<Cigar>) = if i < 6 {
+            let (expected_seq, expected_cigar): (&[u8], Vec<Cigar>) = if i < 12 {
                 (HP_INS_SEQ, hp_ins_cigar())
             } else {
                 (CLEAN_SEQ, clean_cigar())
@@ -4302,7 +4309,7 @@ mod tests {
             );
             seen += 1;
         }
-        assert_eq!(seen, 10);
+        assert_eq!(seen, 20);
 
         assert_eq!(stats.reads_reassigned_ref_to_ins, 0);
         assert_eq!(stats.reads_reassigned_ref_to_del, 0);

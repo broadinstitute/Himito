@@ -33,6 +33,29 @@ mod denoise_indel;
 /// 0.04 recall starts falling (0.965) as real low-frequency heteroplasmies drop out.
 pub const DENOISE_KEEP_VAF: f64 = 0.03;
 
+/// Stage-1 early stop of the adaptive permutation test (ONT-recall T1): a variant
+/// that has collected this many null exceedances has a p-value well above any BH
+/// threshold, so its remaining draws are wasted.
+///
+/// 20 was chosen with `scripts/ont_recall/perm_retest.py --mode adaptive` on the
+/// HapMap ONT r10 raw matrix (base_r10): it keeps all 54 truth rows and 0 non-truth
+/// while skipping most of the draws a fixed 10k-round run spends on clear nulls.
+pub const PERM_STOP_AFTER: u32 = 20;
+
+/// Headroom factor of the adaptive permutation floor target (ONT-recall T1).
+/// Variants still at zero exceedances are extended to
+/// `ceil(PERM_HEADROOM * m / (alpha * k0))` rounds, so the floor p-value
+/// `1/(R+1)` sits `PERM_HEADROOM` times below the BH bar `alpha * k0 / m`.
+/// 10 resolved the HapMap ONT r10 floor (54 truth, 0 non-truth) in the oracle.
+pub const PERM_HEADROOM: f64 = 10.0;
+
+/// Hard cap on per-variant permutation rounds in the adaptive test (ONT-recall T1).
+pub const PERM_MAX_ROUNDS: usize = 100_000;
+
+/// Base seed of the per-variant permutation RNG, XORed with FNV-1a-64 of the variant
+/// name, so adaptive results are reproducible under rayon (ONT-recall T1).
+pub const PERM_SEED: u64 = 42;
+
 /// Minimal observations required on EACH strand for an allele to be a candidate.
 ///
 /// Was `--min-strand`. Every caller in the repo — QuickStart, both eval scripts,
@@ -188,11 +211,15 @@ enum Commands {
         #[clap(long, value_parser )]
         permutation_frequency_threshold: Option<f64>,
 
-        /// permutation rounds per variant. The smallest attainable p-value is
-        /// 1/(rounds+1), so this must leave headroom below --p-value-threshold after
-        /// Benjamini-Hochberg. Cost scales linearly; lower it to speed up large graphs.
+        /// minimum rounds per tested variant; with the default adaptive mode, variants
+        /// at the p-value floor are extended automatically until BH can resolve them
         #[clap(long, value_parser, default_value_t = 1000)]
         permutation_rounds: usize,
+
+        /// permutation test mode: adaptive (extend floor variants, stop clear nulls
+        /// early) or fixed (exactly --permutation-rounds per variant)
+        #[clap(long, value_enum, default_value_t = call::PermutationMode::Adaptive)]
+        permutation_mode: call::PermutationMode,
 
         /// what to do with strand-skewed variants: flag them in FILTER, or additionally
         /// drop low-VAF SNPs outright (default: drop for ont-denoised, flag otherwise)
@@ -429,11 +456,15 @@ enum Commands {
         #[clap(long, value_parser)]
         permutation_frequency_threshold: Option<f64>,
 
-        /// permutation rounds per variant. The smallest attainable p-value is
-        /// 1/(rounds+1), so this must leave headroom below --p-value-threshold after
-        /// Benjamini-Hochberg. Cost scales linearly; lower it to speed up large graphs.
+        /// minimum rounds per tested variant; with the default adaptive mode, variants
+        /// at the p-value floor are extended automatically until BH can resolve them
         #[clap(long, value_parser, default_value_t = 1000)]
         permutation_rounds: usize,
+
+        /// permutation test mode: adaptive (extend floor variants, stop clear nulls
+        /// early) or fixed (exactly --permutation-rounds per variant)
+        #[clap(long, value_enum, default_value_t = call::PermutationMode::Adaptive)]
+        permutation_mode: call::PermutationMode,
 
         /// what to do with strand-skewed variants: flag them in FILTER, or additionally
         /// drop low-VAF SNPs outright (default: drop for ont-denoised, flag otherwise)
@@ -770,6 +801,7 @@ fn main() {
             indel_false_threshold,
             permutation_frequency_threshold,
             permutation_rounds,
+            permutation_mode,
             strand_bias_action,
             strand_bias_drop_max_hf,
             no_left_align,
@@ -862,6 +894,7 @@ fn main() {
                 indel_false_threshold,
                 permutation_frequency_threshold_,
                 permutation_rounds,
+                permutation_mode,
                 strand_bias_action,
                 strand_bias_drop_max_hf,
                 left_align,
@@ -972,6 +1005,7 @@ fn main() {
             indel_false_threshold,
             permutation_frequency_threshold,
             permutation_rounds,
+            permutation_mode,
             strand_bias_action,
             strand_bias_drop_max_hf,
             no_left_align,
@@ -1000,6 +1034,7 @@ fn main() {
                 indel_false_threshold,
                 permutation_frequency_threshold,
                 permutation_rounds,
+                permutation_mode,
                 strand_bias_action,
                 strand_bias_drop_max_hf,
                 left_align,

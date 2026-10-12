@@ -1509,6 +1509,270 @@ fn filter_strand_bias(
     (kept, filtered_matrix)
 }
 
+// ---- adaptive permutation (ONT-recall T1) ----
+
+/// How `permutation_test` draws its null.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum PermutationMode {
+    /// Draw `--permutation-rounds` per tested variant, extending the variants that sit
+    /// at the p-value floor until Benjamini-Hochberg can resolve them (default).
+    Adaptive,
+    /// Exactly `--permutation-rounds` draws for every tested variant (historical).
+    Fixed,
+}
+
+/// A genotype row as bitsets over reads. Value `> 0.5` is alt, NaN is uncovered and
+/// 0 is covered-reference, so `alt` is always a subset of `cov`.
+pub(crate) struct BitRow {
+    pub alt: Vec<u64>,
+    pub cov: Vec<u64>,
+    /// Indices of the covered reads: the pool a shuffle draws its alt reads from.
+    pub covered_idx: Vec<u32>,
+    pub n_alt: u32,
+}
+
+impl BitRow {
+    pub(crate) fn from_row(row: &[f64]) -> BitRow {
+        let words = (row.len() + 63) / 64;
+        let mut alt = vec![0u64; words];
+        let mut cov = vec![0u64; words];
+        let mut covered_idx = Vec::new();
+        let mut n_alt = 0u32;
+        for (j, &v) in row.iter().enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            cov[j >> 6] |= 1u64 << (j & 63);
+            covered_idx.push(j as u32);
+            if v > 0.5 {
+                alt[j >> 6] |= 1u64 << (j & 63);
+                n_alt += 1;
+            }
+        }
+        BitRow { alt, cov, covered_idx, n_alt }
+    }
+}
+
+/// Jaccard of a (possibly shuffled) row `x` against row `y`, identical to
+/// `genotype_jaccard_similarity` on the f64 rows: reads uncovered in either row are
+/// ignored, and the union is 0 when neither row has an alt among shared reads.
+#[inline]
+pub(crate) fn jaccard_bits(x_alt: &[u64], x_cov: &[u64], y: &BitRow) -> f64 {
+    let mut inter = 0u32;
+    let mut union = 0u32;
+    for w in 0..x_alt.len() {
+        inter += (x_alt[w] & y.alt[w]).count_ones();
+        union += ((x_alt[w] & y.cov[w]) | (y.alt[w] & x_cov[w])).count_ones();
+    }
+    if union == 0 {
+        0.0
+    } else {
+        inter as f64 / union as f64
+    }
+}
+
+/// Bitset analogue of `sum_jaccard_against_others`.
+#[inline]
+fn sum_jaccard_bits(x_alt: &[u64], x_cov: &[u64], self_index: usize, rows: &[BitRow]) -> f64 {
+    let mut sum = 0.0;
+    for (j, y) in rows.iter().enumerate() {
+        if j != self_index {
+            sum += jaccard_bits(x_alt, x_cov, y);
+        }
+    }
+    sum
+}
+
+/// Bitset analogue of `shuffle_genotypes`: place `row.n_alt` alts on a uniform random
+/// subset of the covered reads (partial Fisher-Yates on `scratch`), writing the
+/// result into `out_alt`. Coverage is unchanged, so only the alt bits move.
+pub(crate) fn shuffle_bits(
+    row: &BitRow,
+    scratch: &mut Vec<u32>,
+    out_alt: &mut [u64],
+    rng: &mut impl rand::Rng,
+) {
+    scratch.clear();
+    scratch.extend_from_slice(&row.covered_idx);
+    out_alt.fill(0);
+    let len = scratch.len();
+    for t in 0..row.n_alt as usize {
+        let j = rng.random_range(t..len);
+        scratch.swap(t, j);
+        let r = scratch[t] as usize;
+        out_alt[r >> 6] |= 1u64 << (r & 63);
+    }
+}
+
+/// Materialize the matrix rows once, as the permutation code compares each row
+/// against every other.
+fn matrix_rows(matrix: &Array2<f64>) -> Vec<Vec<f64>> {
+    (0..matrix.nrows())
+        .map(|j| matrix.slice(s![j, ..]).iter().copied().collect())
+        .collect()
+}
+
+/// FNV-1a 64-bit, used to derive a per-variant RNG seed from the variant name.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Null draws of one tested variant: how many reached the observation, out of how many.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PermOutcome {
+    pub exceed: u32,
+    pub draws: u32,
+}
+
+impl PermOutcome {
+    /// Empirical p with the add-one correction, `(exceed + 1) / (draws + 1)`.
+    pub(crate) fn p_value(&self) -> f64 {
+        (self.exceed + 1) as f64 / (self.draws + 1) as f64
+    }
+}
+
+pub(crate) struct AdaptiveResult {
+    /// One outcome per entry of `tested`, in the same order.
+    pub outcomes: Vec<PermOutcome>,
+    /// Final per-variant round target of the floor-resolving stage (stage 1's
+    /// `min_rounds` when no variant was at the floor).
+    pub r_target: usize,
+    pub total_draws: u64,
+}
+
+/// Draws per batch; the early-stop test runs between batches.
+const PERM_BATCH: u32 = 100;
+/// Most floor-resolving passes (each only ever raises the target).
+const PERM_MAX_STAGE2_PASSES: usize = 5;
+
+struct PermState {
+    rng: rand::rngs::StdRng,
+    exceed: u32,
+    draws: u32,
+}
+
+/// Adaptive, floor-aware permutation test (ONT-recall T1).
+///
+/// Stage 1 draws up to `min_rounds` per tested variant, stopping a variant once it has
+/// `PERM_STOP_AFTER` exceedances (its p is then clearly above any BH threshold).
+/// Stage 2 resolves the floor: the `k0` variants with zero exceedances sit at
+/// `p = 1/(draws+1)`, and BH over `m` tests can only call them at `alpha` if that
+/// floor is below `alpha * k0 / m`. They are extended to
+/// `R_target = ceil(PERM_HEADROOM * m / (alpha * k0))` (capped at `PERM_MAX_ROUNDS`),
+/// repeating while the target grows. Mirrors `scripts/ont_recall/perm_retest.py
+/// --mode adaptive`, the oracle.
+///
+/// `rows` is every matrix row (the Jaccard sum runs over all of them), `tested`
+/// indexes the rows that get a null, and `names[i]` seeds row `i`'s RNG, so the result
+/// is deterministic regardless of how rayon schedules the work.
+pub(crate) fn adaptive_permutation(
+    rows: &[Vec<f64>],
+    tested: &[usize],
+    names: &[String],
+    min_rounds: usize,
+    alpha: f64,
+) -> AdaptiveResult {
+    use rand::SeedableRng;
+    let started = std::time::Instant::now();
+    let m = tested.len();
+    if m == 0 || min_rounds == 0 {
+        return AdaptiveResult {
+            outcomes: vec![PermOutcome { exceed: 0, draws: 0 }; m],
+            r_target: min_rounds,
+            total_draws: 0,
+        };
+    }
+    let stop_after = crate::PERM_STOP_AFTER;
+    let bits: Vec<BitRow> = rows.iter().map(|r| BitRow::from_row(r)).collect();
+    let words = bits.first().map_or(0, |b| b.alt.len());
+    let obs: Vec<f64> = tested
+        .iter()
+        .map(|&i| sum_jaccard_bits(&bits[i].alt, &bits[i].cov, i, &bits))
+        .collect();
+    let mut states: Vec<PermState> = tested
+        .iter()
+        .map(|&i| PermState {
+            rng: rand::rngs::StdRng::seed_from_u64(crate::PERM_SEED ^ fnv1a64(names[i].as_bytes())),
+            exceed: 0,
+            draws: 0,
+        })
+        .collect();
+
+    // Extend the variants in `which` (indices into `tested`) to `target` draws.
+    let extend = |states: &mut Vec<PermState>, which: &[usize], target: usize| {
+        let target = target as u32;
+        // Disjoint &mut access to the chosen states, one rayon task per variant.
+        let mut picked: Vec<(usize, &mut PermState)> = Vec::with_capacity(which.len());
+        let mut want = which.iter().copied().peekable();
+        for (k, st) in states.iter_mut().enumerate() {
+            if want.peek() == Some(&k) {
+                picked.push((k, st));
+                want.next();
+            }
+        }
+        picked.into_par_iter().for_each_init(
+            || (Vec::<u32>::new(), vec![0u64; words]),
+            |(scratch, buf), (k, st)| {
+                let i = tested[k];
+                let row = &bits[i];
+                let threshold = obs[k] - 1e-9;
+                while st.draws < target && st.exceed < stop_after {
+                    let n = PERM_BATCH.min(target - st.draws);
+                    for _ in 0..n {
+                        shuffle_bits(row, scratch, buf, &mut st.rng);
+                        if sum_jaccard_bits(buf, &row.cov, i, &bits) >= threshold {
+                            st.exceed += 1;
+                        }
+                    }
+                    st.draws += n;
+                }
+            },
+        );
+    };
+    let total = |states: &Vec<PermState>| states.iter().map(|s| s.draws as u64).sum::<u64>();
+
+    let all: Vec<usize> = (0..m).collect();
+    extend(&mut states, &all, min_rounds);
+    let mut target = min_rounds;
+    let k0 = states.iter().filter(|s| s.exceed == 0).count();
+    println!(
+        "Permutation stage 1: m={} k0={} R_target={} draws={} time={:.1}s",
+        m, k0, target, total(&states), started.elapsed().as_secs_f64()
+    );
+
+    for pass in 0..PERM_MAX_STAGE2_PASSES {
+        let floor: Vec<usize> = (0..m).filter(|&k| states[k].exceed == 0).collect();
+        if floor.is_empty() {
+            break;
+        }
+        let new_target = crate::PERM_MAX_ROUNDS
+            .min((crate::PERM_HEADROOM * m as f64 / (alpha * floor.len() as f64)).ceil() as usize);
+        if new_target <= target {
+            break;
+        }
+        target = new_target;
+        extend(&mut states, &floor, target);
+        println!(
+            "Permutation stage 2.{}: m={} k0={} R_target={} draws={} time={:.1}s",
+            pass + 1, m, floor.len(), target, total(&states), started.elapsed().as_secs_f64()
+        );
+    }
+
+    AdaptiveResult {
+        outcomes: states
+            .iter()
+            .map(|s| PermOutcome { exceed: s.exceed, draws: s.draws })
+            .collect(),
+        r_target: target,
+        total_draws: total(&states),
+    }
+}
+
 fn permutation_test(
     matrix: &Array2<f64>,
     p_value_threshold: f64,
@@ -1517,15 +1781,16 @@ fn permutation_test(
     filtered_var: &Vec<Variant>,
     coverage: &HashMap<usize, usize>,
     permutation_frequency_threshold:f64,
-    data_type: &str
+    data_type: &str,
+    mode: PermutationMode,
 ) -> (Vec<Variant>, Array2<f64>, Vec<String>) {
 
     let bar = ProgressBar::new(filtered_var.len() as u64);
-    let nulls = get_null_distribution(filtered_var, &matrix, permutation_round, permutation_frequency_threshold);
-    let collected_values: Vec<Option<(f64, String)>> = (0..filtered_var.len()).into_par_iter().map(|i| {
-        bar.inc(1);
+
+    // Admission: which variants are candidates for the permutation test at all.
+    // (The matrix-frequency gate below is applied on top, per mode.)
+    let admitted = |i: usize| -> bool {
         let current_variant = &filtered_var[i];
-        let index = generate_variant_name(current_variant);
         // A variant whose position carries no coverage entry cannot be scored; the
         // original `.unwrap()` here panicked on that instead of leaving it untested.
         let depth = coverage.get(&current_variant.pos).copied().unwrap_or(0);
@@ -1536,11 +1801,11 @@ fn permutation_test(
         };
 
         if frequency > heteroplasmic_error_threshold {
-            return None;
+            return false;
         }
         // exclude large indel
         if (current_variant.ref_allele.len() as i32 - current_variant.alt_allele.len() as i32).abs() > 50 {
-            return None;
+            return false;
         }
 
         let is_snp = current_variant.ref_allele.len() == 1 && current_variant.alt_allele.len() == 1;
@@ -1555,8 +1820,48 @@ fn permutation_test(
         // SNPs here left them with no discriminative filter anywhere in the pipeline:
         // `filter_strand_bias` only flagged, and `Potential_Artifact` is indel-only.
         // That gap is exactly where the residual low-VAF SNP false positives came from.
-        if is_snp && data_type == "pacbio" {
+        !(is_snp && data_type == "pacbio")
+    };
+
+    // Fixed: a per-variant null of `permutation_round` draws for every variant.
+    // Adaptive (ONT-recall T1): p-values by row index from the staged draws.
+    let (nulls, adaptive_p): (HashMap<String, Vec<f64>>, HashMap<usize, f64>) = match mode {
+        PermutationMode::Fixed => (
+            get_null_distribution(filtered_var, &matrix, permutation_round, permutation_frequency_threshold),
+            HashMap::new(),
+        ),
+        PermutationMode::Adaptive => {
+            let rows = matrix_rows(matrix);
+            let names: Vec<String> = filtered_var.iter().map(generate_variant_name).collect();
+            // No null for a variant above `permutation_frequency_threshold` by MATRIX
+            // alt frequency (the same gate `get_null_distribution` applies).
+            let tested: Vec<usize> = (0..filtered_var.len())
+                .filter(|&i| {
+                    admitted(i)
+                        && alt_frequency(matrix.slice(s![i, ..])) <= permutation_frequency_threshold
+                })
+                .collect();
+            let res = adaptive_permutation(&rows, &tested, &names, permutation_round, p_value_threshold);
+            let p: HashMap<usize, f64> = tested
+                .iter()
+                .zip(res.outcomes.iter())
+                .filter(|(_, o)| o.draws > 0)
+                .map(|(&i, o)| (i, o.p_value()))
+                .collect();
+            (HashMap::new(), p)
+        }
+    };
+    let collected_values: Vec<Option<(f64, String)>> = (0..filtered_var.len()).into_par_iter().map(|i| {
+        bar.inc(1);
+        let current_variant = &filtered_var[i];
+        let index = generate_variant_name(current_variant);
+        if !admitted(i) {
             return None;
+        }
+
+        if mode == PermutationMode::Adaptive {
+            // Untested (no draws) is missing evidence, not evidence of an artifact.
+            return adaptive_p.get(&i).map(|&p| (p, index));
         }
 
         // No null draws for this variant (it sits above `permutation_frequency_threshold`
@@ -1666,6 +1971,7 @@ pub fn start(
     indel_false_threshold: f64,
     permutation_frequency_threshold: f64,
     permutation_rounds: usize,
+    permutation_mode: PermutationMode,
     strand_bias_action: Option<StrandBiasAction>,
     strand_bias_drop_max_hf: f64,
     left_align: bool,
@@ -1745,7 +2051,7 @@ pub fn start(
         None => (var_record.clone(), matrix.clone()),
     };
 
-    let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&sb_matrix, p_value_threshold, heteroplasmic_frequency_threshold, permutation_rounds, &sb_filtered_var, &coverage, permutation_frequency_threshold, data_type);
+    let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&sb_matrix, p_value_threshold, heteroplasmic_frequency_threshold, permutation_rounds, &sb_filtered_var, &coverage, permutation_frequency_threshold, data_type, permutation_mode);
 
     // write filtered vcf
     let _ = write_vcf(
@@ -2248,6 +2554,7 @@ mod tests {
 
         let (kept, _m, _names) = permutation_test(
             &matrix, 0.5, 0.9, 200, &variants, &coverage, 0.9, "ont-denoised",
+            PermutationMode::Fixed,
         );
         let kept_names: Vec<String> = kept.iter().map(generate_variant_name).collect();
 
@@ -2266,6 +2573,7 @@ mod tests {
 
         let (kept, _m, _names) = permutation_test(
             &matrix, 0.5, 0.9, 200, &variants, &coverage, 0.9, "pacbio",
+            PermutationMode::Fixed,
         );
         let kept_names: Vec<String> = kept.iter().map(generate_variant_name).collect();
 
@@ -2295,9 +2603,175 @@ mod tests {
 
         let (kept, _m, _names) = permutation_test(
             &matrix, 0.5, 0.5, 16, &variants, &coverage, 0.7, "ont-denoised",
+            PermutationMode::Fixed,
         );
 
         assert_eq!(kept.len(), 2, "variants with an empty null must be kept, not dropped");
+    }
+
+    // ---------------------------------------------------------------------
+    // Adaptive, floor-aware permutation test (ONT-recall T1)
+    // ---------------------------------------------------------------------
+
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    /// `n` reads x `rows` random genotype rows: ~20% NaN (uncovered), ~10% alt.
+    fn random_genotype_row(rng: &mut StdRng, n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|_| {
+                let u: f64 = rng.random();
+                if u < 0.20 {
+                    f64::NAN
+                } else if u < 0.30 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bit_jaccard_matches_f64_jaccard() {
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..200 {
+            let a = random_genotype_row(&mut rng, 300);
+            let b = random_genotype_row(&mut rng, 300);
+            let (ba, bb) = (BitRow::from_row(&a), BitRow::from_row(&b));
+            let want = genotype_jaccard_similarity(&a, &b);
+            let got = jaccard_bits(&ba.alt, &ba.cov, &bb);
+            assert_eq!(got, want, "bitset Jaccard must equal the f64 Jaccard exactly");
+        }
+    }
+
+    #[test]
+    fn bit_shuffle_preserves_alt_count_and_coverage() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let row = random_genotype_row(&mut rng, 300);
+        let br = BitRow::from_row(&row);
+        let mut scratch: Vec<u32> = Vec::new();
+        let mut alt = vec![0u64; br.alt.len()];
+        let popcnt = |w: &[u64]| w.iter().map(|x| x.count_ones()).sum::<u32>();
+        for _ in 0..1000 {
+            shuffle_bits(&br, &mut scratch, &mut alt, &mut rng);
+            assert_eq!(popcnt(&alt), br.n_alt, "shuffle must preserve the alt count");
+            assert!(
+                alt.iter().zip(&br.cov).all(|(a, c)| a & !c == 0),
+                "shuffled alts must stay inside the covered reads"
+            );
+        }
+    }
+
+    /// 10 identical lineage rows (alt in the same 24 of 400 reads) plus 120
+    /// independent noise rows (8 random alts each). The 10 lineage rows sit at the
+    /// permutation p-value floor, which fixed R = 1000 cannot get through BH.
+    fn floor_matrix() -> (Vec<Variant>, Array2<f64>, HashMap<usize, usize>) {
+        let n_reads = 400;
+        let mut rng = StdRng::seed_from_u64(2026);
+        let mut variants = Vec::new();
+        let mut matrix = Array2::<f64>::zeros((130, n_reads));
+        for i in 0..130 {
+            variants.push(snp(100 + i, "A", if i < 10 { 24 } else { 8 }));
+            if i < 10 {
+                for j in 0..24 {
+                    matrix[[i, j]] = 1.0;
+                }
+            } else {
+                let mut placed = 0;
+                while placed < 8 {
+                    let j = rng.random_range(0..n_reads);
+                    if matrix[[i, j]] == 0.0 {
+                        matrix[[i, j]] = 1.0;
+                        placed += 1;
+                    }
+                }
+            }
+        }
+        let coverage: HashMap<usize, usize> = (0..130).map(|i| (100 + i, n_reads)).collect();
+        (variants, matrix, coverage)
+    }
+
+    fn lineage_kept(kept: &[Variant]) -> (usize, usize) {
+        let lineage = kept.iter().filter(|v| v.pos < 110).count();
+        (lineage, kept.len() - lineage)
+    }
+
+    #[test]
+    fn fixed_permutation_cannot_resolve_the_bh_floor() {
+        let (variants, matrix, coverage) = floor_matrix();
+        let (kept, _m, _n) = permutation_test(
+            &matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10",
+            PermutationMode::Fixed,
+        );
+        let (lineage, _noise) = lineage_kept(&kept);
+        assert_eq!(
+            lineage, 0,
+            "R = 1000 puts 10 lineage rows at p = 1/1001, so BH q = 0.013 > 0.01: all 10 excluded"
+        );
+    }
+
+    #[test]
+    fn adaptive_permutation_resolves_the_bh_floor() {
+        let (variants, matrix, coverage) = floor_matrix();
+        let (kept, _m, _n) = permutation_test(
+            &matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10",
+            PermutationMode::Adaptive,
+        );
+        let (lineage, noise) = lineage_kept(&kept);
+        assert_eq!(lineage, 10, "adaptive must keep every lineage row");
+        assert!(noise <= 1, "at most one noise row may survive, got {noise}");
+
+        let rows = matrix_rows(&matrix);
+        let tested: Vec<usize> = (0..variants.len()).collect();
+        let names: Vec<String> = variants.iter().map(generate_variant_name).collect();
+        let res = adaptive_permutation(&rows, &tested, &names, 1000, 0.01);
+        assert!(
+            res.r_target >= 13000,
+            "10 * 130 / (0.01 * 10) = 13000 rounds needed, reported {}",
+            res.r_target
+        );
+    }
+
+    #[test]
+    fn adaptive_permutation_stops_clear_nulls_early() {
+        let (variants, matrix, _cov) = floor_matrix();
+        let rows = matrix_rows(&matrix);
+        let tested: Vec<usize> = (0..variants.len()).collect();
+        let names: Vec<String> = variants.iter().map(generate_variant_name).collect();
+        let min_rounds = 1000;
+        let res = adaptive_permutation(&rows, &tested, &names, min_rounds, 0.01);
+        let mut checked = 0;
+        for (k, o) in res.outcomes.iter().enumerate() {
+            let p = (o.exceed + 1) as f64 / (o.draws + 1) as f64;
+            if p > 0.1 {
+                checked += 1;
+                assert!(
+                    (o.draws as usize) < min_rounds,
+                    "variant {k} with p = {p:.3} should have stopped early, drew {}",
+                    o.draws
+                );
+            }
+        }
+        assert!(checked > 50, "expected many clear nulls, saw {checked}");
+    }
+
+    #[test]
+    fn adaptive_permutation_is_deterministic() {
+        let (variants, matrix, _cov) = floor_matrix();
+        let rows = matrix_rows(&matrix);
+        let tested: Vec<usize> = (0..variants.len()).collect();
+        let names: Vec<String> = variants.iter().map(generate_variant_name).collect();
+        let a = adaptive_permutation(&rows, &tested, &names, 1000, 0.01);
+        let b = adaptive_permutation(&rows, &tested, &names, 1000, 0.01);
+        assert_eq!(a.r_target, b.r_target);
+        let pv = |r: &AdaptiveResult| -> Vec<u64> {
+            r.outcomes
+                .iter()
+                .map(|o| ((o.exceed + 1) as f64 / (o.draws + 1) as f64).to_bits())
+                .collect()
+        };
+        assert_eq!(pv(&a), pv(&b), "p-values must be byte-identical across runs");
     }
 
     // ---------------------------------------------------------------------

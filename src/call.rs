@@ -1639,6 +1639,142 @@ fn filter_strand_bias(
     (kept, filtered_matrix)
 }
 
+/// ONT-recall R3-T3. Retest `Strand_bias`-flagged indels with alt/cover reads from
+/// BAM genotyping (`genotype_from_bam` shapes) instead of graph edges, which can
+/// split an indel's alt reads unevenly by strand. Same column-local null and
+/// effect gate as `filter_strand_bias`; the flag is cleared when
+/// `p >= p_threshold || effect < min_effect`. Fewer than `min_reads`
+/// strand-resolved BAM alt reads keep the graph verdict. SNVs and other filters
+/// are returned unchanged. `graph_counts` (graph fwd/rev per variant name) is
+/// only logged.
+#[allow(clippy::too_many_arguments)]
+fn recount_indel_strand_bias(
+    variants: &[Variant],
+    graph_counts: &HashMap<String, (usize, usize)>,
+    bam_read_record: &HashMap<String, Vec<serde_json::Value>>,
+    bam_cover_record: &HashMap<String, HashSet<String>>,
+    strand_map: &HashMap<String, bool>,
+    expected_fwd_frac: f64,
+    p_threshold: f64,
+    min_reads: usize,
+    min_effect: f64,
+) -> Vec<Variant> {
+    let mut out = variants.to_vec();
+    for variant in out.iter_mut() {
+        if variant.variant_type == "SNP" || variant.filter.as_deref() != Some("Strand_bias") {
+            continue;
+        }
+        let name = generate_variant_name(variant);
+        let (gfwd, grev) = graph_counts.get(&name).copied().unwrap_or((0, 0));
+        let alt: HashSet<&str> = bam_read_record
+            .get(&name)
+            .map(|reads| reads.iter().filter_map(|r| r.as_str()).collect())
+            .unwrap_or_default();
+        let (mut fwd, mut rev) = (0usize, 0usize);
+        for r in &alt {
+            match strand_map.get(*r) {
+                Some(true) => rev += 1,
+                Some(false) => fwd += 1,
+                None => {}
+            }
+        }
+        let total = fwd + rev;
+        if total < min_reads {
+            println!(
+                "Strand-bias BAM recount, {:?}, graph fwd={}, rev={}; BAM alt reads={} < {}: kept flagged",
+                name, gfwd, grev, total, min_reads
+            );
+            continue;
+        }
+        let (mut cfwd, mut crev) = (0usize, 0usize);
+        if let Some(cover) = bam_cover_record.get(&name) {
+            for r in cover.iter().filter(|r| !alt.contains(r.as_str())) {
+                match strand_map.get(r) {
+                    Some(true) => crev += 1,
+                    Some(false) => cfwd += 1,
+                    None => {}
+                }
+            }
+        }
+        let null_frac = if cfwd + crev >= crate::STRAND_LOCAL_MIN_READS {
+            cfwd as f64 / (cfwd + crev) as f64
+        } else {
+            expected_fwd_frac
+        };
+        let alt_frac = fwd as f64 / total as f64;
+        let effect = (alt_frac - null_frac).abs();
+        let p_value = strand_bias_pvalue(fwd, rev, null_frac);
+        let cleared = p_value >= p_threshold || effect < min_effect;
+        println!(
+            "Strand-bias BAM recount, {:?}, graph fwd={}, rev={}; BAM fwd={}, rev={}, alt_frac={:.3}, null_frac={:.3}, effect={:.3}, p={:.3e}: {}",
+            name, gfwd, grev, fwd, rev, alt_frac, null_frac, effect, p_value,
+            if cleared { "cleared" } else { "kept flagged" }
+        );
+        if cleared {
+            variant.filter = None;
+        }
+    }
+    out
+}
+
+/// ONT-recall R3-T3. Genotype only the `Strand_bias`-flagged indels in `bam` (the
+/// raw, pre-denoise BAM) and recount them with `recount_indel_strand_bias`. The
+/// strand map and library fraction come from `bam` itself, since its reads are
+/// the ones genotyped. `graph_read_record`/`graph_strand_map` are the inputs of
+/// `filter_strand_bias`, used only to log the graph counts alongside.
+#[allow(clippy::too_many_arguments)]
+fn recount_flagged_indels_from_bam(
+    variants: &[Variant],
+    graph_read_record: &HashMap<String, Vec<serde_json::Value>>,
+    graph_strand_map: &HashMap<String, bool>,
+    bam: &Path,
+    refseq: &[u8],
+    ref_name: &str,
+    opts: &GenotypeOpts,
+    p_threshold: f64,
+) -> Vec<Variant> {
+    let flagged: Vec<Variant> = variants
+        .iter()
+        .filter(|v| v.variant_type != "SNP" && v.filter.as_deref() == Some("Strand_bias"))
+        .cloned()
+        .collect();
+    if flagged.is_empty() {
+        return variants.to_vec();
+    }
+    let graph_counts: HashMap<String, (usize, usize)> = flagged
+        .iter()
+        .map(|v| {
+            let name = generate_variant_name(v);
+            let reads: HashSet<&str> = graph_read_record
+                .get(&name)
+                .map(|rs| rs.iter().filter_map(|r| r.as_str()).collect())
+                .unwrap_or_default();
+            let rev = reads.iter().filter(|r| graph_strand_map.get(**r) == Some(&true)).count();
+            let fwd = reads.iter().filter(|r| graph_strand_map.get(**r) == Some(&false)).count();
+            (name, (fwd, rev))
+        })
+        .collect();
+    let (read_record, cover_record) = genotype_from_bam(bam, refseq, ref_name, &flagged, opts);
+    let (strand_map, fwd_frac) = build_strand_map(&bam.to_path_buf());
+    println!(
+        "Strand-bias BAM recount: {} flagged indel(s) from {} (forward fraction {:.3})",
+        flagged.len(),
+        bam.display(),
+        fwd_frac
+    );
+    recount_indel_strand_bias(
+        variants,
+        &graph_counts,
+        &read_record,
+        &cover_record,
+        &strand_map,
+        fwd_frac,
+        p_threshold,
+        2,
+        crate::STRAND_BIAS_MIN_EFFECT,
+    )
+}
+
 // ---- adaptive permutation (ONT-recall T1) ----
 
 /// How `permutation_test` draws its null.
@@ -2191,7 +2327,7 @@ pub fn start(
             let (strand_map, fwd_frac) = build_strand_map(bam);
             println!("Library forward-strand fraction: {:.3}", fwd_frac);
             println!("Strand-bias action: {:?} (SNPs below HF {:.3})", action, strand_bias_drop_max_hf);
-            filter_strand_bias(
+            let (sb_var, sb_matrix) = filter_strand_bias(
                 &var_record,
                 &matrix,
                 &read_record,
@@ -2205,7 +2341,24 @@ pub fn start(
                 action,
                 strand_bias_drop_max_hf,
                 crate::STRAND_BIAS_MIN_EFFECT,
-            )
+            );
+            // ONT-recall R3-T3: retest flagged indels from the raw BAM's reads
+            // before the permutation test. `bam` may be denoised, so only
+            // `linkage_bam` qualifies; without it the graph verdict stands.
+            let sb_var = match linkage_bam {
+                Some(raw) => recount_flagged_indels_from_bam(
+                    &sb_var,
+                    &read_record,
+                    &strand_map,
+                    raw,
+                    ref_seq.as_bytes(),
+                    &ref_header,
+                    &genotype_opts,
+                    strand_bias_threshold,
+                ),
+                None => sb_var,
+            };
+            (sb_var, sb_matrix)
         }
         None => (var_record.clone(), matrix.clone()),
     };
@@ -3245,6 +3398,56 @@ mod tests {
         let case = local_null_case(snp(33, "C", 55), 1, 54, 536, 464, 2000);
         assert_eq!(run_sb(&case, 0.5, StrandBiasAction::Flag)[0].filter.as_deref(), Some("Strand_bias"));
         assert!(run_sb(&case, 0.5, StrandBiasAction::Drop).is_empty());
+    }
+
+    // ---- BAM recount of flagged indels (ONT-recall R3-T3) ----
+
+    /// Flag `v` from graph counts 10/0 against a balanced column, then recount it
+    /// from BAM-genotyped alt reads `bam_fwd`/`bam_rev` against a balanced column.
+    fn graph_flagged_then_bam_recount(v: Variant, bam_fwd: usize, bam_rev: usize) -> Vec<Variant> {
+        let graph = local_null_case(v.clone(), 10, 0, 50, 50, 1000);
+        let flagged = run_sb(&graph, 0.5, StrandBiasAction::Flag);
+        assert_eq!(flagged[0].filter.as_deref(), Some("Strand_bias"), "graph 10/0 must flag");
+        let bam = local_null_case(v, bam_fwd, bam_rev, 50, 50, 1000);
+        recount_indel_strand_bias(
+            &flagged, &HashMap::new(), &bam.2, &bam.4, &bam.3, 0.5, 0.01, 2,
+            crate::STRAND_BIAS_MIN_EFFECT,
+        )
+    }
+
+    #[test]
+    fn bam_recount_clears_strand_bias_on_a_balanced_indel() {
+        // 302A>ACC: the graph edges split the alt reads by strand, the BAM reads don't.
+        let out = graph_flagged_then_bam_recount(indel(302, "A", "ACC", 20), 9, 11);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].filter, None, "9/11 vs a balanced column must clear the flag");
+    }
+
+    #[test]
+    fn bam_recount_keeps_strand_bias_on_a_skewed_indel() {
+        let out = graph_flagged_then_bam_recount(indel(33, "CG", "C", 20), 1, 19);
+        assert_eq!(out[0].filter.as_deref(), Some("Strand_bias"), "1/19 stays flagged");
+    }
+
+    #[test]
+    fn bam_recount_leaves_snvs_and_other_filters_alone() {
+        let out = graph_flagged_then_bam_recount(snp(500, "A", 20), 9, 11);
+        assert_eq!(out[0].filter.as_deref(), Some("Strand_bias"), "SNVs are not recounted");
+
+        let mut other = indel(302, "A", "ACC", 20);
+        other.filter = Some("Potential_Artifact".into());
+        let bam = local_null_case(other.clone(), 9, 11, 50, 50, 1000);
+        let out = recount_indel_strand_bias(
+            &[other], &HashMap::new(), &bam.2, &bam.4, &bam.3, 0.5, 0.01, 2,
+            crate::STRAND_BIAS_MIN_EFFECT,
+        );
+        assert_eq!(out[0].filter.as_deref(), Some("Potential_Artifact"));
+    }
+
+    #[test]
+    fn bam_recount_keeps_the_flag_when_the_bam_has_too_few_alt_reads() {
+        let out = graph_flagged_then_bam_recount(indel(302, "A", "ACC", 20), 1, 0);
+        assert_eq!(out[0].filter.as_deref(), Some("Strand_bias"));
     }
 
     #[test]

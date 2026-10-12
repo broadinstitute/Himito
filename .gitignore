@@ -8,7 +8,9 @@ Himito_benchmark
 Lineage_paper
 lineage_eval/benchmark_results/
 msaplot
-scripts
+scripts/*
+!scripts/ont_recall/
+!scripts/ont_recall/**
 plantgenome
 resource
 rtg_ref

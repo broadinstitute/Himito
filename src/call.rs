@@ -672,7 +672,7 @@ fn write_vcf(
     )?;
     writeln!(
         file,
-        "##FILTER=<ID=Strand_bias,Description=\"Alt-supporting reads are significantly skewed toward one strand relative to library composition\">"
+        "##FILTER=<ID=Strand_bias,Description=\"Alt-supporting reads are significantly skewed toward one strand relative to the reads covering the site\">"
     )?;
     writeln!(
         file,
@@ -1411,7 +1411,9 @@ pub fn resolve_strand_bias_action(
 }
 
 /// Flag (and, under `StrandBiasAction::Drop`, remove) variants whose alt-supporting reads are significantly strand-skewed
-/// relative to the library's forward/reverse composition; flagged variants get
+/// relative to the forward/reverse composition of the non-alt reads covering the site (library
+/// composition when fewer than `STRAND_LOCAL_MIN_READS` covering reads are strand-resolved)
+/// AND by at least `min_effect` in forward fraction (ONT-recall T3); flagged variants get
 /// `filter = Some("Strand_bias")` so the call survives in the VCF with FILTER set accordingly.
 /// Variants with fewer than `min_reads`
 /// strand-resolved supporting reads are kept (too little evidence to judge). Near-homoplasmic
@@ -1427,6 +1429,7 @@ fn filter_strand_bias(
     matrix: &Array2<f64>,
     read_record: &HashMap<String, Vec<serde_json::Value>>,
     strand_map: &HashMap<String, bool>,
+    cover_record: &HashMap<String, HashSet<String>>,
     coverage: &HashMap<usize, usize>,
     expected_fwd_frac: f64,
     p_threshold: f64,
@@ -1434,6 +1437,7 @@ fn filter_strand_bias(
     homoplasmic_frequency_threshold: f64,
     action: StrandBiasAction,
     drop_max_hf: f64,
+    min_effect: f64,
 ) -> (Vec<Variant>, Array2<f64>) {
     let mut keep_idx = Vec::new();
     let mut kept = Vec::new();
@@ -1477,8 +1481,36 @@ fn filter_strand_bias(
             continue;
         }
 
-        let p_value = strand_bias_pvalue(fwd, rev, expected_fwd_frac);
-        if p_value < p_threshold {
+        // ONT-recall T3: the null is the forward fraction of the reads covering THIS
+        // column (when enough are strand-resolved), not the library's; and a p-value
+        // alone is not enough, the alt's forward fraction must also differ by at least
+        // `min_effect` from that null.
+        let (mut cfwd, mut crev) = (0usize, 0usize);
+        if let Some(cover) = cover_record.get(&name) {
+            for read_name in cover {
+                // The null describes the reads that did NOT carry the alt. `cover_record`
+                // is per graph edge and contains the alt reads, so for a low-coverage
+                // edge it is mostly the artifact itself (33CG>C: 34 of 38) and would
+                // make the artifact define its own null.
+                if seen.contains(read_name) {
+                    continue;
+                }
+                match strand_map.get(read_name) {
+                    Some(true) => crev += 1,
+                    Some(false) => cfwd += 1,
+                    None => {}
+                }
+            }
+        }
+        let null_frac = if cfwd + crev >= crate::STRAND_LOCAL_MIN_READS {
+            cfwd as f64 / (cfwd + crev) as f64
+        } else {
+            expected_fwd_frac
+        };
+        let alt_frac = fwd as f64 / total as f64;
+        let effect = (alt_frac - null_frac).abs();
+        let p_value = strand_bias_pvalue(fwd, rev, null_frac);
+        if p_value < p_threshold && effect >= min_effect {
             // The drop is deliberately narrow: SNPs only, and only below `drop_max_hf`.
             // Indels already have `Potential_Artifact` to catch them, and above the
             // ceiling a skew is likelier to be fragmented read attribution across
@@ -1488,8 +1520,8 @@ fn filter_strand_bias(
                 && hf < drop_max_hf
             {
                 println!(
-                    "Strand-biased (dropped), {:?}, fwd={}, rev={}, hf={:.4}, p={:.3e}",
-                    name, fwd, rev, hf, p_value
+                    "Strand-biased (dropped), {:?}, fwd={}, rev={}, alt_frac={:.3}, null_frac={:.3}, hf={:.4}, p={:.3e}",
+                    name, fwd, rev, alt_frac, null_frac, hf, p_value
                 );
                 continue;
             }
@@ -1497,8 +1529,8 @@ fn filter_strand_bias(
             // Potential_Artifact) instead of dropping the call
             variant.filter = Some("Strand_bias".to_string());
             println!(
-                "Strand-biased (flagged, kept), {:?}, fwd={}, rev={}, p={:.3e}",
-                name, fwd, rev, p_value
+                "Strand-biased (flagged, kept), {:?}, fwd={}, rev={}, alt_frac={:.3}, null_frac={:.3}, p={:.3e}",
+                name, fwd, rev, alt_frac, null_frac, p_value
             );
         }
         keep_idx.push(i);
@@ -2039,6 +2071,7 @@ pub fn start(
                 &matrix,
                 &read_record,
                 &strand_map,
+                &cover_record,
                 &coverage,
                 fwd_frac,
                 strand_bias_threshold,
@@ -2046,6 +2079,7 @@ pub fn start(
                 permutation_frequency_threshold,
                 action,
                 strand_bias_drop_max_hf,
+                crate::STRAND_BIAS_MIN_EFFECT,
             )
         }
         None => (var_record.clone(), matrix.clone()),
@@ -2807,8 +2841,8 @@ mod tests {
         let (variants, matrix, read_record, strand_map, coverage) = strand_skewed_snp();
 
         let (kept, kept_matrix) = filter_strand_bias(
-            &variants, &matrix, &read_record, &strand_map, &coverage,
-            0.5, 0.01, 2, 0.7, StrandBiasAction::Drop, 0.10,
+            &variants, &matrix, &read_record, &strand_map, &HashMap::new(), &coverage,
+            0.5, 0.01, 2, 0.7, StrandBiasAction::Drop, 0.10, crate::STRAND_BIAS_MIN_EFFECT,
         );
 
         assert!(kept.is_empty(), "a strand-skewed low-VAF SNP must be dropped, not flagged");
@@ -2820,8 +2854,8 @@ mod tests {
         let (variants, matrix, read_record, strand_map, coverage) = strand_skewed_snp();
 
         let (kept, _m) = filter_strand_bias(
-            &variants, &matrix, &read_record, &strand_map, &coverage,
-            0.5, 0.01, 2, 0.7, StrandBiasAction::Flag, 0.10,
+            &variants, &matrix, &read_record, &strand_map, &HashMap::new(), &coverage,
+            0.5, 0.01, 2, 0.7, StrandBiasAction::Flag, 0.10, crate::STRAND_BIAS_MIN_EFFECT,
         );
 
         assert_eq!(kept.len(), 1, "flag mode must keep the call");
@@ -2841,8 +2875,8 @@ mod tests {
         let matrix = Array2::<f64>::zeros((1, 10));
         let coverage: HashMap<usize, usize> = [(100, 50)].into_iter().collect();
         let (kept, _m) = filter_strand_bias(
-            &variants, &matrix, &read_record_snp, &strand_map, &coverage,
-            0.5, 0.01, 2, 0.7, StrandBiasAction::Drop, 0.10,
+            &variants, &matrix, &read_record_snp, &strand_map, &HashMap::new(), &coverage,
+            0.5, 0.01, 2, 0.7, StrandBiasAction::Drop, 0.10, crate::STRAND_BIAS_MIN_EFFECT,
         );
         assert_eq!(kept.len(), 1, "a SNP above the drop ceiling is flagged, not dropped");
         assert_eq!(kept[0].filter.as_deref(), Some("Strand_bias"));
@@ -2855,10 +2889,139 @@ mod tests {
             [(iname, ireads)].into_iter().collect();
         let icoverage: HashMap<usize, usize> = [(100, 200)].into_iter().collect();
         let (ikept, _m) = filter_strand_bias(
-            &ivariants, &matrix, &iread_record, &strand_map, &icoverage,
-            0.5, 0.01, 2, 0.7, StrandBiasAction::Drop, 0.10,
+            &ivariants, &matrix, &iread_record, &strand_map, &HashMap::new(), &icoverage,
+            0.5, 0.01, 2, 0.7, StrandBiasAction::Drop, 0.10, crate::STRAND_BIAS_MIN_EFFECT,
         );
         assert_eq!(ikept.len(), 1, "indels are never dropped by the strand-bias filter");
+    }
+
+    // ---- column-local strand-bias null (ONT-recall T3) ----
+
+    /// Build a one-SNP scenario: `fwd`/`rev` alt reads (names `a*`), and covering
+    /// reads (`c*`) in addition to the alt reads, which `cover_record` also holds with `cover_fwd`/`cover_rev` strand split.
+    #[allow(clippy::type_complexity)]
+    fn local_null_case(
+        variant: Variant,
+        alt_fwd: usize,
+        alt_rev: usize,
+        cover_fwd: usize,
+        cover_rev: usize,
+        depth: usize,
+    ) -> (
+        Vec<Variant>,
+        Array2<f64>,
+        HashMap<String, Vec<serde_json::Value>>,
+        HashMap<String, bool>,
+        HashMap<String, HashSet<String>>,
+        HashMap<usize, usize>,
+    ) {
+        let name = generate_variant_name(&variant);
+        let mut strand_map = HashMap::new();
+        let mut alt_reads = Vec::new();
+        for i in 0..alt_fwd {
+            strand_map.insert(format!("a{i}"), false);
+            alt_reads.push(json!(format!("a{i}")));
+        }
+        for i in 0..alt_rev {
+            strand_map.insert(format!("ar{i}"), true);
+            alt_reads.push(json!(format!("ar{i}")));
+        }
+        // the real `cover_record` set contains the alt reads too
+        let mut cover: HashSet<String> = strand_map.keys().cloned().collect();
+        for i in 0..cover_fwd {
+            strand_map.insert(format!("c{i}"), false);
+            cover.insert(format!("c{i}"));
+        }
+        for i in 0..cover_rev {
+            strand_map.insert(format!("cr{i}"), true);
+            cover.insert(format!("cr{i}"));
+        }
+        let read_record: HashMap<String, Vec<serde_json::Value>> =
+            [(name.clone(), alt_reads)].into_iter().collect();
+        let cover_record: HashMap<String, HashSet<String>> =
+            [(name, cover)].into_iter().collect();
+        let coverage: HashMap<usize, usize> = [(variant.pos, depth)].into_iter().collect();
+        let n = alt_fwd + alt_rev;
+        (vec![variant], Array2::<f64>::zeros((1, n.max(1))), read_record, strand_map, cover_record, coverage)
+    }
+
+    fn run_sb(
+        case: &(
+            Vec<Variant>,
+            Array2<f64>,
+            HashMap<String, Vec<serde_json::Value>>,
+            HashMap<String, bool>,
+            HashMap<String, HashSet<String>>,
+            HashMap<usize, usize>,
+        ),
+        library_frac: f64,
+        action: StrandBiasAction,
+    ) -> Vec<Variant> {
+        filter_strand_bias(
+            &case.0, &case.1, &case.2, &case.3, &case.4, &case.5,
+            library_frac, 0.01, 2, 0.7, action, 0.10, crate::STRAND_BIAS_MIN_EFFECT,
+        )
+        .0
+    }
+
+    #[test]
+    fn strand_bias_uses_column_local_null() {
+        // 7805G>A: alt 45F/27R (62.5% fwd), column 54% fwd, library 0.498.
+        // vs library p=0.034 would flag at 0.05 but the alt matches its column.
+        let case = local_null_case(snp(7805, "A", 72), 45, 27, 54, 46, 1000);
+        let local_p = strand_bias_pvalue(45, 27, 0.54);
+        assert!(local_p >= 0.01, "local null p={local_p}");
+        for action in [StrandBiasAction::Flag, StrandBiasAction::Drop] {
+            let kept = run_sb(&case, 0.498, action);
+            assert_eq!(kept.len(), 1);
+            assert_eq!(kept[0].filter, None, "{action:?}: must not be flagged against the local null");
+        }
+    }
+
+    #[test]
+    fn strand_bias_needs_an_effect_not_just_a_p_value() {
+        // 1000 alt reads at 600/400 vs a 50% local null: p~1e-10, effect 0.10.
+        let case = local_null_case(snp(500, "A", 1000), 600, 400, 50, 50, 5000);
+        assert!(strand_bias_pvalue(600, 400, 0.5) < 1e-8);
+        let kept = run_sb(&case, 0.5, StrandBiasAction::Flag);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].filter, None, "a 0.10 effect is below STRAND_BIAS_MIN_EFFECT");
+    }
+
+    #[test]
+    fn strand_bias_still_flags_single_strand_artifacts() {
+        // 33CG>C: alt 1F/54R against a local 0.536 fwd null.
+        let case = local_null_case(indel(33, "CG", "C", 55), 1, 54, 536, 464, 2000);
+        let kept = run_sb(&case, 0.5, StrandBiasAction::Flag);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].filter.as_deref(), Some("Strand_bias"));
+        // an SNP with the same evidence is flagged under Flag and removed under Drop
+        let case = local_null_case(snp(33, "C", 55), 1, 54, 536, 464, 2000);
+        assert_eq!(run_sb(&case, 0.5, StrandBiasAction::Flag)[0].filter.as_deref(), Some("Strand_bias"));
+        assert!(run_sb(&case, 0.5, StrandBiasAction::Drop).is_empty());
+    }
+
+    #[test]
+    fn strand_bias_local_null_excludes_the_alt_reads_themselves() {
+        // 33CG>C on HapMap r10: the edge's cover set was 38 reads, 34 of them the
+        // reverse-only alt reads. Counting them made the "local" null 0.05 and the
+        // artifact looked normal. Without them only 4 covering reads remain (< 20),
+        // so the library fraction is the null and the artifact is flagged.
+        let case = local_null_case(indel(33, "CG", "C", 34), 0, 34, 2, 2, 302);
+        assert_eq!(case.4.values().next().unwrap().len(), 38);
+        let kept = run_sb(&case, 0.498, StrandBiasAction::Flag);
+        assert_eq!(kept[0].filter.as_deref(), Some("Strand_bias"));
+    }
+
+    #[test]
+    fn strand_bias_falls_back_to_library_fraction_with_few_covering_reads() {
+        // Only 10 strand-resolved covering reads (< STRAND_LOCAL_MIN_READS): the
+        // local fraction is ignored and the library fraction (0.5) is the null.
+        // Covering reads are all forward, which would make 10/0 look unremarkable
+        // if the local null were wrongly used.
+        let case = local_null_case(snp(100, "A", 10), 10, 0, 10, 0, 200);
+        let kept = run_sb(&case, 0.5, StrandBiasAction::Flag);
+        assert_eq!(kept[0].filter.as_deref(), Some("Strand_bias"));
     }
 
     // ===================================================================

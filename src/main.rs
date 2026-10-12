@@ -56,6 +56,22 @@ pub const PERM_MAX_ROUNDS: usize = 100_000;
 /// name, so adaptive results are reproducible under rayon (ONT-recall T1).
 pub const PERM_SEED: u64 = 42;
 
+/// Minimum absolute difference between an alt allele's forward-strand fraction and
+/// the null forward fraction before `Strand_bias` fires (ONT-recall T3).
+///
+/// A binomial p-value alone flags any large-N allele with a trivial skew: 600/400
+/// alt reads against a 50% null is p~1e-10 yet only a 0.10 shift. Single-strand
+/// artifacts are far outside this (HapMap ONT r10: `33CG>C` 0/34 is 0.50 from the
+/// library fraction, `1598G>A` 35/0 is 0.53), while the true `7805G>A` (28/14 vs
+/// a 0.54 column) is ~0.13. 0.20 clears the true call and keeps every artifact.
+pub const STRAND_BIAS_MIN_EFFECT: f64 = 0.20;
+
+/// Strand-resolved covering reads needed before the strand-bias null is the
+/// column's own forward fraction rather than the library's (ONT-recall T3).
+/// Below this the local fraction has a standard error > ~0.11 and the library
+/// fraction is the safer null.
+pub const STRAND_LOCAL_MIN_READS: usize = 20;
+
 /// Minimal observations required on EACH strand for an allele to be a candidate.
 ///
 /// Was `--min-strand`. Every caller in the repo — QuickStart, both eval scripts,

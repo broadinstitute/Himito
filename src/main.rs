@@ -72,6 +72,20 @@ pub const STRAND_BIAS_MIN_EFFECT: f64 = 0.20;
 /// fraction is the safer null.
 pub const STRAND_LOCAL_MIN_READS: usize = 20;
 
+/// Minimum heteroplasmic frequency for a SNP to be exempt from the co-occurrence
+/// permutation test (ONT-recall T4).
+///
+/// The test's Jaccard statistic punishes a variant on the MAJORITY lineage: HapMap
+/// ONT r10 `12969C>T` (a true heteroplasmy) gets q 0.99 and is vetoed. A strong,
+/// strand-balanced SNP is exempt; weak ones (the low-VAF artifact regime the test
+/// exists for) are still tested.
+pub const COOC_EXEMPT_HF: f64 = 0.10;
+
+/// Minimum alt-read count for the co-occurrence exemption (ONT-recall T4); with
+/// `COOC_EXEMPT_HF` it keeps the exemption to variants with real support
+/// (12969C>T has AC well above this).
+pub const COOC_EXEMPT_MIN_AC: usize = 20;
+
 /// Minimal observations required on EACH strand for an allele to be a candidate.
 ///
 /// Was `--min-strand`. Every caller in the repo — QuickStart, both eval scripts,

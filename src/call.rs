@@ -1842,6 +1842,21 @@ fn permutation_test(
 
         let is_snp = current_variant.ref_allele.len() == 1 && current_variant.alt_allele.len() == 1;
 
+        // ONT-recall T4: a strong SNP with a clean strand flag is not tested. The
+        // Jaccard co-occurrence statistic punishes a variant that lives on the
+        // MAJORITY lineage -- its reads overlap every other lineage's markers
+        // poorly -- so a real heteroplasmy there looks like a scattered artifact
+        // (HapMap ONT 12969C>T: q 0.99). The strand flag (T3) already screens the
+        // systematic single-strand artifacts, so a SNP with `filter == None`, HF >=
+        // COOC_EXEMPT_HF and AC >= COOC_EXEMPT_MIN_AC is kept untested.
+        if is_snp
+            && current_variant.filter.is_none()
+            && frequency >= crate::COOC_EXEMPT_HF
+            && current_variant.allele_count >= crate::COOC_EXEMPT_MIN_AC
+        {
+            return false;
+        }
+
         // PacBio: exclude SNPs from the permutation test -- its SNP accuracy is high
         // enough that the co-occurrence test costs more true low-VAF heteroplasmies
         // than it saves false positives.
@@ -2615,6 +2630,95 @@ mod tests {
             kept_names.contains(&artifact),
             "pacbio must keep SNPs exempt from the permutation test"
         );
+    }
+
+    /// Mirrors HapMap ONT 12969C>T: X is a real heteroplasmy living on the MAJORITY
+    /// lineage. 300 reads in three exclusive lineages -- A (240 reads, 3 markers,
+    /// HF 0.8, above the null threshold so untested), B (36 reads, 15 markers) and
+    /// C (24 reads, 15 markers). X is a SNP on 45 random A reads (HF 0.15, AC 45).
+    /// Returns (variants, matrix, coverage); X is variant index 0.
+    fn majority_lineage_heteroplasmy(x: Variant) -> (Vec<Variant>, Array2<f64>, HashMap<usize, usize>) {
+        let n_reads = 300;
+        let mut rng = StdRng::seed_from_u64(12969);
+        let mut variants = vec![x];
+        let mut rows: Vec<Vec<f64>> = vec![vec![0.0; n_reads]];
+        // 45 random reads among A (reads 0..240)
+        let mut placed = 0;
+        while placed < 45 {
+            let j = rng.random_range(0..240);
+            if rows[0][j] == 0.0 {
+                rows[0][j] = 1.0;
+                placed += 1;
+            }
+        }
+        let lineages = [(0usize, 240usize, 3usize), (240, 276, 15), (276, 300, 15)];
+        let mut pos = 1000;
+        for (lo, hi, n_markers) in lineages {
+            for _ in 0..n_markers {
+                variants.push(snp(pos, "G", hi - lo));
+                let mut row = vec![0.0; n_reads];
+                for cell in row.iter_mut().take(hi).skip(lo) {
+                    *cell = 1.0;
+                }
+                rows.push(row);
+                pos += 10;
+            }
+        }
+        let mut matrix = Array2::<f64>::zeros((rows.len(), n_reads));
+        for (i, row) in rows.iter().enumerate() {
+            for (j, v) in row.iter().enumerate() {
+                matrix[[i, j]] = *v;
+            }
+        }
+        let coverage: HashMap<usize, usize> =
+            variants.iter().map(|v| (v.pos, n_reads)).collect();
+        (variants, matrix, coverage)
+    }
+
+    fn run_majority_lineage(x: Variant) -> Vec<String> {
+        let (variants, matrix, coverage) = majority_lineage_heteroplasmy(x);
+        let (kept, _m, _n) = permutation_test(
+            &matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10",
+            PermutationMode::Adaptive,
+        );
+        let kept_names: Vec<String> = kept.iter().map(generate_variant_name).collect();
+        // sanity: all 33 lineage markers (A untested, B/C tested) must survive
+        assert_eq!(
+            kept.iter().filter(|v| v.pos >= 1000).count(),
+            33,
+            "lineage markers must survive the test"
+        );
+        kept_names
+    }
+
+    #[test]
+    fn cooccurrence_test_exempts_strong_balanced_snps() {
+        // ONT-recall T4. The co-occurrence statistic punishes a variant that sits on
+        // the MAJORITY lineage (12969C>T, q 0.99 on HapMap), so a strong SNP whose
+        // strand flag is clean is exempt from it.
+        let x = |filter: Option<&str>| {
+            let mut v = snp(500, "C", 45);
+            v.filter = filter.map(String::from);
+            v
+        };
+
+        let kept = run_majority_lineage(x(None));
+        assert!(
+            kept.contains(&generate_variant_name(&x(None))),
+            "a strong strand-balanced SNP must be exempt from the co-occurrence veto"
+        );
+
+        let kept = run_majority_lineage(x(Some("Strand_bias")));
+        assert!(
+            !kept.contains(&generate_variant_name(&x(None))),
+            "a strand-biased SNP must still be tested and rejected"
+        );
+
+        let mut indel_x = indel(500, "TT", "T", 45);
+        indel_x.filter = None;
+        let name = generate_variant_name(&indel_x);
+        let kept = run_majority_lineage(indel_x);
+        assert!(!kept.contains(&name), "an indel with the same evidence must still be tested");
     }
 
     #[test]

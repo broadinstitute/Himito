@@ -17,6 +17,10 @@ Modes
                    --max-rounds, repeating until R_target stops growing.
   --mode normal    z-score of the observation against its own null (mean, sd),
                    one-sided normal tail. Diagnostic only.
+  --mode max-partner  ONT-recall T8 prototype: for each tested variant, over
+                   partners with >= --min-shared co-alt reads, take the
+                   hypergeometric upper-tail p on co-covered reads, multiply by
+                   the partner count (Bonferroni), then BH as usual.
 
 Validated 2026-10-11 on HapMap ONT r10 (HG00097.raw_matrix.csv): fixed R=1000
 passes 0 truth (min q 0.0107 > 0.01); adaptive passes 54 truth / 0 non-truth,
@@ -36,7 +40,7 @@ import pysam
 ap = argparse.ArgumentParser()
 ap.add_argument("--matrix", required=True)
 ap.add_argument("--truth", required=True)
-ap.add_argument("--mode", choices=["fixed", "adaptive", "normal"], default="adaptive")
+ap.add_argument("--mode", choices=["fixed", "adaptive", "normal", "max-partner"], default="adaptive")
 ap.add_argument("--rounds", type=int, default=1000, help="fixed R, or stage-1 minimum")
 ap.add_argument("--max-rounds", type=int, default=100000)
 ap.add_argument("--stop-after", type=int, default=20, help="sequential stop: exceedances")
@@ -44,6 +48,7 @@ ap.add_argument("--headroom", type=float, default=10.0)
 ap.add_argument("--alpha", type=float, default=0.01)
 ap.add_argument("--test-hf", type=float, default=0.2)
 ap.add_argument("--null-hf", type=float, default=0.7)
+ap.add_argument("--min-shared", type=int, default=2, help="max-partner: min co-alt reads")
 ap.add_argument("--seed", type=int, default=42)
 a = ap.parse_args()
 
@@ -91,12 +96,70 @@ def run(i, target, chunk=200):
             break
     state[i][0], state[i][1] = e, d
 
+def hypergeom_sf(a, Npop, K, n):
+    """P(X >= a) for X ~ Hypergeom(N=Npop, K=K, n=n)."""
+    if a <= 0:
+        return 1.0
+    if Npop <= 0 or n <= 0 or K <= 0:
+        return 1.0
+    # survival: 1 - cdf(a-1)
+    from math import lgamma
+    def logC(n_, k_):
+        if k_ < 0 or k_ > n_:
+            return float("-inf")
+        return lgamma(n_ + 1) - lgamma(k_ + 1) - lgamma(n_ - k_ + 1)
+    log_den = logC(Npop, n)
+    if log_den == float("-inf"):
+        return 1.0
+    s = 0.0
+    lo = max(0, n + K - Npop)
+    hi = min(a - 1, K, n)
+    # cdf via summing pmf 0..a-1, then sf = 1 - cdf; for large a use upper sum
+    if a - 1 - lo < (min(K, n) - (a - 1)):
+        for x in range(lo, hi + 1):
+            s += math.exp(logC(K, x) + logC(Npop - K, n - x) - log_den)
+        return max(0.0, min(1.0, 1.0 - s))
+    s = 0.0
+    for x in range(max(a, lo), min(K, n) + 1):
+        s += math.exp(logC(K, x) + logC(Npop - K, n - x) - log_den)
+    return max(0.0, min(1.0, s))
+
+def max_partner_p(i):
+    """Bonferroni-adjusted min hypergeometric p over partners with >= min-shared co-alts."""
+    partners = []
+    for j in range(V):
+        if j == i:
+            continue
+        both = int((alt[i] & alt[j]).sum())
+        if both < a.min_shared:
+            continue
+        cocov = int((cov[i] & cov[j]).sum())
+        n_i = int((alt[i] & cov[j]).sum())   # query alts among co-covered
+        K_j = int((alt[j] & cov[i]).sum())   # partner alts among co-covered
+        # both already counted on full; restrict to co-covered (same set)
+        a_ij = both
+        p_ij = hypergeom_sf(a_ij, cocov, K_j, n_i)
+        partners.append((p_ij, j, a_ij, cocov))
+    if not partners:
+        return 1.0, 0, None
+    partners.sort(key=lambda t: t[0])
+    p_min, j_best, a_best, _ = partners[0]
+    p_adj = min(1.0, p_min * len(partners))
+    return p_adj, len(partners), (names[j_best], a_best, p_min)
+
 if a.mode == "normal":
     p = {}
     for i in tested:
         nd = draws(i, a.rounds)
         z = (obs[i] - nd.mean()) / max(nd.std(), 1e-12)
         p[i] = 0.5 * math.erfc(z / math.sqrt(2))
+elif a.mode == "max-partner":
+    p = {}
+    best = {}
+    for i in tested:
+        p[i], npart, info = max_partner_p(i)
+        best[i] = (npart, info)
+    print(f"max-partner: tested={m} min_shared={a.min_shared}", file=sys.stderr)
 else:
     for i in tested:
         if a.mode == "fixed":
@@ -130,3 +193,14 @@ print(f"{a.matrix}: mode={a.mode} rows={V} reads={N} tested={m} ({ist.sum()} tru
 print(f"  pass at alpha {a.alpha}: truth {int((ok & ist).sum())}  non-truth {int((ok & ~ist).sum())}")
 print("  non-truth passing: " + ", ".join(f"{names[i]}(hf {af[i]:.3f})" for k, i in enumerate(ids) if ok[k] and not ist[k]))
 print("  truth failing: " + ", ".join(f"{names[i]}(HL {truth[names[i]]:.3g}, q {q[k]:.2g})" for k, i in enumerate(ids) if not ok[k] and ist[k]))
+if a.mode == "max-partner":
+    # Newly rescued vs adaptive baseline: truth that pass here
+    print("  truth passing (name, q, best_partner, co-alts, raw_p, n_partners):")
+    for k, i in enumerate(ids):
+        if ok[k] and ist[k]:
+            npart, info = best[i]
+            if info is None:
+                print(f"    {names[i]} q={q[k]:.3g} (no partner)")
+            else:
+                pj, a_ij, p_raw = info
+                print(f"    {names[i]} q={q[k]:.3g} partner={pj} co={a_ij} p_raw={p_raw:.2g} npart={npart}")

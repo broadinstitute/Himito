@@ -119,11 +119,23 @@ rarer needs both:
 ### Use `ont-denoised`, not `ont-r10`
 
 `run_himito.sh` runs `Himito denoise` only when the profile is `ont-denoised`;
-`ont-r10` skips it. Without indel denoising the graph is swamped (94,694 edges
-vs 25,503 on the same reads) and the VCF comes back empty regardless of `-f`.
+`ont-r10` skips it. Without indel denoising the graph is swamped (~108k edges
+vs ~26k on the same reads). Before the 2026-10-11 adaptive permutation fix
+(ONT-recall T1), that inflated candidate set emptied the VCF via the BH
+p-value floor. After T1 the VCF is no longer empty, but lineage metrics still
+favour denoise on the default pbsim accuracy (~89% identity). Measured on the
+frozen standard config (30 seeds, Himito at `adaa96a`):
+
+| profile | var_precision | var_recall | ad_f1 | hap_f1 | mean edges |
+|---|---|---|---|---|---|
+| ont-r10 | 0.965 | 0.937 | 0.756 | 0.292 | 107,637 |
+| ont-denoised | 0.997 | 1.000 | 0.994 | 0.972 | 26,001 |
+
 `simulate_reads.sh` simulates both profiles identically, so `ont-denoised`
-changes only the Himito path, not the data. The committed benchmarks were
-produced under `ont-denoised`.
+changes only the Himito path, not the data. Keep `ont-denoised` as the
+simulation default; see also Needs-a-decision #1 in
+`dev_docs/superpowers/plans/2026-10-11-ont-recall-high-coverage.md`. The
+committed benchmarks were produced under `ont-denoised`.
 
 ### Low `var_recall` is usually a gate, not the graph
 

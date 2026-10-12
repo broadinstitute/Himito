@@ -18,6 +18,7 @@ mod tracts;
 mod scite;
 mod denoise;
 mod denoise_indel;
+mod linkage;
 
 /// Keep threshold for denoise's per-site substitution model: an eligible non-ref
 /// allele survives only if the site model's EM frequency estimate reaches this.
@@ -89,6 +90,58 @@ pub const COOC_EXEMPT_HF: f64 = 0.10;
 /// `COOC_EXEMPT_HF` it keeps the exemption to variants with real support
 /// (12969C>T has AC well above this).
 pub const COOC_EXEMPT_MIN_AC: usize = 20;
+
+/// Lowest pileup HF of a read-linkage candidate SNV allele (ONT-recall R3-T2).
+/// HG00438's private alleles sit at 0.6–1.7% in the merged HapMap reads
+/// (`merge215k`, ~5,000×) and never reach the graph's `-v 0.01`; 0.4% admits all
+/// 12 while the rule still rescues 0 of 760 noise alleles at 0.2–5% HF.
+pub const LINK_MIN_HF: f64 = 0.004;
+
+/// HF ceiling of a linkage candidate (ONT-recall R3-T2). Enrichment cannot exceed
+/// 1/HF of the partner, so the rule only resolves lineages below ~8–10%; higher
+/// alleles are the permutation test's job (7805A at 10% is not rescued).
+pub const LINK_MAX_HF: f64 = 0.20;
+
+/// Minimum alt reads of a linkage candidate (ONT-recall R3-T2). The 99th-percentile
+/// per-column noise count on HapMap ONT is 10 reads; 11087 (6 reads) stays out.
+pub const LINK_MIN_AC: u32 = 10;
+
+/// Partners must be more than this many bp apart (ONT-recall R3-T2), so one local
+/// error event (the 2542A/2567A pair is 25 bp apart) cannot link with itself.
+pub const LINK_MIN_DIST: u32 = 20;
+
+/// Reads above this quantile of error rate (NM / aligned length) are dropped from
+/// every linkage count (ONT-recall R3-T2). HapMap merge: median 0.013, 95th
+/// percentile 0.129; dropping the top 5% changed no outcome there, and it guards
+/// against errors co-occurring on bad reads.
+pub const LINK_ERR_QUANTILE: f64 = 0.95;
+
+/// Minimum shared carriers of a linked pair, overall (ONT-recall R3-T2).
+pub const LINK_MIN_SHARED: u32 = 5;
+
+/// Minimum shared carriers of a linked pair on EACH strand (ONT-recall R3-T2).
+pub const LINK_MIN_SHARED_STRAND: u32 = 3;
+
+/// Minimum reads covering both partners, overall (ONT-recall R3-T2).
+pub const LINK_MIN_COCOVER: u32 = 50;
+
+/// Minimum reads covering both partners on EACH strand (ONT-recall R3-T2).
+pub const LINK_MIN_COCOVER_STRAND: u32 = 30;
+
+/// Minimum enrichment (shared / expected shared) of a linked pair, overall and per
+/// strand (ONT-recall R3-T2). Same-lineage truth pairs on HapMap merge: median 52×;
+/// the forward-only noise pair 2542A/2567A reaches 14.7×.
+pub const LINK_MIN_ENRICH: f64 = 10.0;
+
+/// Overall log10 hypergeometric upper-tail p bar of a linked pair (ONT-recall
+/// R3-T2): stricter than Bonferroni 0.01 over 1e8 pairs. Truth pairs: median
+/// −14.5, weakest −6.3 (that one is rescued through a stronger partner).
+pub const LINK_LOG10P: f64 = -10.0;
+
+/// Per-strand log10 p bar of a linked pair (ONT-recall R3-T2). Without the
+/// per-strand rule 2542A (129/2) and 2567A (117/3) pass at log10 p −10.0; the
+/// strongest noise pair with both alleles strand-balanced reaches only −4.5.
+pub const LINK_STRAND_LOG10P: f64 = -5.0;
 
 /// Minimal observations required on EACH strand for an allele to be a candidate.
 ///
@@ -288,6 +341,13 @@ enum Commands {
         /// Windows within ~12 bp of the circular origin cannot be scored and stay missing.
         #[clap(long = "genotype-from-bam", action)]
         genotype_from_bam: bool,
+
+        /// ONT-recall R3-T2: turn off read-linkage rescue of low-frequency SNVs. By default
+        /// ont-r9/ont-r10/ont-denoised add PASS SNVs (0.4-20% HF in the raw `<prefix>.mt.bam`
+        /// pileup) that co-occur on the same reads, on both strands, with another such allele;
+        /// they carry INFO LINK. Never on for pacbio.
+        #[clap(long = "no-linkage-rescue", action)]
+        no_linkage_rescue: bool,
 
     },
 
@@ -541,6 +601,13 @@ enum Commands {
         /// false calls from very noisy reads.
         #[clap(long, value_parser)]
         genotype_max_ed: Option<u32>,
+
+        /// ONT-recall R3-T2: raw (pre-denoise), coordinate-sorted BAM for read-linkage rescue
+        /// of low-frequency SNVs: alleles at 0.4-20% HF in its pileup that co-occur on the same
+        /// reads, on both strands, with another such allele are added as PASS SNVs with INFO LINK.
+        /// Off when absent.
+        #[clap(long, value_parser)]
+        linkage_bam: Option<PathBuf>,
 
         /// Plan 2026-10-11 T5: with --genotype-bam, reference bases on each side of a site
         /// scored against the read (before homopolymer push-out and +-2 padding).
@@ -812,6 +879,13 @@ pub fn init_rayon_threads(threads: Option<usize>) -> AnyhowResult<()> {
     Ok(())
 }
 
+/// ONT-recall R3-T2 (R3-6): quick-start runs linkage rescue on the raw mt BAM for
+/// ONT data unless `--no-linkage-rescue`; PacBio stays off until evaluated.
+fn quickstart_linkage_bam<'a>(data_type: &str, no_linkage_rescue: bool, mt_output: &'a PathBuf) -> Option<&'a PathBuf> {
+    let ont = matches!(data_type, "ont-r9" | "ont-r10" | "ont-denoised");
+    (ont && !no_linkage_rescue).then_some(mt_output)
+}
+
 fn main() {
     // Review 2026-09-25 T5: a library function must not install the process logger, and denoise/scite logs were otherwise silent.
     env_logger::init();
@@ -845,6 +919,7 @@ fn main() {
             no_left_align,
             left_align_compat: _,
             genotype_from_bam,
+            no_linkage_rescue,
         } => {
             // Plan 2026-09-26 T4
             let left_align = !no_left_align;
@@ -941,6 +1016,8 @@ fn main() {
                 // Plan 2026-10-11 T5: pre-denoise BAM (mt_output), NOT build_bam.
                 if genotype_from_bam { Some(&mt_output) } else { None },
                 call::GenotypeOpts::default(),
+                // ONT-recall R3-T2 (R3-6): raw mt_output, NOT build_bam.
+                quickstart_linkage_bam(&data_type, no_linkage_rescue, &mt_output),
             );
             let annotated_graph_output = output_prefix.with_extension("gfa");
             let methyl_output = output_prefix.with_extension("bed");
@@ -1053,6 +1130,7 @@ fn main() {
             genotype_bam,
             genotype_max_ed,
             genotype_flank,
+            linkage_bam,
         } => {
             // Plan 2026-09-26 T4
             let left_align = !no_left_align;
@@ -1087,6 +1165,8 @@ fn main() {
                     max_ed: genotype_max_ed.unwrap_or(u32::MAX),
                     ..call::GenotypeOpts::default()
                 },
+                // ONT-recall R3-T2
+                linkage_bam.as_ref(),
             );
         }
 
@@ -1333,6 +1413,38 @@ mod lineage_opts_validation_tests {
         let mut on = base.to_vec();
         on.push("--collapse-hp");
         assert!(collapse_of(&on), "--collapse-hp must enable it");
+    }
+}
+
+#[cfg(test)]
+mod linkage_cli_tests {
+    use super::*;
+
+    #[test]
+    fn quickstart_linkage_rescue_is_on_for_ont_only() {
+        let mt = PathBuf::from("x.mt.bam");
+        for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
+            assert_eq!(quickstart_linkage_bam(dt, false, &mt), Some(&mt), "{dt}");
+            assert_eq!(quickstart_linkage_bam(dt, true, &mt), None, "{dt}");
+        }
+        assert_eq!(quickstart_linkage_bam("pacbio", false, &mt), None);
+    }
+
+    #[test]
+    fn linkage_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out", "--no-linkage-rescue",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Commands::QuickStart { no_linkage_rescue: true, .. }));
+        let cli = Cli::try_parse_from([
+            "Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf", "--linkage-bam", "raw.bam",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Call { linkage_bam, .. } => assert_eq!(linkage_bam, Some(PathBuf::from("raw.bam"))),
+            other => panic!("unexpected subcommand: {other:?}"),
+        }
     }
 }
 

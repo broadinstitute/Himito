@@ -19,6 +19,7 @@ use regex::Regex;
 use adjustp::{adjust, Procedure};
 use bio::io::fasta::{Reader, Record};
 use crate::denoise_indel::{normalize_left, Allele};
+use crate::linkage::{self, LinkCall};
 use rust_htslib::bam::{Read as HtsRead, Reader as BamReader, Record as BamRecord};
 use rust_htslib::bam::ext::BamRecordExtensions;
 
@@ -630,7 +631,70 @@ fn filter_vcf_record(
     filtered_var
 }
 
-fn write_vcf(
+/// ONT-recall R3-T2 (R3-7). Folds accepted linkage calls into the graph calls.
+/// A graph SNV of the same allele that is already PASS is left alone; a filtered
+/// one gets its FILTER cleared. Returns the updated graph calls and the linkage
+/// calls that still need a record of their own.
+pub(crate) fn merge_link_calls(variants: &[Variant], links: &[LinkCall]) -> (Vec<Variant>, Vec<LinkCall>) {
+    let key = |pos: usize, r: &str, a: &str| (pos, r.to_ascii_uppercase(), a.to_ascii_uppercase());
+    let by_allele: HashMap<(usize, String, String), &LinkCall> = links
+        .iter()
+        .map(|l| (key(l.pos, &l.ref_allele, &l.alt_allele), l))
+        .collect();
+    let mut seen: HashSet<(usize, String, String)> = HashSet::new();
+    let mut merged = variants.to_vec();
+    for v in merged.iter_mut().filter(|v| v.variant_type == "SNP") {
+        let k = key(v.pos, &v.ref_allele, &v.alt_allele);
+        if let Some(l) = by_allele.get(&k) {
+            if let Some(old) = v.filter.take() {
+                println!(
+                    "Linkage rescue cleared FILTER {} on {} (partner {}, log10p {:.2})",
+                    old,
+                    generate_variant_name(v),
+                    l.partner_name,
+                    l.log10p
+                );
+            }
+            seen.insert(k);
+        }
+    }
+    let new_calls = links
+        .iter()
+        .filter(|l| !seen.contains(&key(l.pos, &l.ref_allele, &l.alt_allele)))
+        .cloned()
+        .collect();
+    (merged, new_calls)
+}
+
+/// ONT-recall R3-T2. A rescued SNV as a matrix/genotyping `Variant`.
+fn link_variant(l: &LinkCall) -> Variant {
+    Variant {
+        pos: l.pos,
+        ref_allele: l.ref_allele.clone(),
+        alt_allele: l.alt_allele.clone(),
+        variant_type: "SNP".to_string(),
+        allele_count: l.ac as usize,
+        filter: None,
+    }
+}
+
+/// ONT-recall R3-T2 (R3-7). A rescued SNV record; DP/AD/HF are pileup counts.
+fn format_link_record(l: &LinkCall) -> String {
+    let hf = if l.dp == 0 { 0.0 } else { l.ac as f32 / l.dp as f32 };
+    format!(
+        "chrM\t{}\t.\t{}\t{}\t.\tPASS\tDP={};LINK={},{:.2}\tGT:AD:HF\t1:{}:{}",
+        l.pos + 1,
+        l.ref_allele,
+        l.alt_allele,
+        l.dp,
+        l.partner_name,
+        l.log10p,
+        l.ac,
+        hf
+    )
+}
+
+pub(crate) fn write_vcf(
     variants: &[Variant],
     coverage: &HashMap<usize, usize>,
     output_file: &PathBuf,
@@ -639,6 +703,7 @@ fn write_vcf(
     referencelength:usize,
     indel_false_threshold: f64,
     left_align: bool,
+    links: Option<&[LinkCall]>,
 ) -> std::io::Result<()> {
     let mut file = File::create(Path::new(output_file))?;
 
@@ -653,6 +718,12 @@ fn write_vcf(
         file,
         "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">"
     )?;
+    if links.is_some() {
+        writeln!(
+            file,
+            "##INFO=<ID=LINK,Number=2,Type=String,Description=\"Read-linkage rescue: the most strongly linked partner allele and the log10 hypergeometric p of their co-occurrence on co-covering reads (DP/AD/HF from the raw BAM pileup)\">"
+        )?;
+    }
     writeln!(
         file,
         "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
@@ -694,10 +765,22 @@ fn write_vcf(
             .then(a.alt_allele.cmp(&b.alt_allele))
     });
 
-    // Write variant records
+    // Graph records sorted by internal pos are also sorted by VCF POS (an indel's
+    // internal pos is its VCF POS, a SNP's is POS - 1), so linkage records merge
+    // in by POS, after any graph record at the same POS (ONT-recall R3-T2).
+    let mut sorted_links: Vec<&LinkCall> = links.unwrap_or(&[]).iter().collect();
+    sorted_links.sort_by(|a, b| a.pos.cmp(&b.pos).then(a.alt_allele.cmp(&b.alt_allele)));
+    let vcf_pos = |v: &Variant| if v.variant_type == "SNP" { v.pos + 1 } else { v.pos };
+    let mut li = 0;
     for variant in sorted_variants {
-
+        while li < sorted_links.len() && sorted_links[li].pos + 1 < vcf_pos(&variant) {
+            writeln!(file, "{}", format_link_record(sorted_links[li]))?;
+            li += 1;
+        }
         writeln!(file, "{}", format_vcf_record(&variant, coverage.clone(), indel_false_threshold))?;
+    }
+    for l in &sorted_links[li..] {
+        writeln!(file, "{}", format_link_record(l))?;
     }
 
     Ok(())
@@ -2050,6 +2133,9 @@ pub fn start(
     // the final variants in this BAM (the graph matrix moves to `.graph_matrix.csv`).
     genotype_bam: Option<&PathBuf>,
     genotype_opts: GenotypeOpts,
+    // ONT-recall R3-T2: raw (pre-denoise) BAM for read-linkage rescue of
+    // low-frequency SNVs; None turns the rescue off.
+    linkage_bam: Option<&PathBuf>,
 ) {
     if data_type != "pacbio" && data_type != "ont-r9" && data_type != "ont-r10" && data_type != "ont-denoised" {
         eprintln!("Error: data type must be pacbio or ont-r9 or ont-r10 or ont-denoised");
@@ -2126,6 +2212,29 @@ pub fn start(
 
     let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&sb_matrix, p_value_threshold, heteroplasmic_frequency_threshold, permutation_rounds, &sb_filtered_var, &coverage, permutation_frequency_threshold, data_type, permutation_mode);
 
+    // ONT-recall R3-T2: read-linkage rescue (R3-7 merge, R3-8 matrix rows).
+    let link_calls: Option<Vec<LinkCall>> = linkage_bam.and_then(|bam| {
+        match linkage::rescue(bam, ref_seq.as_bytes(), &ref_header, &linkage::LinkOpts::default()) {
+            Ok((calls, _summary)) => Some(calls),
+            Err(e) => {
+                eprintln!("Warning: linkage rescue failed ({e:#}); continuing without it.");
+                None
+            }
+        }
+    });
+    let (permu_filtered_var, new_links) = match &link_calls {
+        Some(calls) => merge_link_calls(&permu_filtered_var, calls),
+        None => (permu_filtered_var, Vec::new()),
+    };
+    for l in &new_links {
+        println!(
+            "LINK m.{}{}>{} AC {} DP {} ({}/{}) partner {} shared {} enrich {:.1} log10p {:.2}",
+            l.pos + 1, l.ref_allele, l.alt_allele, l.ac, l.dp, l.fwd, l.rev,
+            l.partner_name, l.shared, l.enrich, l.log10p
+        );
+    }
+    let rescued_var: Vec<Variant> = new_links.iter().map(link_variant).collect();
+
     // write filtered vcf
     let _ = write_vcf(
         &permu_filtered_var,
@@ -2136,6 +2245,7 @@ pub fn start(
         ref_seq.len(),
         indel_false_threshold,
         left_align,
+        link_calls.as_ref().map(|_| new_links.as_slice()),
     );
     // write matrix
     // Plan 2026-10-11 T5: VCF, raw_matrix, strand-bias and permutation inputs above
@@ -2150,6 +2260,7 @@ pub fn start(
         output_file,
         &filtered_matrix,
         &permu_filtered_var,
+        &rescued_var,
         &read_set,
         genotype_src.as_ref(),
     ) {
@@ -2169,10 +2280,13 @@ pub struct GenotypeSource<'a> {
 /// that is the graph matrix, exactly as before. With one, the matrix comes from
 /// `genotype_from_bam(variants)` through the unchanged `construct_matrix`, and
 /// the graph matrix is kept in `<output>.graph_matrix.csv`.
+/// `rescued` (ONT-recall R3-T2, R3-8) has no graph rows, so it is genotyped from
+/// the BAM along with `variants` and is absent from the graph matrix.
 fn write_final_matrix(
     output_file: &Path,
     graph_matrix: &Array2<f64>,
     variants: &[Variant],
+    rescued: &[Variant],
     graph_reads: &[String],
     genotype: Option<&GenotypeSource>,
 ) -> Result<(), Box<dyn Error>> {
@@ -2186,10 +2300,11 @@ fn write_final_matrix(
                 graph_reads,
                 output_file.with_extension("graph_matrix.csv"),
             )?;
+            let all: Vec<Variant> = variants.iter().chain(rescued).cloned().collect();
             let (read_record, cover_record) =
-                genotype_from_bam(src.bam, src.refseq, src.ref_name, variants, &src.opts);
+                genotype_from_bam(src.bam, src.refseq, src.ref_name, &all, &src.opts);
             let (matrix, var_record, read_set) =
-                construct_matrix(&read_record, &cover_record, variants);
+                construct_matrix(&read_record, &cover_record, &all);
             println!(
                 "Genotyped {} variants x {} reads from {}",
                 var_record.len(),
@@ -3523,7 +3638,7 @@ mod tests {
         let path = std::env::temp_dir().join(name);
         let variants = vec![del_at(HOMOPOLYMER_REF, 5, 1, 3)];
         let coverage: HashMap<usize, usize> = [(5, 30)].into_iter().collect();
-        write_vcf(&variants, &coverage, &path, "s1", "chrM", 10, 0.1, left_align).unwrap();
+        write_vcf(&variants, &coverage, &path, "s1", "chrM", 10, 0.1, left_align, None).unwrap();
         std::fs::read_to_string(&path).unwrap()
     }
 
@@ -3923,7 +4038,7 @@ mod tests {
         let out = tmp_out("none");
         let v = geno_snp();
         let (m, vars, reads) = graph_matrix_fixture(&v);
-        write_final_matrix(&out, &m, &vars, &reads, None).unwrap();
+        write_final_matrix(&out, &m, &vars, &[], &reads, None).unwrap();
 
         let text = std::fs::read_to_string(out.with_extension("matrix.csv")).unwrap();
         assert_eq!(text, "variant,g1,g2\nm.31A>T,1,\n");
@@ -3940,7 +4055,7 @@ mod tests {
         let src = GenotypeSource {
             bam: &bam, refseq: GENO_REF.as_bytes(), ref_name: "chrM", opts: GenotypeOpts::default(),
         };
-        write_final_matrix(&out, &m, &vars, &reads, Some(&src)).unwrap();
+        write_final_matrix(&out, &m, &vars, &[], &reads, Some(&src)).unwrap();
 
         // matrix.csv is BAM-genotyped: reads sorted by name, ref pseudo-read all 0,
         // r_del / r_short missing (they are not in the matrix at all: never covered).

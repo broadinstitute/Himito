@@ -349,6 +349,16 @@ enum Commands {
         #[clap(long = "no-linkage-rescue", action)]
         no_linkage_rescue: bool,
 
+        /// ONT-recall Phase2 T6a: denoise's keep threshold (only used with -d ont-denoised).
+        /// An eligible non-ref allele survives denoise only if the site model's
+        /// quality-weighted EM frequency f reaches this; below it the allele is corrected
+        /// to the consensus. Distinct from -v/--vaf-threshold, the caller's raw HF cut on
+        /// called variants. 0.03 comes from a 0.01-0.04 sweep over 20 lineage_eval
+        /// ont-r10 cells: variant precision 0.837 -> 0.967 at full recall; above 0.04
+        /// recall falls as real low-frequency heteroplasmies are erased.
+        #[clap(long, value_parser, default_value_t = DENOISE_KEEP_VAF)]
+        denoise_keep_vaf: f64,
+
     },
 
     /// Filter reads derived from Numts
@@ -920,6 +930,7 @@ fn main() {
             left_align_compat: _,
             genotype_from_bam,
             no_linkage_rescue,
+            denoise_keep_vaf,
         } => {
             // Plan 2026-09-26 T4
             let left_align = !no_left_align;
@@ -960,7 +971,8 @@ fn main() {
                     // caller's HF cut here made the two impossible to tune apart, and
                     // at 0.01 the site model keeps marginal noise alleles whose reads
                     // then reach the VCF (precision 0.837 vs 0.967 at 0.03).
-                    DENOISE_KEEP_VAF, 0.7,
+                    // ONT-recall Phase2 T6a: --denoise-keep-vaf, default DENOISE_KEEP_VAF.
+                    denoise_keep_vaf, 0.7,
                     // Indel correction is on in QuickStart. Every other field keeps
                     // its `Default` value, which `validate_indel_opts` accepts as-is,
                     // so there is nothing to validate here. The generic HP length
@@ -1445,6 +1457,35 @@ mod linkage_cli_tests {
             Commands::Call { linkage_bam, .. } => assert_eq!(linkage_bam, Some(PathBuf::from("raw.bam"))),
             other => panic!("unexpected subcommand: {other:?}"),
         }
+    }
+}
+
+// ONT-recall Phase2 T6a
+#[cfg(test)]
+mod denoise_keep_vaf_cli_tests {
+    use super::*;
+
+    fn keep_vaf_of(extra: &[&str]) -> f64 {
+        let mut args = vec!["Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out"];
+        args.extend_from_slice(extra);
+        match Cli::try_parse_from(args).unwrap().command {
+            Commands::QuickStart { denoise_keep_vaf, vaf_threshold, .. } => {
+                assert_eq!(vaf_threshold, 0.01, "-v must stay independent of --denoise-keep-vaf");
+                denoise_keep_vaf
+            }
+            other => panic!("expected the QuickStart subcommand, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quickstart_denoise_keep_vaf_defaults_to_the_constant() {
+        assert_eq!(keep_vaf_of(&[]), DENOISE_KEEP_VAF);
+        assert_eq!(DENOISE_KEEP_VAF, 0.03);
+    }
+
+    #[test]
+    fn quickstart_denoise_keep_vaf_explicit_value_wins() {
+        assert_eq!(keep_vaf_of(&["--denoise-keep-vaf", "0.01"]), 0.01);
     }
 }
 

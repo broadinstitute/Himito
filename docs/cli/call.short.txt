@@ -1,0 +1,21 @@
+Call Variants from Sequence Graph
+
+Usage: Himito call [OPTIONS] --graphfile <GRAPHFILE> --reference-fasta <REFERENCE_FASTA> --sample-id <SAMPLE_ID> --output-file <OUTPUT_FILE>
+
+Options:
+  -g, --graphfile <GRAPHFILE>
+          anchor graph (GFA)
+      --threads <THREADS>
+          worker threads for parallel stages
+  -r, --reference-fasta <REFERENCE_FASTA>
+          reference FASTA (rCRS)
+  -s, --sample-id <SAMPLE_ID>
+          sample name written to the VCF
+  -d, --data-type <DATA_TYPE>
+          sequencing data type; sets the filter presets [default: pacbio] [possible values: pacbio, ont-r9, ont-r10, ont-denoised]
+  -o, --output-file <OUTPUT_FILE>
+          output VCF path
+  -b, --bam <BAM>
+          raw pre-denoise BAM: strand filter, linkage rescue, matrix.csv
+  -h, --help
+          Print help (see more with '--help')

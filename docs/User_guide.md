@@ -55,8 +55,8 @@ Here's a basic workflow to get started with Himito:
 msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ./target/release/Himito correct -g <output.gfa> -b <bwt_file, e.g. sr_msbwt.npy> -o <corrected.gfa> -m <minimal_supporting_sr> -q <query_length, should be less than short read length>
 
-# call variants from graph
-./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf>
+# call variants from graph (-b: raw mt BAM for strand filter and the matrix)
+./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -s <sampleid> -d <data_type> -o <output.vcf> -b <mt_output.bam>
 
 # extract major haplotype from graph
 ./target/release/Himito asm -g <output.gfa>  -o <output.majorhaplotpe.fasta> -s <header string, e.g. "HG002 major haplotype">
@@ -131,17 +131,30 @@ Identifies homoplasmic and heteroplasmic variants from the mitochondrial graph.
 ```
 
 Required Parameters:
-- -g, --graph <FILE>: Input graph file (GFA format)
-- -r, --reference <FILE>: Mitochondrial reference genome (FASTA)
-- -k, --kmer-size <INT>: K-mer size (should match build step)
+- -g, --graphfile <FILE>: Input graph file (GFA format)
+- -r, --reference-fasta <FILE>: Mitochondrial reference genome (FASTA)
 - -s, --sample-id <STRING>: Sample identifier
-- -d, --data-type <String>: Long Read Sequencing technology (pacbio or ont)
-- -o, --output <FILE>: Output VCF file
+- -d, --data-type <STRING>: pacbio, ont-r9, ont-r10 or ont-denoised
+- -o, --output-file <FILE>: Output VCF file
+
+Optional:
+- -b, --bam <FILE>: raw (pre-denoise) BAM of the same reads. It drives the strand-bias filter,
+  ONT linkage rescue and `<output>.matrix.csv`. `--input-bam` is an alias. Without it the matrix
+  comes from the graph and the strand filter and linkage rescue are off.
+
+Advanced options are hidden from `-h` and listed by `--help`: `-k`, `-m`, `-v`, `-p`, `-f`,
+`--strand-bias-threshold`, `--indel-false-threshold`, `--permutation-frequency-threshold`,
+`--permutation-rounds`, `--no-left-align`. The full text of `-h` and `--help` for `call`,
+`quick-start` and `lineage` is in [`docs/cli/`](cli/).
+
+The strand-bias action, permutation mode and genotyping gates are no longer flags; the data
+type presets set them. `--genotype-bam`, `--linkage-bam`, `--genotype-from-bam` and
+`--cooccurrence-stat` were removed.
 
 Example:
 
 ```
-./target/release/Himito call -g HG002_mt.gfa -r rCRS.fasta -k 21 -s HG002 -o HG002_variants.vcf
+./target/release/Himito call -g HG002_mt.gfa -r rCRS.fasta -s HG002 -d pacbio -o HG002_variants.vcf
 ```
 
 ### asm - Primary Assembly Extraction

@@ -215,6 +215,37 @@ pub const LINEAGE_MIN_READS: usize = 3;
 /// `lineage_eval/lineage_sim/sweep_fpfn.sh` does vary those two.
 pub const LINEAGE_MCMC_SEED: u64 = 42;
 
+/// Lineage root block (always on): minimum HF for a variant to be CONSIDERED
+/// homoplasmic. A gate only; the decision is whether the reads lacking the variant
+/// carry any distinguishing allele.
+///
+/// Were `--root-block-min-hf` and friends (and `--no-root-block`). No WDL, script
+/// or doc ever set one, so they are fixed at the old defaults.
+pub const LINEAGE_ROOT_BLOCK_MIN_HF: f64 = 0.80;
+
+/// Lineage root block: Benjamini-Hochberg q above which a variant's absences count
+/// as unstructured (dropout rather than a real subclone).
+pub const LINEAGE_ROOT_BLOCK_MAX_Q: f64 = 0.05;
+
+/// Lineage root block: below this many absent calls a high-HF variant is admitted
+/// without testing, since there is too little to assess either way.
+pub const LINEAGE_ROOT_BLOCK_MIN_ABSENT: usize = 10;
+
+/// Lineage root block: minimum enrichment odds ratio for a partner's absences to
+/// count as a real subclone rather than depth-inflated significance.
+pub const LINEAGE_ROOT_BLOCK_MIN_OR: f64 = 2.0;
+
+/// Quick-start: longest read span (bp) the graph build aligns. Was `-l`.
+pub const QUICK_START_LENGTH_MAX: usize = 3000;
+
+/// Quick-start: RNG seed of the mt-read downsampling, fixed for reproducible
+/// subsets. Was `--downsample-seed`.
+pub const QUICK_START_DOWNSAMPLE_SEED: u64 = 42;
+
+/// Strand-skewed SNPs below this HF are dropped instead of flagged, when the
+/// data-type preset says drop. Was `--strand-bias-drop-max-hf`.
+pub const STRAND_BIAS_DROP_MAX_HF: f64 = 0.10;
+
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
 #[clap(version = env!("CARGO_PKG_VERSION"))]
@@ -230,7 +261,7 @@ struct Cli {
 
 #[derive(Args, Debug)]
 pub struct GlobalOpts {
-    /// Global options
+    /// worker threads for parallel stages
     #[arg(long, global = true)]
     pub threads: Option<usize>,
 }
@@ -240,138 +271,94 @@ enum Commands {
     /// Quick start pipeline for mitochondrial assembly, variant calling and methylation aggregation
     #[clap(arg_required_else_help = true)]
     QuickStart {
-        /// input path for bam file.
+        /// input BAM of reads, coordinate-sorted
         #[clap(short, long, value_parser, required = true)]
         input_bam: PathBuf,
 
-        /// contig name in the bam file
+        /// mitochondrial contig name in the BAM
         #[clap(short, long, value_parser, default_value = "chrM")]
         chromo: String,
 
-        /// Reference Fasta file, rCRS
+        /// reference FASTA (rCRS)
         #[clap(short, long, value_parser, required = true)]
         reference_path: PathBuf,
 
-        /// sample name of the bam file
+        /// sample name written to the outputs
         #[clap(short, long, value_parser, required = true)]
         sample_id: String,
 
-        /// data type, pacbio, ont-r9, ont-r10
-        #[clap(short, long, value_parser, default_value = "pacbio")]
+        /// sequencing data type; sets the filter and denoise presets
+        #[clap(short, long, default_value = "pacbio", value_parser = clap::builder::PossibleValuesParser::new(DATA_TYPES))]
         data_type: String,
 
-        /// output prefix
+        /// output prefix for the BAM, GFA, VCF, matrix and BED outputs
         #[clap(short, long, value_parser, required = true)]
         output_prefix: PathBuf,
 
-        /// min_probability to determine a C is methylated
-        #[clap(short, long, value_parser, default_value_t = 0.5)]
-        threshold_methylation_prob: f64,
-
-        /// max fraction to keep a read as mtDNA derived
-         #[clap(short, long, value_parser, default_value_t = 0.2)]
-        filter_max_methylation: f64,
-
-        /// Kmer-size
-        #[clap(short, long, value_parser, default_value_t = 21)]
-        kmer_size: usize,
-
-        /// minimal allele count for variants
-        #[clap(short, long, value_parser, default_value_t = 2)]
-        minimal_ac: usize,
-
-        /// max Length to do alignment
-        #[clap(short, long, value_parser, default_value_t = 3000)]
-        length_max: usize,
-
-        /// minimal heteroplasmic frequency for variants
-        #[clap(short, long, value_parser, default_value_t = 0.01)]
-        vaf_threshold: f32,
-
-        /// p-value threshold for permutation test (optional, preset by data-type,(optional, set as 1 to disable permutation test))
-        #[clap(long, value_parser)]
-        p_value_threshold: Option<f64>,
-
-        /// heteroplasmic frequency threshold for permutation test (optional, preset by data-type,higher is more stringent)
-        #[clap(long, value_parser)]
-        heteroplasmic_frequency_threshold: Option<f64>,
-
-        /// maximal reads to keep from mtDNA 
+        /// maximum mtDNA reads kept after downsampling
         #[clap(long, value_parser, default_value_t = 50000)]
         maximal_mt_depth: usize,
 
-        /// RNG seed for mt read downsampling (reproducible subsampling)
-        #[clap(long, value_parser, default_value_t = 42)]
-        downsample_seed: u64,
+        /// minimum probability to call a C methylated
+        #[clap(short, long, value_parser, default_value_t = 0.5, hide_short_help = true)]
+        threshold_methylation_prob: f64,
 
-        /// strand bias threshold for filtering variants
-        #[clap(long, value_parser, default_value_t = 0.05)]
+        /// maximum methylated fraction for a read to count as mtDNA
+        #[clap(short, long, value_parser, default_value_t = 0.2, hide_short_help = true)]
+        filter_max_methylation: f64,
+
+        /// k-mer size of the anchor graph
+        #[clap(short, long, value_parser, default_value_t = 21, hide_short_help = true)]
+        kmer_size: usize,
+
+        /// minimum allele count for a variant
+        #[clap(short, long, value_parser, default_value_t = 2, hide_short_help = true)]
+        minimal_ac: usize,
+
+        /// minimum heteroplasmic frequency for a variant
+        #[clap(short, long, value_parser, default_value_t = 0.01, hide_short_help = true)]
+        vaf_threshold: f32,
+
+        /// permutation-test p-value cutoff; 1 disables it (preset by data type)
+        #[clap(long, value_parser, hide_short_help = true)]
+        p_value_threshold: Option<f64>,
+
+        /// permutation-test frequency threshold (preset by data type)
+        #[clap(long, value_parser, hide_short_help = true)]
+        heteroplasmic_frequency_threshold: Option<f64>,
+
+        /// p-value cutoff of the strand-bias filter
+        #[clap(long, value_parser, default_value_t = 0.05, hide_short_help = true)]
         strand_bias_threshold: f64,
 
-        /// indels below this HF are flagged Potential_Artifact (optional, preset by data-type:
-        /// ONT 0.015 because small indels under 20% HF must already pass the co-occurrence test;
-        /// pacbio 0.1). ONT-recall T5
-        #[clap(long, value_parser)]
+        /// indels below this HF are flagged Potential_Artifact (preset by data type)
+        #[clap(long, value_parser, hide_short_help = true)]
         indel_false_threshold: Option<f64>,
 
-        /// heteroplasmic frequency threshold for permutation test
-        #[clap(long, value_parser )]
+        /// variants above this matrix frequency skip the permutation test (preset)
+        #[clap(long, value_parser, hide_short_help = true)]
         permutation_frequency_threshold: Option<f64>,
 
-        /// minimum rounds per tested variant; with the default adaptive mode, variants
-        /// at the p-value floor are extended automatically until BH can resolve them
-        #[clap(long, value_parser, default_value_t = 1000)]
+        /// minimum permutation rounds per tested variant
+        #[clap(long, value_parser, default_value_t = 1000, hide_short_help = true)]
         permutation_rounds: usize,
 
-        /// permutation test mode: adaptive (extend floor variants, stop clear nulls
-        /// early) or fixed (exactly --permutation-rounds per variant)
-        #[clap(long, value_enum, default_value_t = call::PermutationMode::Adaptive)]
-        permutation_mode: call::PermutationMode,
-
-        /// co-occurrence statistic of the permutation test (experiment, ONT-recall Phase2 T8)
-        #[clap(long, value_enum, default_value_t = call::CooccurrenceStat::SumJaccard, hide = true)]
-        cooccurrence_stat: call::CooccurrenceStat,
-
-        /// what to do with strand-skewed variants: flag them in FILTER, or additionally
-        /// drop low-VAF SNPs outright (default: drop for ont-denoised, flag otherwise)
-        #[clap(long, value_enum)]
-        strand_bias_action: Option<call::StrandBiasAction>,
-
-        /// heteroplasmic-frequency ceiling below which a strand-skewed SNP is dropped
-        /// rather than merely flagged (only used with --strand-bias-action drop)
-        #[clap(long, value_parser, default_value_t = 0.10)]
-        strand_bias_drop_max_hf: f64,
-
-        /// (default) left-align indels against the reference, as `bcftools norm` does, so that
-        /// equivalent spellings of one event in a homopolymer or tandem repeat
-        /// collapse into a single record with their supporting reads pooled. This
-        /// changes reported POS/REF/ALT, AC and HF for indels, and the variant names
-        /// used as row labels in the output matrix. An indel that would shift past
-        /// the start of the reference stops there rather than wrapping around the
-        /// circular origin.
+        // `--left-align` is a no-op kept so old command lines still parse.
+        /// no-op; indels are left-aligned by default
         #[clap(long = "left-align", action, hide = true)]
-        left_align_compat: bool, // accepted for backwards compatibility; now a no-op
-        /// disable indel left-alignment (reproduces pre-2026-09 variant names)
-        #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat")]
+        left_align_compat: bool,
+
+        /// do not left-align indels (reproduces pre-2026-09 variant names)
+        #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat", hide_short_help = true)]
         no_left_align: bool,
 
-        /// ONT-recall R3-T2: turn off read-linkage rescue of low-frequency SNVs. By default
-        /// ont-r9/ont-r10/ont-denoised add PASS SNVs (0.4-20% HF in the raw `<prefix>.mt.bam`
-        /// pileup) that co-occur on the same reads, on both strands, with another such allele;
-        /// they carry INFO LINK. Never on for pacbio.
-        #[clap(long = "no-linkage-rescue", action)]
+        /// turn off read-linkage rescue of low-frequency SNVs (ONT only)
+        #[clap(long = "no-linkage-rescue", action, hide_short_help = true)]
         no_linkage_rescue: bool,
 
-        /// ONT-recall Phase2 T6a: denoise's keep threshold (only used with -d ont-denoised).
-        /// An eligible non-ref allele survives denoise only if the site model's
-        /// quality-weighted EM frequency f reaches this; below it the allele is corrected
-        /// to the consensus. Distinct from -v/--vaf-threshold, the caller's raw HF cut on
-        /// called variants. 0.03 comes from a 0.01-0.04 sweep over 20 lineage_eval
-        /// ont-r10 cells: variant precision 0.837 -> 0.967 at full recall; above 0.04
-        /// recall falls as real low-frequency heteroplasmies are erased.
-        #[clap(long, value_parser, default_value_t = DENOISE_KEEP_VAF)]
+        /// keep threshold of the denoise site model (ont-denoised only)
+        #[clap(long, value_parser, default_value_t = DENOISE_KEEP_VAF, hide_short_help = true)]
         denoise_keep_vaf: f64,
-
     },
 
     /// Filter reads derived from Numts
@@ -519,101 +506,73 @@ enum Commands {
     ///Call Variants from Sequence Graph
     #[clap(arg_required_else_help = true)]
     Call {
-        /// path for anchor graph.
+        /// anchor graph (GFA)
         #[clap(short, long, value_parser)]
         graphfile: PathBuf,
 
-        /// Reference Fasta path
+        /// reference FASTA (rCRS)
         #[clap(short, long, value_parser, required = true)]
         reference_fasta: PathBuf,
 
-        /// sample name of the bam file
+        /// sample name written to the VCF
         #[clap(short, long, value_parser, required = true)]
         sample_id: String,
 
-        /// data type, pacbio, ont-r9, ont-r10, ont-denoised
-        #[clap(short, long, value_parser, default_value = "pacbio")]
+        /// sequencing data type; sets the filter presets
+        #[clap(short, long, default_value = "pacbio", value_parser = clap::builder::PossibleValuesParser::new(DATA_TYPES))]
         data_type: String,
 
-        /// output file name
+        /// output VCF path
         #[clap(short, long, value_parser, required = true)]
         output_file: PathBuf,
 
-        /// Kmer-size
-        #[clap(short, long, value_parser, default_value_t = 21)]
-        k: usize,
-
-        /// minimal allele count for variants
-        #[clap(short, long, value_parser, default_value_t = 2)]
-        minimal_ac: usize,
-
-        /// minimal heteroplasmic frequency for variants
-        #[clap(short, long, value_parser, default_value_t = 0.01)]
-        vaf_threshold: f32,
-
-        /// p-value threshold for permutation test (optional, set as 1 to disable permutation test)
-        #[clap(short, long, value_parser)]
-        p_value_threshold: Option<f64>,
-
-        /// frequency threshold for permutation test (optional)
-        #[clap(short, long, value_parser)]
-        frequency_threshold: Option<f64>,
-
-        /// raw (pre-denoise), coordinate-sorted BAM of the same reads. It drives the strand-bias
-        /// filter, ONT linkage rescue and `<output>.matrix.csv` (re-genotyped from these reads,
-        /// the lineage input). Without it the matrix comes from the graph and the other two are off.
+        /// raw pre-denoise BAM: strand filter, linkage rescue, matrix.csv
         #[clap(short = 'b', long = "bam", alias = "input-bam", value_parser)]
         bam: Option<PathBuf>,
 
-        /// p-value threshold for the strand-bias filter (only used with --bam)
-        #[clap(long, value_parser, default_value_t = 0.01)]
+        /// k-mer size of the anchor graph
+        #[clap(short, long, value_parser, default_value_t = 21, hide_short_help = true)]
+        k: usize,
+
+        /// minimum allele count for a variant
+        #[clap(short, long, value_parser, default_value_t = 2, hide_short_help = true)]
+        minimal_ac: usize,
+
+        /// minimum heteroplasmic frequency for a variant
+        #[clap(short, long, value_parser, default_value_t = 0.01, hide_short_help = true)]
+        vaf_threshold: f32,
+
+        /// permutation-test p-value cutoff; 1 disables it (preset by data type)
+        #[clap(short, long, value_parser, hide_short_help = true)]
+        p_value_threshold: Option<f64>,
+
+        /// permutation-test frequency threshold (preset by data type)
+        #[clap(short, long, value_parser, hide_short_help = true)]
+        frequency_threshold: Option<f64>,
+
+        /// p-value cutoff of the strand-bias filter (only used with --bam)
+        #[clap(long, value_parser, default_value_t = 0.01, hide_short_help = true)]
         strand_bias_threshold: f64,
 
-        /// indels below this HF are flagged Potential_Artifact (optional, preset by data-type:
-        /// ONT 0.015 because small indels under 20% HF must already pass the co-occurrence test;
-        /// pacbio 0.1). ONT-recall T5
-        #[clap(long, value_parser)]
+        /// indels below this HF are flagged Potential_Artifact (preset by data type)
+        #[clap(long, value_parser, hide_short_help = true)]
         indel_false_threshold: Option<f64>,
 
-        /// heteroplasmic frequency threshold for permutation test (optional, preset by data-type)
-        #[clap(long, value_parser)]
+        /// variants above this matrix frequency skip the permutation test (preset)
+        #[clap(long, value_parser, hide_short_help = true)]
         permutation_frequency_threshold: Option<f64>,
 
-        /// minimum rounds per tested variant; with the default adaptive mode, variants
-        /// at the p-value floor are extended automatically until BH can resolve them
-        #[clap(long, value_parser, default_value_t = 1000)]
+        /// minimum permutation rounds per tested variant
+        #[clap(long, value_parser, default_value_t = 1000, hide_short_help = true)]
         permutation_rounds: usize,
 
-        /// permutation test mode: adaptive (extend floor variants, stop clear nulls
-        /// early) or fixed (exactly --permutation-rounds per variant)
-        #[clap(long, value_enum, default_value_t = call::PermutationMode::Adaptive)]
-        permutation_mode: call::PermutationMode,
-
-        /// co-occurrence statistic of the permutation test (experiment, ONT-recall Phase2 T8)
-        #[clap(long, value_enum, default_value_t = call::CooccurrenceStat::SumJaccard, hide = true)]
-        cooccurrence_stat: call::CooccurrenceStat,
-
-        /// what to do with strand-skewed variants: flag them in FILTER, or additionally
-        /// drop low-VAF SNPs outright (default: drop for ont-denoised, flag otherwise)
-        #[clap(long, value_enum)]
-        strand_bias_action: Option<call::StrandBiasAction>,
-
-        /// heteroplasmic-frequency ceiling below which a strand-skewed SNP is dropped
-        /// rather than merely flagged (only used with --strand-bias-action drop)
-        #[clap(long, value_parser, default_value_t = 0.10)]
-        strand_bias_drop_max_hf: f64,
-
-        /// (default) left-align indels against the reference, as `bcftools norm` does, so that
-        /// equivalent spellings of one event in a homopolymer or tandem repeat
-        /// collapse into a single record with their supporting reads pooled. This
-        /// changes reported POS/REF/ALT, AC and HF for indels, and the variant names
-        /// used as row labels in the output matrix. An indel that would shift past
-        /// the start of the reference stops there rather than wrapping around the
-        /// circular origin.
+        // `--left-align` is a no-op kept so old command lines still parse.
+        /// no-op; indels are left-aligned by default
         #[clap(long = "left-align", action, hide = true)]
-        left_align_compat: bool, // accepted for backwards compatibility; now a no-op
-        /// disable indel left-alignment (reproduces pre-2026-09 variant names)
-        #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat")]
+        left_align_compat: bool,
+
+        /// do not left-align indels (reproduces pre-2026-09 variant names)
+        #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat", hide_short_help = true)]
         no_left_align: bool,
     },
 
@@ -733,26 +692,15 @@ enum Commands {
     /// Infer mitochondrial lineage tree from Himito read_var matrix CSV and heteroplasmic variants
     #[clap(arg_required_else_help = true)]
     Lineage {
-        /// path for the Himito matrix CSV (<prefix>.matrix.csv)
+        /// Himito matrix CSV (<prefix>.matrix.csv)
         #[clap(short, long, value_parser, required = true)]
         matrix_file: PathBuf,
 
-        /// path for the Himito VCF; used to read each variant's HF and
-        /// restrict the analysis to heteroplasmic (non-fixed) sites
+        /// Himito VCF; restricts the analysis to its heteroplasmic sites
         #[clap(short, long, value_parser)]
         vcf_file: Option<PathBuf>,
 
-        /// minimal heteroplasmic frequency (inclusive) for a variant to be considered
-        #[clap(long, value_parser, default_value_t = 0.01)]
-        min_hf: f64,
-
-        /// maximal heteroplasmic frequency (exclusive) for a variant to be
-        /// considered; the default excludes fixed/homoplasmic variants (HF >= 0.95)
-        #[clap(long, value_parser, default_value_t = 0.95)]
-        max_hf: f64,
-
-        /// data type, pacbio, ont-r9, ont-r10, ont-denoised; selects the
-        /// default SCITE fp/fn rates
+        /// sequencing data type; sets the SCITE error-rate preset
         #[clap(
             short,
             long,
@@ -761,75 +709,51 @@ enum Commands {
         )]
         data_type: String,
 
-        /// SCITE false-positive rate (alpha): P(observed=1 | true=0)
-        /// (optional; preset by data type)
-        #[clap(long, value_parser)]
-        fp_rate: Option<f64>,
-
-        /// SCITE false-negative rate (beta): P(observed=0 | true=1)
-        /// (optional; preset by data type)
-        #[clap(long, value_parser)]
-        fn_rate: Option<f64>,
-
-        /// SCITE false-positive rate inside known HP tracts
-        /// (optional; default is min(0.5, 2 × the resolved --fp-rate))
-        #[clap(long, value_parser)]
-        hp_fp_rate: Option<f64>,
-
-        /// SCITE false-negative rate inside known HP tracts
-        /// (optional; default is min(0.5, 2 × the resolved --fn-rate))
-        #[clap(long, value_parser)]
-        hp_fn_rate: Option<f64>,
-
-        /// merge equivalent spellings inside known hypervariable rCRS homopolymer
-        /// tracts (D310 302-315, HVS1-C 16183-16193, CA514 513-525) into one
-        /// sequence-level allele per distinct tract sequence (e.g. a T16189C C10 run).
-        /// Renames those variants to `m.<start><tract_ref>><tract_alt>`. Off by default.
-        #[clap(long, action)]
-        collapse_hp: bool,
-
-        /// number of MCMC iterations per chain
-        #[clap(long, value_parser, default_value_t = 5000)]
-        mcmc_iterations: usize,
-
-        /// number of independent MCMC chains (best tree across all is kept)
-        #[clap(long, value_parser, default_value_t = 3)]
-        mcmc_chains: usize,
-
-        /// disable root-block collapsing; every variant enters the mutation-tree
-        /// search, reproducing pre-1.2 behaviour
-        #[clap(long, action)]
-        no_root_block: bool,
-
-        /// root block: minimum HF for a variant to be CONSIDERED homoplasmic.
-        /// A gate only — the decision is whether the reads lacking the variant
-        /// carry any distinguishing allele
-        #[clap(long, value_parser, default_value_t = 0.80)]
-        root_block_min_hf: f64,
-
-        /// root block: Benjamini-Hochberg q above which a variant's absences
-        /// count as unstructured (dropout rather than a real subclone)
-        #[clap(long, value_parser, default_value_t = 0.05)]
-        root_block_max_q: f64,
-
-        /// root block: below this many absent calls, admit a high-HF variant
-        /// without testing — there is too little to assess either way
-        #[clap(long, value_parser, default_value_t = 10)]
-        root_block_min_absent: usize,
-
-        /// root block: minimum enrichment odds ratio for a partner's absences to
-        /// count as a real subclone rather than depth-inflated significance.
-        /// Larger is stricter and keeps more variants homoplasmic at high depth
-        #[clap(long, value_parser, default_value_t = 2.0)]
-        root_block_min_or: f64,
-
-        /// also write raw_haplotype_map.tsv and raw_variant_cooccurrence.tsv
-        #[clap(long, action)]
-        debug: bool,
-
-        /// output prefix; writes <prefix>.haplotype_map.tsv
+        /// output prefix; writes <prefix>.haplotype_map.tsv and the trees
         #[clap(short, long, value_parser, required = true)]
         output_prefix: String,
+
+        /// minimum heteroplasmic frequency (inclusive) of a variant
+        #[clap(long, value_parser, default_value_t = 0.01)]
+        min_hf: f64,
+
+        /// maximum heteroplasmic frequency (exclusive); excludes fixed variants
+        #[clap(long, value_parser, default_value_t = 0.95)]
+        max_hf: f64,
+
+        /// SCITE false-positive rate (preset by data type)
+        #[clap(long, value_parser, hide_short_help = true)]
+        fp_rate: Option<f64>,
+
+        /// SCITE false-negative rate (preset by data type)
+        #[clap(long, value_parser, hide_short_help = true)]
+        fn_rate: Option<f64>,
+
+        /// SCITE false-positive rate in HP tracts (twice --fp-rate, capped at 0.5)
+        #[clap(long, value_parser, hide_short_help = true)]
+        hp_fp_rate: Option<f64>,
+
+        /// SCITE false-negative rate in HP tracts (twice --fn-rate, capped at 0.5)
+        #[clap(long, value_parser, hide_short_help = true)]
+        hp_fn_rate: Option<f64>,
+
+        /// merge equivalent spellings inside known rCRS homopolymer tracts
+        // Tracts: D310 302-315, HVS1-C 16183-16193, CA514 513-525. Variants are
+        // renamed `m.<start><tract_ref>><tract_alt>`.
+        #[clap(long, action, hide_short_help = true)]
+        collapse_hp: bool,
+
+        /// MCMC iterations per chain
+        #[clap(long, value_parser, default_value_t = 5000, hide_short_help = true)]
+        mcmc_iterations: usize,
+
+        /// independent MCMC chains; the best tree is kept
+        #[clap(long, value_parser, default_value_t = 3, hide_short_help = true)]
+        mcmc_chains: usize,
+
+        /// also write raw_haplotype_map.tsv and raw_variant_cooccurrence.tsv
+        #[clap(long, action, hide_short_help = true)]
+        debug: bool,
     }
 }
 
@@ -896,22 +820,16 @@ fn main() {
             output_prefix,
             threshold_methylation_prob,
             filter_max_methylation,
-            length_max,
             kmer_size,
             minimal_ac,
             vaf_threshold,
             p_value_threshold,
             heteroplasmic_frequency_threshold,
             maximal_mt_depth,
-            downsample_seed,
             strand_bias_threshold,
             indel_false_threshold,
             permutation_frequency_threshold,
             permutation_rounds,
-            permutation_mode,
-            cooccurrence_stat,
-            strand_bias_action,
-            strand_bias_drop_max_hf,
             no_left_align,
             left_align_compat: _,
             no_linkage_rescue,
@@ -933,7 +851,7 @@ fn main() {
                 threshold_methylation_prob,
                 filter_max_methylation,
                 maximal_mt_depth,
-                downsample_seed,
+                QUICK_START_DOWNSAMPLE_SEED,
             );
             
             // For ONT, denoise the mt BAM so reads consolidate; PacBio is untouched.
@@ -983,7 +901,7 @@ fn main() {
 
             let graph_output = output_prefix.with_extension("gfa");
             // Preserve the historical default edge-read gate (2) for this combined pipeline.
-            let _ = build::start(&graph_output, kmer_size, &build_bam, &reference_path, length_max, 2);
+            let _ = build::start(&graph_output, kmer_size, &build_bam, &reference_path, QUICK_START_LENGTH_MAX, 2);
 
             let assemble_output = output_prefix.with_extension("fasta");
             asm::start(&graph_output, &assemble_output, &sample_id);
@@ -1007,10 +925,11 @@ fn main() {
                 indel_false_threshold,
                 permutation_frequency_threshold_,
                 permutation_rounds,
-                permutation_mode,
-                cooccurrence_stat,
-                strand_bias_action,
-                strand_bias_drop_max_hf,
+                // Adaptive permutation test; Fixed is only reachable from unit tests.
+                call::PermutationMode::Adaptive,
+                // None: the data-type preset (drop for ont-denoised, flag otherwise).
+                None,
+                STRAND_BIAS_DROP_MAX_HF,
                 left_align,
                 no_linkage_rescue,
             );
@@ -1117,10 +1036,6 @@ fn main() {
             indel_false_threshold,
             permutation_frequency_threshold,
             permutation_rounds,
-            permutation_mode,
-            cooccurrence_stat,
-            strand_bias_action,
-            strand_bias_drop_max_hf,
             no_left_align,
             left_align_compat: _,
         } => {
@@ -1146,10 +1061,11 @@ fn main() {
                 indel_false_threshold,
                 permutation_frequency_threshold,
                 permutation_rounds,
-                permutation_mode,
-                cooccurrence_stat,
-                strand_bias_action,
-                strand_bias_drop_max_hf,
+                // Adaptive permutation test; Fixed is only reachable from unit tests.
+                call::PermutationMode::Adaptive,
+                // None: the data-type preset (drop for ont-denoised, flag otherwise).
+                None,
+                STRAND_BIAS_DROP_MAX_HF,
                 left_align,
                 false,
             );
@@ -1234,11 +1150,6 @@ fn main() {
             collapse_hp,
             mcmc_iterations,
             mcmc_chains,
-            no_root_block,
-            root_block_min_hf,
-            root_block_max_q,
-            root_block_min_absent,
-            root_block_min_or,
             debug,
             output_prefix,
         } => {
@@ -1256,18 +1167,14 @@ fn main() {
             } else {
                 &[]
             };
-            let root_block = if no_root_block {
-                None
-            } else {
-                Some(rootblock::RootBlockConfig {
-                    min_hf: root_block_min_hf,
-                    max_q: root_block_max_q,
-                    min_absent: root_block_min_absent,
-                    min_or: root_block_min_or,
-                    // The dropout rate that makes the HF gate depth-relative is
-                    // the SCITE fn rate, supplied by `run_scite_pipeline`.
-                })
-            };
+            // Root block is always on. The dropout rate that makes its HF gate
+            // depth-relative is the SCITE fn rate, supplied by `run_scite_pipeline`.
+            let root_block = Some(rootblock::RootBlockConfig {
+                min_hf: LINEAGE_ROOT_BLOCK_MIN_HF,
+                max_q: LINEAGE_ROOT_BLOCK_MAX_Q,
+                min_absent: LINEAGE_ROOT_BLOCK_MIN_ABSENT,
+                min_or: LINEAGE_ROOT_BLOCK_MIN_OR,
+            });
             // Review 2026-09-25 T6: reject 0 chains here. `run_mcmc_multichain`
             // panics on an empty chain list, and a CLI flag should fail with a
             // message instead of a library panic.
@@ -1587,5 +1494,238 @@ mod left_align_cli_tests {
         ])
         .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+}
+
+// Cleanup C3: visible / advanced / hard-coded option split.
+//   visible  -> in `-h` and `--help`
+//   advanced -> `hide_short_help`: parses, but only `--help` lists it
+//   gone     -> hard-coded constant or removed: parses nowhere, listed nowhere
+#[cfg(test)]
+mod option_split_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    struct Split {
+        sub: &'static str,
+        visible: &'static [&'static str],
+        // (long flag, value to parse it with; "" for a switch)
+        advanced: &'static [(&'static str, &'static str)],
+        gone: &'static [&'static str],
+    }
+
+    const QUICK_START: Split = Split {
+        sub: "quick-start",
+        visible: &[
+            "--input-bam", "--chromo", "--reference-path", "--sample-id", "--data-type",
+            "--output-prefix", "--maximal-mt-depth", "--threads",
+        ],
+        advanced: &[
+            ("--kmer-size", "21"), ("--minimal-ac", "2"), ("--vaf-threshold", "0.01"),
+            ("--threshold-methylation-prob", "0.5"), ("--filter-max-methylation", "0.2"),
+            ("--p-value-threshold", "0.01"), ("--heteroplasmic-frequency-threshold", "0.5"),
+            ("--strand-bias-threshold", "0.05"), ("--indel-false-threshold", "0.1"),
+            ("--permutation-frequency-threshold", "0.5"), ("--permutation-rounds", "1000"),
+            ("--no-left-align", ""), ("--no-linkage-rescue", ""), ("--denoise-keep-vaf", "0.03"),
+        ],
+        gone: &[
+            "--length-max", "--downsample-seed", "--strand-bias-drop-max-hf",
+            "--strand-bias-action", "--permutation-mode", "--cooccurrence-stat",
+            "--genotype-from-bam", "--left-align",
+        ],
+    };
+
+    const CALL: Split = Split {
+        sub: "call",
+        visible: &[
+            "--graphfile", "--reference-fasta", "--sample-id", "--data-type", "--output-file",
+            "--bam", "--threads",
+        ],
+        advanced: &[
+            ("--k", "21"), ("--minimal-ac", "2"), ("--vaf-threshold", "0.01"),
+            ("--p-value-threshold", "0.01"), ("--frequency-threshold", "0.5"),
+            ("--strand-bias-threshold", "0.01"), ("--indel-false-threshold", "0.1"),
+            ("--permutation-frequency-threshold", "0.5"), ("--permutation-rounds", "1000"),
+            ("--no-left-align", ""),
+        ],
+        gone: &[
+            "--strand-bias-action", "--strand-bias-drop-max-hf", "--permutation-mode",
+            "--genotype-max-ed", "--genotype-flank", "--cooccurrence-stat",
+            "--genotype-bam", "--linkage-bam", "--left-align", "--input-bam",
+        ],
+    };
+
+    const LINEAGE: Split = Split {
+        sub: "lineage",
+        visible: &[
+            "--matrix-file", "--vcf-file", "--data-type", "--output-prefix", "--min-hf",
+            "--max-hf", "--threads",
+        ],
+        advanced: &[
+            ("--fp-rate", "0.005"), ("--fn-rate", "0.02"), ("--hp-fp-rate", "0.01"),
+            ("--hp-fn-rate", "0.04"), ("--collapse-hp", ""), ("--mcmc-iterations", "100"),
+            ("--mcmc-chains", "2"), ("--debug", ""),
+        ],
+        gone: &[
+            "--no-root-block", "--root-block-min-hf", "--root-block-max-q",
+            "--root-block-min-absent", "--root-block-min-or",
+        ],
+    };
+
+    /// (short help, long help) of a subcommand, as `-h` and `--help` print them.
+    fn helps(sub: &str) -> (String, String) {
+        let mut root = Cli::command();
+        root.build();
+        let cmd = root.find_subcommand_mut(sub).expect("subcommand exists");
+        (cmd.render_help().to_string(), cmd.render_long_help().to_string())
+    }
+
+    /// Long flags that head an option entry (not ones merely mentioned in prose).
+    fn listed(help: &str) -> Vec<String> {
+        help.lines()
+            .map(str::trim_start)
+            .filter(|l| l.starts_with('-'))
+            .flat_map(|l| {
+                l.split_whitespace()
+                    .take_while(|t| t.starts_with('-'))
+                    .filter(|t| t.starts_with("--"))
+                    .map(|t| t.trim_end_matches(',').to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn cmdline(split: &Split, extra: &[&str]) -> Vec<String> {
+        let base: &[&str] = match split.sub {
+            "quick-start" => &["Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out"],
+            "call" => &["Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf"],
+            "lineage" => &["Himito", "lineage", "-m", "m.csv", "-o", "out"],
+            other => panic!("no base command line for {other}"),
+        };
+        base.iter().chain(extra).map(|s| s.to_string()).collect()
+    }
+
+    fn check(split: &Split) {
+        let (short, long) = helps(split.sub);
+        let (short, long) = (listed(&short), listed(&long));
+        let has = |v: &[String], f: &str| v.iter().any(|x| x == f);
+        for f in split.visible {
+            assert!(has(&short, f), "{} -h must list {f}", split.sub);
+            assert!(has(&long, f), "{} --help must list {f}", split.sub);
+        }
+        for (f, _) in split.advanced {
+            assert!(!has(&short, f), "{} -h must NOT list advanced {f}", split.sub);
+            assert!(has(&long, f), "{} --help must list advanced {f}", split.sub);
+        }
+        for f in split.gone {
+            assert!(!has(&short, f), "{} -h must not list {f}", split.sub);
+            assert!(!has(&long, f), "{} --help must not list {f}", split.sub);
+        }
+    }
+
+    fn check_parse(split: &Split) {
+        for (f, v) in split.advanced {
+            let extra: Vec<&str> = if v.is_empty() { vec![f] } else { vec![f, v] };
+            if let Err(e) = Cli::try_parse_from(cmdline(split, &extra)) {
+                panic!("{} {f}: advanced flag must still parse: {e}", split.sub);
+            }
+        }
+        for f in split.gone {
+            // `--input-bam` is a live alias of `--bam` on call, not a removed flag.
+            if *f == "--input-bam" || *f == "--left-align" {
+                continue;
+            }
+            let err = Cli::try_parse_from(cmdline(split, &[f, "1"])).expect_err(f);
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{} {f}", split.sub);
+        }
+    }
+
+    #[test]
+    fn quick_start_help_split() {
+        check(&QUICK_START);
+    }
+
+    #[test]
+    fn call_help_split() {
+        check(&CALL);
+    }
+
+    #[test]
+    fn lineage_help_split() {
+        check(&LINEAGE);
+    }
+
+    #[test]
+    fn quick_start_advanced_parse_and_removed_rejected() {
+        check_parse(&QUICK_START);
+    }
+
+    #[test]
+    fn call_advanced_parse_and_removed_rejected() {
+        check_parse(&CALL);
+    }
+
+    #[test]
+    fn lineage_advanced_parse_and_removed_rejected() {
+        check_parse(&LINEAGE);
+    }
+
+    #[test]
+    fn left_align_is_a_hidden_noop_on_quick_start_and_call() {
+        for split in [&QUICK_START, &CALL] {
+            Cli::try_parse_from(cmdline(split, &["--left-align"])).unwrap();
+            let (short, long) = helps(split.sub);
+            assert!(!listed(&short).iter().any(|f| f == "--left-align"));
+            assert!(!listed(&long).iter().any(|f| f == "--left-align"));
+        }
+    }
+
+    #[test]
+    fn call_input_bam_alias_still_parses_but_is_not_listed() {
+        Cli::try_parse_from(cmdline(&CALL, &["--input-bam", "raw.bam"])).unwrap();
+        let (short, long) = helps("call");
+        assert!(!listed(&short).iter().any(|f| f == "--input-bam"));
+        assert!(!listed(&long).iter().any(|f| f == "--input-bam"));
+    }
+
+    #[test]
+    fn data_type_is_validated_on_quick_start_and_call() {
+        for split in [&QUICK_START, &CALL] {
+            let err = Cli::try_parse_from(cmdline(split, &["-d", "ont-10"])).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{}", split.sub);
+            for dt in DATA_TYPES {
+                Cli::try_parse_from(cmdline(split, &["-d", dt])).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn help_strings_are_one_short_line_without_defaults() {
+        let mut root = Cli::command();
+        root.build();
+        for sub in ["quick-start", "call", "lineage"] {
+            for arg in root.find_subcommand(sub).unwrap().get_arguments() {
+                let id = arg.get_id();
+                // clap's own -h/--help carries a long form by design.
+                if arg.is_hide_set() || id == "help" || id == "version" {
+                    continue;
+                }
+                assert!(arg.get_long_help().is_none(), "{sub} --{id}: long help set");
+                let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+                assert!(!help.is_empty(), "{sub} --{id}: no help");
+                assert!(!help.contains('\n'), "{sub} --{id}: help spans lines");
+                assert!(help.chars().count() <= 80, "{sub} --{id}: {} chars", help.chars().count());
+                assert!(!help.to_lowercase().contains("default"), "{sub} --{id}: names a default");
+            }
+        }
+    }
+
+    #[test]
+    fn lineage_root_block_is_always_on() {
+        // The constants the Lineage arm passes (formerly the flag defaults).
+        assert_eq!(LINEAGE_ROOT_BLOCK_MIN_HF, 0.80);
+        assert_eq!(LINEAGE_ROOT_BLOCK_MAX_Q, 0.05);
+        assert_eq!(LINEAGE_ROOT_BLOCK_MIN_ABSENT, 10);
+        assert_eq!(LINEAGE_ROOT_BLOCK_MIN_OR, 2.0);
     }
 }

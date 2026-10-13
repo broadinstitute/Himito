@@ -1496,7 +1496,7 @@ pub(crate) fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64)
 }
 
 /// What `filter_strand_bias` does with a variant it finds strand-skewed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrandBiasAction {
     /// Set `FILTER=Strand_bias` but keep the call in the VCF (historical behaviour).
     Flag,
@@ -1791,59 +1791,15 @@ fn recount_flagged_indels_from_bam(
 
 // ---- adaptive permutation (ONT-recall T1) ----
 
-/// How `permutation_test` draws its null.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+/// How `permutation_test` draws its null. The CLI always runs `Adaptive`; `Fixed`
+/// stays for the characterization tests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermutationMode {
     /// Draw `--permutation-rounds` per tested variant, extending the variants that sit
     /// at the p-value floor until Benjamini-Hochberg can resolve them (default).
     Adaptive,
     /// Exactly `--permutation-rounds` draws for every tested variant (historical).
     Fixed,
-}
-
-/// Co-occurrence statistic of the permutation test. // ONT-recall Phase2 T8
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-pub enum CooccurrenceStat {
-    /// Sum of Jaccard against every other row, permutation null (default).
-    SumJaccard,
-    /// Experiment: Bonferroni-adjusted min hypergeometric p over linked partners.
-    MaxPartner,
-}
-
-/// Fewest co-alt reads that make a row a max-partner candidate. // ONT-recall Phase2 T8
-const MAX_PARTNER_MIN_SHARED: u32 = 2;
-
-/// Max-partner p of row `i` (ONT-recall Phase2 T8): over every other row `j` sharing
-/// at least `MAX_PARTNER_MIN_SHARED` alt reads with `i`, the hypergeometric upper tail
-/// of the shared alts on the reads both rows cover (`i`'s and `j`'s alts among those
-/// reads as the draws and successes), minimised and multiplied by the partner count.
-/// A row with no partner gets p = 1. Mirrors `scripts/ont_recall/perm_retest.py
-/// --mode max-partner`. Returns (p, partner count).
-pub(crate) fn max_partner_p(i: usize, bits: &[BitRow]) -> (f64, usize) {
-    let x = &bits[i];
-    let mut min_log10p = 0.0f64;
-    let mut partners = 0usize;
-    for (j, y) in bits.iter().enumerate() {
-        if j == i {
-            continue;
-        }
-        let (mut shared, mut cocov, mut n_i, mut k_j) = (0u32, 0u32, 0u32, 0u32);
-        for w in 0..x.alt.len() {
-            shared += (x.alt[w] & y.alt[w]).count_ones();
-            cocov += (x.cov[w] & y.cov[w]).count_ones();
-            n_i += (x.alt[w] & y.cov[w]).count_ones();
-            k_j += (y.alt[w] & x.cov[w]).count_ones();
-        }
-        if shared < MAX_PARTNER_MIN_SHARED {
-            continue;
-        }
-        partners += 1;
-        min_log10p = min_log10p.min(crate::linkage::log10_hyper_sf(shared, cocov, k_j, n_i));
-    }
-    if partners == 0 {
-        return (1.0, 0);
-    }
-    ((10f64.powf(min_log10p) * partners as f64).min(1.0), partners)
 }
 
 /// A genotype row as bitsets over reads. Value `> 0.5` is alt, NaN is uncovered and
@@ -2109,25 +2065,6 @@ fn permutation_test(
     data_type: &str,
     mode: PermutationMode,
 ) -> (Vec<Variant>, Array2<f64>, Vec<String>) {
-    permutation_test_with_stat(
-        matrix, p_value_threshold, heteroplasmic_error_threshold, permutation_round,
-        filtered_var, coverage, permutation_frequency_threshold, data_type, mode,
-        CooccurrenceStat::SumJaccard,
-    )
-}
-
-fn permutation_test_with_stat(
-    matrix: &Array2<f64>,
-    p_value_threshold: f64,
-    heteroplasmic_error_threshold:f64,
-    permutation_round: usize,
-    filtered_var: &Vec<Variant>,
-    coverage: &HashMap<usize, usize>,
-    permutation_frequency_threshold:f64,
-    data_type: &str,
-    mode: PermutationMode,
-    stat: CooccurrenceStat,
-) -> (Vec<Variant>, Array2<f64>, Vec<String>) {
 
     let bar = ProgressBar::new(filtered_var.len() as u64);
 
@@ -2184,23 +2121,8 @@ fn permutation_test_with_stat(
 
     // Fixed: a per-variant null of `permutation_round` draws for every variant.
     // Adaptive (ONT-recall T1): p-values by row index from the staged draws.
-    // MaxPartner (ONT-recall Phase2 T8): no null at all; p by row index from
-    // `max_partner_p` over the same tested set, whatever `mode` says.
-    let precomputed_p = stat == CooccurrenceStat::MaxPartner || mode == PermutationMode::Adaptive;
+    let precomputed_p = mode == PermutationMode::Adaptive;
     let (nulls, adaptive_p): (HashMap<String, Vec<f64>>, HashMap<usize, f64>) = match mode {
-        _ if stat == CooccurrenceStat::MaxPartner => {
-            let bits: Vec<BitRow> = matrix_rows(matrix).iter().map(|r| BitRow::from_row(r)).collect();
-            let p: HashMap<usize, f64> = (0..filtered_var.len())
-                .into_par_iter()
-                .filter(|&i| {
-                    admitted(i)
-                        && alt_frequency(matrix.slice(s![i, ..])) <= permutation_frequency_threshold
-                })
-                .map(|i| (i, max_partner_p(i, &bits).0))
-                .collect();
-            println!("Max-partner co-occurrence: tested={} min_shared={}", p.len(), MAX_PARTNER_MIN_SHARED);
-            (HashMap::new(), p)
-        }
         PermutationMode::Fixed => (
             get_null_distribution(filtered_var, &matrix, permutation_round, permutation_frequency_threshold),
             HashMap::new(),
@@ -2358,7 +2280,6 @@ pub fn start(
     permutation_frequency_threshold: f64,
     permutation_rounds: usize,
     permutation_mode: PermutationMode,
-    cooccurrence_stat: CooccurrenceStat,
     strand_bias_action: Option<StrandBiasAction>,
     strand_bias_drop_max_hf: f64,
     left_align: bool,
@@ -2456,7 +2377,7 @@ pub fn start(
         None => (var_record.clone(), matrix.clone()),
     };
 
-    let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test_with_stat(&sb_matrix, p_value_threshold, heteroplasmic_frequency_threshold, permutation_rounds, &sb_filtered_var, &coverage, permutation_frequency_threshold, data_type, permutation_mode, cooccurrence_stat);
+    let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&sb_matrix, p_value_threshold, heteroplasmic_frequency_threshold, permutation_rounds, &sb_filtered_var, &coverage, permutation_frequency_threshold, data_type, permutation_mode);
 
     // ONT-recall R3-T2: read-linkage rescue (R3-7 merge, R3-8 matrix rows).
     let link_calls: Option<Vec<LinkCall>> = linkage_bam.and_then(|bam| {
@@ -3305,12 +3226,12 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Max-partner co-occurrence statistic (ONT-recall Phase2 T8)
+    // Summed-Jaccard limit on a small lineage (ONT-recall Phase2 T8 finding)
     // ---------------------------------------------------------------------
 
     /// HG002-style minority lineage: two private alleles on 6 reads each, 4 shared,
     /// among 120 noise rows (8 random alts each) over 200 reads. The noise drowns the
-    /// pair's summed Jaccard; their one strong partner does not.
+    /// pair's summed Jaccard.
     fn small_lineage_matrix() -> (Vec<Variant>, Array2<f64>, HashMap<usize, usize>) {
         let (n_reads, n_noise) = (200, 120);
         let mut rng = StdRng::seed_from_u64(2002);
@@ -3337,10 +3258,10 @@ mod tests {
         (variants, matrix, coverage)
     }
 
-    fn run_small_lineage(mode: PermutationMode, stat: CooccurrenceStat) -> (usize, usize) {
+    fn run_small_lineage(mode: PermutationMode) -> (usize, usize) {
         let (variants, matrix, coverage) = small_lineage_matrix();
-        let (kept, _m, _n) = permutation_test_with_stat(
-            &matrix, 0.01, 0.2, 200, &variants, &coverage, 0.7, "ont-r10", mode, stat,
+        let (kept, _m, _n) = permutation_test(
+            &matrix, 0.01, 0.2, 200, &variants, &coverage, 0.7, "ont-r10", mode,
         );
         let lineage = kept.iter().filter(|v| v.pos < 200).count();
         (lineage, kept.len() - lineage)
@@ -3348,40 +3269,8 @@ mod tests {
 
     #[test]
     fn sum_jaccard_rejects_a_small_lineage() {
-        let (lineage, _) = run_small_lineage(PermutationMode::Fixed, CooccurrenceStat::SumJaccard);
+        let (lineage, _) = run_small_lineage(PermutationMode::Fixed);
         assert_eq!(lineage, 0, "the summed Jaccard of a 2-allele lineage is drowned by noise");
-    }
-
-    #[test]
-    fn max_partner_keeps_a_small_lineage_and_rejects_noise() {
-        for mode in [PermutationMode::Fixed, PermutationMode::Adaptive] {
-            let (lineage, noise) = run_small_lineage(mode, CooccurrenceStat::MaxPartner);
-            assert_eq!(lineage, 2, "max-partner must keep both lineage alleles ({mode:?})");
-            assert_eq!(noise, 0, "max-partner must reject every noise row ({mode:?})");
-        }
-    }
-
-    #[test]
-    fn max_partner_p_is_partner_count_times_min_hypergeometric_p() {
-        let (_v, matrix, _c) = small_lineage_matrix();
-        let bits: Vec<BitRow> = matrix_rows(&matrix).iter().map(|r| BitRow::from_row(r)).collect();
-        let (p, partners) = max_partner_p(0, &bits);
-        assert!(partners >= 1);
-        // Best partner is row 1: 4 shared of 6 x 6 alts on 200 co-covered reads.
-        // P(X >= 4) = sum_{x=4..6} C(6,x) C(194,6-x) / C(200,6).
-        let c = |n: f64, k: f64| statrs::function::gamma::ln_gamma(n + 1.0)
-            - statrs::function::gamma::ln_gamma(k + 1.0)
-            - statrs::function::gamma::ln_gamma(n - k + 1.0);
-        let hyper: f64 = (4..=6)
-            .map(|x| (c(6.0, x as f64) + c(194.0, (6 - x) as f64) - c(200.0, 6.0)).exp())
-            .sum();
-        let want = hyper * partners as f64;
-        assert!((p - want).abs() / want < 1e-9, "p {p} != {partners} x {hyper}");
-
-        // A row sharing < MAX_PARTNER_MIN_SHARED alts with every other row has p = 1.
-        let lone = BitRow::from_row(&[1.0, 0.0, 0.0, 0.0]);
-        let other = BitRow::from_row(&[1.0, 1.0, 0.0, 0.0]);
-        assert_eq!(max_partner_p(0, &[lone, other]), (1.0, 0));
     }
 
     // ---------------------------------------------------------------------

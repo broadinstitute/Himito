@@ -59,6 +59,11 @@ If GitHub, Docker Hub, or `crates.io` are slow or unreachable, use the **Zenodo 
 ```
 If you are analyzing high coverage samples, remember to set ```--maximal-mt-depth``` to a reasonable number. -d accepts: pacbio (default), ont-r9, ont-r10, ont-denoised
 
+`-h` lists only the common options of `quick-start`, `call` and `lineage`. The tuning
+options (for example `-k`, `-v`, `--p-value-threshold`, `--permutation-rounds`) still work
+but are listed only by `--help`. The full help text of each command is kept in
+[`docs/cli/`](docs/cli/).
+
 `quick-start` left-aligns indels by default and forwards that to the variant-calling
 step. Pass `--no-left-align` to reproduce pre-2026-09 variant names; see
 [call variants from graph](#call-variants-from-graph-default-for-pacbio) below.
@@ -98,8 +103,14 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ### Downstream analysis
 #### call variants from graph, default for pacbio.
 ```
-./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf>
+./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -s <sampleid> -d <data_type> -o <output.vcf> -b <raw_mt.bam>
 ```
+
+`-b/--bam` takes the raw (pre-denoise) BAM of the same reads. It drives the strand-bias
+filter, ONT linkage rescue and `<output>.matrix.csv`. `--input-bam` is accepted as an alias.
+Without `-b`, the matrix comes from the graph and the strand filter and linkage rescue are off.
+`--genotype-bam`, `--linkage-bam`, `--genotype-from-bam` and `--cooccurrence-stat` were removed,
+and the strand-bias action, permutation mode and genotyping gates are now fixed by the data type.
 
 Indels are left-aligned against the reference by default, the way `bcftools norm`
 does, so that equivalent spellings of one event in a homopolymer or tandem repeat
@@ -124,6 +135,7 @@ guarantee rather than a transformation and typically changes nothing.
 ./target/release/Himito methyl -g <output.annotated.gfa> -p <min_prob> -b <mt_test.bam> -o <methyl.bed>
 ```
 #### enumerate all possible haplotypes within windows (deprecated)
+```
 ./target/release/Himito minorhap -g <output.gfa> -o <output.allhaplotype.fasta> -s <sample_id>
 ```
 
@@ -182,6 +194,10 @@ Outputs include a mutation tree, read-level lineage Newick tree, the cleaned rea
 ```
 
 Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix_all_variants.csv`, `<output_prefix>.variant_cooccurrence.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv` and `<output_prefix>.raw_variant_cooccurrence.tsv`.
+
+`lineage` shows `-m -v -d -o --min-hf --max-hf` in `-h`; the error-rate, MCMC and `--debug`
+options are listed by `--help`. The root block is always on, so `--no-root-block` and the
+`--root-block-*` flags were removed.
 
 To Do: 
 1. add four gamete test

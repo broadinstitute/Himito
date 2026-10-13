@@ -63,10 +63,6 @@ HP_FP_RATE=""
 HP_FN_RATE=""
 # Plan 2026-09-27 T11. "call" skips Himito lineage after sim.matrix.csv and sim.vcf exist.
 STOP_AFTER=""
-# Plan 2026-10-11 T5. Which BAM `Himito call --genotype-bam` re-genotypes the lineage
-# matrix from: raw (the pre-denoise aln.sorted.bam), denoised (the BAM fed to build;
-# same as raw unless the profile is ont-denoised), or none (graph matrix, as before).
-GENOTYPE_BAM_MODE=none
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --outdir) OUTDIR="$2"; shift 2;;
@@ -90,7 +86,6 @@ while [[ $# -gt 0 ]]; do
     --collapse-hp) COLLAPSE_HP=1; shift;;
     --hp-fp-rate) HP_FP_RATE="$2"; shift 2;;
     --hp-fn-rate) HP_FN_RATE="$2"; shift 2;;
-    --genotype-bam) GENOTYPE_BAM_MODE="$2"; shift 2;;
     --stop-after)
       STOP_AFTER="$2"; shift 2
       [[ "$STOP_AFTER" == "call" ]] || { echo "--stop-after must be call (got $STOP_AFTER)" >&2; exit 1; }
@@ -104,14 +99,8 @@ done
   echo "  [--permutation-frequency-threshold F] [--strand-bias-threshold F]" >&2
   echo "  [--indel-false-threshold F] [--min-edge-reads N] [--min-hf F] [--max-hf F]" >&2
   echo "  [--collapse-hp] [--hp-fp-rate F] [--hp-fn-rate F] [--stop-after call]" >&2
-  echo "  [--genotype-bam raw|denoised|none]" >&2
   exit 1
 }
-
-case "$GENOTYPE_BAM_MODE" in
-  raw|denoised|none) ;;
-  *) echo "--genotype-bam must be raw, denoised or none (got $GENOTYPE_BAM_MODE)" >&2; exit 1;;
-esac
 
 case "$PROFILE" in
   hifi)    MMPRESET="map-hifi"; DTYPE="pacbio";;
@@ -186,25 +175,21 @@ fi
 "$HIMITO" build -i "$BUILD_BAM" -r "$REF" -k "$KMER" -o "$HDIR/sim.gfa" -l 3000 \
   --min-edge-reads "$MIN_EDGE_READS"
 
-# Call variants: -o is the VCF; matrix.csv is derived as <o>.matrix.csv.
+# Call variants: -o is the VCF; matrix.csv is derived as <o>.matrix.csv. --bam is the
+# raw (pre-denoise) BAM: strand map, linkage rescue and the re-genotyped matrix.
 # `-p` / `--p-value-threshold` is omitted so call::resolve_thresholds applies
 # the data-type default (0.01 for every profile this script supports). `-f` is
 # only forwarded when --frequency-threshold was set; otherwise that default
 # (0.2 here) applies too.
 CALL_ARGS=(
   -g "$HDIR/sim.gfa" -r "$REF" -s "$SAMPLE" -d "$CALL_DATATYPE"
-  -o "$HDIR/sim.vcf" -k "$KMER" --input-bam "$BUILD_BAM"
+  -o "$HDIR/sim.vcf" -k "$KMER" --bam "$BAM"
   -m "$MINIMAL_AC" -v "$VAF"
   --permutation-frequency-threshold "$PERM_FREQ_THRESHOLD"
   --strand-bias-threshold "$STRAND_BIAS_THRESHOLD"
   --indel-false-threshold "$INDEL_FALSE_THRESHOLD"
 )
 [[ -n "$FREQ_THRESHOLD" ]] && CALL_ARGS+=(-f "$FREQ_THRESHOLD")
-# Plan 2026-10-11 T5. none leaves `call` byte-identical to before.
-case "$GENOTYPE_BAM_MODE" in
-  raw)      CALL_ARGS+=(--genotype-bam "$BAM");;
-  denoised) CALL_ARGS+=(--genotype-bam "$BUILD_BAM");;
-esac
 "$HIMITO" call "${CALL_ARGS[@]}"
 
 # Plan 2026-09-27 T11. The HP-rate sweep re-runs lineage itself. Leave the

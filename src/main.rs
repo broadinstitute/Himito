@@ -89,6 +89,12 @@ pub const STRAND_BIAS_MIN_EFFECT: f64 = 0.20;
 /// fraction is the safer null.
 pub const STRAND_LOCAL_MIN_READS: usize = 20;
 
+/// Matrix genotyping: a read whose best local edit distance exceeds this is left missing (ONT only).
+pub const GENOTYPE_MAX_ED_ONT: u32 = 4;
+
+/// Matrix genotyping: reference bases scored on each side of a site.
+pub const GENOTYPE_FLANK: usize = 10;
+
 /// Minimum heteroplasmic frequency for a SNP to be exempt from the co-occurrence
 /// permutation test (ONT-recall T4).
 ///
@@ -349,15 +355,6 @@ enum Commands {
         #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat")]
         no_left_align: bool,
 
-        /// Plan 2026-10-11 T5: build the variant x read matrix (`<prefix>.matrix.csv`) by
-        /// re-genotyping every called variant in the reads of the NUMT-filtered,
-        /// pre-denoise BAM (`<prefix>.mt.bam`) with local realignment, instead of
-        /// reading it off the graph. Variant discovery, the VCF and all filtering
-        /// still use the graph; the graph matrix is kept as `<prefix>.graph_matrix.csv`.
-        /// Windows within ~12 bp of the circular origin cannot be scored and stay missing.
-        #[clap(long = "genotype-from-bam", action)]
-        genotype_from_bam: bool,
-
         /// ONT-recall R3-T2: turn off read-linkage rescue of low-frequency SNVs. By default
         /// ont-r9/ont-r10/ont-denoised add PASS SNVs (0.4-20% HF in the raw `<prefix>.mt.bam`
         /// pileup) that co-occur on the same reads, on both strands, with another such allele;
@@ -562,11 +559,13 @@ enum Commands {
         #[clap(short, long, value_parser)]
         frequency_threshold: Option<f64>,
 
-        /// optional BAM file; when provided, variants are additionally filtered by strand bias
-        #[clap(long, value_parser)]
-        input_bam: Option<PathBuf>,
+        /// raw (pre-denoise), coordinate-sorted BAM of the same reads. It drives the strand-bias
+        /// filter, ONT linkage rescue and `<output>.matrix.csv` (re-genotyped from these reads,
+        /// the lineage input). Without it the matrix comes from the graph and the other two are off.
+        #[clap(short = 'b', long = "bam", alias = "input-bam", value_parser)]
+        bam: Option<PathBuf>,
 
-        /// p-value threshold for the strand-bias filter (only used with --input-bam)
+        /// p-value threshold for the strand-bias filter (only used with --bam)
         #[clap(long, value_parser, default_value_t = 0.01)]
         strand_bias_threshold: f64,
 
@@ -616,33 +615,6 @@ enum Commands {
         /// disable indel left-alignment (reproduces pre-2026-09 variant names)
         #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat")]
         no_left_align: bool,
-
-        /// Plan 2026-10-11 T5: re-genotype every called variant in this BAM and use that as
-        /// `<output>.matrix.csv` (the lineage input); the graph matrix moves to
-        /// `<output>.graph_matrix.csv`. The VCF and all filtering still use the graph. The
-        /// BAM should be the PRE-denoise alignment of the same reads (denoising turns
-        /// uncertain ALT bases into REF). Windows within ~12 bp of the circular origin
-        /// (position 0 / reference length) cannot be scored and stay missing.
-        #[clap(long, value_parser)]
-        genotype_bam: Option<PathBuf>,
-
-        /// Plan 2026-10-11 T5: with --genotype-bam, leave a read missing at a site when its
-        /// best local edit distance exceeds this (default: no gate). Trades recall for fewer
-        /// false calls from very noisy reads.
-        #[clap(long, value_parser)]
-        genotype_max_ed: Option<u32>,
-
-        /// ONT-recall R3-T2: raw (pre-denoise), coordinate-sorted BAM for read-linkage rescue
-        /// of low-frequency SNVs: alleles at 0.4-20% HF in its pileup that co-occur on the same
-        /// reads, on both strands, with another such allele are added as PASS SNVs with INFO LINK.
-        /// Off when absent.
-        #[clap(long, value_parser)]
-        linkage_bam: Option<PathBuf>,
-
-        /// Plan 2026-10-11 T5: with --genotype-bam, reference bases on each side of a site
-        /// scored against the read (before homopolymer push-out and +-2 padding).
-        #[clap(long, value_parser, default_value_t = 10)]
-        genotype_flank: usize,
     },
 
     /// Extract Major Haplotype as Fasta file from Graph
@@ -909,13 +881,6 @@ pub fn init_rayon_threads(threads: Option<usize>) -> AnyhowResult<()> {
     Ok(())
 }
 
-/// ONT-recall R3-T2 (R3-6): quick-start runs linkage rescue on the raw mt BAM for
-/// ONT data unless `--no-linkage-rescue`; PacBio stays off until evaluated.
-fn quickstart_linkage_bam<'a>(data_type: &str, no_linkage_rescue: bool, mt_output: &'a PathBuf) -> Option<&'a PathBuf> {
-    let ont = matches!(data_type, "ont-r9" | "ont-r10" | "ont-denoised");
-    (ont && !no_linkage_rescue).then_some(mt_output)
-}
-
 fn main() {
     // Review 2026-09-25 T5: a library function must not install the process logger, and denoise/scite logs were otherwise silent.
     env_logger::init();
@@ -949,7 +914,6 @@ fn main() {
             strand_bias_drop_max_hf,
             no_left_align,
             left_align_compat: _,
-            genotype_from_bam,
             no_linkage_rescue,
             denoise_keep_vaf,
         } => {
@@ -1037,7 +1001,8 @@ fn main() {
                 &data_type_,
                 p_value_threshold,
                 frequency_threshold,
-                Some(&build_bam),
+                // Raw mt BAM, not build_bam (denoise turns uncertain ALTs into REF).
+                Some(&mt_output),
                 strand_bias_threshold,
                 indel_false_threshold,
                 permutation_frequency_threshold_,
@@ -1047,11 +1012,7 @@ fn main() {
                 strand_bias_action,
                 strand_bias_drop_max_hf,
                 left_align,
-                // Plan 2026-10-11 T5: pre-denoise BAM (mt_output), NOT build_bam.
-                if genotype_from_bam { Some(&mt_output) } else { None },
-                call::GenotypeOpts::default(),
-                // ONT-recall R3-T2 (R3-6): raw mt_output, NOT build_bam.
-                quickstart_linkage_bam(&data_type, no_linkage_rescue, &mt_output),
+                no_linkage_rescue,
             );
             let annotated_graph_output = output_prefix.with_extension("gfa");
             let methyl_output = output_prefix.with_extension("bed");
@@ -1151,7 +1112,7 @@ fn main() {
             data_type,
             p_value_threshold,
             frequency_threshold,
-            input_bam,
+            bam,
             strand_bias_threshold,
             indel_false_threshold,
             permutation_frequency_threshold,
@@ -1162,10 +1123,6 @@ fn main() {
             strand_bias_drop_max_hf,
             no_left_align,
             left_align_compat: _,
-            genotype_bam,
-            genotype_max_ed,
-            genotype_flank,
-            linkage_bam,
         } => {
             // Plan 2026-09-26 T4
             let left_align = !no_left_align;
@@ -1184,7 +1141,7 @@ fn main() {
                 &data_type,
                 p_value_threshold,
                 frequency_threshold,
-                input_bam.as_ref(),
+                bam.as_deref(),
                 strand_bias_threshold,
                 indel_false_threshold,
                 permutation_frequency_threshold,
@@ -1194,15 +1151,7 @@ fn main() {
                 strand_bias_action,
                 strand_bias_drop_max_hf,
                 left_align,
-                // Plan 2026-10-11 T5
-                genotype_bam.as_ref(),
-                call::GenotypeOpts {
-                    flank: genotype_flank,
-                    max_ed: genotype_max_ed.unwrap_or(u32::MAX),
-                    ..call::GenotypeOpts::default()
-                },
-                // ONT-recall R3-T2
-                linkage_bam.as_ref(),
+                false,
             );
         }
 
@@ -1457,30 +1406,67 @@ mod linkage_cli_tests {
     use super::*;
 
     #[test]
-    fn quickstart_linkage_rescue_is_on_for_ont_only() {
-        let mt = PathBuf::from("x.mt.bam");
-        for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
-            assert_eq!(quickstart_linkage_bam(dt, false, &mt), Some(&mt), "{dt}");
-            assert_eq!(quickstart_linkage_bam(dt, true, &mt), None, "{dt}");
-        }
-        assert_eq!(quickstart_linkage_bam("pacbio", false, &mt), None);
-    }
-
-    #[test]
     fn linkage_flags_parse() {
         let cli = Cli::try_parse_from([
             "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out", "--no-linkage-rescue",
         ])
         .unwrap();
         assert!(matches!(cli.command, Commands::QuickStart { no_linkage_rescue: true, .. }));
-        let cli = Cli::try_parse_from([
-            "Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf", "--linkage-bam", "raw.bam",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Call { linkage_bam, .. } => assert_eq!(linkage_bam, Some(PathBuf::from("raw.bam"))),
+    }
+}
+
+// Cleanup C1: one BAM input for `call`; `quick-start` has no matrix switch.
+#[cfg(test)]
+mod bam_cli_tests {
+    use super::*;
+
+    const CALL: [&str; 9] = ["Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o"];
+
+    fn call_args(extra: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = CALL.iter().map(|s| s.to_string()).collect();
+        v.push("out.vcf".into());
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v
+    }
+
+    fn bam_of(extra: &[&str]) -> Option<PathBuf> {
+        match Cli::try_parse_from(call_args(extra)).unwrap().command {
+            Commands::Call { bam, .. } => bam,
             other => panic!("unexpected subcommand: {other:?}"),
         }
+    }
+
+    #[test]
+    fn call_short_flag_sets_bam() {
+        assert_eq!(bam_of(&["-b", "raw.bam"]), Some(PathBuf::from("raw.bam")));
+        assert_eq!(bam_of(&["--bam", "raw.bam"]), Some(PathBuf::from("raw.bam")));
+    }
+
+    #[test]
+    fn call_input_bam_is_an_alias_of_bam() {
+        assert_eq!(bam_of(&["--input-bam", "raw.bam"]), Some(PathBuf::from("raw.bam")));
+    }
+
+    #[test]
+    fn call_bam_is_optional() {
+        assert_eq!(bam_of(&[]), None);
+    }
+
+    #[test]
+    fn call_rejects_the_removed_bam_flags() {
+        for flag in ["--genotype-bam", "--linkage-bam"] {
+            let err = Cli::try_parse_from(call_args(&[flag, "x.bam"])).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{flag}");
+        }
+    }
+
+    #[test]
+    fn quickstart_rejects_genotype_from_bam() {
+        let err = Cli::try_parse_from([
+            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out", "--genotype-from-bam",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }
 

@@ -1016,6 +1016,20 @@ impl Default for GenotypeOpts {
     }
 }
 
+/// Matrix genotyping knobs by data type: ONT gets the noise gate, PacBio none.
+pub fn resolve_genotype_opts(data_type: &str) -> GenotypeOpts {
+    let max_ed = match data_type {
+        "ont-r9" | "ont-r10" | "ont-denoised" => crate::GENOTYPE_MAX_ED_ONT,
+        _ => u32::MAX,
+    };
+    GenotypeOpts { flank: crate::GENOTYPE_FLANK, max_ed, ..GenotypeOpts::default() }
+}
+
+/// Linkage rescue runs on ONT data unless switched off; PacBio is not evaluated.
+pub fn linkage_rescue_enabled(data_type: &str, no_linkage_rescue: bool) -> bool {
+    matches!(data_type, "ont-r9" | "ont-r10" | "ont-denoised") && !no_linkage_rescue
+}
+
 /// One genotyping site: a window on the reference and the haplotypes scored
 /// inside it. `haps[0]` is REF; `haps[1 + j]` is the allele of `members[j]`.
 struct GenoSite {
@@ -1438,7 +1452,7 @@ pub(crate) fn empirical_p_value(null: &[f64], observation: f64) -> f64 {
 /// Build a map from read name (BAM qname) to strand (true = reverse, false = forward),
 /// using primary, mapped alignments only. Also returns the library-wide forward-strand
 /// fraction, which is the expected forward proportion for an unbiased allele.
-fn build_strand_map(bam_file: &PathBuf) -> (HashMap<String, bool>, f64) {
+fn build_strand_map(bam_file: &Path) -> (HashMap<String, bool>, f64) {
     let mut bam = BamReader::from_path(bam_file)
         .unwrap_or_else(|e| panic!("Failed to open BAM {:?}: {}", bam_file, e));
     let mut strand_map = HashMap::new();
@@ -1755,7 +1769,7 @@ fn recount_flagged_indels_from_bam(
         })
         .collect();
     let (read_record, cover_record) = genotype_from_bam(bam, refseq, ref_name, &flagged, opts);
-    let (strand_map, fwd_frac) = build_strand_map(&bam.to_path_buf());
+    let (strand_map, fwd_frac) = build_strand_map(bam);
     println!(
         "Strand-bias BAM recount: {} flagged indel(s) from {} (forward fraction {:.3})",
         flagged.len(),
@@ -2336,7 +2350,9 @@ pub fn start(
     data_type: &str,
     p_value_threshold: f64,
     heteroplasmic_frequency_threshold: f64,
-    bam_file: Option<&PathBuf>,
+    // Raw (pre-denoise) BAM of the same reads: strand map, linkage rescue and the
+    // matrix. None: no strand filter, no linkage, graph matrix (with a warning).
+    bam: Option<&Path>,
     strand_bias_threshold: f64,
     indel_false_threshold: f64,
     permutation_frequency_threshold: f64,
@@ -2346,13 +2362,7 @@ pub fn start(
     strand_bias_action: Option<StrandBiasAction>,
     strand_bias_drop_max_hf: f64,
     left_align: bool,
-    // Plan 2026-10-11 T5: when Some, `<out>.matrix.csv` is rebuilt by re-genotyping
-    // the final variants in this BAM (the graph matrix moves to `.graph_matrix.csv`).
-    genotype_bam: Option<&PathBuf>,
-    genotype_opts: GenotypeOpts,
-    // ONT-recall R3-T2: raw (pre-denoise) BAM for read-linkage rescue of
-    // low-frequency SNVs; None turns the rescue off.
-    linkage_bam: Option<&PathBuf>,
+    no_linkage_rescue: bool,
 ) {
     if data_type != "pacbio" && data_type != "ont-r9" && data_type != "ont-r10" && data_type != "ont-denoised" {
         eprintln!("Error: data type must be pacbio or ont-r9 or ont-r10 or ont-denoised");
@@ -2403,7 +2413,10 @@ pub fn start(
     // them first means the co-occurrence backbone is built only from calls that already
     // survived an independent, read-level check.
     let action = resolve_strand_bias_action(data_type, strand_bias_action);
-    let (sb_filtered_var, sb_matrix) = match bam_file {
+    // The matrix gate must not move the VCF, so the indel recount below is ungated.
+    let recount_opts = GenotypeOpts { flank: crate::GENOTYPE_FLANK, ..GenotypeOpts::default() };
+    let linkage_bam = bam.filter(|_| linkage_rescue_enabled(data_type, no_linkage_rescue));
+    let (sb_filtered_var, sb_matrix) = match bam {
         Some(bam) => {
             let (strand_map, fwd_frac) = build_strand_map(bam);
             println!("Library forward-strand fraction: {:.3}", fwd_frac);
@@ -2423,9 +2436,8 @@ pub fn start(
                 strand_bias_drop_max_hf,
                 crate::STRAND_BIAS_MIN_EFFECT,
             );
-            // ONT-recall R3-T3: retest flagged indels from the raw BAM's reads
-            // before the permutation test. `bam` may be denoised, so only
-            // `linkage_bam` qualifies; without it the graph verdict stands.
+            // ONT-recall R3-T3: retest flagged indels from the BAM's reads before
+            // the permutation test; ONT only, otherwise the graph verdict stands.
             let sb_var = match linkage_bam {
                 Some(raw) => recount_flagged_indels_from_bam(
                     &sb_var,
@@ -2434,7 +2446,7 @@ pub fn start(
                     raw,
                     ref_seq.as_bytes(),
                     &ref_header,
-                    &genotype_opts,
+                    &recount_opts,
                     strand_bias_threshold,
                 ),
                 None => sb_var,
@@ -2481,14 +2493,12 @@ pub fn start(
         left_align,
         link_calls.as_ref().map(|_| new_links.as_slice()),
     );
-    // write matrix
-    // Plan 2026-10-11 T5: VCF, raw_matrix, strand-bias and permutation inputs above
-    // are untouched; only the final lineage matrix may come from the BAM.
-    let genotype_src = genotype_bam.map(|bam| GenotypeSource {
-        bam: bam.as_path(),
+    // The VCF and every filter above run on the graph; only the lineage matrix is BAM-genotyped.
+    let genotype_src = bam.map(|bam| GenotypeSource {
+        bam,
         refseq: ref_seq.as_bytes(),
         ref_name: &ref_header,
-        opts: genotype_opts,
+        opts: resolve_genotype_opts(data_type),
     });
     if let Err(e) = write_final_matrix(
         output_file,
@@ -2502,7 +2512,7 @@ pub fn start(
     }
 }
 
-/// Plan 2026-10-11 T5. Where to re-genotype the final variants from.
+/// Where to re-genotype the final variants from.
 pub struct GenotypeSource<'a> {
     pub bam: &'a Path,
     pub refseq: &'a [u8],
@@ -2510,12 +2520,19 @@ pub struct GenotypeSource<'a> {
     pub opts: GenotypeOpts,
 }
 
-/// Plan 2026-10-11 T5. Writes `<output>.matrix.csv`. Without a genotyping source
-/// that is the graph matrix, exactly as before. With one, the matrix comes from
-/// `genotype_from_bam(variants)` through the unchanged `construct_matrix`, and
-/// the graph matrix is kept in `<output>.graph_matrix.csv`.
-/// `rescued` (ONT-recall R3-T2, R3-8) has no graph rows, so it is genotyped from
-/// the BAM along with `variants` and is absent from the graph matrix.
+/// Where `<output>.matrix.csv` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatrixSource {
+    Bam,
+    Graph,
+}
+
+const GRAPH_MATRIX_WARNING: &str =
+    "Warning: no --bam given; matrix.csv comes from the graph, not from re-genotyped reads.";
+
+/// Writes `<output>.matrix.csv`: re-genotyped from the BAM, or the graph matrix with a
+/// warning when there is no BAM. `rescued` (linkage) has no graph rows, so only the BAM
+/// matrix holds it.
 fn write_final_matrix(
     output_file: &Path,
     graph_matrix: &Array2<f64>,
@@ -2523,17 +2540,15 @@ fn write_final_matrix(
     rescued: &[Variant],
     graph_reads: &[String],
     genotype: Option<&GenotypeSource>,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<MatrixSource, Box<dyn Error>> {
     let matrix_output = output_file.with_extension("matrix.csv");
     match genotype {
-        None => write_matrix_to_csv(graph_matrix, variants, graph_reads, matrix_output),
+        None => {
+            eprintln!("{GRAPH_MATRIX_WARNING}");
+            write_matrix_to_csv(graph_matrix, variants, graph_reads, matrix_output)?;
+            Ok(MatrixSource::Graph)
+        }
         Some(src) => {
-            write_matrix_to_csv(
-                graph_matrix,
-                variants,
-                graph_reads,
-                output_file.with_extension("graph_matrix.csv"),
-            )?;
             let all: Vec<Variant> = variants.iter().chain(rescued).cloned().collect();
             let (read_record, cover_record) =
                 genotype_from_bam(src.bam, src.refseq, src.ref_name, &all, &src.opts);
@@ -2545,7 +2560,8 @@ fn write_final_matrix(
                 read_set.len(),
                 src.bam.display()
             );
-            write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output)
+            write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output)?;
+            Ok(MatrixSource::Bam)
         }
     }
 }
@@ -4402,16 +4418,19 @@ mod tests {
         let out = tmp_out("none");
         let v = geno_snp();
         let (m, vars, reads) = graph_matrix_fixture(&v);
-        write_final_matrix(&out, &m, &vars, &[], &reads, None).unwrap();
+        let source = write_final_matrix(&out, &m, &vars, &[], &reads, None).unwrap();
 
+        // Cleanup C1 (D2): no `--bam` falls back to the graph matrix and warns.
+        assert_eq!(source, MatrixSource::Graph);
+        assert!(GRAPH_MATRIX_WARNING.contains("--bam"), "{GRAPH_MATRIX_WARNING}");
         let text = std::fs::read_to_string(out.with_extension("matrix.csv")).unwrap();
         assert_eq!(text, "variant,g1,g2\nm.31A>T,1,\n");
         assert!(!out.with_extension("graph_matrix.csv").exists());
     }
 
-    // Plan 2026-10-11 T5
+    // Cleanup C1 (D1): replaces the T5 test that kept `graph_matrix.csv` (intended change).
     #[test]
-    fn write_final_matrix_with_genotype_bam_swaps_matrix_and_keeps_graph_copy() {
+    fn write_final_matrix_with_bam_writes_no_graph_copy() {
         let out = tmp_out("swap");
         let v = geno_snp();
         let (m, vars, reads) = graph_matrix_fixture(&v);
@@ -4419,15 +4438,37 @@ mod tests {
         let src = GenotypeSource {
             bam: &bam, refseq: GENO_REF.as_bytes(), ref_name: "chrM", opts: GenotypeOpts::default(),
         };
-        write_final_matrix(&out, &m, &vars, &[], &reads, Some(&src)).unwrap();
+        let source = write_final_matrix(&out, &m, &vars, &[], &reads, Some(&src)).unwrap();
 
         // matrix.csv is BAM-genotyped: reads sorted by name, ref pseudo-read all 0,
         // r_del / r_short missing (they are not in the matrix at all: never covered).
+        assert_eq!(source, MatrixSource::Bam);
         let text = std::fs::read_to_string(out.with_extension("matrix.csv")).unwrap();
         assert_eq!(text, "variant,chrM,r_alt,r_ref,r_split\nm.31A>T,0,1,0,1\n");
-        // The graph matrix is preserved next to it, untouched.
-        let g = std::fs::read_to_string(out.with_extension("graph_matrix.csv")).unwrap();
-        assert_eq!(g, "variant,g1,g2\nm.31A>T,1,\n");
+        assert!(!out.with_extension("graph_matrix.csv").exists());
+    }
+
+    // Cleanup C1 (D3)
+    #[test]
+    fn resolve_genotype_opts_gates_ont_noise_only() {
+        for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
+            let o = resolve_genotype_opts(dt);
+            assert_eq!(o.max_ed, 4, "{dt}");
+            assert_eq!((o.flank, o.margin), (10, 1), "{dt}");
+        }
+        let o = resolve_genotype_opts("pacbio");
+        assert_eq!(o.max_ed, u32::MAX);
+        assert_eq!((o.flank, o.margin), (10, 1));
+    }
+
+    // Cleanup C1 (R3-6): linkage rescue is on for ONT unless disabled; PacBio stays off.
+    #[test]
+    fn linkage_rescue_is_on_for_ont_only() {
+        for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
+            assert!(linkage_rescue_enabled(dt, false), "{dt}");
+            assert!(!linkage_rescue_enabled(dt, true), "{dt}");
+        }
+        assert!(!linkage_rescue_enabled("pacbio", false));
     }
 
     // ONT-recall T5

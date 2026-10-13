@@ -26,7 +26,7 @@ mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
 
 t0=$(date +%s)
 "$HIMITO" quick-start -i "$BAM" -c chrM -r "$REF" -s HG00097_ont -d "$MODE" -o "$PREFIX" \
-  --genotype-from-bam "$@" > "$PREFIX.quickstart.log" 2>&1
+  "$@" > "$PREFIX.quickstart.log" 2>&1
 t1=$(date +%s)
 echo "quick-start: $((t1 - t0))s total; strand-bias + permutation step: $(( $(mtime "$PREFIX.vcf") - $(mtime "$PREFIX.raw_matrix.csv") ))s"
 

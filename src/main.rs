@@ -20,230 +20,67 @@ mod denoise;
 mod denoise_indel;
 mod linkage;
 
-/// Keep threshold for denoise's per-site substitution model: an eligible non-ref
-/// allele survives only if the site model's EM frequency estimate reaches this.
-///
-/// Deliberately NOT the caller's `--vaf`, which the two used to share. That one is a
-/// raw HF cut on an already-called variant; this one is compared against a
-/// quality-weighted estimate that discounts alt observations explainable as error,
-/// which makes it far sharper on noise whose raw HF overlaps real heteroplasmies.
-///
-/// 0.03 was chosen by sweeping 0.01-0.04 over the 20 ont-r10 n=10 depth>=300 cells in
-/// lineage_eval: it lifts variant precision 0.837 -> 0.967 while holding variant
-/// recall at 1.000 and ancestor-descendant F1 within 0.003 of the optimum. Above
-/// 0.04 recall starts falling (0.965) as real low-frequency heteroplasmies drop out.
+// Thresholds: see dev_docs/superpowers/plans/2026-10-11-ont-recall-high-coverage.md
 pub const DENOISE_KEEP_VAF: f64 = 0.03;
-
-/// ONT-recall Phase2 T6b: lower edge of denoise's "pending" band. An eligible allele
-/// with `PENDING_FLOOR <= f < DENOISE_KEEP_VAF` is not corrected outright; it is kept
-/// if it rides on the same reads as a kept minor allele (linkage rescue), else
-/// corrected as before.
-///
-/// Evidence: HapMap `ont-denoised` erased 7 of 34 real HG02257 heteroplasmies (3439,
-/// 3552, 4715, 9545, 10873, 13263, 15043) that sit right on the 0.03 line, because
-/// sites are decided independently: 13/13 reads carrying the kept `9540C` also carry
-/// `9545G`, yet `9545G` was rewritten on 12 of them. The floor only bounds how many
-/// eligible error alleles enter the linkage test; rescue itself needs linkage.
 pub const PENDING_FLOOR: f64 = 0.005;
-
-/// Stage-1 early stop of the adaptive permutation test (ONT-recall T1): a variant
-/// that has collected this many null exceedances has a p-value well above any BH
-/// threshold, so its remaining draws are wasted.
-///
-/// Tuned to 10 (from plan default 20) after the post-T5 HapMap A/B: oracle truth
-/// pass is identical across stop ∈ {5,10,20,40}, and end-to-end TP/FP match
-/// (92/2). 10 cuts stage-1 noise draws without making early-stopped p-values as
-/// noisy as stop=5.
 pub const PERM_STOP_AFTER: u32 = 10;
-
-/// Headroom factor of the adaptive permutation floor target (ONT-recall T1).
-/// Variants still at zero exceedances are extended to
-/// `ceil(PERM_HEADROOM * m / (alpha * k0))` rounds, so the floor p-value
-/// `1/(R+1)` sits `PERM_HEADROOM` times below the BH bar `alpha * k0 / m`.
-/// Tuned to 5 (from plan default 10) after the post-T5 HapMap A/B on
-/// `t5_r10.raw_matrix.csv`: every (stop,head) candidate kept oracle truth 54 /
-/// non-truth 0; (10,5) matched end-to-end TP 92 / FP 2 while cutting floor
-/// draws ~46% (666k → 359k). Headroom 5 still puts min_q ≈ 0.002 ≪ alpha 0.01.
 pub const PERM_HEADROOM: f64 = 5.0;
-
-/// Hard cap on per-variant permutation rounds in the adaptive test (ONT-recall T1).
 pub const PERM_MAX_ROUNDS: usize = 100_000;
-
-/// Base seed of the per-variant permutation RNG, XORed with FNV-1a-64 of the variant
-/// name, so adaptive results are reproducible under rayon (ONT-recall T1).
 pub const PERM_SEED: u64 = 42;
-
-/// Minimum absolute difference between an alt allele's forward-strand fraction and
-/// the null forward fraction before `Strand_bias` fires (ONT-recall T3).
-///
-/// A binomial p-value alone flags any large-N allele with a trivial skew: 600/400
-/// alt reads against a 50% null is p~1e-10 yet only a 0.10 shift. Single-strand
-/// artifacts are far outside this (HapMap ONT r10: `33CG>C` 0/34 is 0.50 from the
-/// library fraction, `1598G>A` 35/0 is 0.53), while the true `7805G>A` (28/14 vs
-/// a 0.54 column) is ~0.13. 0.20 clears the true call and keeps every artifact.
 pub const STRAND_BIAS_MIN_EFFECT: f64 = 0.20;
-
-/// Strand-resolved covering reads needed before the strand-bias null is the
-/// column's own forward fraction rather than the library's (ONT-recall T3).
-/// Below this the local fraction has a standard error > ~0.11 and the library
-/// fraction is the safer null.
 pub const STRAND_LOCAL_MIN_READS: usize = 20;
-
-/// Matrix genotyping: a read whose best local edit distance exceeds this is left missing (ONT only).
 pub const GENOTYPE_MAX_ED_ONT: u32 = 4;
-
-/// Matrix genotyping: reference bases scored on each side of a site.
 pub const GENOTYPE_FLANK: usize = 10;
-
-/// Minimum heteroplasmic frequency for a SNP to be exempt from the co-occurrence
-/// permutation test (ONT-recall T4).
-///
-/// The test's Jaccard statistic punishes a variant on the MAJORITY lineage: HapMap
-/// ONT r10 `12969C>T` (a true heteroplasmy) gets q 0.99 and is vetoed. A strong,
-/// strand-balanced SNP is exempt; weak ones (the low-VAF artifact regime the test
-/// exists for) are still tested.
 pub const COOC_EXEMPT_HF: f64 = 0.10;
-
-/// Minimum alt-read count for the co-occurrence exemption (ONT-recall T4); with
-/// `COOC_EXEMPT_HF` it keeps the exemption to variants with real support
-/// (12969C>T has AC well above this).
 pub const COOC_EXEMPT_MIN_AC: usize = 20;
-
-/// Lowest pileup HF of a read-linkage candidate SNV allele (ONT-recall R3-T2).
-/// HG00438's private alleles sit at 0.6–1.7% in the merged HapMap reads
-/// (`merge215k`, ~5,000×) and never reach the graph's `-v 0.01`; 0.4% admits all
-/// 12 while the rule still rescues 0 of 760 noise alleles at 0.2–5% HF.
 pub const LINK_MIN_HF: f64 = 0.004;
-
-/// HF ceiling of a linkage candidate (ONT-recall R3-T2). Enrichment cannot exceed
-/// 1/HF of the partner, so the rule only resolves lineages below ~8–10%; higher
-/// alleles are the permutation test's job (7805A at 10% is not rescued).
 pub const LINK_MAX_HF: f64 = 0.20;
-
-/// Minimum alt reads of a linkage candidate (ONT-recall R3-T2). The 99th-percentile
-/// per-column noise count on HapMap ONT is 10 reads; 11087 (6 reads) stays out.
 pub const LINK_MIN_AC: u32 = 10;
-
-/// Partners must be more than this many bp apart (ONT-recall R3-T2), so one local
-/// error event (the 2542A/2567A pair is 25 bp apart) cannot link with itself.
 pub const LINK_MIN_DIST: u32 = 20;
-
-/// Reads above this quantile of error rate (NM / aligned length) are dropped from
-/// every linkage count (ONT-recall R3-T2). HapMap merge: median 0.013, 95th
-/// percentile 0.129; dropping the top 5% changed no outcome there, and it guards
-/// against errors co-occurring on bad reads.
 pub const LINK_ERR_QUANTILE: f64 = 0.95;
-
-/// Minimum shared carriers of a linked pair, overall (ONT-recall R3-T2).
 pub const LINK_MIN_SHARED: u32 = 5;
-
-/// Minimum shared carriers of a linked pair on EACH strand (ONT-recall R3-T2).
 pub const LINK_MIN_SHARED_STRAND: u32 = 3;
-
-/// Minimum reads covering both partners, overall (ONT-recall R3-T2).
 pub const LINK_MIN_COCOVER: u32 = 50;
-
-/// Minimum reads covering both partners on EACH strand (ONT-recall R3-T2).
 pub const LINK_MIN_COCOVER_STRAND: u32 = 30;
-
-/// Minimum enrichment (shared / expected shared) of a linked pair, overall and per
-/// strand (ONT-recall R3-T2). Same-lineage truth pairs on HapMap merge: median 52×;
-/// the forward-only noise pair 2542A/2567A reaches 14.7×.
 pub const LINK_MIN_ENRICH: f64 = 10.0;
-
-/// Overall log10 hypergeometric upper-tail p bar of a linked pair (ONT-recall
-/// R3-T2): stricter than Bonferroni 0.01 over 1e8 pairs. Truth pairs: median
-/// −14.5, weakest −6.3 (that one is rescued through a stronger partner).
 pub const LINK_LOG10P: f64 = -10.0;
-
-/// Per-strand log10 p bar of a linked pair (ONT-recall R3-T2). Without the
-/// per-strand rule 2542A (129/2) and 2567A (117/3) pass at log10 p −10.0; the
-/// strongest noise pair with both alleles strand-balanced reaches only −4.5.
 pub const LINK_STRAND_LOG10P: f64 = -5.0;
-
-/// Minimal observations required on EACH strand for an allele to be a candidate.
-///
-/// Was `--min-strand`. Every caller in the repo — QuickStart, both eval scripts,
-/// and every unit test — used 2, so the flag never did anything but restate its
-/// own default.
 pub const DENOISE_MIN_STRAND: u32 = 2;
-
-/// p-value threshold for the per-allele strand-bias test (binomial, against the
-/// column's own forward fraction); alleles below it lose candidacy.
-///
-/// Was `--strand-bias-p`. `0.0` disables the test entirely — a path `fit_site`'s
-/// unit tests still exercise, which is why the plumbing below keeps this as a
-/// parameter even though no CLI flag sets it any more.
 pub const DENOISE_STRAND_BIAS_P: f64 = 0.01;
-
-/// Within-column frequency at or above which an allele skips the strand-bias
-/// test (a single-strand artifact cannot reach a near-homoplasmic frequency).
-///
-/// Was `--homoplasmic-vaf`. Note this is the *standalone denoise* value; the
-/// QuickStart pipeline deliberately passes 0.7 instead (see the `QuickStart`
-/// arm), matching `call.rs`'s own homoplasmic threshold.
 pub const DENOISE_HOMOPLASMIC_VAF: f64 = 0.95;
 
 /// The data types Himito accepts wherever a `-d/--data-type` is taken.
-///
-/// Used as the clap `PossibleValuesParser` set so an unrecognised value is
-/// rejected before any work starts. This matters because the fp/fn preset
-/// lookup in `lineage::resolve_error_rates` has a catch-all arm: without this
-/// list a typo'd `-d ont-10` would silently run to completion with raw-ONT
-/// rates and exit 0.
 pub const DATA_TYPES: [&str; 4] = ["pacbio", "ont-r9", "ont-r10", "ont-denoised"];
 
-/// Minimal reads a variant must be present in / absent from for `lineage` to
-/// treat it as informative (it needs both to place a bifurcation).
-///
-/// Were `--min-presence` / `--min-absence`. Nothing in the repo — no WDL, no
-/// eval script, no doc — ever set either, and `git log -S` finds no commit that
-/// ever did.
+/// Minimal reads a variant must be present in / absent from for `lineage` to treat it as informative.
 pub const LINEAGE_MIN_PRESENCE: usize = 2;
 pub const LINEAGE_MIN_ABSENCE: usize = 1;
 
 /// Minimal reads backing a haplotype for `lineage` to report it.
-///
-/// Was `--min-reads`. Drops low-count haplotypes from the haplotype maps and
-/// from the tips of `<prefix>.read_lineage.nwk`.
 pub const LINEAGE_MIN_READS: usize = 3;
 
 /// RNG seed for the SCITE MCMC search, fixed so runs are reproducible.
-///
-/// Was `--mcmc-seed`. Every invocation in the repo used the default 42;
-/// `--mcmc-iterations` and `--mcmc-chains` remain flags because
-/// `lineage_eval/lineage_sim/sweep_fpfn.sh` does vary those two.
 pub const LINEAGE_MCMC_SEED: u64 = 42;
 
-/// Lineage root block (always on): minimum HF for a variant to be CONSIDERED
-/// homoplasmic. A gate only; the decision is whether the reads lacking the variant
-/// carry any distinguishing allele.
-///
-/// Were `--root-block-min-hf` and friends (and `--no-root-block`). No WDL, script
-/// or doc ever set one, so they are fixed at the old defaults.
+/// Lineage root block (always on): minimum HF for a variant to be CONSIDERED homoplasmic.
 pub const LINEAGE_ROOT_BLOCK_MIN_HF: f64 = 0.80;
 
-/// Lineage root block: Benjamini-Hochberg q above which a variant's absences count
-/// as unstructured (dropout rather than a real subclone).
+/// Lineage root block: Benjamini-Hochberg q above which a variant's absences count as unstructured.
 pub const LINEAGE_ROOT_BLOCK_MAX_Q: f64 = 0.05;
 
-/// Lineage root block: below this many absent calls a high-HF variant is admitted
-/// without testing, since there is too little to assess either way.
+/// Lineage root block: below this many absent calls a high-HF variant is admitted without testing.
 pub const LINEAGE_ROOT_BLOCK_MIN_ABSENT: usize = 10;
 
-/// Lineage root block: minimum enrichment odds ratio for a partner's absences to
-/// count as a real subclone rather than depth-inflated significance.
+/// Lineage root block: minimum enrichment odds ratio for a partner's absences to be structured.
 pub const LINEAGE_ROOT_BLOCK_MIN_OR: f64 = 2.0;
 
-/// Quick-start: longest read span (bp) the graph build aligns. Was `-l`.
+/// Quick-start: longest read span (bp) the graph build aligns.
 pub const QUICK_START_LENGTH_MAX: usize = 3000;
 
-/// Quick-start: RNG seed of the mt-read downsampling, fixed for reproducible
-/// subsets. Was `--downsample-seed`.
+/// Quick-start: RNG seed of the mt-read downsampling, fixed for reproducible subsets.
 pub const QUICK_START_DOWNSAMPLE_SEED: u64 = 42;
 
-/// Strand-skewed SNPs below this HF are dropped instead of flagged, when the
-/// data-type preset says drop. Was `--strand-bias-drop-max-hf`.
+/// Strand-skewed SNPs below this HF are dropped instead of flagged.
 pub const STRAND_BIAS_DROP_MAX_HF: f64 = 0.10;
 
 #[derive(Debug, Parser)]
@@ -268,7 +105,7 @@ pub struct GlobalOpts {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Quick start pipeline for mitochondrial assembly, variant calling and methylation aggregation
+    /// Quick start pipeline for mitochondrial assembly.
     #[clap(arg_required_else_help = true)]
     QuickStart {
         /// input BAM of reads, coordinate-sorted
@@ -388,7 +225,7 @@ enum Commands {
          #[clap(short, long, value_parser, default_value_t = 0.2)]
         fraction_max_methylation: f64,
 
-        /// maximal reads to keep from mtDNA 
+        /// maximal reads to keep from mtDNA
         #[clap(long, value_parser, default_value_t = 50000)]
         maximal_mt_depth: usize,
 
@@ -422,14 +259,6 @@ enum Commands {
         length_max: usize,
 
         /// minimal reads on a graph edge before it is aligned into a CIGAR.
-        /// Variants are read only from CIGAR-bearing edges, and reads reaching a
-        /// bubble solely through an un-CIGARed edge are not counted as covering it
-        /// (their genotype stays missing rather than ref). The default of 2 skips
-        /// edges carried by a single read: on noisy long reads those are mostly private
-        /// errors (about 93% of edges on a typical ONT run) and aligning them is the
-        /// bulk of the cost; QuickStart uses 2 as well. Set 1 to align every
-        /// read-supported edge (more recall of low-frequency variants, more false
-        /// positives and a slower build); raise it to be stricter than the default.
         #[clap(long, value_parser, default_value_t = 2)]
         min_edge_reads: usize,
 
@@ -462,16 +291,11 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = false)]
         indels: bool,
 
-        /// an allele carried by at least this fraction of reads at a site is never
-        /// corrected away, whatever candidacy says (protects real heteroplasmy in
-        /// deep repeat contexts, where the candidacy floor can exceed 1.0)
+        /// an allele at or above this fraction of reads at a site is never corrected away.
         #[clap(long, value_parser, default_value_t = 0.2)]
         indel_protect_vaf: f64,
 
-        /// EXPERIMENTAL (off by default): treat a homopolymer as a single LENGTH, so
-        /// any kept length is reachable from any other -- including the insertion ->
-        /// deletion and grow-a-deletion moves the per-event model has to refuse, which
-        /// leave +/-1 miscalls "in the wrong direction" uncorrected. Requires --indels.
+        /// EXPERIMENTAL: treat a homopolymer as a single LENGTH.
         #[clap(long, value_parser, default_value_t = false)]
         indel_hp_length_model: bool,
 
@@ -503,7 +327,7 @@ enum Commands {
         min_support_counts: usize,
     },
 
-    ///Call Variants from Sequence Graph
+    /// Call Variants from Sequence Graph
     #[clap(arg_required_else_help = true)]
     Call {
         /// anchor graph (GFA)
@@ -607,7 +431,7 @@ enum Commands {
         /// min_probability to determine a C is methylated
         #[clap(short, long, value_parser, default_value_t = 0.5)]
         prob_min: f64,
-        /// extract the per-read level methylation signals on major haplotype or all the reads 
+        /// extract per-read methylation signals for the major haplotype or all reads.
         #[clap(short, long, value_parser, default_value_t = false)]
         major_haplotype: bool
     },
@@ -628,7 +452,7 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 100)]
         pad_size: i64,
 
-        /// minimal read ratio supporting each haplotype in a given window, default is 0.01
+        /// minimal read ratio supporting each haplotype in a given window.
         #[clap(short, long, value_parser, default_value_t = 0.01)]
         min_read_ratio: f64,
 
@@ -689,7 +513,7 @@ enum Commands {
         emit_bnd: bool,
     },
 
-    /// Infer mitochondrial lineage tree from Himito read_var matrix CSV and heteroplasmic variants
+    /// Infer mitochondrial lineage tree from Himito read_var matrix CSV.
     #[clap(arg_required_else_help = true)]
     Lineage {
         /// Himito matrix CSV (<prefix>.matrix.csv)
@@ -738,8 +562,7 @@ enum Commands {
         hp_fn_rate: Option<f64>,
 
         /// merge equivalent spellings inside known rCRS homopolymer tracts
-        // Tracts: D310 302-315, HVS1-C 16183-16193, CA514 513-525. Variants are
-        // renamed `m.<start><tract_ref>><tract_alt>`.
+        // Tracts: D310 302-315, HVS1-C 16183-16193, CA514 513-525.
         #[clap(long, action, hide_short_help = true)]
         collapse_hp: bool,
 
@@ -757,26 +580,7 @@ enum Commands {
     }
 }
 
-/// Validate the user-settable `--indel-*` options at the CLI boundary. Only
-/// called when `--indels` is passed (see the `Denoise` arm below): a user who is
-/// not using the feature must never be blocked by it.
-///
-/// This validation deliberately lives here, not inside `IndelOpts` or any
-/// library function: the CLI is the boundary where a human-typed flag value
-/// first exists, and the error message needs the flag's own name, which only
-/// the CLI layer knows.
-///
-/// Only `protect_vaf` is checked, because it is the only numeric field a flag
-/// can still set. The rest of `IndelOpts` now always holds
-/// `IndelOpts::default()`, whose values are in range by construction — checking
-/// a number the user cannot type would be dead code.
-///
-/// `--indel-protect-vaf 0` is load-bearing, not cosmetic: it protects EVERY
-/// non-strand-rejected read (`observed_vaf >= 0.0` is always true), so the only
-/// reads ever corrected are ones that failed a strand gate — the exact inverse
-/// of the "protect less, correct more" a value of 0 looks like it should mean,
-/// and it would otherwise silently disable the feature while still exiting 0
-/// with a valid BAM.
+/// Validate the user-settable `--indel-*` options at the CLI boundary.
 fn validate_indel_opts(o: &denoise_indel::IndelOpts) -> AnyhowResult<()> {
     anyhow::ensure!(
         o.protect_vaf > 0.0 && o.protect_vaf <= 1.0,
@@ -806,7 +610,6 @@ pub fn init_rayon_threads(threads: Option<usize>) -> AnyhowResult<()> {
 }
 
 fn main() {
-    // Review 2026-09-25 T5: a library function must not install the process logger, and denoise/scite logs were otherwise silent.
     env_logger::init();
     let args = Cli::parse();
     init_rayon_threads(args.global.threads);
@@ -835,11 +638,9 @@ fn main() {
             no_linkage_rescue,
             denoise_keep_vaf,
         } => {
-            // Plan 2026-09-26 T4
             let left_align = !no_left_align;
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold_) =
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold, permutation_frequency_threshold);
-            // ONT-recall T5: preset by the *requested* data type (ont-denoised -> ONT value).
             let indel_false_threshold = call::resolve_indel_false_threshold(&data_type, indel_false_threshold);
             let mt_output = output_prefix.with_extension("mt.bam");
             let numts_output = output_prefix.with_extension("numts.bam");
@@ -855,33 +656,14 @@ fn main() {
             );
             
             // For ONT, denoise the mt BAM so reads consolidate; PacBio is untouched.
-            // Methylation (below) keeps reading the ORIGINAL mt_output.
-            // data_type_ only flips to "ont-denoised" when denoise actually succeeds;
-            // on fallback the raw reads keep their original type so the caller still
-            // applies the ONT permutation-test SNP filtering those reads need.
             let (build_bam, data_type_) = if data_type == "ont-denoised" {
                 let denoised = output_prefix.with_extension("mt.denoised.bam");
-                // Denoise settings for the combined pipeline. The strand gates are
-                // the shared constants; the near-homoplasmic exemption is
-                // deliberately 0.7 here — matching `call.rs`'s own
-                // permutation/homoplasmic threshold — and NOT the standalone
-                // denoise value in `DENOISE_HOMOPLASMIC_VAF` (0.95). The two paths
-                // have always differed; an earlier version of this comment claimed
-                // they matched, which was wrong.
+                // Denoise settings for the combined pipeline.
                 if let Err(e) = denoise::start(
                     &mt_output, &denoised, &reference_path, &data_type,
-                    // Denoise's keep threshold, NOT `vaf_threshold`. Passing the
-                    // caller's HF cut here made the two impossible to tune apart, and
-                    // at 0.01 the site model keeps marginal noise alleles whose reads
-                    // then reach the VCF (precision 0.837 vs 0.967 at 0.03).
-                    // ONT-recall Phase2 T6a: --denoise-keep-vaf, default DENOISE_KEEP_VAF.
+                    // Denoise's keep threshold, NOT `vaf_threshold`.
                     denoise_keep_vaf, 0.7,
-                    // Indel correction is on in QuickStart. Every other field keeps
-                    // its `Default` value, which `validate_indel_opts` accepts as-is,
-                    // so there is nothing to validate here. The generic HP length
-                    // model is spelled out rather than left to `Default` (Plan
-                    // 2026-09-26 T8f): it stays OFF in the combined pipeline until an
-                    // eval shows it helps, and that has to be visible here.
+                    // Indel correction is on in QuickStart.
                     &denoise_indel::IndelOpts {
                         enabled: true,
                         hp_length_model: false,
@@ -900,7 +682,6 @@ fn main() {
             info!("Data Type for variant calling: {data_type_}");
 
             let graph_output = output_prefix.with_extension("gfa");
-            // Preserve the historical default edge-read gate (2) for this combined pipeline.
             let _ = build::start(&graph_output, kmer_size, &build_bam, &reference_path, QUICK_START_LENGTH_MAX, 2);
 
             let assemble_output = output_prefix.with_extension("fasta");
@@ -981,19 +762,13 @@ fn main() {
             indel_hp_length_model,
             stats,
         } => {
-            // Every field except `enabled`, `protect_vaf` and `hp_length_model` keeps
-            // its `Default` value: the flags that used to set them all shipped
-            // defaults identical to `IndelOpts::default()` and nothing ever overrode
-            // them.
             let iopts = denoise_indel::IndelOpts {
                 enabled: indels,
                 protect_vaf: indel_protect_vaf,
-                // Plan 2026-09-26 T8f: opt-in, and only meaningful with --indels.
                 hp_length_model: indel_hp_length_model,
                 ..Default::default()
             };
-            // Only validate when --indels is actually in effect: a user who
-            // never opted into the feature must never be blocked by it.
+            // Only validate when --indels is actually in effect.
             if iopts.enabled {
                 if let Err(e) = validate_indel_opts(&iopts) {
                     eprintln!("Error: {e:#}");
@@ -1039,11 +814,9 @@ fn main() {
             no_left_align,
             left_align_compat: _,
         } => {
-            // Plan 2026-09-26 T4
             let left_align = !no_left_align;
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, frequency_threshold, permutation_frequency_threshold);
-            // ONT-recall T5
             let indel_false_threshold = call::resolve_indel_false_threshold(&data_type, indel_false_threshold);
             call::start(
                 &graphfile,
@@ -1159,25 +932,21 @@ fn main() {
                 .map(|p| p.to_str().expect("vcf-file path is not valid UTF-8"));
             let (fp_rate, fn_rate) =
                 lineage::resolve_error_rates(&data_type, fp_rate, fn_rate);
-            // Plan 2026-09-26 T6. Factor 2 is a placeholder until the T7 sweep.
             let hp_rates = lineage::resolve_hp_rates(fp_rate, fn_rate, hp_fp_rate, hp_fn_rate);
-            // Plan 2026-09-26 T9. Empty slice: collapse is the identity.
+            // Empty slice: collapse is the identity.
             let tracts = if collapse_hp {
                 crate::tracts::KNOWN_TRACTS
             } else {
                 &[]
             };
-            // Root block is always on. The dropout rate that makes its HF gate
-            // depth-relative is the SCITE fn rate, supplied by `run_scite_pipeline`.
+            // Root block is always on.
             let root_block = Some(rootblock::RootBlockConfig {
                 min_hf: LINEAGE_ROOT_BLOCK_MIN_HF,
                 max_q: LINEAGE_ROOT_BLOCK_MAX_Q,
                 min_absent: LINEAGE_ROOT_BLOCK_MIN_ABSENT,
                 min_or: LINEAGE_ROOT_BLOCK_MIN_OR,
             });
-            // Review 2026-09-25 T6: reject 0 chains here. `run_mcmc_multichain`
-            // panics on an empty chain list, and a CLI flag should fail with a
-            // message instead of a library panic.
+            // `run_mcmc_multichain` panics on an empty chain list.
             if let Err(e) = validate_lineage_opts(mcmc_chains) {
                 eprintln!("Error: {e:#}");
                 std::process::exit(1);
@@ -1226,9 +995,7 @@ mod indel_opts_validation_tests {
 
     #[test]
     fn protect_vaf_zero_is_rejected() {
-        // FIX 4: --indel-protect-vaf 0 protects every non-strand-rejected
-        // read, so it is the exact inverse of "protect less, correct more"
-        // and must be rejected, not silently accepted with a zero exit code.
+        // --indel-protect-vaf 0 protects every non-strand-rejected read, so it is the exact inverse of "protect less.
         let mut o = opts();
         o.protect_vaf = 0.0;
         assert!(validate_indel_opts(&o).is_err());
@@ -1248,17 +1015,10 @@ mod indel_opts_validation_tests {
         assert!(validate_indel_opts(&o).is_err());
     }
 
-    // The former per-field range tests (err_cap, err0, err_scale, floor_mult,
-    // delta, vaf, max_len, flank) were deleted along with the flags that set
-    // those fields. They now always hold `IndelOpts::default()`, which
-    // `shipped_defaults_pass_validation` above covers; a test that pokes a
-    // value no user can supply would only be testing the poke.
+    // The former per-field range tests were deleted along with the flags that set those fields.
 
     #[test]
     fn hp_length_model_is_off_unless_the_flag_is_passed() {
-        // Plan 2026-09-26 T8f: the flag is the ONLY way to reach the generic HP
-        // length model, so "off by default" has to be a property of argument
-        // parsing, not just of `IndelOpts::default()`.
         use clap::Parser;
         let base = [
             "Himito", "denoise", "-i", "in.bam", "-o", "out.bam", "-r", "ref.fa", "--indels",
@@ -1294,7 +1054,6 @@ mod lineage_opts_validation_tests {
 
     #[test]
     fn collapse_hp_is_off_unless_the_flag_is_passed() {
-        // Plan 2026-09-26 T9.
         use clap::Parser;
         let base = ["Himito", "lineage", "-m", "matrix.csv", "-o", "out"];
         let collapse_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
@@ -1322,7 +1081,6 @@ mod linkage_cli_tests {
     }
 }
 
-// Cleanup C1: one BAM input for `call`; `quick-start` has no matrix switch.
 #[cfg(test)]
 mod bam_cli_tests {
     use super::*;
@@ -1377,7 +1135,6 @@ mod bam_cli_tests {
     }
 }
 
-// ONT-recall Phase2 T6a
 #[cfg(test)]
 mod denoise_keep_vaf_cli_tests {
     use super::*;
@@ -1406,8 +1163,7 @@ mod denoise_keep_vaf_cli_tests {
     }
 }
 
-// Plan 2026-09-26 T4. Effective left-alignment is the default; `--left-align`
-// remains accepted and `--no-left-align` turns it off.
+// Effective left-alignment is the default; `--left-align` remains accepted and `--no-left-align` turns it off.
 #[cfg(test)]
 mod left_align_cli_tests {
     use super::*;
@@ -1497,10 +1253,6 @@ mod left_align_cli_tests {
     }
 }
 
-// Cleanup C3: visible / advanced / hard-coded option split.
-//   visible  -> in `-h` and `--help`
-//   advanced -> `hide_short_help`: parses, but only `--help` lists it
-//   gone     -> hard-coded constant or removed: parses nowhere, listed nowhere
 #[cfg(test)]
 mod option_split_tests {
     use super::*;
@@ -1631,7 +1383,6 @@ mod option_split_tests {
             }
         }
         for f in split.gone {
-            // `--input-bam` is a live alias of `--bam` on call, not a removed flag.
             if *f == "--input-bam" || *f == "--left-align" {
                 continue;
             }
@@ -1722,7 +1473,6 @@ mod option_split_tests {
 
     #[test]
     fn lineage_root_block_is_always_on() {
-        // The constants the Lineage arm passes (formerly the flag defaults).
         assert_eq!(LINEAGE_ROOT_BLOCK_MIN_HF, 0.80);
         assert_eq!(LINEAGE_ROOT_BLOCK_MAX_Q, 0.05);
         assert_eq!(LINEAGE_ROOT_BLOCK_MIN_ABSENT, 10);

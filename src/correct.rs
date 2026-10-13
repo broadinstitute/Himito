@@ -67,7 +67,7 @@ pub fn start (graph_file: &PathBuf, bwt_file: &String, reference_file: &PathBuf,
             }
         }
 
-        //keep reference paths
+        // keep reference paths
         let reads_list = edge_data.get("reads").unwrap().as_array().unwrap();
         for read in reads_list{
             if read.as_str().unwrap() == ref_header{

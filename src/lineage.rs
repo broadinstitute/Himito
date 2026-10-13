@@ -47,17 +47,11 @@ pub struct DistMatrix {
     /// Haplotype labels in row/column order (same order as `HaplotypeMatrix::haplotypes`)
     pub labels: Vec<String>,
     /// `data[i][j]` = normalised Hamming distance between haplotype i and j.
-    /// Values are in [0.0, 1.0]. Diagonal is 0.0.
     pub data: Vec<Vec<f64>>,
 }
 
 /// Build a pairwise Hamming distance matrix from haplotype binary profiles.
-///
-/// Distance = (number of differing jointly covered positions) / (number of jointly
-/// covered positions). Pairs with no jointly covered site are filled with the mean
-/// of the finite off-diagonal distances, or 0.0 when no pair has shared coverage.
-/// The matrix never contains NaN. If there are no variants (shouldn't happen after
-/// filtering), all distances are 0.
+/// The matrix never contains NaN.
 pub fn hamming_distance_matrix(matrix: &HaplotypeMatrix) -> DistMatrix {
     let n = matrix.haplotypes.len();
     let labels: Vec<String> = matrix.haplotypes.iter().map(|h| h.id.clone()).collect();
@@ -75,7 +69,6 @@ pub fn hamming_distance_matrix(matrix: &HaplotypeMatrix) -> DistMatrix {
                     }
                 }
             }
-            // Plan 2026-09-26 T1: mark pairs with no shared coverage for mean-fill.
             let d = if compared > 0 {
                 diff as f64 / compared as f64
             } else {
@@ -86,7 +79,6 @@ pub fn hamming_distance_matrix(matrix: &HaplotypeMatrix) -> DistMatrix {
         }
     }
 
-    // Plan 2026-09-26 T1: mean of finite off-diagonal distances (i < j), else 0.0.
     let mut sum = 0.0;
     let mut count = 0usize;
     for i in 0..n {
@@ -114,15 +106,8 @@ pub fn hamming_distance_matrix(matrix: &HaplotypeMatrix) -> DistMatrix {
 // ─── Neighbor-Joining ─────────────────────────────────────────────────────────
 
 /// Build a rooted Neighbor-Joining tree from `dist`.
-///
-/// Rooting strategy:
-/// * If a haplotype with the all-zero profile exists (no mutations → reference
-///   ancestor), the tree is re-rooted at that haplotype's parent so the
-///   outgroup hangs directly from the root.
-/// * Otherwise the NJ root (midpoint of the final two-taxon join) is kept.
 pub fn neighbor_joining(hap_matrix: &HaplotypeMatrix) -> Result<Tree> {
-    // The distance matrix is a pure function of `hap_matrix`; taking both let a
-    // caller pass a matrix built from different haplotypes than the leaves.
+    // The distance matrix is a pure function of `hap_matrix`.
     let dist = hamming_distance_matrix(hap_matrix);
     let n = dist.labels.len();
     if n < 2 {
@@ -247,9 +232,6 @@ pub fn neighbor_joining(hap_matrix: &HaplotypeMatrix) -> Result<Tree> {
     let mut tree = Tree { nodes, root: root_id };
 
     // ── Re-root at ancestral haplotype's parent (outgroup rooting) ───────────
-    // Pick the no-alt haplotype with the most covered reference calls; require
-    // at least one `Some` so an all-`None` read is not treated as ancestral.
-    // Review 2026-09-25 T2
     if let Some(og_hap) = pick_outgroup(hap_matrix) {
         reroot_at_outgroup_parent(&mut tree, &og_hap.id);
         eprintln!(
@@ -262,11 +244,6 @@ pub fn neighbor_joining(hap_matrix: &HaplotypeMatrix) -> Result<Tree> {
 }
 
 /// Choose the ancestral (no-alt) haplotype to use as the NJ outgroup.
-///
-/// Among haplotypes with no alt calls, prefer the one with the most covered
-/// reference sites, then the highest read count; keep the earlier haplotype on
-/// a full tie so the choice is deterministic. All-`None` profiles are excluded
-/// because zero coverage is not evidence of ancestry. Review 2026-09-25 T2
 fn pick_outgroup(hm: &HaplotypeMatrix) -> Option<&Haplotype> {
     hm.haplotypes
         .iter()
@@ -282,9 +259,6 @@ fn pick_outgroup(hm: &HaplotypeMatrix) -> Option<&Haplotype> {
 }
 
 /// Re-root `tree` so that the parent of `outgroup_label` becomes the new root.
-///
-/// Algorithm: collect the path from the outgroup's parent up to the current
-/// root, then reverse all parent–child edges along that path.
 fn reroot_at_outgroup_parent(tree: &mut Tree, outgroup_label: &str) {
     // Find the outgroup leaf
     let og_id = match tree.nodes.iter().find(|n| n.label == outgroup_label) {
@@ -301,8 +275,7 @@ fn reroot_at_outgroup_parent(tree: &mut Tree, outgroup_label: &str) {
         return;
     }
 
-    // Collect path from new_root up to (and including) old root,
-    // capturing branch lengths BEFORE any modification.
+    // Collect path from new_root up to (and including) old root, capturing branch lengths BEFORE any modification.
     let mut path: Vec<usize>  = vec![new_root];
     let mut bls:  Vec<f64>    = vec![tree.nodes[new_root].branch_length];
     let mut cur = new_root;
@@ -320,8 +293,7 @@ fn reroot_at_outgroup_parent(tree: &mut Tree, outgroup_label: &str) {
         }
     }
 
-    // Reverse edges: for each consecutive pair (child, parent) in path,
-    // make child the new parent.
+    // Reverse edges: for each consecutive pair (child, parent) in path, make child the new parent.
     for i in 0..path.len().saturating_sub(1) {
         let child  = path[i];
         let parent = path[i + 1];
@@ -336,9 +308,7 @@ fn reroot_at_outgroup_parent(tree: &mut Tree, outgroup_label: &str) {
     tree.nodes[new_root].branch_length = 0.0;
     tree.root = new_root;
 
-    // If the old root has become a unary node (only one remaining child),
-    // collapse it: attach its single child directly to new_root, summing
-    // branch lengths so no information is lost.
+    // If the old root has become a unary node, collapse it: attach its single child directly to new_root.
     let old_root = *path.last().unwrap();
     if tree.nodes[old_root].children.len() == 1 {
         let sole_child = tree.nodes[old_root].children[0];
@@ -377,8 +347,6 @@ pub struct HaplotypeMatrix {
 pub type HfMap = HashMap<String, f64>;
 
 /// Binary matrix after filtering.
-/// `data[variant_idx][read_idx]` is `Some(0)` (ref), `Some(1)` (alt), or
-/// `None` (uncovered/missing in the source matrix.csv).
 pub struct BinaryMatrix {
     pub variants: Vec<String>,
     pub reads: Vec<String>,
@@ -386,12 +354,6 @@ pub struct BinaryMatrix {
 }
 
 /// Every row of a Himito `.matrix.csv`, binarised but **unfiltered**.
-///
-/// Plan 2026-09-26 T5. The filter pass and the fixed-homoplasmy scan used to
-/// each open and parse the CSV themselves; both now consume one of these, so
-/// the file is read once and any row-level transform (tract collapse) is seen
-/// by both. Cells are `Some(1)` (alt), `Some(0)` (explicit ref) or `None`
-/// (empty/unparseable, i.e. uncovered).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RawMatrix {
     pub variants: Vec<String>,
@@ -400,14 +362,10 @@ pub struct RawMatrix {
 }
 
 /// Parse a Himito VCF file and return a map from variant ID to HF value.
-///
-/// Variant IDs are reconstructed as `m.<POS><REF>><ALT>` (the format Himito
-/// uses in the matrix CSV), e.g. `m.13376T>C`.
 pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
     let mut reader = Reader::from_path(vcf_path)
         .with_context(|| format!("Cannot read VCF: {vcf_path}"))?;
-    // Plan 2026-09-26 T4. `call` writes this only when indels were left-aligned.
-    // A missing line means homopolymer indels may be split across several names.
+    // `call` writes this only when indels were left-aligned.
     let left_aligned = reader.header().header_records().iter().any(|rec| {
         matches!(
             rec,
@@ -434,10 +392,7 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
         // Extract position (0-based in htslib → 1-based in VCF/Himito IDs)
         let pos = rec.pos() + 1;
 
-        // rec.alleles() borrows rec immutably; collect into owned Strings so we
-        // can release the borrow before calling rec.format() (mut borrow). Keep
-        // every ALT so multiallelic sites contribute one variant id per ALT
-        // (skipping alleles[1..] gracefully handles ALT-less records).
+        // rec.alleles() borrows rec immutably; collect into owned Strings.
         let (ref_allele, alt_alleles): (String, Vec<String>) = {
             let alleles = rec.alleles();
             let ref_allele = std::str::from_utf8(alleles[0]).unwrap_or("").to_owned();
@@ -449,10 +404,7 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
             (ref_allele, alts)
         };
 
-        // Read the HF FORMAT field (float, first sample). Prefer Himito's HF;
-        // fall back to AF when HF is absent. HF/AF are Number=A, so the i-th
-        // value lines up with the i-th ALT; fall back to the first value for
-        // single-valued encodings.
+        // Read the HF FORMAT field (float, first sample).
         let hf_data = rec
             .format(b"HF")
             .float()
@@ -468,8 +420,7 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
             // println!("hf_data: {:?} {} {}", hf, min_hf, max_hf);
             if hf >= min_hf && hf < max_hf {
                 let vid = format!("m.{pos}{ref_allele}>{alt_allele}");
-                // Keep the first occurrence of a variant id (deterministic across
-                // duplicate records) rather than silently overwriting.
+                // Keep the first occurrence of a variant id (deterministic across duplicate records) rather than silently overwriting.
                 map.entry(vid).or_insert(hf);
             }
         }
@@ -478,38 +429,15 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
 }
 
 /// How a variant's heteroplasmic frequency is judged during matrix filtering.
-///
-/// These are one enum rather than three independent parameters (`hf_map`,
-/// `min_hf`, `max_hf`) because **exactly one of the two ways applies per run**,
-/// and the old signature could not say so: it took all three and decided
-/// between them at the use site with `hf_map.is_empty()`. That left `min_hf` and
-/// `max_hf` silently inert on the with-VCF path — already baked into the map by
-/// [`parse_vcf`] — and made an empty-but-present map indistinguishable from "no
-/// VCF given", which silently downgraded a VCF run whose variants all fell
-/// outside the band into a matrix-derived one. The enum makes the choice
-/// structural, so neither can happen.
 pub enum HfFilter {
-    /// A VCF was supplied. [`parse_vcf`] already applied the HF band while
-    /// building `map`, so membership in it *is* the filter — including when
-    /// the map is empty, which correctly keeps nothing.
-    ///
-    /// `min`/`max` are the same band, retained for one reason only: tract
-    /// alleles (plan 2026-09-26 T5) do not exist in the VCF, since they are
-    /// synthesised from several of its records, so they must be judged on the
-    /// matrix-derived frequency instead. No other row consults them.
+    /// A VCF was supplied.
     FromVcf { map: HfMap, min: f64, max: f64 },
-    /// No VCF was supplied. Recompute HF from the matrix and keep
-    /// `min <= hf < max`.
+    /// No VCF was supplied.
     FromMatrix { min: f64, max: f64 },
 }
 
 impl HfFilter {
-    /// Whether a variant named `vid`, observed at alt frequency `freq` among the
-    /// reads that cover it, passes the heteroplasmy filter.
-    ///
-    /// `tract_rows` holds the names of the collapsed tract-allele rows; those
-    /// are judged on `freq` against the band on both paths, because the VCF
-    /// only ever carries their constituent calls. Plan 2026-09-26 T5.
+    /// `tract_rows` holds the names of the collapsed tract-allele rows.
     fn keeps(&self, vid: &str, freq: f64, tract_rows: &std::collections::HashSet<String>) -> bool {
         match self {
             HfFilter::FromVcf { map, min, max } => {
@@ -523,9 +451,7 @@ impl HfFilter {
         }
     }
 
-    /// Whether the decision for `vid` can be made from its name alone, before
-    /// the row is counted. True only on the VCF path for non-tract rows, where
-    /// the verdict does not depend on the observed frequency.
+    /// Whether the decision for `vid` can be made from its name alone, before the row is counted.
     fn rejects_by_name(&self, vid: &str, tract_rows: &std::collections::HashSet<String>) -> bool {
         matches!(self, HfFilter::FromVcf { .. })
             && !tract_rows.contains(vid)
@@ -534,19 +460,6 @@ impl HfFilter {
 }
 
 /// Read `matrix_path` (Himito `.matrix.csv`) and apply filters:
-///
-/// * **Prevalence** — keep rows where the variant is present in ≥ `min_presence`
-///   reads AND absent from ≥ `min_absence` reads (guarantees a bifurcation).
-/// * **Heteroplasmy** — per `hf`; see [`HfFilter`]. The matrix-derived frequency
-///   is `present / (present + absent)` — alt calls over *covered* reads — which
-///   matches Himito's VCF `HF = allele_count / read_depth`, so the with-VCF and
-///   without-VCF variant sets agree.
-///
-/// Counts are binarised: any count ≥ 1 becomes 1.
-///
-/// Plan 2026-09-26 T5: `start` no longer goes through here — it needs the raw
-/// rows before filtering — but the one-call path-based form is kept for other
-/// callers and tests.
 #[allow(dead_code)]
 pub fn load_and_filter_matrix(
     matrix_path: &str,
@@ -560,12 +473,7 @@ pub fn load_and_filter_matrix(
     Ok(filter_matrix(&raw, hf, min_presence, min_absence, &Default::default()))
 }
 
-/// Parse every row of a Himito `.matrix.csv` into a [`RawMatrix`], applying no
-/// filter at all. `Some(0)` = explicit ref call, `Some(1)` = alt, `None` =
-/// missing/uncovered (empty or unparseable cell).
-///
-/// `Read`-generic so it can be exercised without touching disk.
-/// Plan 2026-09-26 T5.
+/// Parse every row of a Himito `.matrix.csv` into a [`RawMatrix`], applying no filter at all.
 pub fn read_raw_matrix<R: std::io::Read>(reader: R) -> Result<RawMatrix> {
     let mut rdr = csv::Reader::from_reader(reader);
     let headers = rdr.headers()?.clone();
@@ -595,9 +503,6 @@ pub fn read_raw_matrix<R: std::io::Read>(reader: R) -> Result<RawMatrix> {
 }
 
 /// Apply the prevalence and heteroplasmy filters to a [`RawMatrix`].
-/// Plan 2026-09-26 T5: split out of the old `parse_binary_matrix`; the order of
-/// the two filters, and their semantics, are unchanged. `tract_rows` names the
-/// collapsed tract alleles, which [`HfFilter`] judges differently.
 pub fn filter_matrix(
     raw: &RawMatrix,
     hf: &HfFilter,
@@ -609,8 +514,7 @@ pub fn filter_matrix(
     let mut data: Vec<Vec<Option<u8>>> = Vec::new();
 
     for (vid, row) in raw.variants.iter().zip(raw.data.iter()) {
-        // On the VCF path the verdict needs only the name, so rows that cannot
-        // survive are rejected before anything is counted.
+        // On the VCF path the verdict needs only the name, so rows that cannot survive are rejected before anything is counted.
         if hf.rejects_by_name(vid, tract_rows) {
             continue;
         }
@@ -621,10 +525,7 @@ pub fn filter_matrix(
             continue;
         }
 
-        // Matrix-derived HF: alt calls over *covered* reads (present + absent),
-        // NOT row.len(). This mirrors Himito's VCF `HF = allele_count / read_depth`
-        // so the homoplasmy filter keeps the same variants with and without a VCF.
-        // Uncovered (`None`) cells must be excluded from the denominator.
+        // Matrix-derived HF: alt calls over *covered* reads (present + absent), NOT row.len().
         let covered = present + absent;
         let freq = if covered > 0 { present as f64 / covered as f64 } else { 0.0 };
 
@@ -640,18 +541,6 @@ pub fn filter_matrix(
 }
 
 /// Collapse every known homopolymer tract in `raw` into sequence-level alleles.
-///
-/// Plan 2026-09-26 T5. See [`crate::tracts`] for why: inside a hypervariable
-/// run, one read's length change can be spelled at several reference positions,
-/// so left-alignment alone cannot merge them. For each read, all of its calls
-/// inside a tract (including an interrupting SNV such as T16189C) are applied
-/// to the tract's reference sequence; reads with the same resulting sequence
-/// carry the same allele. The constituent rows are replaced by one row per
-/// distinct non-reference tract sequence, named
-/// `m.<start><ref_seq>><alt_seq>`, inserted where the first constituent row
-/// was and sorted by alt sequence. Rows outside every tract, variants that
-/// straddle a tract boundary and variants that are not a plain SNV, insertion
-/// or deletion pass through untouched.
 pub fn collapse_tracts(raw: RawMatrix, tracts: &[crate::tracts::Tract]) -> RawMatrix {
     let spans = crate::scite::variant_spans(&raw.variants);
     let n_reads = raw.reads.len();
@@ -664,8 +553,7 @@ pub fn collapse_tracts(raw: RawMatrix, tracts: &[crate::tracts::Tract]) -> RawMa
             continue;
         };
         match tract_op(vid, &tracts[t]) {
-            // A name that is not a plain SNV/insertion/deletion is treated like
-            // a straddling variant: it keeps its own row.
+            // A name that is not a plain SNV/insertion/deletion is treated like a straddling variant: it keeps its own row.
             ParsedOp::NotCollapsible => {}
             ParsedOp::RefMismatch => {
                 if !disabled[t] {
@@ -736,7 +624,6 @@ pub fn collapse_tracts(raw: RawMatrix, tracts: &[crate::tracts::Tract]) -> RawMa
             })
             .collect();
 
-        // Plan 2026-09-26 T5 step 6.
         info!(
             "[lineage] Tract {} ({}-{}): {} row(s) collapsed into {} allele(s); \
              {} read(s) set to missing for partial coverage, {} for conflicting calls.",
@@ -758,8 +645,7 @@ pub fn collapse_tracts(raw: RawMatrix, tracts: &[crate::tracts::Tract]) -> RawMa
         }
     }
 
-    // Reassemble in input order, replacing each tract's rows with its alleles
-    // at the position of the first row that went into them.
+    // Reassemble in input order, putting each tract's alleles where its first row was.
     let owner: HashMap<usize, usize> = members
         .iter()
         .enumerate()
@@ -787,14 +673,12 @@ pub fn collapse_tracts(raw: RawMatrix, tracts: &[crate::tracts::Tract]) -> RawMa
     RawMatrix { variants, reads: raw.reads, data }
 }
 
-/// One edit a carried variant applies to a tract's reference sequence, in
-/// offsets from the tract start. Plan 2026-09-26 T5.
+/// One edit a carried variant applies to a tract's reference sequence.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TractOp {
     /// Replace the base at `offset`.
     Sub { offset: usize, base: u8 },
-    /// Insert `seq` after `offset`. The anchor base itself is not edited, so a
-    /// substitution at the same offset composes with this.
+    /// Insert `seq` after `offset`.
     Ins { offset: usize, seq: Vec<u8> },
     /// Delete `len` bases starting at `offset` (the base after the anchor).
     Del { offset: usize, len: usize },
@@ -805,14 +689,11 @@ enum ParsedOp {
     Op(TractOp),
     /// Not a plain SNV, insertion or deletion — left as its own row.
     NotCollapsible,
-    /// The REF spelled in the name is not what the tract reference has there,
-    /// so this reference is not rCRS and the tract must not be collapsed.
+    /// The REF spelled in the name is not what the tract reference has there.
     RefMismatch,
 }
 
-/// Split `m.<pos><ref>><alt>` into its three fields, requiring both alleles to
-/// be plain base strings. Positions are parsed exactly as
-/// `scite::parse_variant_span` does, so spans and operations always agree.
+/// Split `m.<pos><ref>><alt>` into its three fields, requiring both alleles to be plain base strings.
 fn parse_variant_name(variant: &str) -> Option<(u64, &str, &str)> {
     let rest = variant.strip_prefix("m.")?;
     let digits_len = rest.chars().take_while(|c| c.is_ascii_digit()).count();
@@ -849,8 +730,7 @@ fn tract_op(variant: &str, tract: &crate::tracts::Tract) -> ParsedOp {
     }
 }
 
-/// Apply every operation a read carries to `ref_seq` in one left-to-right walk,
-/// or `None` if two of them contradict each other. Plan 2026-09-26 T5.
+/// Apply every operation a read carries to `ref_seq` in one left-to-right walk.
 fn apply_tract_ops(ref_seq: &str, ops: &[&TractOp]) -> Option<String> {
     let bases = ref_seq.as_bytes();
     let n = bases.len();
@@ -861,8 +741,7 @@ fn apply_tract_ops(ref_seq: &str, ops: &[&TractOp]) -> Option<String> {
     for op in ops {
         match op {
             TractOp::Sub { offset, base } => {
-                // Two *different* substitutions at one offset contradict; the
-                // same one twice is just a duplicated row.
+                // Two *different* substitutions at one offset contradict; the same one twice is just a duplicated row.
                 if sub[*offset].is_some_and(|b| b != *base) {
                     return None;
                 }
@@ -901,22 +780,7 @@ fn apply_tract_ops(ref_seq: &str, ops: &[&TractOp]) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Names of the near-fixed (homoplasmic) variants the heteroplasmy filter drops
-/// for sitting at or above the HF ceiling — the variants `load_and_filter_matrix`
-/// removes purely for *not bifurcating* the tree, not for lack of support.
-///
-/// A variant qualifies when it is supported by at least `min_presence` reads and
-/// its matrix-derived frequency (`present / (present + absent)`, the same
-/// covered-reads denominator [`filter_matrix`] uses) is `>= max_hf`. Names
-/// already present in `exclude` (the variants that survived filtering, i.e. the
-/// informative + block set) are skipped so nothing is double-reported.
-///
-/// Read order matches the matrix header, but the caller only needs the names:
-/// these variants are homoplasmic, so their cleaned genotype is present in every
-/// read regardless of column order.
-///
-/// Plan 2026-09-26 T5: takes the already-parsed [`RawMatrix`] rather than a path,
-/// so the CSV is read once and this scan sees the same rows the filter saw.
+/// Near-fixed variants dropped by the HF ceiling, not for lack of support.
 pub fn collect_fixed_homoplasmies(
     raw: &RawMatrix,
     max_hf: f64,
@@ -939,11 +803,7 @@ pub fn collect_fixed_homoplasmies(
     fixed
 }
 
-/// Write `cleaned` to `out_path`, then append one all-present row per name in
-/// `fixed` — the near-fixed homoplasmies [`collect_fixed_homoplasmies`]
-/// recovered. The result is the full read x variant genotype table,
-/// heteroplasmic *and* homoplasmic. Plan 2026-09-26 T3: this used to copy
-/// `cleaned_matrix.csv` off disk; it now clones the in-memory matrix.
+/// Write `cleaned` to `out_path`, then append one all-present row per name in `fixed`.
 fn write_cleaned_matrix_all_variants(
     cleaned: &crate::scite::CleanedMatrix,
     fixed: &[String],
@@ -960,10 +820,8 @@ fn write_cleaned_matrix_all_variants(
 
 
 /// Collapse reads with identical binary profiles into unique haplotypes.
-///
-/// Haplotypes are sorted by ascending mutation count (number of 1-bits),
-/// then lexicographically by profile, so that the all-zero haplotype (if
-/// present) is always `H0000`.
+/// Haplotypes are sorted by ascending mutation count (number of 1-bits), then lexicographically by
+/// profile, so that the all-zero haplotype (if present) is always `H0000`.
 pub fn deduplicate(matrix: &BinaryMatrix, min_reads: usize) -> HaplotypeMatrix {
     let n_reads    = matrix.reads.len();
     let n_variants = matrix.variants.len();
@@ -1012,10 +870,6 @@ pub fn deduplicate(matrix: &BinaryMatrix, min_reads: usize) -> HaplotypeMatrix {
 
 
 /// Run the four-gamete test on every pair of variants.
-///
-/// Returns a list of `(variant_a, variant_b)` pairs where all four
-/// combinations {00, 01, 10, 11} are observed across haplotypes — a
-/// violation of the Infinite Sites Assumption (ISA).
 pub fn four_gamete_test(matrix: &HaplotypeMatrix) -> Vec<(String, String)> {
     let n_var = matrix.variants.len();
     let profiles: Vec<&Vec<Option<u8>>> =
@@ -1026,8 +880,7 @@ pub fn four_gamete_test(matrix: &HaplotypeMatrix) -> Vec<(String, String)> {
         for j in (i + 1)..n_var {
             let mut seen = [false; 4]; // index = a*2 + b for states a,b ∈ {0,1}
             for profile in &profiles {
-                // A haplotype only informs the pair if it covers BOTH sites;
-                // missing calls (`None`) are excluded rather than read as ref.
+                // A haplotype only informs the pair if it covers BOTH sites; missing calls are excluded rather than read as ref.
                 if let (Some(a), Some(b)) = (profile[i], profile[j]) {
                     let idx = (a * 2 + b) as usize;
                     seen[idx] = true;
@@ -1060,10 +913,7 @@ pub fn write_haplotype_map(hap_matrix: &HaplotypeMatrix, path: &str) -> Result<(
         writeln!(w, "{}\t{n_mut}\t{}\t{readlist}", hap.id, hap.count)?;
 
     }
-    // Always represent the ancestral haplotype (the tree root: no heteroplasmic
-    // variants). If the deduplicated haplotypes already contain an all-reference
-    // profile it is kept as-is; otherwise a synthetic zero-read root row is
-    // appended so the ancestral state is consistent with the lineage tree.
+    // Always represent the ancestral haplotype (the tree root: no heteroplasmic variants).
     let has_ancestral = hap_matrix
         .haplotypes
         .iter()
@@ -1076,16 +926,6 @@ pub fn write_haplotype_map(hap_matrix: &HaplotypeMatrix, path: &str) -> Result<(
 
 
 /// Per-data-type SCITE error rates, with explicit values always winning.
-///
-/// `None` means "not supplied on the command line", so the data-type default
-/// applies; `Some(v)` is used verbatim. Mirrors `call::resolve_thresholds`.
-///
-/// The defaults come from the fp/fn sweeps in `lineage_eval`
-/// (`sweep_fpfn.sh`, scored by `score_lineage.py`):
-///
-/// * `pacbio` (HiFi) — fp 0.005 / fn 0.05 (flat grid; unchanged).
-/// * ONT (`ont-r9` / `ont-r10` / `ont-denoised`) — fp 0.005 / fn 0.02 for the
-///   raw-BAM matrix (cleanup C2; all three share one preset).
 pub fn resolve_error_rates(
     data_type: &str,
     fp_rate: Option<f64>,
@@ -1104,8 +944,7 @@ pub fn resolve_error_rates(
     )
 }
 
-/// Plan 2026-09-26 T6. Placeholder until the T7 sweep: twice the resolved
-/// global rate, capped at 0.5. An explicit flag is used verbatim, including 0.
+/// An explicit flag is used verbatim, including 0.
 pub fn resolve_hp_rates(
     fp_rate: f64,
     fn_rate: f64,
@@ -1137,18 +976,11 @@ pub fn start(
     debug: bool,
     output_prefix: &str,
 ) -> Result<()> {
-    // No `data_type` parameter: the rates arrive already resolved by
-    // `resolve_error_rates`, and the accepted-vocabulary check now lives on the
-    // clap flag itself (`main.rs`'s `DATA_TYPES`), so an unrecognised value is
-    // rejected before any file is opened rather than here.
+    // No `data_type` parameter: the rates arrive already resolved by `resolve_error_rates`.
     info!("Starting lineage analysis...");
     info!("SCITE fp={fp_rate}, fn={fn_rate}, hp_fp={}, hp_fn={}", hp_rates.0, hp_rates.1);
 
     // ── Step 1: decide how HF is judged, then filter the binary matrix ────────
-    // The VCF is optional, and which branch runs is exactly what decides where
-    // `min_hf`/`max_hf` are consumed: `parse_vcf` applies them while building the
-    // map, or the matrix path applies them to a frequency it computes itself.
-    // They are never applied twice, and never ignored.
     let hf = match vcf_file {
         Some(path) => {
             info!("[1/6] Parsing VCF: {}", path);
@@ -1161,15 +993,12 @@ pub fn start(
     };
 
     info!("[1/6] Loading and filtering matrix: {}", matrix_file);
-    // Plan 2026-09-26 T5: parse the CSV once. The filter below and the
-    // fixed-homoplasmy scan further down both read these same rows.
+    // The filter below and the fixed-homoplasmy scan further down both read these same rows.
     let raw = read_raw_matrix(
         File::open(matrix_file)
             .with_context(|| format!("Cannot read matrix CSV: {matrix_file}"))?,
     )?;
-    // Plan 2026-09-26 T9: collapse is opt-in. An empty slice is the identity
-    // and leaves `tract_rows` empty, so the VCF path drops tract-looking names
-    // that are not in the map, as it did before T5.
+    // An empty slice is the identity and leaves `tract_rows` empty.
     if tracts.is_empty() {
         info!("[lineage] HP tract collapse: off (pass --collapse-hp to enable)");
     } else {
@@ -1203,8 +1032,7 @@ pub fn start(
              so more distinguishable haplotypes."
         );
     }
-    // Diagnostic: variant pairs violating the infinite-sites assumption (all four
-    // gametes observed) hint at recurrent/back mutation or recombination.
+    // Diagnostic: variant pairs violating the infinite-sites assumption hint at recurrent/back mutation or recombination.
     let violations = four_gamete_test(&hap_matrix);
     if !violations.is_empty() {
         info!(
@@ -1212,7 +1040,7 @@ pub fn start(
             violations.len()
         );
     }
-    // Plan 2026-09-26 T3. The pre-SCITE haplotype map is a debug artifact.
+    // The pre-SCITE haplotype map is a debug artifact.
     if debug {
         let hmap_path = format!("{}.raw_haplotype_map.tsv", output_prefix);
         write_haplotype_map(&hap_matrix, &hmap_path)?;
@@ -1220,11 +1048,7 @@ pub fn start(
 
     // ── Step 3: SCITE mutation-tree search (NJ-informed MCMC) ─────────────────
     info!("[3/6] Running SCITE mutation-tree search...");
-    // Returns the cleaned reads already deduplicated into haplotypes. This used
-    // to be recovered by re-reading `cleaned_matrix.csv` back off disk and
-    // deduplicating it a second time with fully-permissive thresholds; the
-    // result was provably the same matrix, since both paths dedup the same cells
-    // with the same `min_reads` and the same deterministic ordering.
+    // Returns the cleaned reads already deduplicated into haplotypes.
     let out = crate::scite::run_scite_pipeline(
         &binary,
         fp_rate,
@@ -1239,12 +1063,7 @@ pub fn start(
         output_prefix,
     )?;
 
-    // Near-fixed homoplasmies were removed by the HF ceiling before the tree was
-    // built, so the cleaned matrix never sees them. Recover them and emit a
-    // companion table carrying every variant — heteroplasmic and homoplasmic — so
-    // the homoplasmy set is reported in full regardless of coverage.
-    // Plan 2026-09-26 T3: append those rows in memory instead of re-reading
-    // cleaned_matrix.csv.
+    // Near-fixed homoplasmies were removed by the HF ceiling before the tree was built.
     let kept: std::collections::HashSet<String> = binary.variants.iter().cloned().collect();
     let fixed_homoplasmies = collect_fixed_homoplasmies(&raw, max_hf, min_presence, &kept);
     if !fixed_homoplasmies.is_empty() {
@@ -1261,11 +1080,6 @@ pub fn start(
     let cleaned_hap_matrix = out.cleaned_haplotypes;
 
     // ── Step 4: write final haplotype map (filtered by SCITE) ─────────────────
-    // No re-filtering here, by design: the cleaned matrix holds exactly the
-    // variants the tree was built on, and re-applying prevalence/HF filters after
-    // imputation (which removed the `None` cells, and can push a variant to
-    // absent == 0 or freq == 1.0) would re-drop variants and make the no-VCF
-    // output diverge from the VCF one.
     info!(
         "[4/6] Cleaned reads deduplicated into {} haplotypes across {} variants.",
         cleaned_hap_matrix.haplotypes.len(),
@@ -1292,8 +1106,7 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
-    /// An `HfFilter::FromVcf` holding exactly `names`, as `parse_vcf` would have
-    /// produced it after applying the HF band.
+    /// An `HfFilter::FromVcf` holding exactly `names`.
     fn from_vcf(names: &[&str]) -> HfFilter {
         HfFilter::FromVcf {
             map: names.iter().map(|n| (n.to_string(), 0.5)).collect(),
@@ -1302,8 +1115,7 @@ mod tests {
         }
     }
 
-    /// Parse `csv` and filter it, i.e. what the old `parse_binary_matrix` did in
-    /// one call. Plan 2026-09-26 T5.
+    /// Parse `csv` and filter it, i.e. what the old `parse_binary_matrix` did in one call.
     fn filter_from_csv(
         csv: &str,
         hf: &HfFilter,
@@ -1363,7 +1175,6 @@ mod tests {
 
     #[test]
     fn resolve_error_rates_presets_differ_per_data_type() {
-        // Intended (cleanup C2 / D4): all ONT types share the raw-BAM preset.
         assert_eq!(resolve_error_rates("pacbio", None, None), (0.005, 0.05));
         let ont = (0.005, 0.02);
         assert_eq!(resolve_error_rates("ont-denoised", None, None), ont);
@@ -1390,9 +1201,8 @@ mod tests {
 
     #[test]
     fn resolve_hp_rates_defaults_to_twice_the_global_rate_capped_at_half() {
-        // Plan 2026-09-26 T6. The factor 2 is a placeholder until the T7 sweep.
         assert_eq!(resolve_hp_rates(0.005, 0.05, None, None), (0.01, 0.1));
-        // 2 × 0.4 = 0.8, which the cap pulls back to 0.5. The fn side stays under it.
+        // 2 × 0.4 = 0.8, which the cap pulls back to 0.5.
         assert_eq!(resolve_hp_rates(0.4, 0.01, None, None), (0.5, 0.02));
         // An explicit flag is used verbatim, including a value above the cap and 0.
         assert_eq!(resolve_hp_rates(0.005, 0.05, Some(0.9), None), (0.9, 0.1));
@@ -1427,10 +1237,7 @@ mod tests {
 
     #[test]
     fn collect_fixed_homoplasmies_finds_near_fixed_sites_not_already_kept() {
-        // m.100: freq 4/4 = 1.0 (>= max_hf 0.95), supported -> recovered.
-        // m.200: freq 3/4 = 0.75 (< max_hf) -> heteroplasmic, not recovered.
-        // m.300: freq 1.0 but only 1 supporting read (< min_presence 2) -> noise.
-        // m.400: freq 1.0 and supported, but already kept -> excluded.
+        // m.100: freq 4/4 = 1.0, supported -> recovered. m.200: freq 3/4 = 0.75 -> heteroplasmic, not recovered. m.300.
         let csv = "variant,r1,r2,r3,r4\n\
                    m.100A>G,1,1,1,1\n\
                    m.200C>T,1,1,1,0\n\
@@ -1445,7 +1252,7 @@ mod tests {
 
     #[test]
     fn write_cleaned_matrix_all_variants_appends_all_present_rows() {
-        // Plan 2026-09-26 T3. Built in memory; the expected text is unchanged.
+        // Built in memory; the expected text is unchanged.
         let cleaned = crate::scite::CleanedMatrix {
             variants: vec!["m.200C>T".to_string()],
             reads: vec!["r1".to_string(), "r2".to_string(), "r3".to_string()],
@@ -1472,8 +1279,7 @@ mod tests {
         let matrix = BinaryMatrix {
             variants: vec!["m.100A>G".to_string()],
             reads: vec!["r1".to_string(), "r2".to_string()],
-            // Both reads are "ref-or-missing" if you ignore the distinction,
-            // but r1 is an explicit ref call and r2 is genuinely uncovered.
+            // Both reads are "ref-or-missing" if you ignore the distinction.
             data: vec![vec![Some(0), None]],
         };
         let hap_matrix = deduplicate(&matrix, 1);
@@ -1546,7 +1352,6 @@ mod tests {
         };
         let dist = hamming_distance_matrix(&hap_matrix);
         // Jointly covered sites are A and B only (H0 is missing at C).
-        // They differ at B only -> distance = 1/2.
         assert!((dist.data[0][1] - 0.5).abs() < 1e-12);
         assert!((dist.data[1][0] - 0.5).abs() < 1e-12);
     }
@@ -1557,9 +1362,7 @@ mod tests {
 
     #[test]
     fn hamming_distance_matrix_fills_uncovered_pairs_with_mean_distance() {
-        // Plan 2026-09-26 T1. H0 and H1 share no covered site. H0–H2 and H1–H2
-        // each differ at their only jointly covered site, so the mean of the
-        // defined off-diagonal distances is 1.0.
+        // H0 and H1 share no covered site.
         let hap_matrix = HaplotypeMatrix {
             variants: vec!["A".into(), "B".into()],
             haplotypes: vec![
@@ -1584,7 +1387,7 @@ mod tests {
 
     #[test]
     fn hamming_distance_matrix_zero_fills_when_no_pair_has_shared_coverage() {
-        // Plan 2026-09-26 T1. With no finite off-diagonal distance, the fill is 0.0.
+        // With no finite off-diagonal distance, the fill is 0.0.
         let hap_matrix = HaplotypeMatrix {
             variants: vec!["A".into(), "B".into()],
             haplotypes: vec![
@@ -1614,9 +1417,7 @@ mod tests {
 
     #[test]
     fn four_gamete_test_missing_calls_do_not_fabricate_the_ref_gamete() {
-        // Only 01, 10, 11 are truly observed. The "00" gamete would only appear
-        // if a None were read as ref (the old behavior). With None excluded there
-        // is no violation.
+        // Only 01, 10, 11 are truly observed.
         let matrix = HaplotypeMatrix {
             variants: vec!["A".into(), "B".into()],
             haplotypes: vec![
@@ -1646,8 +1447,7 @@ mod tests {
 
         assert_eq!(tree.root, 3);
         assert_eq!(tree.nodes[3].parent, None);
-        // Old root (4) collapses; H2 hangs directly under the new root with its
-        // branch length summed through the old root (5.0 + 3.0).
+        // Old root (4) collapses; H2 hangs directly under the new root with its branch length summed through the old root.
         assert_eq!(tree.nodes[2].parent, Some(3));
         assert!((tree.nodes[2].branch_length - 8.0).abs() < 1e-12);
         // Outgroup and sibling keep their original lengths to INT3.
@@ -1683,7 +1483,7 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.99
         assert_eq!(map.len(), 3);
     }
 
-    // Plan 2026-09-26 T4. Captures `warn!` so the missing-header case is observable.
+    // Captures `warn!` so the missing-header case is observable.
     struct NormalizationLog;
 
     static NORMALIZATION_LOG: std::sync::Mutex<Vec<(std::thread::ThreadId, String)>> =
@@ -1735,8 +1535,7 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
         )
     }
 
-    /// Plan 2026-09-26 T4. A VCF without `##HimitoNormalization` must still parse,
-    /// and must warn once that homopolymer indels may be split across names.
+    /// A VCF without `##HimitoNormalization` must still parse.
     #[test]
     fn parse_vcf_warns_once_when_header_lacks_himito_normalization() {
         install_normalization_log();
@@ -1777,8 +1576,7 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
         );
     }
 
-    /// Plan 2026-09-26 T3. Temp prefixes are stable across runs, so leftovers
-    /// from a previous debug run must be removed before the absence check.
+    /// Temp prefixes are stable across runs.
     fn prepare_debug_output_prefix(dir_name: &str) -> (String, String) {
         let dir = std::env::temp_dir().join(dir_name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1838,7 +1636,6 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
 
     #[test]
     fn debug_false_omits_raw_files_and_cleaned_matrix() {
-        // Plan 2026-09-26 T3.
         let (matrix, prefix) = prepare_debug_output_prefix("himito_t3_debug_off");
         run_small_lineage(&matrix, &prefix, false, &[]);
         for suffix in [
@@ -1856,7 +1653,6 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
 
     #[test]
     fn debug_true_writes_both_raw_files() {
-        // Plan 2026-09-26 T3.
         let (matrix, prefix) = prepare_debug_output_prefix("himito_t3_debug_on");
         run_small_lineage(&matrix, &prefix, true, &[]);
         for suffix in [".raw_haplotype_map.tsv", ".raw_variant_cooccurrence.tsv"] {
@@ -1868,9 +1664,7 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
         }
     }
 
-    /// Two HVS1-C rows plus one variant outside every tract. Both tract rows
-    /// are present in one read and absent in the other three (HF 0.25), so
-    /// they clear `min_presence`/`min_absence` and the default HF band.
+    /// Two HVS1-C rows plus one variant outside every tract.
     fn write_hvs1_opt_in_matrix(dir_name: &str) -> (String, String) {
         let dir = std::env::temp_dir().join(dir_name);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1894,7 +1688,6 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
 
     #[test]
     fn empty_tracts_keep_hvs1_names_and_known_tracts_collapse_them() {
-        // Plan 2026-09-26 T9.
         let (matrix, off) = write_hvs1_opt_in_matrix("himito_t9_collapse_off");
         run_small_lineage(&matrix, &off, false, &[]);
         let off_csv = cleaned_names(&off);
@@ -1930,9 +1723,7 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3
 
     #[test]
     fn empty_tracts_drop_a_tract_looking_row_absent_from_the_vcf() {
-        // Plan 2026-09-26 T9. With no tracts, `tract_rows` is empty, so
-        // `HfFilter::FromVcf` drops a name that is not in the VCF map — the
-        // pre-T5 behaviour — rather than judging it on the matrix band.
+        // With no tracts, `tract_rows` is empty, so `HfFilter::FromVcf` drops a name that is not in the VCF map.
         let dir = std::env::temp_dir().join("himito_t9_vcf_empty_tracts");
         std::fs::create_dir_all(&dir).unwrap();
         let matrix_path = dir.join("matrix.csv");
@@ -1994,12 +1785,7 @@ chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.5
     }
 }
 
-/// Parity checks: the with-VCF and without-VCF variant filtering must select the
-/// same variants, so a lineage run produces identical output either way (assuming
-/// a VCF whose HF matches the matrix and which applies no extra filters).
-/// Plan 2026-09-26 T5. Every case is spelled against the real `HVS1-C` tract
-/// (rCRS 16183-16193, `ACCCCCTCCCC`), so the fixtures double as a check that
-/// the tract table lines up with the variant names `call` emits.
+/// Parity checks: the with-VCF and without-VCF variant filtering must select the same variants.
 #[cfg(test)]
 mod tract_collapse_tests {
     use super::*;
@@ -2040,8 +1826,7 @@ mod tract_collapse_tests {
 
     #[test]
     fn collapse_tracts_merges_equivalent_spellings_of_one_c_run() {
-        // Case 1. r1 carries the extra C before the interrupting T, r2 after
-        // it; both are C11 once T16189C is applied. r3/r4 are plain C10.
+        // Case 1. r1 carries the extra C before the interrupting T, r2 after it.
         let out = collapse_tracts(
             raw(
                 &["m.16183A>AC", "m.16189T>TC", "m.16189T>C"],
@@ -2056,7 +1841,7 @@ mod tract_collapse_tests {
 
     #[test]
     fn collapse_tracts_empty_slice_returns_the_input_unchanged() {
-        // Plan 2026-09-26 T9. The T5 case-1 fixture, with no tracts to collapse.
+        // The T5 case-1 fixture, with no tracts to collapse.
         let input = raw(
             &["m.16183A>AC", "m.16189T>TC", "m.16189T>C"],
             &["1000", "0100", "1111"],
@@ -2075,8 +1860,7 @@ mod tract_collapse_tests {
             raw(&["m.16183A>AC", "m.16189T>C"], &["100", "010"]),
             KNOWN_TRACTS,
         );
-        // r1 keeps the T and gains a C; r2 is C10. Neither equals the
-        // reference, and no row is emitted for the reference sequence.
+        // r1 keeps the T and gains a C; r2 is C10.
         assert_eq!(out.variants, vec![hvs1(C10), hvs1("ACCCCCCTCCCC")]);
         assert_eq!(out.data, vec![cells("010"), cells("100")]);
     }
@@ -2094,8 +1878,7 @@ mod tract_collapse_tests {
 
     #[test]
     fn collapse_tracts_sets_conflicting_reads_missing() {
-        // Case 4, all three conflict kinds. In each fixture r1 carries both
-        // rows and r2 only the second one, which must still collapse.
+        // Case 4, all three conflict kinds.
 
         // Two insertions after the same offset.
         let out = collapse_tracts(
@@ -2124,7 +1907,7 @@ mod tract_collapse_tests {
 
     #[test]
     fn collapse_tracts_leaves_variants_straddling_the_boundary_alone() {
-        // Case 5. `m.16193CA>C` deletes 16194, one base past the tract.
+        // Case 5.
         let out = collapse_tracts(
             raw(&["m.16189T>C", "m.16193CA>C"], &["11", "01"]),
             KNOWN_TRACTS,
@@ -2135,8 +1918,7 @@ mod tract_collapse_tests {
 
     #[test]
     fn collapse_tracts_leaves_non_indel_non_snv_names_alone() {
-        // Case 5, second half of the rule: an MNV is not collapsible, so it
-        // stays its own row while the rest of the tract still collapses.
+        // Case 5, second half of the rule: an MNV is not collapsible.
         let out = collapse_tracts(
             raw(&["m.16188CT>GA", "m.16189T>C"], &["10", "11"]),
             KNOWN_TRACTS,
@@ -2147,8 +1929,7 @@ mod tract_collapse_tests {
 
     #[test]
     fn collapse_tracts_skips_a_tract_whose_reference_does_not_match() {
-        // Case 6. rCRS has C at 16185, so `m.16185G>A` says this is not rCRS;
-        // the whole tract passes through untouched.
+        // Case 6. rCRS has C at 16185, so `m.16185G>A` says this is not rCRS; the whole tract passes through untouched.
         let input = raw(&["m.16185G>A", "m.16189T>C"], &["10", "11"]);
         let expected = input.clone();
         assert_eq!(collapse_tracts(input, KNOWN_TRACTS), expected);
@@ -2156,7 +1937,7 @@ mod tract_collapse_tests {
 
     #[test]
     fn collapse_tracts_keeps_other_rows_in_place() {
-        // Case 7. Tract rows land where the first constituent row was.
+        // Case 7.
         let out = collapse_tracts(
             raw(
                 &["m.100A>G", "m.16189T>C", "m.200C>T", "m.16183A>AC", "m.300G>A"],
@@ -2180,8 +1961,7 @@ mod tract_collapse_tests {
         );
     }
 
-    /// The rows `lineage::start` feeds the filter: three tract calls plus one
-    /// ordinary variant.
+    /// The rows `lineage::start` feeds the filter: three tract calls plus one ordinary variant.
     fn collapsed_fixture() -> (RawMatrix, HashSet<String>) {
         let csv = "variant,r1,r2,r3,r4\n\
                    m.16183A>AC,1,0,0,0\n\
@@ -2203,8 +1983,7 @@ mod tract_collapse_tests {
 
     #[test]
     fn tract_rows_are_judged_on_matrix_frequency_on_the_vcf_path() {
-        // Step 5. The VCF knows `m.3243A>G` and nothing about the tract
-        // alleles, which are synthesised from three of its records.
+        // Step 5.
         let (raw, tract_rows) = collapsed_fixture();
         assert_eq!(tract_rows.len(), 2);
         let mut map = HfMap::new();
@@ -2222,8 +2001,7 @@ mod tract_collapse_tests {
             vec![hvs1(C10), hvs1(C11), "m.3243A>G".to_string()]
         );
 
-        // Both tract alleles sit at 2/4 = 0.50, so a ceiling below that drops
-        // them while the VCF-listed variant is untouched by the band.
+        // Both tract alleles sit at 2/4 = 0.50.
         let kept = filter_matrix(
             &raw,
             &HfFilter::FromVcf { map, min: 0.2, max: 0.4 },
@@ -2264,7 +2042,7 @@ mod vcf_parity_tests {
     use super::*;
     use std::io::Cursor;
 
-    /// Build a `variant,r1..r10` CSV. `cells` are raw tokens ("" = uncovered).
+    /// Build a `variant,r1..r10` CSV.
     fn build_csv(rows: &[(&str, [&str; 10])]) -> String {
         let mut csv = String::from("variant,r1,r2,r3,r4,r5,r6,r7,r8,r9,r10\n");
         for (vid, cells) in rows {
@@ -2278,8 +2056,7 @@ mod vcf_parity_tests {
         csv
     }
 
-    /// Parse `csv` and filter it, i.e. what the old `parse_binary_matrix` did in
-    /// one call. Plan 2026-09-26 T5.
+    /// Parse `csv` and filter it, i.e. what the old `parse_binary_matrix` did in one call.
     fn filter_from_csv(
         csv: &str,
         hf: &HfFilter,
@@ -2292,13 +2069,7 @@ mod vcf_parity_tests {
 
     #[test]
     fn no_vcf_matrix_frequency_filter_matches_vcf_hf_filter() {
-        // present/absent/uncovered per variant, thresholds min_hf=0.2 max_hf=0.85:
-        //   m.100A>G  present=3 absent=3 uncovered=4 -> HF 3/6  = 0.50  KEEP
-        //   m.200C>T  present=1 absent=3 uncovered=6 -> HF 1/4  = 0.25  KEEP
-        //             (row.len() denom would give 1/10 = 0.10 -> wrongly DROPPED,
-        //              so this row exercises the covered-read denominator)
-        //   m.300G>A  present=9 absent=1 uncovered=0 -> HF 9/10 = 0.90  DROP (homoplasmic)
-        //   m.400T>C  present=1 absent=9 uncovered=0 -> HF 1/10 = 0.10  DROP (too low)
+        // present/absent/uncovered per variant, thresholds min_hf=0.2 max_hf=0.85.
         let csv = build_csv(&[
             ("m.100A>G", ["1", "1", "1", "0", "0", "0", "", "", "", ""]),
             ("m.200C>T", ["1", "0", "0", "0", "", "", "", "", "", ""]),
@@ -2308,10 +2079,7 @@ mod vcf_parity_tests {
 
         let (min_presence, min_absence, min_hf, max_hf) = (1usize, 1usize, 0.2f64, 0.85f64);
 
-        // "With VCF": the map holds exactly the variants whose HF is in range, as
-        // parse_vcf would produce (HF computed as alt/coverage). Note the band
-        // itself is NOT passed here any more — under `FromVcf` it is already
-        // spent, which is precisely what the enum makes unstateable.
+        // "With VCF": the map holds exactly the variants whose HF is in range, as parse_vcf would produce.
         let mut with_vcf_hf = HfMap::new();
         with_vcf_hf.insert("m.100A>G".to_string(), 0.50);
         with_vcf_hf.insert("m.200C>T".to_string(), 0.25);
@@ -2340,9 +2108,7 @@ mod vcf_parity_tests {
 
     #[test]
     fn no_vcf_denominator_excludes_uncovered_reads() {
-        // Heteroplasmic among covered reads but "rare" if uncovered cells are
-        // counted: present=2 absent=2 uncovered=6 -> covered HF 2/4 = 0.50,
-        // row.len() HF 2/10 = 0.20. A threshold between the two isolates the bug.
+        // Heteroplasmic among covered reads but "rare" if uncovered cells are counted.
         let csv = build_csv(&[("m.500A>C", ["1", "1", "0", "0", "", "", "", "", "", ""])]);
         let kept = filter_from_csv(
             &csv,
@@ -2350,20 +2116,13 @@ mod vcf_parity_tests {
             1,
             1,
         );
-        // Covered-read denominator (0.50) retains it; the old row.len() denominator
-        // (0.20 < 0.30) would have dropped it.
+        // Covered-read denominator (0.50) retains it; the old row.len() denominator (0.20 < 0.30) would have dropped it.
         assert_eq!(kept.variants, vec!["m.500A>C"]);
     }
 
     #[test]
     fn a_vcf_matching_no_variants_keeps_nothing_rather_than_falling_back() {
-        // BEHAVIOR CHANGE, deliberate. A VCF whose variants all fall outside the
-        // HF band yields an empty map. The old three-parameter signature decided
-        // "is a VCF in play?" by `hf_map.is_empty()`, so an empty map was
-        // indistinguishable from "no VCF given" and the matrix-derived band
-        // silently took over — filtering by a criterion the user never asked
-        // for, and admitting variants the VCF had excluded. `FromVcf` says
-        // which mode is in play independently of how many entries it holds.
+        // BEHAVIOR CHANGE, deliberate.
         let csv = build_csv(&[("m.100A>G", ["1", "1", "1", "0", "0", "0", "", "", "", ""])]);
         let kept = filter_from_csv(
             &csv,

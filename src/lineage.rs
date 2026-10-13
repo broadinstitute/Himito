@@ -1841,7 +1841,7 @@ mod tract_collapse_tests {
 
     #[test]
     fn collapse_tracts_empty_slice_returns_the_input_unchanged() {
-        // The T5 case-1 fixture, with no tracts to collapse.
+        // The case-1 fixture, with no tracts to collapse.
         let input = raw(
             &["m.16183A>AC", "m.16189T>TC", "m.16189T>C"],
             &["1000", "0100", "1111"],

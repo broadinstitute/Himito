@@ -568,7 +568,7 @@ fn compute_corrections(
         }
     }
 
-    // ---- ONT-recall Phase2 T6b: linkage rescue of pending alleles ----
+    // ---- linkage rescue of pending alleles ----
     let rescued = rescue_linked_pending(&deferred, &carriers, &kept_minors, &spans);
     stats.alt_alleles_rescued_by_linkage = rescued.len() as u64;
     let mut pending_keys: Vec<&AlleleKey> = deferred.keys().collect();
@@ -884,7 +884,7 @@ fn apply_corrections(
                                             &observed, model, iopts,
                                         ) {
                                             indel::Assignment::Keep => continue,
-                                            // Unreachable at an HP site (T8c), but counted rather than silently dropped if that ever changes.
+                                            // Unreachable at an HP site, but counted rather than silently dropped if that ever changes.
                                             indel::Assignment::Refused => {
                                                 stats
                                                     .assignments_skipped_unsupported_transition += 1;

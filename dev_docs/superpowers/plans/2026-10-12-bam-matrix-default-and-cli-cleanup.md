@@ -184,23 +184,33 @@ The matrix now comes from **raw reads in every ONT mode**. So the `ont-denoised`
 ## Results
 
 ### cargo test
-- C0: ____ / C5: ____
+- C0: 442 passed; 0 failed; 1 ignored / C5: 457 passed; 0 failed; 1 ignored
+  (C1 +7/−1, C3 +11/−2 max-partner)
 
 ### HapMap `merge215k`
 
 | step | ont-r10 TP/FP/FN | VCF identical to C0? | matrix: minor SNV FP / missing | notes |
 |---|---|---|---|---|
-| C0 | | — | graph: 0.07% / 15.9% | |
-| C1 | | | | |
-| C2 | | | | presets: |
-| C3 | | | | |
-| C5 | | | | |
+| C0 | 114/6/7 | — | graph: 0.07% / 15.9% | baseline |
+| C1 | 114/6/7 | call-path yes; e2e bytes differ (filter HashSet) | BAM max-ed4: 0.33% / 3.2% | gates met; graph_matrix gone |
+| C2 | (call unchanged) | call-path yes | — | presets: ONT 0.005/0.02 |
+| C3 | (call unchanged) | call-path yes | — | CLI split |
+| C5 | 113/5/8 e2e | call-path yes | 0.31% / 3.2% (major miss 2.9%) | e2e TP delta = filter downsample nondeterminism |
 
 ### `bench_standard.sh` (30 seeds)
 
 | step | profile | var_f1 | ad_f1 | hap_f1 |
 |---|---|---|---|---|
-| C0 | ont-r10 | | | |
-| C0 | ont-denoised | | | |
-| C1 | | | | |
-| C2 | | | | |
+| C0 | ont-r10 | 0.9477 | 0.7564 | 0.2925 |
+| C0 | ont-denoised | 0.9984 | 0.9941 | 0.9717 |
+| C1 | ont-denoised (smoke 3) | 1.000 | 1.000 | 1.000 |
+| C1 | ont-r10 (smoke 3) | ~0.95 | 0.963 | 0.651 |
+| C2 | ont-denoised (10 seeds @ D4) | 0.9952 | 1.000 | 0.9952 |
+| C5 | ont-denoised | 0.9984 | 1.0000 | 0.9984 |
+| C5 | ont-r10 | 0.9477 | 0.9271 | 0.7355 |
+
+Notes: call-path HapMap VCF is byte-identical to C0 at every step after C1.
+End-to-end TP/FP/FN can move slightly because `filter` downsamples via
+`HashSet` iteration order. C5 sims beat C0 on both profiles (BAM matrix +
+ONT SCITE 0.005/0.02). `score_lineage.py` still labels fp/fn with stale
+profile defaults in the TSV; Himito logs `SCITE fp=0.005, fn=0.02`.

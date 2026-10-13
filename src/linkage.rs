@@ -1,11 +1,4 @@
-//! Read-linkage rescue of low-frequency SNVs (ONT-recall R3-T2).
-//!
-//! A sub-2% allele that is a real lineage marker rides on the same molecules as
-//! the other markers of that lineage; a sequencing error does not. From a raw
-//! (pre-denoise) BAM pileup, every SNV allele in `[LINK_MIN_HF, LINK_MAX_HF)` is
-//! paired with the others, and an allele is accepted when at least one partner
-//! co-occurs with it far beyond chance, overall AND on each strand separately.
-//! `scripts/ont_recall/linkage_oracle.py` is the reference for the same rule.
+//! A sub-2% lineage marker rides on the same molecules as the other markers; a sequencing error does not.
 
 use std::path::Path;
 use std::time::Instant;
@@ -52,7 +45,8 @@ impl Default for LinkOpts {
     }
 }
 
-/// An accepted allele. `pos` is 0-based, like `call::Variant::pos` for SNPs.
+/// An accepted allele.
+/// `pos` is 0-based, like `call::Variant::pos` for SNPs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkCall {
     pub pos: usize,
@@ -83,8 +77,7 @@ fn ln_choose(n: u32, k: u32) -> f64 {
     ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)
 }
 
-/// log10 P(X >= k) for X ~ Hypergeometric(population `n_total`, `k_succ`
-/// successes, `n_draw` draws), summed in log space.
+/// log10 P(X >= k) for X ~ Hypergeometric(population `n_total`, `k_succ` successes, `n_draw` draws).
 pub fn log10_hyper_sf(k: u32, n_total: u32, k_succ: u32, n_draw: u32) -> f64 {
     if k == 0 {
         return 0.0;
@@ -134,10 +127,7 @@ impl Fenwick {
     }
 }
 
-/// For each query `(lo, hi)` with `lo <= hi`, the (forward, reverse) number of
-/// spans `[start, end)` that contain both positions. Spans are swept by start,
-/// queries by `lo`, and one Fenwick tree per strand over span ends answers
-/// "end > hi" for the spans already started.
+/// For each query `(lo, hi)` with `lo <= hi`.
 pub fn cocover_counts(spans: &[(u32, u32, bool)], queries: &[(u32, u32)], len: u32) -> Vec<(u32, u32)> {
     let mut by_start: Vec<usize> = (0..spans.len()).collect();
     by_start.sort_unstable_by_key(|&i| spans[i].0);
@@ -224,14 +214,12 @@ fn span_index(spans: &[(u32, u32)], p: u32) -> Option<usize> {
     spans.iter().position(|&(s, e)| s <= p && p < e)
 }
 
-/// A read co-covers two positions when its merged spans cover both, possibly
-/// through different records (a read split across the circular origin).
+/// A read co-covers two positions when its merged spans cover both.
 fn covers_both(spans: &[(u32, u32)], lo: u32, hi: u32) -> bool {
     span_index(spans, lo).is_some() && span_index(spans, hi).is_some()
 }
 
-/// One side (overall or one strand) of the R3-4 pair rule. Returns
-/// `(enrichment, log10 p)` when it passes.
+/// One side (overall or one strand) of the R3-4 pair rule.
 fn pair_rule(k: u32, n_total: u32, k_succ: u32, n_draw: u32, min_cover: u32, min_shared: u32, min_enrich: f64, max_log10p: f64) -> Option<(f64, f64)> {
     if n_total < min_cover || k < min_shared {
         return None;
@@ -244,15 +232,14 @@ fn pair_rule(k: u32, n_total: u32, k_succ: u32, n_draw: u32, min_cover: u32, min
     (lp <= max_log10p).then_some((enrich, lp))
 }
 
-/// ONT-recall R3-T2. Read-linkage rescue on `ref_name` of a coordinate-sorted BAM
-/// (the raw, pre-denoise reads). Returns every accepted allele with its best
-/// partner, sorted by position; whether it is already called is the caller's
-/// business (R3-5, R3-7).
+/// Read-linkage rescue on `ref_name` of a coordinate-sorted BAM (the raw, pre-denoise reads).
+/// Returns every accepted allele with its best partner, sorted by position; whether it is already
+/// called is the caller's business (R3-5, R3-7).
 pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -> Result<(Vec<LinkCall>, LinkSummary)> {
     let t0 = Instant::now();
     let mut summary = LinkSummary::default();
 
-    // 1. Reads: id, strand of the primary record, max error rate, merged spans.
+    // 1.
     let mut reader = bam::Reader::from_path(bam_path)
         .with_context(|| format!("cannot open linkage BAM {bam_path:?}"))?;
     let tid = match reader.header().tid(ref_name.as_bytes()) {
@@ -321,7 +308,7 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
     let bad: Vec<bool> = reads.iter().map(|r| r.err > err_cut).collect();
     summary.bad_reads = bad.iter().filter(|&&b| b).count();
 
-    // 2. Candidates from one pileup pass over the good reads.
+    // 2.
     let mut reader = bam::Reader::from_path(bam_path)
         .with_context(|| format!("cannot open linkage BAM {bam_path:?}"))?;
     let mut plp = reader.pileup();
@@ -388,7 +375,7 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
     }
     summary.candidates = cands.len();
 
-    // 3. Pairs more than min_dist apart sharing >= min_shared carriers.
+    // 3.
     let n_c = cands.len();
     let pos_of: Vec<u32> = cands.iter().map(|c| c.pos).collect();
     let mut index: Vec<Vec<u32>> = vec![Vec::new(); reads.len()];
@@ -429,10 +416,7 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
     pairs.sort_unstable();
     summary.pairs_tested = pairs.len();
 
-    // 4. Co-covered read counts per strand. The Fenwick sweep counts reads with
-    // ONE merged span over both positions (spans of a read are disjoint, so at
-    // most one per read); reads covering them through different spans are added
-    // by a direct scan of the multi-span reads.
+    // 4.
     let good: Vec<&ReadInfo> = reads.iter().zip(&bad).filter(|(_, &b)| !b).map(|(r, _)| r).collect();
     let spans: Vec<(u32, u32, bool)> = good
         .iter()
@@ -451,7 +435,7 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
         }
     });
 
-    // 5. Overall and per-strand hypergeometric rule (R3-4).
+    // 5.
     let passing: Vec<(u32, u32, u32, f64, f64)> = pairs
         .par_iter()
         .zip(cocover.par_iter())
@@ -514,7 +498,7 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
         .collect();
     summary.pairs_passing = passing.len();
 
-    // 6. Accept every candidate with >= 1 passing partner; report the strongest.
+    // 6.
     let mut best: Vec<Option<(u32, u32, f64, f64)>> = vec![None; n_c];
     for &(ia, ib, k, enrich, lp) in &passing {
         for (me, other) in [(ia, ib), (ib, ia)] {
@@ -600,8 +584,7 @@ mod tests {
         d
     }
 
-    /// Header `chr1`, `chrM`: chrM reads are tid 1, so a `tid() == 0` assumption
-    /// sees nothing. Every chrM read is a full-length match at position 0.
+    /// Header `chr1`, `chrM`: chrM reads are tid 1, so a `tid() == 0` assumption sees nothing.
     fn write_fixture(path: &Path, refseq: &[u8], reads: &[FxRead]) {
         let mut header = Header::new();
         for (name, len) in [("chr1", 100usize), ("chrM", refseq.len())] {
@@ -643,8 +626,7 @@ mod tests {
         }
     }
 
-    /// `N_READS` reads alternating forward/reverse; read `i` carries allele A
-    /// (at `pa`) when `a(i)`, B (at `pb`) when `b(i)`, with NM `nm(i)`.
+    /// `N_READS` reads alternating forward/reverse; read `i` carries allele A (at `pa`) when `a(i)`.
     fn run_scenario(
         tag: &str,
         pa: usize,
@@ -761,8 +743,7 @@ mod tests {
 
     #[test]
     fn linkage_only_on_bad_reads_is_rejected() {
-        // The 40 carriers are the highest-error reads (NM/len 0.2 vs 0.01), above
-        // the 95th percentile, so they leave every count and nothing is a candidate.
+        // The 40 carriers are the highest-error reads, above the 95th percentile.
         let (calls, summary) =
             run_scenario("bad", 200, 700, |i| i < 40, |i| i < 40, |i| if i < 40 { 200 } else { 10 });
         assert_eq!(summary.bad_reads, 40);
@@ -772,8 +753,7 @@ mod tests {
 
     #[test]
     fn reads_split_into_two_records_co_cover_both_alleles() {
-        // Like a read split at the circular origin: every read is a primary record
-        // over [0, 300) plus a supplementary over [600, 1000); alleles at 100 and 900.
+        // Like a read split at the circular origin.
         let refseq = fixture_ref();
         let mut header = Header::new();
         for (name, len) in [("chr1", 100usize), ("chrM", REF_LEN)] {

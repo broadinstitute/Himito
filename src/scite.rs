@@ -13,11 +13,6 @@ use crate::lineage::{self, BinaryMatrix, HaplotypeMatrix};
 use crate::rootblock::{self, RootBlockConfig};
 
 /// A growable bitset over mutation/variant ids, backed by `Vec<u64>` words.
-///
-/// Bit `i` set means mutation/variant `i` is present. Backing the mask with a
-/// word vector (rather than a single `u64`) lifts the old 63-variant ceiling on
-/// the SCITE search: any number of mutations is representable. An empty mask
-/// (no words) represents the all-zero germline state.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Mask {
     words: Vec<u64>,
@@ -62,16 +57,10 @@ impl Mask {
     }
 }
 
-/// Log-likelihood differences below this are treated as exact ties. Attachment
-/// and unary-path ordering both have genuinely flat regions (see
-/// `polish_unary_path_order`), and resolving those by float noise makes the
-/// output depend on iteration order rather than on the data.
+/// Log-likelihood differences below this are treated as exact ties.
 const LL_TIE_EPS: f64 = 1e-9;
 
-/// A SCITE-style mutation tree: `n_mutations` mutation nodes (ids
-/// `0..n_mutations`, in the same order as `BinaryMatrix::variants`) plus one
-/// root node (id `n_mutations`, the unmutated germline state).
-/// `parent[i]` is node `i`'s parent; the root is its own parent.
+/// A SCITE-style mutation tree: `n_mutations` mutation nodes plus one root node.
 #[derive(Debug, Clone)]
 pub struct MutationTree {
     pub n_mutations: usize,
@@ -83,8 +72,7 @@ impl MutationTree {
         self.n_mutations
     }
 
-    /// Bitmask of mutation ids on the path from `node` to the root,
-    /// inclusive of `node` itself if it is a mutation node. Root's mask is 0.
+    /// Bitmask of mutation ids on the path from `node` to the root.
     pub fn ancestor_mask(&self, node: usize) -> Mask {
         let mut mask = Mask::new();
         let mut cur = node;
@@ -96,11 +84,6 @@ impl MutationTree {
     }
 
     /// Bitmask of all proper descendants of `node` (not including itself).
-    ///
-    /// Note: `swap_subtrees` (Task 8) builds its own "descendants" list using
-    /// `ancestor_mask` with a filter that *does* include `node` itself — those
-    /// two conventions are intentionally different. This method is only used in
-    /// `propose_prune_reattach` to exclude a node's own subtree from reattachment targets.
     fn descendant_mask(&self, node: usize) -> Mask {
         let children = self.children_of();
         let mut mask = Mask::new();
@@ -126,24 +109,14 @@ impl MutationTree {
         children
     }
 
-    /// Returns a new tree identical to `self` except `node`'s parent is
-    /// `new_parent`. Does not validate acyclicity — callers must only pass a
-    /// `new_parent` outside `node`'s own subtree (see `descendant_mask`).
+    /// Returns a new tree identical to `self` except `node`'s parent is `new_parent`.
     fn with_parent(&self, node: usize, new_parent: usize) -> MutationTree {
         let mut parent = self.parent.clone();
         parent[node] = new_parent;
         MutationTree { n_mutations: self.n_mutations, parent }
     }
 
-    /// A random valid tree: process mutations in random order, attaching
-    /// each one to a uniformly random *already-placed* node (root counts as
-    /// placed from the start). This is a "random recursive tree" — every
-    /// node it produces is acyclic by construction. It is not uniformly
-    /// distributed over all labeled trees the way reference SCITE's
-    /// Prüfer-sequence generator is, but that distinction doesn't matter for
-    /// MCMC correctness (see the plan header) — only for how fast chains
-    /// that DO start randomly mix, which the multi-chain restarts (Task 10)
-    /// already compensate for.
+    /// A random valid tree: process mutations in random order.
     pub fn random(n_mutations: usize, rng: &mut impl Rng) -> Self {
         let root = n_mutations;
         let mut parent = vec![root; n_mutations + 1];
@@ -167,25 +140,17 @@ impl MutationTree {
 }
 
 /// Fixed sequencing/genotyping error rates used in the SCITE likelihood model.
-///
-/// Plan 2026-09-26 T6. `per_variant[v]` overrides the global rates at variant
-/// `v`. An empty vector (see [`ErrorRates::uniform`]) keeps today's scoring.
-/// An index past the vector also uses the global rates, on purpose:
-/// `write_read_lineage_newick` scores haplotype profiles that include appended
-/// root-block columns past `n_mutations`, and those columns must keep the
-/// global false-positive term.
 pub struct ErrorRates {
     /// alpha: P(observed = 1 | true = 0) — false positive rate.
     pub fp_rate: f64,
     /// beta: P(observed = 0 | true = 1) — false negative rate.
     pub fn_rate: f64,
-    /// Optional `(fp, fn)` per variant index. Empty means every variant uses
-    /// the global rates.
+    /// Optional `(fp, fn)` per variant index.
     pub per_variant: Vec<(f64, f64)>,
 }
 
 impl ErrorRates {
-    /// Global rates for every variant. `per_variant` is empty.
+    /// Global rates for every variant.
     pub fn uniform(fp: f64, fnr: f64) -> Self {
         ErrorRates {
             fp_rate: fp,
@@ -194,23 +159,12 @@ impl ErrorRates {
         }
     }
 
-    /// The rates as every likelihood computation must use them: clamped into
-    /// `[RATE_FLOOR, 1 - RATE_FLOOR]` so no logarithm is infinite.
-    ///
-    /// Both scoring paths go through [`Self::clamped_for`], which is
-    /// load-bearing rather than tidiness. `attach_all_reads` scores reads
-    /// through [`AttachmentScorer`] while `write_read_lineage_newick` scores
-    /// haplotype profiles through [`best_attachment`]. If one clamped and the
-    /// other did not, then at `--fp-rate 0` — a supported input — the unclamped
-    /// path would score every node that fails to explain an alt call at exactly
-    /// `-inf`, fall through its tie-break to the root, and place a haplotype tip
-    /// on a different node than the reads that compose it.
+    /// The rates as every likelihood computation must use them.
     fn clamped(&self) -> (f64, f64) {
         Self::clamp_pair(self.fp_rate, self.fn_rate)
     }
 
-    /// Plan 2026-09-26 T6. `per_variant[v]` when `v` is in range, otherwise the
-    /// global rates. Out-of-range is the root-block columns past `n_mutations`.
+    /// `per_variant[v]` when `v` is in range, otherwise the global rates.
     fn clamped_for(&self, v: usize) -> (f64, f64) {
         match self.per_variant.get(v) {
             Some(&(fp, fnr)) => Self::clamp_pair(fp, fnr),
@@ -226,10 +180,7 @@ impl ErrorRates {
     }
 }
 
-/// Log-likelihood of `profile` (one read's observed calls, one per variant,
-/// `None` = missing/uncovered and contributes nothing) given that
-/// `ancestor_mask` bit `i` set means variant `i` is present under the
-/// candidate tree attachment being scored.
+/// Log-likelihood of `profile`; bit `i` of `ancestor_mask` means variant `i` is present.
 pub fn attachment_log_likelihood(
     profile: &[Option<u8>],
     ancestor_mask: &Mask,
@@ -238,7 +189,7 @@ pub fn attachment_log_likelihood(
     let mut ll = 0.0;
     for (i, call) in profile.iter().enumerate() {
         let Some(observed) = call else { continue };
-        // Plan 2026-09-26 T6. Each variant carries its own clamped rates.
+        // Each variant carries its own clamped rates.
         let (fp, fn_rate) = rates.clamped_for(i);
         let expected_mutated = ancestor_mask.get(i);
         let p = match (*observed, expected_mutated) {
@@ -253,14 +204,7 @@ pub fn attachment_log_likelihood(
     ll
 }
 
-/// The tree node (mutation node or root) whose implied genotype best
-/// explains `profile` under `rates`, together with that best log-likelihood.
-///
-/// Ties are broken parsimoniously: among nodes that explain the read equally
-/// well, the one carrying the fewest mutations wins. A read that is uncovered
-/// at a variant pays nothing for having it imputed as alt, so without this
-/// tie-break every partially-covered read drifts to the deepest tied node and
-/// `attach_all_reads` writes alt calls that no observation supports.
+/// The tree node whose implied genotype best explains `profile` under `rates`.
 pub fn best_attachment(
     profile: &[Option<u8>],
     tree: &MutationTree,
@@ -284,31 +228,10 @@ pub fn best_attachment(
     (best_node, best_ll)
 }
 
-/// Error rates are clamped into `[RATE_FLOOR, 1 - RATE_FLOOR]` before any
-/// logarithm is taken.
-///
-/// This is load-bearing, not defensive. `--fp-rate 0` is a supported input
-/// (see `lineage::resolve_error_rates`, which passes `Some(0.0)` through
-/// verbatim). The reference `attachment_log_likelihood` sums `ln(0) = -inf`
-/// directly and stays at `-inf`, but incremental scoring stores the *difference*
-/// between the mutated and unmutated log-probabilities, and `ln(1 - fn) - ln(0)`
-/// is `+inf`. Adding that to a `-inf` base gives `NaN`, which compares false
-/// against every threshold and would silently pin every read to node 0.
-///
-/// Clamping is also the more useful behaviour. At `fp = 0` the reference
-/// implementation scores every node that fails to explain some alt call at
-/// exactly `-inf`, so they all tie and the parsimony tie-break returns the root
-/// regardless of what the data says. The clamped version keeps them ordered.
+/// Error rates are clamped into `[RATE_FLOOR, 1 - RATE_FLOOR]` before any logarithm is taken.
 pub const RATE_FLOOR: f64 = 1e-12;
 
-/// Node visit order and mutation depth for one tree, computed once and reused
-/// across every read.
-///
-/// `preorder` lists every node exactly once with each parent before all of its
-/// children, which is what lets a read's score at a node be computed from its
-/// parent's in a single forward pass. `depth[node]` is the number of mutations
-/// on the root→node path — identical to `tree.ancestor_mask(node).count_ones()`,
-/// but O(1) to read instead of O(depth) to recompute.
+/// Node visit order and mutation depth for one tree, computed once and reused across every read.
 pub struct TreeLayout {
     preorder: Vec<usize>,
     depth: Vec<usize>,
@@ -332,22 +255,7 @@ impl TreeLayout {
     }
 }
 
-/// Per-read log-likelihood terms, precomputed so that scoring a read against a
-/// tree node costs O(1) per node rather than O(n_variants).
-///
-/// A SCITE mutation tree is a perfect phylogeny: `genotype(child)` is
-/// `genotype(parent)` plus exactly one mutation. So the log-likelihood of a read
-/// at a child differs from its value at the parent by a single term — the one
-/// for the child's own mutation. That term is `delta[variant][code]` for the
-/// read's call at the variant (Plan 2026-09-26 T6: the three codes share a
-/// table, but the table is per variant). `base[read]` holds the score at the
-/// root (nothing mutated); every node's score is the root's plus the deltas
-/// along its path, which one forward pass over `TreeLayout::preorder`
-/// accumulates.
-///
-/// Call codes are stored row-major by read, so the scoring pass — which walks
-/// every variant for one fixed read — reads a contiguous slice. A cell the
-/// read does not cover costs nothing at any node.
+/// Per-read log-likelihood terms, precomputed.
 const CODE_UNCOVERED: u8 = 0;
 /// An explicit reference call.
 const CODE_REF: u8 = 1;
@@ -357,26 +265,11 @@ const CODE_ALT: u8 = 2;
 pub struct AttachmentScorer {
     /// `base[r]` = log P(read r's calls | genotype is all-reference).
     base: Vec<f64>,
-    /// `code[r * n_variants + m]` — one of the three `CODE_*` values, naming
-    /// which entry of `delta[m]` cell `(r, m)` contributes.
-    ///
-    /// Stored as one byte per cell rather than the `f64` it selects, because
-    /// the per-cell term takes exactly three values for a given variant:
-    /// an `f64` per cell spends 64 bits carrying 2 bits of information. At
-    /// 100k reads x 200 variants that is ~20MB instead of ~160MB. Flat rather
-    /// than `Vec<Vec<u8>>` for the same reason — a row-per-read layout adds a
-    /// 24-byte header and a separate allocation per read, which at 100k reads
-    /// is another ~2.4MB and scatters the rows across the heap.
-    ///
-    /// Row-major by read, so the scoring pass — which walks every variant for
-    /// one fixed read — reads a contiguous slice.
+    /// `code[r * n_variants + m]` — one of the three `CODE_*` values.
     code: Vec<u8>,
     /// Row stride of `code`.
     n_variants: usize,
-    /// Plan 2026-09-26 T6. `delta[variant][code]` is
-    /// log P(call | variant mutated) − log P(call | variant not mutated).
-    /// The code is still one byte; only the three log-deltas depend on which
-    /// variant the call sits on.
+    /// `delta[variant][code]` is log P(call | variant mutated) − log P(call | variant not mutated).
     delta: Vec<[f64; 3]>,
 }
 
@@ -390,8 +283,7 @@ impl AttachmentScorer {
         let mut delta = vec![[0.0f64; 3]; n_variants];
 
         for m in 0..n_variants {
-            // Plan 2026-09-26 T6. Root score and the mutation delta both use
-            // this variant's own rates, not one matrix-wide pair.
+            // Root score and the mutation delta both use this variant's own rates, not one matrix-wide pair.
             let (fp, fnr) = rates.clamped_for(m);
             let ln_fp = fp.ln();
             let ln_1mfp = (1.0 - fp).ln();
@@ -410,8 +302,7 @@ impl AttachmentScorer {
                         base[r] += ln_1mfp;
                         code[r * n_variants + m] = CODE_REF;
                     }
-                    // Uncovered: contributes nothing at any node, and the
-                    // buffer is already CODE_UNCOVERED.
+                    // Uncovered: contributes nothing at any node, and the buffer is already CODE_UNCOVERED.
                     _ => {}
                 }
             }
@@ -421,25 +312,11 @@ impl AttachmentScorer {
     }
 
     /// How many reads this scorer was built over.
-    ///
-    /// This is the authority on that count, not any `BinaryMatrix` a caller
-    /// happens to have in hand — see [`tree_log_likelihood_with`].
     fn n_reads(&self) -> usize {
         self.base.len()
     }
 
     /// The best-fitting node for read `read` and its log-likelihood.
-    ///
-    /// Identical in result to the reference [`best_attachment`], including its
-    /// parsimony tie-break and its first-wins behaviour among nodes tied on both
-    /// likelihood and mutation count — which is why the selection loop below runs
-    /// in node-index order over a precomputed array rather than folding the
-    /// comparison into the forward pass, whose order is the tree's, not the
-    /// index's.
-    ///
-    /// `scratch` is caller-owned so a loop over reads allocates once, not once
-    /// per read. Its contents on entry are irrelevant; it is resized and
-    /// overwritten for every node before anything reads it.
     pub fn best_attachment(
         &self,
         read: usize,
@@ -456,7 +333,7 @@ impl AttachmentScorer {
         let codes = &self.code[read * self.n_variants..(read + 1) * self.n_variants];
         for &node in &layout.preorder {
             if node != root {
-                // Plan 2026-09-26 T6. `node` is the variant acquired on this edge.
+                // `node` is the variant acquired on this edge.
                 let delta = self.delta[node][codes[node] as usize];
                 scratch[node] = scratch[tree.parent[node]] + delta;
             }
@@ -481,10 +358,6 @@ impl AttachmentScorer {
 }
 
 /// Total log-likelihood of `matrix` under `tree` using a prebuilt scorer.
-///
-/// Prefer this inside any loop that scores many trees against one matrix — the
-/// scorer's precompute is O(reads * variants) and does not depend on the tree,
-/// so hoisting it out of the loop is the whole point of it existing.
 pub fn tree_log_likelihood_with(tree: &MutationTree, scorer: &AttachmentScorer) -> f64 {
     let layout = TreeLayout::new(tree);
     let mut scratch = Vec::new();
@@ -493,12 +366,7 @@ pub fn tree_log_likelihood_with(tree: &MutationTree, scorer: &AttachmentScorer) 
         .sum()
 }
 
-/// Total log-likelihood of `matrix` under `tree`: sum, over every read, of
-/// that read's best-attachment log-likelihood.
-///
-/// Builds a fresh [`AttachmentScorer`] on every call. Callers scoring more than
-/// one tree against the same matrix should build the scorer once and use
-/// [`tree_log_likelihood_with`] instead.
+/// Total log-likelihood of `matrix` under `tree`: sum, over every read.
 pub fn tree_log_likelihood(matrix: &BinaryMatrix, tree: &MutationTree, rates: &ErrorRates) -> f64 {
     let scorer = AttachmentScorer::new(matrix, rates);
     tree_log_likelihood_with(tree, &scorer)
@@ -519,15 +387,9 @@ fn subtree_all_carry(tree: &lineage::Tree, hap_matrix: &HaplotypeMatrix, node_id
     true
 }
 
-/// The half-open reference interval `[start, end)` a variant's REF allele
-/// occupies, in the 1-based coordinates Himito variant names use.
-///
-/// Two variants whose intervals overlap are mutually-exclusive alleles — a
-/// single molecule cannot carry both — so they must never lie on one
-/// root-to-leaf path. Comparing intervals rather than start positions is what
-/// catches a deletion against a substitution *inside* the deleted span:
-/// `m.310TAA>T` covers `[310, 313)` and `m.311A>G` covers `[311, 312)`, which
-/// share no start position but cannot coexist on one molecule.
+/// The half-open reference interval `[start, end)` a variant's REF allele occupies.
+/// Two variants whose intervals overlap are mutually-exclusive alleles — a single molecule cannot
+/// carry both — so they must never lie on one root-to-leaf path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VariantSpan {
     pub start: u64,
@@ -540,21 +402,9 @@ impl VariantSpan {
     }
 }
 
-/// Parse the REF interval out of an `m.<pos><ref>><alt>` name (as built by
-/// `call::generate_variant_name` and `lineage.rs`): `m.310T>C` → `[310, 311)`,
-/// `m.310TAA>T` → `[310, 313)`, `m.310T>TC` → `[310, 311)`.
-///
-/// Indel names anchor on the base *before* the event, and that anchor base is
-/// included in the interval. That is deliberately conservative: it keeps an
-/// indel exclusive with a substitution at its anchor (`m.310T>TC` vs
-/// `m.310T>C`), which is correct under VCF allele semantics — both names assert
-/// a different content for base 310 — at the cost of also separating a deletion
-/// from a substitution at the retained anchor base. Splitting those onto sibling
-/// branches is the safe direction to err.
-///
-/// A name with no parseable position gets a unique one-base sentinel interval
-/// far past any real coordinate, so it can never spuriously conflict with
-/// another variant. `ok` is false in that case so callers can report it.
+/// Parse the REF interval out of an `m.<pos><ref>><alt>` name: `m.310T>C` → `[310, 311)`.
+/// A name with no parseable position gets a unique one-base sentinel interval far past any real
+/// coordinate, so it can never spuriously conflict with another variant.
 fn parse_variant_span(variant: &str, index: usize) -> (VariantSpan, bool) {
     let rest = variant.trim_start_matches("m.");
     let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
@@ -564,10 +414,7 @@ fn parse_variant_span(variant: &str, index: usize) -> (VariantSpan, bool) {
         return (VariantSpan { start: sentinel, end: sentinel + 1 }, false);
     };
 
-    // REF allele: everything between the position and the `>`. `-` is Himito's
-    // placeholder for "no anchor base available" (an indel at the very start of
-    // a reference block); treat it as one base so it still conflicts locally
-    // rather than with nothing at all.
+    // REF allele: everything between the position and the `>`.
     let ref_allele = rest[digits.len()..].split('>').next().unwrap_or("");
     let ref_len = match ref_allele {
         "" | "-" => 1,
@@ -578,10 +425,6 @@ fn parse_variant_span(variant: &str, index: usize) -> (VariantSpan, bool) {
 }
 
 /// Per-variant REF intervals, indexed like `variants`.
-///
-/// Warns if any name is unparseable: the sentinel fallback makes such a variant
-/// unconstrained, so a wholesale naming-convention change would silently turn
-/// the exclusivity guarantee into a no-op. This makes that failure loud.
 pub fn variant_spans(variants: &[String]) -> Vec<VariantSpan> {
     let mut spans = Vec::with_capacity(variants.len());
     let mut unparsed: Vec<&str> = Vec::new();
@@ -611,9 +454,7 @@ pub fn variant_spans(variants: &[String]) -> Vec<VariantSpan> {
     spans
 }
 
-/// Plan 2026-09-26 T6. One `(fp, fn)` per search-matrix variant. A span that
-/// overlaps a [`crate::tracts::KNOWN_TRACTS`] entry — every collapsed T5 tract
-/// allele included — gets `hp_rates`. Every other span keeps the global pair.
+/// One `(fp, fn)` per search-matrix variant.
 fn per_variant_rates(
     spans: &[VariantSpan],
     fp_rate: f64,
@@ -632,8 +473,7 @@ fn per_variant_rates(
         .collect()
 }
 
-/// Whether any mutation in `tree` has a strict ancestor whose REF interval
-/// overlaps its own — i.e. two mutually-exclusive alleles placed on one lineage.
+/// Whether any mutation in `tree` has a strict ancestor whose REF interval overlaps its own.
 pub fn violates_position_exclusivity(tree: &MutationTree, spans: &[VariantSpan]) -> bool {
     (0..tree.n_mutations).any(|node| {
         let span = spans[node];
@@ -648,12 +488,9 @@ pub fn violates_position_exclusivity(tree: &MutationTree, spans: &[VariantSpan])
     })
 }
 
-/// Return a tree equal to `tree` except that every mutation whose REF interval
-/// overlaps one of its ancestors' is lifted to become a sibling of the
-/// shallowest such ancestor, so no two overlapping alleles remain on one
-/// root-to-leaf path. The reattachment target is always an ancestor of the moved
-/// node (never inside its own subtree), so the result stays acyclic; each move
-/// strictly decreases that node's depth, so the loop terminates.
+/// Lift each mutation whose REF interval overlaps an ancestor's to be a sibling of that ancestor.
+/// The reattachment target is always an ancestor of the moved node (never inside its own subtree), so
+/// the result stays acyclic; each move strictly decreases that node's depth, so the loop terminates.
 pub fn enforce_position_exclusivity(tree: &MutationTree, spans: &[VariantSpan]) -> MutationTree {
     let mut result = tree.clone();
     loop {
@@ -680,9 +517,7 @@ pub fn enforce_position_exclusivity(tree: &MutationTree, spans: &[VariantSpan]) 
     result
 }
 
-/// Build an initial mutation tree from the Neighbor-Joining haplotype tree:
-/// each mutation is ranked by the size (in attached reads) of the largest NJ
-/// subtree entirely carrying it, then chained in descending order.
+/// Build an initial mutation tree from the Neighbor-Joining haplotype tree.
 pub fn from_nj_tree(hap_matrix: &HaplotypeMatrix, nj_tree: &lineage::Tree) -> MutationTree {
     let n = hap_matrix.variants.len();
     let mut best_size = vec![0usize; n];
@@ -708,17 +543,14 @@ pub fn from_nj_tree(hap_matrix: &HaplotypeMatrix, nj_tree: &lineage::Tree) -> Mu
         prev = m;
     }
 
-    // The clonality-ranked chain can stack mutually-exclusive overlapping
-    // alleles on one path; split them onto sibling branches before search.
+    // The clonality-ranked chain can stack mutually-exclusive overlapping alleles on one path.
     let tree = MutationTree { n_mutations: n, parent };
     enforce_position_exclusivity(&tree, &variant_spans(&hap_matrix.variants))
 }
 
 /// Two distinct indices in `0..n` by rejection sampling.
-///
-/// Panics when `n < 2`: with fewer than two mutations there is no such pair, and
-/// the rejection loop would otherwise spin forever. Callers must screen for that
-/// (see [`propose_move`], which skips both swap moves in that case).
+/// Panics when `n < 2`: with fewer than two mutations there is no such pair, and the rejection loop
+/// would otherwise spin forever.
 fn sample_two_distinct(n: usize, rng: &mut impl Rng) -> (usize, usize) {
     assert!(n >= 2, "sample_two_distinct needs at least 2 nodes (got {n})");
     let first = rng.random_range(0..n);
@@ -729,15 +561,7 @@ fn sample_two_distinct(n: usize, rng: &mut impl Rng) -> (usize, usize) {
     (first, second)
 }
 
-/// Pick a uniformly random non-root node and reattach it to a uniformly
-/// random node outside its own subtree (excluding itself), so the result is
-/// always acyclic.
-///
-/// This proposal is symmetric: the number of valid reattachment targets for
-/// the chosen node depends only on the size of its own subtree, which this
-/// move does not change (moving a subtree doesn't change what's inside it,
-/// only where it's attached) — so plain Metropolis-Hastings acceptance
-/// (Task 9) needs no extra correction term for this move.
+/// Reattach a random non-root node to a random node outside its own subtree (stays acyclic).
 pub fn propose_prune_reattach(tree: &MutationTree, rng: &mut impl Rng) -> MutationTree {
     let n = tree.n_mutations;
     let node = rng.random_range(0..n);
@@ -748,9 +572,7 @@ pub fn propose_prune_reattach(tree: &MutationTree, rng: &mut impl Rng) -> Mutati
     tree.with_parent(node, new_parent)
 }
 
-/// Relabel two mutation nodes: whichever tree positions `first` and `second`
-/// occupied, they now swap. Symmetric proposal (no Hastings correction),
-/// ported from reference SCITE's `get_new_parent_vec_swap_fast`.
+/// Relabel two mutation nodes: whichever tree positions `first` and `second` occupied, they now swap.
 fn swap_labels(tree: &MutationTree, first: usize, second: usize) -> MutationTree {
     let n = tree.n_mutations;
     let mut parent = tree.parent.clone();
@@ -778,16 +600,7 @@ pub fn propose_swap_labels(tree: &MutationTree, rng: &mut impl Rng) -> MutationT
     swap_labels(tree, first, second)
 }
 
-/// Swap the tree positions of nodes `a` and `b`. When they're in different
-/// lineages this is a direct mutual reattachment. When one is an ancestor of
-/// the other, the ancestor is instead reinserted under a member of the
-/// descendant's (updated) subtree — `choice_index` selects which one, and
-/// must be `< ` the number of such candidates (see the two unit tests above
-/// for how to construct a case where that count is exactly 1). Returns the
-/// Metropolis-Hastings neighborhood-correction factor to multiply into the
-/// acceptance ratio (`1.0` for the different-lineages case).
-///
-/// Ported from reference SCITE's `propose_new_tree` movetype 3.
+/// Swap the tree positions of nodes `a` and `b`.
 fn swap_subtrees(tree: &MutationTree, a: usize, b: usize, choice_index: usize) -> (MutationTree, f64) {
     let n = tree.n_mutations;
     let (node, next_node) = if tree.ancestor_mask(b).get(a) { (b, a) } else { (a, b) };
@@ -827,14 +640,9 @@ pub fn propose_swap_subtrees(tree: &MutationTree, rng: &mut impl Rng) -> (Mutati
     swap_subtrees(tree, node, next_node, choice_index)
 }
 
-/// Weighted move dispatcher, matching reference SCITE's default move-type
-/// probabilities for the non-error-rate moves (`0.55` prune-and-reattach,
-/// `0.4` swap-labels, `0.05` swap-subtrees), renormalized to sum to 1 since
-/// this plan has no error-rate move at all.
+/// Weighted move dispatcher using reference SCITE's default move probabilities (no error-rate move).
 pub fn propose_move(tree: &MutationTree, rng: &mut impl Rng) -> (MutationTree, f64) {
-    // With 0 or 1 mutations only one tree exists, and both swap moves need two
-    // distinct mutation nodes to pick from. Propose the current tree unchanged
-    // (always accepted, no state change) rather than sampling an impossible pair.
+    // With 0 or 1 mutations only one tree exists, and both swap moves need two distinct mutation nodes to pick from.
     if tree.n_mutations < 2 {
         return (tree.clone(), 1.0);
     }
@@ -848,11 +656,7 @@ pub fn propose_move(tree: &MutationTree, rng: &mut impl Rng) -> (MutationTree, f
     }
 }
 
-/// Run one MCMC chain of `n_iterations` moves, starting from `initial_tree`
-/// if given, otherwise a random tree, and return the highest-likelihood tree
-/// seen at any point in the chain (MCMC explores, it doesn't monotonically
-/// improve, so the running best must be tracked separately from the current
-/// state).
+/// Run one MCMC chain of `n_iterations` moves, starting from `initial_tree` if given.
 pub fn run_mcmc(
     matrix: &BinaryMatrix,
     rates: &ErrorRates,
@@ -869,27 +673,20 @@ pub fn run_mcmc(
     let mut best = current.clone();
     let mut best_ll = current_ll;
 
-    // A single mutation (or none) admits exactly one tree — it hangs off the
-    // root — so there is nothing to search. Return it directly instead of
-    // burning `n_iterations` no-op proposals.
+    // A single mutation (or none) admits exactly one tree — it hangs off the root — so there is nothing to search.
     if n < 2 {
         return (current, current_ll);
     }
 
     for _ in 0..n_iterations {
         let (proposal, nbh_correction) = propose_move(&current, rng);
-        // Hard constraint: never let two mutually-exclusive overlapping
-        // alleles share a root-to-leaf path.
+        // Hard constraint: never let two mutually-exclusive overlapping alleles share a root-to-leaf path.
         if violates_position_exclusivity(&proposal, &spans) {
             continue;
         }
         let proposal_ll = tree_log_likelihood_with(&proposal, &scorer);
 
-        // Record the running best BEFORE the Metropolis-Hastings test, not
-        // after. `propose_swap_subtrees` returns a neighbourhood correction
-        // below 1, so a proposal that beats every tree seen so far can still be
-        // rejected — and this function returns the running best, not a posterior
-        // sample, so a rejected-but-better tree would otherwise be lost.
+        // Record the running best BEFORE the Metropolis-Hastings test, not after.
         if proposal_ll > best_ll {
             best = proposal.clone();
             best_ll = proposal_ll;
@@ -905,9 +702,7 @@ pub fn run_mcmc(
     (best, best_ll)
 }
 
-/// Run `n_chains` independent MCMC chains (each with its own derived seed)
-/// and return the single best tree found across all of them. `initial_tree`
-/// is used only for the first chain; the rest always start random.
+/// Run `n_chains` independent MCMC chains and return the single best tree found across all of them.
 pub fn run_mcmc_multichain(
     matrix: &BinaryMatrix,
     rates: &ErrorRates,
@@ -929,8 +724,7 @@ pub fn run_mcmc_multichain(
     best.expect("n_chains must be >= 1")
 }
 
-/// The fully-imputed, denoised genotype matrix implied by attaching every
-/// read to its single best-fitting node in `tree`.
+/// The imputed, denoised genotype matrix from attaching every read to its best node in `tree`.
 #[derive(Debug, Clone)]
 pub struct CleanedMatrix {
     pub variants: Vec<String>,
@@ -951,8 +745,7 @@ pub fn attach_all_reads(matrix: &BinaryMatrix, tree: &MutationTree, rates: &Erro
     let layout = TreeLayout::new(tree);
     let mut scratch = Vec::new();
 
-    // Ancestor masks depend only on the tree, so build them once rather than
-    // re-walking the parent chain for every read.
+    // Ancestor masks depend only on the tree, so build them once rather than re-walking the parent chain for every read.
     let masks: Vec<Mask> = (0..=tree.n_mutations).map(|n| tree.ancestor_mask(n)).collect();
 
     for r in 0..n_reads {
@@ -988,10 +781,7 @@ pub fn write_cleaned_matrix(matrix: &CleanedMatrix, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Pairwise Lewontin linkage-disequilibrium (D', r^2) and one-sided Fisher's
-/// exact enrichment for a variant pair's 2x2 read table
-/// `[[n11, n10], [n01, n00]]`, mirroring `h1_cooccurrence` in the
-/// `heteroplasmy_lineage_test.py` companion script.
+/// Pairwise Lewontin linkage-disequilibrium.
 struct PairCooccurrence {
     n_co: usize,
     n11: usize,
@@ -1011,8 +801,7 @@ fn lchoose(n: f64, k: f64) -> f64 {
     ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)
 }
 
-/// One-sided Fisher's exact p for enrichment of the `n11` cell. Returns
-/// `(odds_ratio, p_greater)`.
+/// One-sided Fisher's exact p for enrichment of the `n11` cell.
 pub(crate) fn fisher_greater(n11: usize, n10: usize, n01: usize, n00: usize) -> (f64, f64) {
     let (a, b, c, d) = (n11 as f64, n10 as f64, n01 as f64, n00 as f64);
     let r1 = a + b;
@@ -1086,8 +875,7 @@ fn write_pair_cooccurrence_table(
     Ok(())
 }
 
-/// Pairwise co-occurrence stats on the SCITE-cleaned (tree-imputed, no
-/// missing values) matrix: every read counts toward every pair's table.
+/// Pairwise co-occurrence stats on the SCITE-cleaned matrix.
 pub fn write_variant_cooccurrence(matrix: &CleanedMatrix, path: &str) -> Result<()> {
     let n = matrix.variants.len();
     let mut pairs = Vec::new();
@@ -1108,10 +896,7 @@ pub fn write_variant_cooccurrence(matrix: &CleanedMatrix, path: &str) -> Result<
     write_pair_cooccurrence_table(&matrix.variants, &pairs, path)
 }
 
-/// Co-occurrence over the first `n` variants only. Block variants are invariant
-/// in the cleaned matrix (all-present by construction), so D'/r2 are undefined
-/// for any pair involving one; `dprime_r2` would return 0.0 via its zero-variance
-/// guard (`scite.rs:991`), which does not crash but is a false statement.
+/// Co-occurrence over the first `n` variants only.
 pub fn write_variant_cooccurrence_upto(matrix: &CleanedMatrix, n: usize, path: &str) -> Result<()> {
     let truncated = CleanedMatrix {
         variants: matrix.variants[..n].to_vec(),
@@ -1122,9 +907,7 @@ pub fn write_variant_cooccurrence_upto(matrix: &CleanedMatrix, n: usize, path: &
     write_variant_cooccurrence(&truncated, path)
 }
 
-/// Same statistics on the raw (pre-SCITE) matrix. Reads with a missing call
-/// (`None`) at either site are excluded from that pair's table, so `n_co`
-/// counts only reads jointly covering both variants.
+/// Same statistics on the raw (pre-SCITE) matrix.
 pub fn write_raw_variant_cooccurrence(matrix: &BinaryMatrix, path: &str) -> Result<()> {
     let n = matrix.variants.len();
     let mut pairs = Vec::new();
@@ -1164,18 +947,11 @@ pub fn write_molecule_summary(matrix: &CleanedMatrix, path: &str) -> Result<()> 
 }
 
 /// How much evidence pins the order of one parent→child edge.
-///
-/// Both fields are `None` when the parent is the root: there is no mutation
-/// above to swap with, so the edge has no order to support.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EdgeEvidence {
     /// Log-likelihood (nats) lost by swapping this mutation with its parent.
-    /// Near zero means the two could be exchanged without the data noticing.
     pub support_ll: Option<f64>,
-    /// `(n_child_without_parent, n_parent_without_child)` over reads calling
-    /// both sites. A near-tie here means the order is a coin flip even when
-    /// `support_ll` looks large, because each read of margin is worth
-    /// `ln((1-β)/β)` nats — at β = 0.05 that is 2.94 nats for a single read.
+    /// `(n_child_without_parent, n_parent_without_child)` over reads calling both sites.
     pub counts: Option<(usize, usize)>,
 }
 
@@ -1185,16 +961,7 @@ const ORDER_SIGN_TEST_ALPHA: f64 = 0.05;
 const ORDER_MIN_SUPPORT_LL: f64 = 1.0;
 
 impl EdgeEvidence {
-    /// Whether the data actually resolves this edge's parent→child direction:
-    /// `Some(true)` resolved, `Some(false)` arbitrary, `None` no order to resolve
-    /// (the parent is the root).
-    ///
-    /// Both tests must pass. The likelihood margin alone is not enough, because
-    /// each read of count margin is worth `ln((1-β)/β)` nats — 2.94 at β = 0.05 —
-    /// so a single read can look like decisive evidence. The sign test on the
-    /// counts asks the blunter question: would a margin this large arise from a
-    /// coin flip? On the ont-r10 eval set this pair of tests separates every
-    /// correctly-ordered edge (p ≤ 0.047) from both arbitrary ones (p = 0.5).
+    /// Whether the data actually resolves this edge's parent→child direction: `Some(true)` resolved.
     pub fn order_resolved(&self) -> Option<bool> {
         let (n_child, n_parent) = self.counts?;
         let support = self.support_ll?;
@@ -1205,8 +972,7 @@ impl EdgeEvidence {
     }
 }
 
-/// Two-sided-in-spirit sign test on a count margin: `P(X ≥ max(a, b))` for
-/// `X ~ Binomial(a + b, 0.5)`. Returns 1.0 for an empty table.
+/// Two-sided-in-spirit sign test on a count margin.
 fn sign_test_p(a: usize, b: usize) -> f64 {
     let n = a + b;
     if n == 0 {
@@ -1220,11 +986,7 @@ fn sign_test_p(a: usize, b: usize) -> f64 {
         .min(1.0)
 }
 
-/// Upper tail `P(X >= k)` for `X ~ Binomial(n, p)`, using the same
-/// log-gamma binomial coefficient as [`sign_test_p`].
-///
-/// `p` outside `(0, 1)` is not used by the excess-absence rule (`dropout_rate
-/// == 0` skips that rule). Plan 2026-09-26 T2.
+/// Upper tail `P(X >= k)` for `X ~ Binomial(n, p)`.
 pub(crate) fn binomial_upper_tail(n: usize, k: usize, p: f64) -> f64 {
     if k == 0 || n == 0 {
         return 1.0;
@@ -1244,20 +1006,7 @@ pub(crate) fn binomial_upper_tail(n: usize, k: usize, p: f64) -> f64 {
         .min(1.0)
 }
 
-/// Log-likelihood lost by swapping `node` with its parent, i.e. the evidence
-/// pinning this edge's direction. `None` when the parent is the root.
-///
-/// This is the same quantity the unary-path hill climb maximises, reported so a
-/// reader can tell an order the data insists on from one that was picked
-/// arbitrarily off a flat likelihood.
-///
-/// Retained with no production caller on purpose. [`edge_evidence`] used to
-/// drive this function once per node and now shares one scorer via
-/// [`edge_order_support_with`], which leaves this as the from-scratch
-/// implementation that
-/// `edge_evidence_matches_per_node_edge_order_support_on_random_trees` checks
-/// the hoisted one against. Deleting it would delete that cross-check, and the
-/// hoist would have nothing independent holding it honest.
+/// Log-likelihood lost by swapping `node` with its parent.
 #[allow(dead_code)]
 pub fn edge_order_support(
     tree: &MutationTree,
@@ -1265,30 +1014,20 @@ pub fn edge_order_support(
     rates: &ErrorRates,
     node: usize,
 ) -> Option<f64> {
-    // Checked before the scorer is built so a node with no order to support
-    // stays free, as it was when this function scored from scratch.
+    // Checked before the scorer is built so a node with no order to support stays free.
     orderable_parent(tree, node)?;
     let scorer = AttachmentScorer::new(matrix, rates);
     let tree_ll = tree_log_likelihood_with(tree, &scorer);
     edge_order_support_with(tree, &scorer, tree_ll, node)
 }
 
-/// The parent of `node`, when this edge has an order to support at all — that
-/// is, when `node` is a mutation node whose parent is not the root. A mutation
-/// hanging directly off the root has nothing above it to be swapped with.
+/// The parent of `node` when the edge has an order to support, else `None`.
 fn orderable_parent(tree: &MutationTree, node: usize) -> Option<usize> {
     let parent = tree.parent[node];
     (parent != tree.root() && node != tree.root()).then_some(parent)
 }
 
-/// [`edge_order_support`] against a prebuilt scorer and the already-computed
-/// log-likelihood of the unswapped `tree`.
-///
-/// Both of those are invariant across nodes, which is the whole point: the
-/// public wrapper builds an `AttachmentScorer` — O(reads * variants) — and
-/// rescores the unswapped tree on every call, so driving it once per mutation
-/// node, as [`edge_evidence`] must, spends O(reads * variants^2) on precompute
-/// alone and recomputes one identical number `n_mutations` times.
+/// [`edge_order_support`] against a prebuilt scorer.
 fn edge_order_support_with(
     tree: &MutationTree,
     scorer: &AttachmentScorer,
@@ -1306,8 +1045,7 @@ pub fn edge_evidence(
     matrix: &BinaryMatrix,
     rates: &ErrorRates,
 ) -> Vec<EdgeEvidence> {
-    // Hoisted out of the per-node loop: neither the scorer nor the unswapped
-    // tree's likelihood depends on which edge is being scored.
+    // Hoisted: neither the scorer nor the unswapped tree's likelihood depends on the node.
     let scorer = AttachmentScorer::new(matrix, rates);
     let tree_ll = tree_log_likelihood_with(tree, &scorer);
 
@@ -1329,9 +1067,9 @@ fn format_support(support: Option<f64>) -> String {
     }
 }
 
-/// Per-candidate record of the root-block decision, so it is auditable rather
-/// than silent. One row per variant clearing the HF gate; variants below the
-/// gate were never candidates and produce no row.
+/// Per-candidate record of the root-block decision, so it is auditable rather than silent.
+/// One row per variant clearing the HF gate; variants below the gate were never candidates and
+/// produce no row.
 pub fn write_root_block_table(
     audit: &[crate::rootblock::RootBlockAudit],
     variants: &[String],
@@ -1344,11 +1082,7 @@ pub fn write_root_block_table(
             Some(q) => format!("{q:.6e}"),
             None => "NA".to_string(),
         };
-        // A saturated tie (min_q >= 1.0) means no partner was ever strictly
-        // better than any other, so whichever `u` happens to sit lowest in
-        // variant order "wins" the incumbent slot in `partition`'s pass 3 —
-        // that index had nothing to do with the decision. Report NA rather
-        // than a partner that reads as "the best-discriminating partner".
+        // A saturated tie means no partner was ever strictly better than any other.
         let partner = match (a.partner, a.min_q) {
             (Some(u), Some(q)) if q < 1.0 => variants[u].clone(),
             _ => "NA".to_string(),
@@ -1394,8 +1128,7 @@ pub fn write_mutation_tree(
             node_name(parent)
         )?;
     }
-    // The root block is ONE row carrying every member, because its internal
-    // order is exactly what the data does not determine.
+    // The root block is ONE row carrying every member.
     if !block_names.is_empty() {
         let root_reads = matrix.attachment.iter().filter(|&&a| a == tree.root()).count();
         writeln!(
@@ -1408,12 +1141,7 @@ pub fn write_mutation_tree(
     Ok(())
 }
 
-/// Recursively emit the Newick token for the subtree at `node`. `edge_muts` are
-/// the mutation ids accumulated (ancestral→derived) on the branch leading into
-/// the node that will actually be emitted here — pass-through mutation nodes fold
-/// their mutation into this list rather than becoming their own node. Each branch
-/// reports an `order_support` list parallel to its `mutation` list, so a collapsed
-/// run whose internal order the data does not resolve is visible as such.
+/// Recursively emit the Newick token for the subtree at `node`.
 fn emit_lineage_node(
     node: usize,
     edge_muts: &[usize],
@@ -1464,10 +1192,7 @@ fn emit_lineage_node(
     }
 
     if is_root {
-        // The root carries no heteroplasmic variants, so it is always emitted as
-        // an explicit ancestral haplotype tip. When reads best-attach to the root
-        // that haplotype supplies the id and read count; otherwise a synthetic
-        // zero-read tip keeps the ancestral state visible in every lineage tree.
+        // The root carries no heteroplasmic variants, so it is always emitted as an explicit ancestral haplotype tip.
         let root_reads: usize = haps.iter().map(|(_, count)| *count).sum();
         let root_hid = if haps.len() == 1 { haps[0].0.clone() } else { "Hroot".to_string() };
         tokens.push(format!("{root_hid}_n{root_reads}:0[&&NHX:reads={root_reads}]"));
@@ -1493,13 +1218,7 @@ fn emit_lineage_node(
     }
 }
 
-/// Write the read lineage tree (Newick + NHX branch mutations, tsinfer-style)
-/// to `path`. Tips are haplotypes (labeled `H<id>_n<reads>`, with a machine-
-/// readable `reads` NHX field); branches carry the mutations acquired, and
-/// pass-through mutation nodes are collapsed so mutations ride on a single
-/// branch (comma-joined, ancestral→derived). Each branch also carries an
-/// `order_support` list parallel to `mutation`: the nats of likelihood pinning
-/// each mutation above the next, or `NA` where there is no mutation above.
+/// Write the read lineage tree (Newick + NHX branch mutations, tsinfer-style) to `path`.
 pub fn write_read_lineage_newick(
     tree: &MutationTree,
     hap_matrix: &HaplotypeMatrix,
@@ -1511,20 +1230,7 @@ pub fn write_read_lineage_newick(
     let children = tree.children_of();
     let mut haps_by_node: Vec<Vec<(String, usize)>> = vec![Vec::new(); tree.n_mutations + 1];
     for hap in &hap_matrix.haplotypes {
-        // `hap.profile` has one entry per column of the CLEANED matrix —
-        // `n_informative + n_block` entries, since `append_block_to_cleaned`
-        // appended the block columns — while `tree.n_mutations ==
-        // n_informative`. That length mismatch is correct, but only by
-        // construction: every block column is `1` on every read, and
-        // `ancestor_mask(node)` never sets a bit past `n_mutations` for any
-        // node, so `attachment_log_likelihood` scores every block column as
-        // "observed=1, expected_mutated=false" -> `ln(fp)`, identically at
-        // every candidate node. That is a constant additive offset per read,
-        // which cancels under `argmax` and does not move the `LL_TIE_EPS`
-        // tie-break; only the returned `_ll` (discarded here) is off by it.
-        // Do not "fix" this by truncating `hap.profile` to `tree.n_mutations`
-        // — that would remove the offset, not change which node wins, so it
-        // would look like a cleanup while being a no-op at best.
+        // `hap.profile` has one entry per column of the CLEANED matrix — `n_informative + n_block` entries.
         let (node, _ll) = best_attachment(&hap.profile, tree, rates);
         haps_by_node[node].push((hap.id.clone(), hap.count));
     }
@@ -1539,18 +1245,11 @@ pub fn write_read_lineage_newick(
         evidence,
     );
 
-    // The block rides on the root, reusing the NHX convention the branches
-    // already use. `emit_lineage_node` always terminates the root token with
-    // the literal `)ROOT`, which nothing else in the string can produce.
+    // The block rides on the root, reusing the NHX convention the branches already use.
     let body = if block_names.is_empty() {
         body
     } else {
-        // Safe today because `emit_lineage_node` emits the literal `)ROOT`
-        // exactly once (line ~1385) — but `replace` is a blind substring
-        // rewrite, and a future format change (e.g. a second string that
-        // happens to contain `)ROOT`) would silently annotate the wrong
-        // token, or none, instead of failing loudly. Assert the invariant
-        // this relies on rather than trusting it silently.
+        // Safe today because `emit_lineage_node` emits the literal `)ROOT` exactly once (line ~1385).
         let n = body.matches(")ROOT").count();
         assert_eq!(n, 1, "expected exactly one )ROOT token in the Newick body, found {n}");
         body.replace(")ROOT", &format!(")ROOT[&&NHX:root_block={}]", block_names.join(",")))
@@ -1561,27 +1260,7 @@ pub fn write_read_lineage_newick(
     Ok(())
 }
 
-/// Re-order the mutations on each maximal unary path towards the maximum-
-/// likelihood ordering, using the orientation ranking (see
-/// [`order_path_by_orientation`]) as both the starting candidate and the
-/// tie-break on likelihood-flat stretches.
-///
-/// Why a path needs polishing at all: on a unary path only the reads that
-/// attach to an *interior* node distinguish one ordering from another, and a
-/// false negative at the ancestral mutation turns a "carries both" read into a
-/// "carries only the child" read — precisely the observation that argues for the
-/// reversed order. So the MCMC's choice of ordering along a chain is decided by
-/// a handful of reads, and where no read attaches in the interior the likelihood
-/// is exactly flat and the choice is pure noise.
-///
-/// The search is a hill climb over adjacent transpositions. Swapping two
-/// neighbours on a unary path changes exactly one implied genotype (the prefix
-/// between them), which makes it the natural elementary move; a full-path
-/// candidate, in contrast, is all-or-nothing, so one bad pair anywhere on a long
-/// path throws away every other correction. A swap is taken when it strictly
-/// improves the likelihood, or when the likelihood is tied and the swap moves
-/// towards the orientation-preferred order — the latter is what makes flat
-/// stretches deterministic instead of iteration-order dependent.
+/// Re-order the mutations on each maximal unary path towards the maximum- likelihood ordering.
 pub fn polish_unary_path_order(
     tree: &MutationTree,
     matrix: &BinaryMatrix,
@@ -1609,8 +1288,6 @@ pub fn polish_unary_path_order(
         let start_names = names(&path);
         let ll_start = tree_log_likelihood_with(&current, &scorer);
 
-        // Rank preferred by the data-driven orientation statistic; used to seed
-        // the climb and to break exact likelihood ties in a fixed direction.
         let preferred = order_path_by_orientation(&path, matrix);
         let rank: HashMap<usize, usize> =
             preferred.iter().enumerate().map(|(i, &m)| (m, i)).collect();
@@ -1632,10 +1309,7 @@ pub fn polish_unary_path_order(
             }
         }
 
-        // Hill climb on adjacent transpositions. Each accepted move either
-        // strictly raises the likelihood or strictly reduces the number of
-        // inversions against `rank` at equal likelihood, so this terminates; the
-        // pass cap is belt-and-braces against float noise.
+        // Hill climb on adjacent transpositions.
         let max_passes = order.len() * order.len() + 8;
         for _ in 0..max_passes {
             let mut improved = false;
@@ -1685,9 +1359,7 @@ pub fn polish_unary_path_order(
     current
 }
 
-/// Maximal unary paths: each is a sequence of ≥1 mutation nodes where every
-/// non-final node has exactly one child. Starts only at nodes whose parent is
-/// the root or a branching node (≠1 child).
+/// Maximal unary paths: each is a sequence of ≥1 mutation nodes.
 fn maximal_unary_paths(tree: &MutationTree) -> Vec<Vec<usize>> {
     let children = tree.children_of();
     let root = tree.root();
@@ -1753,8 +1425,7 @@ fn nesting_p_m_given_o(matrix: &BinaryMatrix, m: usize, o: usize) -> f64 {
     }
 }
 
-/// Coverage-matched orientation counts for the pair `(m, o)`, over reads that
-/// call *both* sites: `(n10, n01)` = (m alt & o ref, m ref & o alt).
+/// Coverage-matched orientation counts for the pair `(m, o)`, over reads that call *both* sites.
 fn orientation_counts(matrix: &BinaryMatrix, m: usize, o: usize) -> (usize, usize) {
     let mut n10 = 0usize;
     let mut n01 = 0usize;
@@ -1769,24 +1440,7 @@ fn orientation_counts(matrix: &BinaryMatrix, m: usize, o: usize) -> (usize, usiz
     (n10, n01)
 }
 
-/// Signed orientation score of `m` against the other mutations on its path:
-/// `Σ_o (n10 - n01)`, positive when `m` tends to be the one seen *without* its
-/// partner and therefore the more ancestral of the pair.
-///
-/// Under a perfect phylogeny with false-negative rate β, if `m` is ancestral to
-/// `o` then a `(m=0, o=1)` read requires a dropout at `m` (probability β) while
-/// `(m=1, o=0)` reads are genuine, so the pairwise log-likelihood ratio between
-/// the two orientations is `(n10 - n01) · ln((1-β)/β)`. That weight is a
-/// positive constant shared by every pair on the path, so it scales the score
-/// without changing the ordering and is left out. Summing the signed pairwise
-/// margins and sorting (a Borda ranking of the orientation tournament) is the
-/// standard cheap approximation to minimum-violation ranking; the likelihood
-/// hill climb in `polish_unary_path_order` then refines it.
-///
-/// This is deliberately restricted to jointly covered reads: comparing raw
-/// allele frequencies across sites with different depth is not meaningful, and
-/// mitochondrial coverage is uneven enough (read ends, NUMT filtering) for that
-/// bias to invert the order on its own.
+/// Signed orientation score of `m` against the other mutations on its path: `Σ_o`.
 fn orientation_score(matrix: &BinaryMatrix, m: usize, path: &[usize]) -> i64 {
     path.iter()
         .filter(|&&o| o != m)
@@ -1798,11 +1452,6 @@ fn orientation_score(matrix: &BinaryMatrix, m: usize, path: &[usize]) -> i64 {
 }
 
 /// Ancestral → derived ordering of the mutations on one unary path.
-///
-/// Primary key is the coverage-matched pairwise orientation score; allele
-/// frequency (a marginal statistic, which also uses reads covering only one of
-/// the two sites) breaks its ties, then mean nesting, then the variant index so
-/// the result is deterministic on genuinely tied data.
 fn order_path_by_orientation(path: &[usize], matrix: &BinaryMatrix) -> Vec<usize> {
     let mut scored: Vec<(usize, i64, f64, f64)> = path
         .iter()
@@ -1854,26 +1503,9 @@ fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usiz
     }
 }
 
-/// A blocked (homoplasmic) variant whose REF span overlaps *any* other
-/// variant in the matrix — blocked or informative — cannot safely stay
-/// blocked. `append_block_to_cleaned` imputes every block member present on
-/// every read; wherever the overlapping variant is also called present (on
-/// its own path through the tree, or as another block member), that asserts
-/// two mutually-exclusive alleles on one molecule, which was structurally
-/// impossible pre-partition. A real heteroplasmy at that locus means the
-/// high-HF member is a major allele, not fixed germline, and belongs in the
-/// tree alongside its partner — this applies equally whether the partner is
-/// currently informative or currently blocked.
-///
-/// A single pass suffices: a variant's fate is decided by whether *anything
-/// else in the full matrix* overlaps its span, not by what else currently
-/// happens to be informative, so there is nothing for pulling one variant
-/// back to newly break for another.
-///
-/// `variants` must be the full (unrestricted) variant list `rb` was computed
-/// over, so span indices line up. Sorts `block`/`informative`/`audit` by
-/// variant index on the way out, and flips `in_block` to `false` on every
-/// audit row for a pulled-back variant.
+/// A blocked variant whose REF span overlaps *any* other variant in the matrix.
+/// `variants` must be the full (unrestricted) variant list `rb` was computed over, so span indices
+/// line up.
 fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> rootblock::RootBlock {
     let spans = variant_spans(variants);
 
@@ -1897,10 +1529,7 @@ fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> 
     for a in rb.audit.iter_mut() {
         if pulled_back.contains(&a.variant) {
             a.in_block = false;
-            // Overwrite whatever `partition` recorded (high_raw_vaf/unstructured):
-            // the span conflict is why this variant is NOT in the block, and
-            // that reason must win over the one that would have applied had
-            // the conflict not existed.
+            // Overwrite whatever `partition` recorded: the span conflict is why this variant is NOT in the block.
             a.reason = rootblock::BlockReason::SpanConflict;
         }
     }
@@ -1913,21 +1542,13 @@ fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> 
     rb
 }
 
-/// Plan 2026-09-26 T3. `cleaned` is the matrix after `append_block_to_cleaned`
-/// (what `<prefix>.cleaned_matrix.csv` used to hold). `cleaned_haplotypes`
-/// backs the tips of `<prefix>.read_lineage.nwk`.
+/// `cleaned_haplotypes` backs the tips of `<prefix>.read_lineage.nwk`.
 pub struct SciteOutput {
     pub cleaned: CleanedMatrix,
     pub cleaned_haplotypes: HaplotypeMatrix,
 }
 
-/// Run the MCMC mutation-tree search (starting from an NJ-tree-derived guess
-/// when one can be built), attach every read to its best-fitting node, and
-/// write the SCITE output files with the given `output_prefix`.
-///
-/// `debug` also writes `<prefix>.raw_variant_cooccurrence.tsv`. The cleaned
-/// matrix itself is returned in memory and is not written here; `lineage::start`
-/// turns it into `<prefix>.cleaned_matrix_all_variants.csv`.
+/// Run the MCMC mutation-tree search, attach every read to its best-fitting node.
 pub fn run_scite_pipeline(
     binary: &BinaryMatrix,
     fp_rate: f64,
@@ -1947,20 +1568,15 @@ pub fn run_scite_pipeline(
              relax the --min-hf / --max-hf thresholds."
         );
     }
-    // Partition before anything else looks at the matrix: everything below
-    // searches, scores and reports over `search_matrix`, not `binary`.
+    // Partition before anything else looks at the matrix: everything below searches.
     let rb = match root_block {
         // TODO(plan T6): dropout_rate is still the global fn, not the HP-tract fn.
         Some(cfg) => rootblock::partition(binary, cfg, fn_rate),
         None => rootblock::RootBlock::disabled(binary.variants.len()),
     };
-    // A block member sharing a REF span with a surviving informative variant
-    // is not homoplasmic — see `resolve_span_conflicts`. Must run against the
-    // full (unrestricted) variant list, before `binary` is shadowed below.
+    // A block member sharing a REF span with a surviving informative variant is not homoplasmic.
     let rb = resolve_span_conflicts(rb, &binary.variants);
-    // `write_raw_variant_cooccurrence` reports the raw (pre-partition) data,
-    // where block variants are NOT invariant — they carry exactly the dropout
-    // that made them candidates — so it must keep seeing every variant.
+    // `write_raw_variant_cooccurrence` reports the raw data, where block variants are NOT invariant.
     let full_binary = binary;
     let block_names: Vec<String> =
         rb.block.iter().map(|&v| binary.variants[v].clone()).collect();
@@ -1974,11 +1590,7 @@ pub fn run_scite_pipeline(
     }
     let search_matrix = rootblock::restrict(binary, &rb.informative);
     let binary = &search_matrix;
-    // Haplotypes over the SEARCH matrix, used only to seed the NJ-derived initial
-    // tree. Built here rather than taken from the caller: the caller's haplotypes
-    // are over the unrestricted matrix, so they only lined up when the root block
-    // was empty -- and in that case this is the identical computation (same
-    // matrix, same `min_reads`, deterministic ordering).
+    // Haplotypes over the SEARCH matrix, used only to seed the NJ-derived initial tree.
     let search_hap_matrix = lineage::deduplicate(binary, min_reads);
     let hap_matrix = &search_hap_matrix;
     let no_informative = binary.variants.is_empty();
@@ -1989,11 +1601,7 @@ pub fn run_scite_pipeline(
             block_names.len()
         );
     }
-    // One variant is a valid, if degenerate, run: the tree can only be
-    // root → variant, so there is no topology to search and no variant pair to
-    // score. Every output file is still produced (the two co-occurrence tables
-    // are header-only), which keeps single-variant samples in the same reporting
-    // format as the rest.
+    // One variant is a valid, if degenerate, run: the tree can only be root → variant.
     let single_variant = binary.variants.len() == 1;
     if single_variant {
         info!(
@@ -2011,12 +1619,9 @@ pub fn run_scite_pipeline(
         if initial_tree.is_some() { "derived from Neighbor-Joining haplotype tree" } else { "random (NJ tree unavailable)" }
     );
 
-    // Overlap is not transitive (a deletion can overlap two substitutions that
-    // do not overlap each other), so report the constrained pairs rather than
-    // grouping into sites. Index order keeps the log deterministic.
+    // Overlap is not transitive, so report the constrained pairs rather than grouping into sites.
     let spans = variant_spans(&binary.variants);
-    // Plan 2026-09-26 T6. Restrict has already re-indexed `binary.variants`,
-    // so these rates line up with the search matrix and not the pre-partition names.
+    // Restrict has already re-indexed `binary.variants`.
     let per_variant = per_variant_rates(&spans, fp_rate, fn_rate, hp_rates);
     let n_hp = spans.iter().filter(|span| crate::tracts::overlaps_tract(span)).count();
     info!(
@@ -2051,8 +1656,7 @@ pub fn run_scite_pipeline(
 
     let rates = ErrorRates { fp_rate, fn_rate, per_variant };
     let (tree, ll) = if no_informative {
-        // Zero mutations: root only. `parent` is length n_mutations + 1 and the
-        // root's slot points at itself (see MutationTree::root).
+        // Zero mutations: root only.
         (MutationTree { n_mutations: 0, parent: vec![0] }, 0.0)
     } else {
         run_mcmc_multichain(binary, &rates, n_iterations, n_chains, initial_tree.as_ref(), seed)
@@ -2067,9 +1671,7 @@ pub fn run_scite_pipeline(
     let mut cleaned = attach_all_reads(binary, &tree, &rates);
     let n_informative = rootblock::append_block_to_cleaned(&mut cleaned, &block_names);
 
-    // Per-edge order evidence: how much likelihood pins each mutation above its
-    // parent, and the read counts behind it. Reported rather than acted on — a
-    // near-tie means the pipeline had to pick one of several equally good orders.
+    // Per-edge order evidence: how much likelihood pins each mutation above its parent, and the read counts behind it.
     let evidence = edge_evidence(&tree, binary, &rates);
     let unresolved: Vec<String> = (0..tree.n_mutations)
         .filter(|&m| evidence[m].order_resolved() == Some(false))
@@ -2092,9 +1694,7 @@ pub fn run_scite_pipeline(
         );
     }
 
-    // Plan 2026-09-26 T3. Do not write cleaned_matrix.csv; lineage::start emits
-    // cleaned_matrix_all_variants.csv from `cleaned`. The raw co-occurrence
-    // table is a debug artifact.
+    // Do not write cleaned_matrix.csv; lineage::start emits cleaned_matrix_all_variants.csv from `cleaned`.
     write_variant_cooccurrence_upto(&cleaned, n_informative, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
     if debug {
         write_raw_variant_cooccurrence(full_binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
@@ -2106,8 +1706,6 @@ pub fn run_scite_pipeline(
     }
 
     // Deduplicate the SCITE-cleaned reads into haplotypes for the lineage tree.
-    // Keep the tree's variant set/order (no prevalence re-filter) so the mutation
-    // indices still line up with the tree nodes.
     let cleaned_binary = BinaryMatrix {
         variants: cleaned.variants.clone(),
         reads: cleaned.reads.clone(),
@@ -2138,8 +1736,7 @@ mod tests {
     use super::*;
 
     fn chain_tree() -> MutationTree {
-        // 0 -> 1 -> 2 -> root(3): node0's parent is 1, node1's parent is 2,
-        // node2's parent is root, root's parent is itself.
+        // 0 -> 1 -> 2 -> root(3): node0's parent is 1, node1's parent is 2, node2's parent is root, root's parent is itself.
         MutationTree { n_mutations: 3, parent: vec![1, 2, 3, 3] }
     }
 
@@ -2220,9 +1817,7 @@ mod tests {
 
     #[test]
     fn best_attachment_prefers_the_fewest_mutations_among_equally_likely_nodes() {
-        // Chain root(2) -> A(0) -> B(1). The read is uncovered at A and an
-        // explicit ref at B, so ROOT and A explain it identically well. ROOT is
-        // the parsimonious choice; attaching to A would invent an alt call at A.
+        // Chain root(2) -> A(0) -> B(1).
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
         let rates = ErrorRates::uniform(0.01, 0.1);
         let profile = vec![None, Some(0)];
@@ -2235,8 +1830,7 @@ mod tests {
 
     #[test]
     fn best_attachment_of_a_fully_uncovered_read_is_the_root() {
-        // No observed call at all -> every node has log-likelihood 0. The read
-        // carries no evidence, so it must not be assigned any mutation.
+        // No observed call at all -> every node has log-likelihood 0.
         let tree = MutationTree { n_mutations: 3, parent: vec![3, 0, 1, 3] };
         let rates = ErrorRates::uniform(0.01, 0.1);
         let profile = vec![None, None, None];
@@ -2248,8 +1842,7 @@ mod tests {
 
     #[test]
     fn attach_all_reads_does_not_fabricate_alt_calls_for_uncovered_sites() {
-        // r_partial is uncovered at A and an explicit ref at B: attaching it
-        // below A would write A=1 into the cleaned matrix out of nothing.
+        // r_partial is uncovered at A and an explicit ref at B.
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
         let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = BinaryMatrix {
@@ -2324,9 +1917,7 @@ mod tests {
             assert!((wrapped - want).abs() < 1e-9, "trial {trial}: wrapper {wrapped} vs {want}");
         }
 
-        // Plan 2026-09-26 T6. A second case whose rates differ by variant. Both
-        // scoring paths must still agree to 1e-9, and the likelihood must move
-        // relative to the global rates — otherwise `per_variant` is ignored.
+        // A second case whose rates differ by variant.
         let mut rng = StdRng::seed_from_u64(0xF00D);
         let global = ErrorRates::uniform(0.005, 0.05);
         let mut saw_rate_effect = false;
@@ -2386,9 +1977,7 @@ mod tests {
 
     #[test]
     fn attach_all_reads_is_unchanged_by_the_incremental_scorer() {
-        // Pins the cleaned-matrix output, which every downstream file is derived
-        // from. Chain root(3) -> 2 -> 1 -> 0 with a mix of covered, uncovered, and
-        // contradictory calls.
+        // Pins the cleaned-matrix output, which every downstream file is derived from.
         let matrix = BinaryMatrix {
             variants: vec!["m.100A>G".into(), "m.200C>T".into(), "m.300G>A".into()],
             reads: vec!["r0".into(), "r1".into(), "r2".into(), "r3".into()],
@@ -2414,8 +2003,7 @@ mod tests {
             }
         }
 
-        // Plan 2026-09-26 T6. Non-uniform rates: the incremental scorer must
-        // still match the reference, and a high fn at B must attach below B.
+        // Non-uniform rates: the incremental scorer must still match the reference, and a high fn at B must attach below B.
         let chain = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
         let chain_matrix = BinaryMatrix {
             variants: vec!["A".into(), "B".into()],
@@ -2439,10 +2027,7 @@ mod tests {
         assert!((got_ll - want_ll).abs() < 1e-9, "{got_ll} vs {want_ll}");
     }
 
-    /// Plan 2026-09-26 T6. Chain root → A → B. The read carries A and is absent
-    /// at B. When B's false-negative rate is high enough that a dropout is more
-    /// likely than a true ref, the read attaches at B. The global rate leaves
-    /// it at A, above B.
+    /// Chain root → A → B.
     #[test]
     fn absence_at_a_high_fn_variant_attaches_below_that_variant() {
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
@@ -2461,8 +2046,7 @@ mod tests {
         assert_eq!(below, 1, "high fn at B explains the absence as dropout");
     }
 
-    /// Plan 2026-09-26 T6. Known-tract spans, including a T5 tract allele and a
-    /// boundary straddler, take the HP rates. Everything else keeps the global pair.
+    /// Known-tract spans, including a T5 tract allele and a boundary straddler, take the HP rates.
     #[test]
     fn per_variant_rates_are_higher_inside_known_hp_tracts() {
         let variants = vec![
@@ -2481,8 +2065,7 @@ mod tests {
         assert_eq!(rates[4], (0.01, 0.05), "one base before the tract");
     }
 
-    /// Plan 2026-09-26 T6. Columns past `per_variant` — the root-block genotypes
-    /// appended beyond `n_mutations` — stay on the global rate.
+    /// Columns past `per_variant` — the root-block genotypes appended beyond `n_mutations`.
     #[test]
     fn columns_past_per_variant_use_the_global_rate() {
         let profile = vec![Some(1), Some(1)];
@@ -2513,12 +2096,7 @@ mod tests {
     fn from_nj_tree_orders_mutations_by_largest_fully_carrying_subtree() {
         use lineage::{Haplotype, HaplotypeMatrix, Node, Tree};
 
-        // 3 leaf haplotypes, all children of one root:
-        //   H0 (5 reads): neither A nor B
-        //   H1 (3 reads): A only
-        //   H2 (2 reads): A and B
-        // A's largest fully-carrying subtree is {H1} (3 reads) since H0 lacks A.
-        // B's largest fully-carrying subtree is {H2} (2 reads) since H0, H1 lack B.
+        // 3 leaf haplotypes, all children of one root: H0 (5 reads): neither A nor B.
         let hap_matrix = HaplotypeMatrix {
             variants: vec!["A".to_string(), "B".to_string()],
             haplotypes: vec![
@@ -2572,14 +2150,12 @@ mod tests {
 
     #[test]
     fn variant_spans_flags_a_deletion_against_a_substitution_inside_its_span() {
-        // The gap a start-position-only check misses: 311 lies inside the
-        // deletion's REF span but shares no start coordinate with it.
+        // The gap a start-position-only check misses.
         let variants = vec!["m.310TAA>T".to_string(), "m.311A>G".to_string()];
         let s = variant_spans(&variants);
         assert!(s[0].overlaps(&s[1]));
 
-        // ...while the base just past the deletion is untouched and free to
-        // sit anywhere on the same lineage.
+        // ...while the base just past the deletion is untouched and free to sit anywhere on the same lineage.
         let outside = variant_spans(&["m.310TAA>T".to_string(), "m.313G>A".to_string()]);
         assert!(!outside[0].overlaps(&outside[1]));
     }
@@ -2617,8 +2193,7 @@ mod tests {
 
     #[test]
     fn enforce_position_exclusivity_resolves_three_overlapping_alleles() {
-        // 500(0) -> 310(1) -> 310(2) -> 310(3): needs more than one pass, since
-        // lifting node 2 leaves node 3 still under it.
+        // 500(0) -> 310(1) -> 310(2) -> 310(3): needs more than one pass, since lifting node 2 leaves node 3 still under it.
         let spans = vec![
             span(500, 501),
             span(310, 311),
@@ -2633,8 +2208,7 @@ mod tests {
 
     #[test]
     fn enforce_position_exclusivity_always_returns_an_acyclic_tree() {
-        // Heavy overlap (12 variants over 4 loci, one of them a wide deletion)
-        // is the stress case for the lift-to-sibling loop.
+        // Heavy overlap (12 variants over 4 loci, one of them a wide deletion) is the stress case for the lift-to-sibling loop.
         let mut spans = Vec::new();
         for i in 0..12u64 {
             let locus = (i % 4) * 10;
@@ -2656,9 +2230,7 @@ mod tests {
 
     #[test]
     fn from_nj_tree_breaks_an_overlapping_chain_off_the_clonality_ranking() {
-        // Two haplotypes: one carrying m.310T>C, one carrying m.310T>TC. The
-        // clonality chain would stack them; the two alleles must end up on
-        // separate branches instead.
+        // Two haplotypes: one carrying m.310T>C, one carrying m.310T>TC.
         let hap_matrix = HaplotypeMatrix {
             variants: vec!["m.310T>C".to_string(), "m.310T>TC".to_string()],
             haplotypes: vec![
@@ -2686,8 +2258,6 @@ mod tests {
 
     #[test]
     fn run_mcmc_never_places_same_position_alleles_on_one_path() {
-        // m.16126T>C is the shared ancestor; m.310T>TC and m.310T>C are its two
-        // mutually-exclusive descendants (never co-observed on a read).
         let variants = vec![
             "m.16126T>C".to_string(),
             "m.310T>TC".to_string(),
@@ -2725,12 +2295,7 @@ mod tests {
         );
     }
 
-    /// Test-only RNG that replays a fixed sequence of `u64` words, cycling
-    /// once exhausted. `Rng` is blanket-implemented for any `RngCore`, so this
-    /// drops straight into any `&mut impl Rng` parameter — used below to drive
-    /// `run_mcmc` through one exact, pre-scripted sequence of proposal and
-    /// accept/reject draws, rather than relying on a seed to happen to
-    /// exercise a specific code path.
+    /// Test-only RNG that replays a fixed sequence of `u64` words, cycling once exhausted.
     struct ScriptedRng { words: Vec<u64>, idx: usize }
     impl rand::RngCore for ScriptedRng {
         fn next_u32(&mut self) -> u32 { (self.next_u64() >> 32) as u32 }
@@ -2749,23 +2314,7 @@ mod tests {
 
     #[test]
     fn run_mcmc_records_a_rejected_but_superior_swap_subtrees_proposal() {
-        // Forces the exact defect path deterministically, rather than hoping a
-        // seed happens to hit it (the seed-based test above didn't, on any of
-        // its four seeds). Word-to-outcome mapping below was verified
-        // empirically against rand 0.9.3's `random::<f64>()` (top 53 bits of
-        // the word, scaled by 2^-53) and `random_range(0..n)` for a
-        // power-of-two `n` (top bits of the word, exact — no rejection
-        // sampling) via a throwaway probe test before being hardcoded here.
-        //
-        // Starting tree (parent = [2, 2, 4, 4, 4]): root(4) has children 2, 3;
-        // node 2 has children 0, 1. `propose_swap_subtrees` is scripted to
-        // pick the pair (1, 2) — 1 is a descendant of 2 (same lineage) — which
-        // reinserts node 2 under node 1, giving proposal parent
-        // [2, 4, 1, 4, 4] with `nbh_correction == 0.5` (< 1, the condition
-        // that lets a superior proposal be rejected). The single read is
-        // scored so that the proposal's tree strictly beats the start tree,
-        // and the final scripted draw (~1.0) forces the MH test to reject it
-        // anyway.
+        // Forces the exact defect path deterministically.
         let matrix = BinaryMatrix {
             variants: vec!["m.100A>G".into(), "m.200C>T".into(), "m.300G>A".into(), "m.400T>C".into()],
             reads: vec!["r0".into()],
@@ -2794,19 +2343,9 @@ mod tests {
              ({proposal_ll} vs {start_ll})"
         );
 
-        // Guard that the proposal is actually REJECTED, which is the only
-        // reason this test distinguishes the fixed code from the broken code.
-        // The pre-fix implementation also recorded `best` on acceptance, so if
-        // the scripted draw ever started accepting this proposal, every
-        // assertion below would still pass — against the broken code too.
-        //
-        // The draw is derived through rand's own `f64` mapping rather than
-        // hardcoded, so a future change to that mapping moves this guard with
-        // it instead of silently invalidating the test.
+        // Guard that the proposal is actually REJECTED.
         let mh_draw: f64 = ScriptedRng { words: vec![u64::MAX], idx: 0 }.random();
-        // Mirrors `run_mcmc`: acceptance = nbh_correction * exp(proposal - current),
-        // with 0.5 the correction `swap_subtrees` returns for this scripted pair,
-        // and `current_ll == start_ll` on the single iteration this test runs.
+        // Mirrors `run_mcmc`: acceptance = nbh_correction * exp(proposal - current).
         let acceptance = 0.5 * (proposal_ll - start_ll).exp();
         assert!(
             acceptance <= mh_draw,
@@ -2816,9 +2355,7 @@ mod tests {
              assertions below would pass for the wrong reason"
         );
 
-        // The MH draw above was rigged to reject the proposal, yet it is
-        // strictly better than the start tree -- a correct implementation
-        // must have recorded it as the running best before that rejection.
+        // The MH draw above was rigged to reject the proposal.
         assert_eq!(
             best.parent, proposal.parent,
             "a rejected-but-superior swap-subtrees proposal must still be returned as best"
@@ -2856,16 +2393,6 @@ mod tests {
 
     #[test]
     fn run_mcmc_reaches_the_optimum_on_an_exhaustively_searchable_space() {
-        // General sanity check, not a defect-specific regression test: over a
-        // 3-mutation space small enough to brute-force, thousands of
-        // iterations of MCMC must reach the true optimum, for any seed. (It
-        // does not specifically exercise the rejected-but-superior
-        // swap-subtrees case — with propose_move's move weights and a space
-        // this thoroughly explored, the optimum is overwhelmingly likely to
-        // be reached via a prune-reattach or swap-labels acceptance, where
-        // nbh_correction == 1 and the pre-fix code recorded `best` correctly
-        // too. See `run_mcmc_records_a_rejected_but_superior_swap_subtrees_proposal`
-        // for a test that deterministically forces that specific path.)
         let matrix = BinaryMatrix {
             variants: vec!["m.100A>G".into(), "m.200C>T".into(), "m.300G>A".into()],
             reads: (0..9).map(|i| format!("r{i}")).collect(),
@@ -2961,8 +2488,7 @@ mod tests {
     #[test]
     fn swap_subtrees_same_lineage_reinserts_ancestor_with_hastings_correction() {
         let tree = MutationTree { n_mutations: 4, parent: vec![2, 2, 4, 4, 4] };
-        // node=1, next_node=2: node1's only current "descendant" (self-inclusive)
-        // is itself, so this is fully deterministic regardless of choice_index.
+        // node=1, next_node=2: node1's only current "descendant" is itself.
         let (proposal, correction) = swap_subtrees(&tree, 1, 2, 0);
         assert_eq!(proposal.parent, vec![2, 4, 1, 4, 4]);
         assert!((correction - 0.5).abs() < 1e-12);
@@ -2971,14 +2497,10 @@ mod tests {
     #[test]
     fn swap_labels_star_topology_does_not_double_fire_self_loop_fixup() {
         // Star tree: all leaves are direct children of root(4).
-        // Swapping any two leaves must not break the star structure or
-        // double-apply the self-loop fixup. This is the topology the
-        // chain_tree test misses.
         let tree = MutationTree { n_mutations: 4, parent: vec![4, 4, 4, 4, 4] };
         let swapped = swap_labels(&tree, 0, 3);
         assert_valid_tree(&swapped);
-        // Labels 0 and 3 are leaves with no children — the parent array is
-        // unchanged for all other nodes; only positions 0 and 3 swap.
+        // Labels 0 and 3 are leaves with no children — the parent array is unchanged for all other nodes.
         assert_eq!(swapped.parent, vec![4, 4, 4, 4, 4]);
     }
 
@@ -3187,9 +2709,7 @@ mod tests {
 
     #[test]
     fn run_scite_pipeline_handles_more_than_63_variants() {
-        // 65 variants exceeds the old u64-bitmask limit. Reads form a nested
-        // chain: read j carries variants 0..j, so every variant has both
-        // present and absent reads and the deepest mutations live on bits ≥64.
+        // 65 variants exceeds the old u64-bitmask limit.
         let n_var = 65;
         let n_reads = n_var + 1;
         let variants: Vec<String> = (0..n_var).map(|i| format!("m.{i}")).collect();
@@ -3209,8 +2729,6 @@ mod tests {
 
         let nwk = format!("{prefix}.read_lineage.nwk");
         assert!(std::path::Path::new(&nwk).exists(), "expected {nwk} to exist");
-        // Plan 2026-09-26 T3. debug is false here, so cleaned_matrix.csv and
-        // raw_variant_cooccurrence.tsv are not written.
         for suffix in [
             ".variant_cooccurrence.tsv",
             ".molecule_summary.tsv",
@@ -3223,9 +2741,7 @@ mod tests {
 
     #[test]
     fn run_scite_pipeline_handles_a_single_variant() {
-        // One variant: the only possible tree is root → m.A, the co-occurrence
-        // tables have no pair to report, and the swap proposals (which need two
-        // distinct mutation nodes) must never be reached.
+        // One variant: the only possible tree is root → m.A, the co-occurrence tables have no pair to report.
         let matrix = BinaryMatrix {
             variants: vec!["m.100A>G".to_string()],
             reads: (0..10).map(|i| format!("r{i}")).collect(),
@@ -3251,15 +2767,11 @@ mod tests {
             "expected m.100A>G under ROOT, got:\n{tree_tsv}"
         );
         // Header-only co-occurrence table: a single variant forms no pair.
-        // Plan 2026-09-26 T3. debug is false, so the raw table is not written;
-        // the cleaned table is still header-only.
         let content = std::fs::read_to_string(format!("{prefix}.variant_cooccurrence.tsv")).unwrap();
         assert_eq!(content.lines().count(), 1, "expected header only in .variant_cooccurrence.tsv");
         let nwk = std::fs::read_to_string(format!("{prefix}.read_lineage.nwk")).unwrap();
         assert!(nwk.contains("mutation=m.100A>G"), "got newick: {nwk}");
 
-        // Plan 2026-09-26 T3. debug is false, so cleaned_matrix.csv and
-        // raw_variant_cooccurrence.tsv are not part of the default outputs.
         for suffix in [
             ".variant_cooccurrence.tsv",
             ".molecule_summary.tsv",
@@ -3274,9 +2786,7 @@ mod tests {
 
     #[test]
     fn propose_move_leaves_a_single_mutation_tree_unchanged() {
-        // Guards the infinite rejection loop in `sample_two_distinct`: with one
-        // mutation the swap moves have no second node to draw, so `propose_move`
-        // must return the current tree instead of proposing one.
+        // Guards the infinite rejection loop in `sample_two_distinct`.
         let tree = MutationTree { n_mutations: 1, parent: vec![1, 1] };
         let mut rng = StdRng::seed_from_u64(4);
         for _ in 0..100 {
@@ -3305,8 +2815,6 @@ mod tests {
 
         run_scite_pipeline(&matrix, 0.01, 0.1, (0.01, 0.1), 500, 2, 123, 1, None, false, &prefix).unwrap();
 
-        // Plan 2026-09-26 T3. debug is false, so cleaned_matrix.csv and
-        // raw_variant_cooccurrence.tsv are not part of the default outputs.
         for suffix in [
             ".variant_cooccurrence.tsv",
             ".molecule_summary.tsv",
@@ -3323,12 +2831,7 @@ mod tests {
     fn write_read_lineage_newick_collapses_and_annotates_reads_and_mutations() {
         use lineage::{Haplotype, HaplotypeMatrix};
 
-        // root(4) -> A(0) -> B(1) -> {C(2), D(3)}
-        //   A: no haplotypes, single child B      -> collapses onto B's branch
-        //   B: branch point (C, D, and hap H3)    -> ancestral node anc1
-        //   C: single haplotype H0, no children   -> collapses onto H0's tip branch
-        //   D: two haplotypes H1, H2              -> ancestral node anc3
-        //   H3 attaches to internal node B        -> length-0 tip, reads only
+        // root(4) -> A(0) -> B(1) -> {C(2), D(3)}.
         let tree = MutationTree { n_mutations: 4, parent: vec![4, 0, 1, 1, 4] };
         let rates = ErrorRates::uniform(0.01, 0.05);
 
@@ -3355,10 +2858,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(&path).ok();
 
-        // No haplotype carries zero mutations, so the ancestral root state is
-        // materialised as a synthetic zero-read tip (Hroot) under ROOT. Each
-        // branch reports the per-mutation order support alongside the mutations,
-        // so a collapsed run of mutations whose order is arbitrary is visible.
+        // No haplotype has zero mutations, so the root state becomes a synthetic zero-read tip.
         assert_eq!(
             content,
             "((H0_n9:1[&&NHX:mutation=mC:order_support=0.000:reads=9],\
@@ -3372,9 +2872,7 @@ mod tests {
     fn write_read_lineage_newick_uses_all_zero_haplotype_as_root_tip() {
         use lineage::{Haplotype, HaplotypeMatrix};
 
-        // root(1) -> A(0). The all-zero haplotype (H0000, 5 reads) best-attaches
-        // to the root and supplies the ancestral tip's id/count directly — no
-        // synthetic Hroot, and its reads are not double-counted elsewhere.
+        // root(1) -> A(0).
         let tree = MutationTree { n_mutations: 1, parent: vec![1, 1] };
         let rates = ErrorRates::uniform(0.01, 0.05);
         let hap_matrix = HaplotypeMatrix {
@@ -3460,12 +2958,7 @@ mod tests {
 
     #[test]
     fn path_order_uses_jointly_covered_counts_not_coverage_biased_allele_frequency() {
-        // A is ancestral: among the 4 reads covering both sites it appears once
-        // without B and never the other way round. But A is only covered in
-        // those 4 reads (AF 2/4 = 0.50) while B is covered in all 20
-        // (AF 12/20 = 0.60), so a global-AF sort puts B first — the per-variant
-        // denominators are not comparable. The coverage-matched pairwise counts
-        // (n10 = 1, n01 = 0) put A first.
+        // A is ancestral: among the 4 reads covering both sites it appears once without B and never the other way round.
         let matrix = matrix_from_rows(
             &["A", "B"],
             &[
@@ -3480,9 +2973,7 @@ mod tests {
 
     #[test]
     fn path_order_falls_back_to_allele_frequency_when_joint_counts_are_tied() {
-        // A and B never appear apart among jointly covered reads (n10 = n01 = 0),
-        // so the pairwise statistic is uninformative. The marginal counts still
-        // rank A ancestral, using reads that cover only one of the two sites.
+        // A and B never appear apart among jointly covered reads (n10 = n01 = 0), so the pairwise statistic is uninformative.
         let matrix = matrix_from_rows(
             &["A", "B"],
             &[
@@ -3495,9 +2986,7 @@ mod tests {
 
     #[test]
     fn polish_reorders_a_path_that_a_global_af_sort_leaves_untouched() {
-        // Same coverage-biased pair as above, with the tree already in the wrong
-        // order (B ancestral). A global-AF sort agrees with the wrong order and
-        // therefore proposes nothing at all.
+        // Same coverage-biased pair as above, with the tree already in the wrong order (B ancestral).
         let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(
             &["A", "B"],
@@ -3514,11 +3003,7 @@ mod tests {
 
     #[test]
     fn polish_keeps_climbing_after_the_first_candidate_ordering() {
-        // Starting chain ROOT -> 2 -> 1 -> 0 (LL -15.706). The orientation sort
-        // proposes 2 -> 0 -> 1, which is an improvement (LL -9.716) but not the
-        // best ordering: 0 -> 2 -> 1 scores -6.722 and is the exhaustive ML over
-        // all six permutations. A single accept/reject on one candidate stops at
-        // the first improvement; adjacent swaps reach the optimum.
+        // A single accept/reject on one candidate stops at the first improvement; adjacent swaps reach the optimum.
         let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(
             &["m0", "m1", "m2"],
@@ -3537,10 +3022,7 @@ mod tests {
 
     #[test]
     fn polish_is_deterministic_and_terminates_on_a_likelihood_flat_path() {
-        // All three variants are carried as a block, so no read attaches to an
-        // interior node and every one of the six orderings has the same
-        // likelihood. The climb must settle on the orientation-preferred order
-        // (index order, since every statistic ties here) instead of cycling.
+        // All three variants are carried as a block.
         let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(
             &["A", "B", "C"],
@@ -3560,8 +3042,7 @@ mod tests {
 
     #[test]
     fn edge_order_support_is_flat_when_no_read_separates_two_mutations() {
-        // Same block-carried data: nothing distinguishes A above B from B above
-        // A, so the edge carries no evidence at all.
+        // Same block-carried data: nothing distinguishes A above B from B above A, so the edge carries no evidence at all.
         let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(
             &["A", "B", "C"],
@@ -3578,8 +3059,7 @@ mod tests {
 
     #[test]
     fn edge_order_support_is_large_when_reads_pin_the_order() {
-        // Six reads carry A without B, none carry B without A, so putting B
-        // above A would have to explain all six as dropouts at B.
+        // Six reads carry A without B, none carry B without A.
         let rates = ErrorRates::uniform(0.001, 0.05);
         let matrix = matrix_from_rows(&["A", "B"], &["1111111111", "1111000000"]);
         let chain = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
@@ -3590,9 +3070,7 @@ mod tests {
 
     #[test]
     fn order_resolved_flags_a_near_tie_even_when_the_likelihood_looks_confident() {
-        // Numbers taken from the ont-r10 eval set. The inverted edge carries ~6
-        // nats of likelihood — which reads as confident — but its count margin is
-        // one read (sign-test p = 0.5), so the order is not actually resolved.
+        // The inverted edge looks confident by likelihood, but its count margin is one read.
         let inverted = EdgeEvidence { support_ll: Some(5.989), counts: Some((8, 9)) };
         assert_eq!(inverted.order_resolved(), Some(false));
 
@@ -3620,17 +3098,14 @@ mod tests {
         let evidence = edge_evidence(&chain, &matrix, &rates);
         assert_eq!(evidence[0].counts, None, "A hangs from the root");
         assert_eq!(evidence[0].support_ll, None);
-        // B without A: read 3. A without B: read 2.
+        // B without A: read 3.
         assert_eq!(evidence[1].counts, Some((1, 1)));
         assert!(evidence[1].support_ll.is_some());
     }
 
     #[test]
     fn edge_evidence_matches_per_node_edge_order_support_on_random_trees() {
-        // Pins the invariant that `edge_evidence`'s hoisting must preserve: what
-        // it computes in bulk — one scorer and one unswapped-tree likelihood
-        // shared across every node — must equal what `edge_order_support`
-        // computes node by node, rebuilding both each time.
+        // Pins the invariant that `edge_evidence`'s hoisting must preserve: what it computes in bulk.
         let mut rng = StdRng::seed_from_u64(0xED6E);
         let rates = ErrorRates::uniform(0.005, 0.05);
 
@@ -3683,7 +3158,7 @@ mod tests {
 
     #[test]
     fn polish_unary_path_order_moves_distal_children_to_new_tip() {
-        // Path ROOT→0→1 with distal children 2,3 under tip 1. AF prefers 1 ancestral to 0.
+        // Path ROOT→0→1 with distal children 2,3 under tip 1.
         let rates = ErrorRates::uniform(0.01, 0.05);
         let matrix = BinaryMatrix {
             variants: vec!["m0".into(), "m1".into(), "m2".into(), "m3".into()],
@@ -3707,27 +3182,7 @@ mod tests {
         assert_eq!(polished.parent[3], 0);
     }
 
-    /// Corpus-backed regression test, so it is `#[ignore]`d by default.
-    ///
-    /// Unlike the synthetic polish tests above, this one asserts against a real
-    /// simulated ONT-R10 run, which is the whole point of it: the specific
-    /// evidence margins it pins down (see the comment at the end) only arise from
-    /// genuine read-level data, so replacing the corpus with a hand-built matrix
-    /// would turn it into a duplicate of
-    /// `polish_unary_path_order_moves_distal_children_to_new_tip` while still
-    /// claiming to be an integration test. The inputs are generated artifacts of
-    /// `lineage_eval/lineage_sim/run_eval.sh` (which needs read simulators and the
-    /// conda environment in that directory) and are deliberately not committed,
-    /// so an unconditional `#[test]` here made `cargo test` red on every clean
-    /// checkout and masked real regressions.
-    ///
     /// To run it, point it at a corpus you have generated:
-    ///
-    /// ```text
-    /// HIMITO_TEST_MATRIX=/path/to/sim.matrix.csv \
-    /// HIMITO_TEST_VCF=/path/to/sim.vcf \
-    ///     cargo test --bin Himito -- --ignored polish_fixes_fully_flipped
-    /// ```
     #[test]
     #[ignore = "needs a generated lineage_eval corpus; set HIMITO_TEST_MATRIX and HIMITO_TEST_VCF"]
     fn polish_fixes_fully_flipped_ont_eval_tree() {
@@ -3737,8 +3192,7 @@ mod tests {
         let vcf = std::env::var("HIMITO_TEST_VCF").unwrap_or_else(|_| {
             format!("{}/lineage_eval/lineage_sim/tmp/eval_ont_r10/himito/sim.vcf", env!("CARGO_MANIFEST_DIR"))
         });
-        // A raw unwrap here reported only "file not found", which read like a bug
-        // in the code under test rather than a missing input.
+        // A raw unwrap here reported only "file not found".
         for (label, path) in [("HIMITO_TEST_VCF", &vcf), ("HIMITO_TEST_MATRIX", &mat)] {
             assert!(
                 std::path::Path::new(path).exists(),
@@ -3788,19 +3242,7 @@ mod tests {
         assert_eq!(polished.parent[ix("m.14577T>A")], ix("m.2358A>C"));
         assert_eq!(polished.parent[ix("m.11749A>T")], root);
 
-        // The long chain is recovered as 11749 → {12477, 7102}: 11749 ancestral to
-        // both, as in the truth tree. The order *within* the 12477/7102 pair is not
-        // recoverable from this data set and is deliberately not asserted:
-        //   * the pairwise counts are n10 = 8 vs n01 = 9 — a one-read margin
-        //     (sign-test p ≈ 0.7), so the coverage-matched evidence is a coin flip;
-        //   * the truth order (12477 ancestral) needs 9 dropouts at 12477 while the
-        //     reverse needs 8 at 7102, so *any* likelihood with a symmetric
-        //     false-negative rate prefers the reverse, by ≈ 6 nats;
-        //   * the full pipeline on this same data already returns the reverse
-        //     (`sim_lineage.mutation_tree.tsv`), and did so before this polish
-        //     existed — the old whole-path rule only reached the truth order from
-        //     this artificially flipped starting tree, not from the MCMC's tree.
-        // `edge_order_support` is what surfaces the ambiguity to the user.
+        // The long chain is recovered as 11749 → {12477, 7102}: 11749 ancestral to both, as in the truth tree.
         let chain = [ix("m.12477T>G"), ix("m.7102T>C")];
         let deep = if polished.parent[chain[0]] == chain[1] { chain[0] } else { chain[1] };
         let shallow = if deep == chain[0] { chain[1] } else { chain[0] };
@@ -3818,11 +3260,7 @@ mod tests {
     #[test]
     fn incremental_scorer_matches_reference_best_attachment_on_random_trees() {
         let mut rng = StdRng::seed_from_u64(0xC0FFEE);
-        // Swept across rate regimes, not just the pacbio default. The degenerate
-        // rows are the ones that matter: at 0.0 and 1.0 an unclamped path scores
-        // whole classes of nodes at -inf and its tie-break stops discriminating,
-        // so these rows are what hold the reference and the scorer to the same
-        // `ErrorRates::clamped` view of the model.
+        // The degenerate rows are the ones that matter.
         let rate_settings = [
             (0.005, 0.05), // pacbio default
             (0.0001, 0.01), // ont-denoised default
@@ -3895,8 +3333,7 @@ mod tests {
 
     #[test]
     fn tree_layout_preorder_visits_every_parent_before_its_children() {
-        // The forward scoring pass depends on this: scratch[parent] must already be
-        // final when scratch[node] is computed from it.
+        // The forward scoring pass depends on this.
         let mut rng = StdRng::seed_from_u64(19);
         for n in 1..12usize {
             let tree = MutationTree::random(n, &mut rng);
@@ -3917,11 +3354,7 @@ mod tests {
 
     #[test]
     fn attachment_scorer_clamps_zero_rates_instead_of_producing_nan() {
-        // fp = 0 is a supported CLI input (`--fp-rate 0`, passed through verbatim by
-        // lineage::resolve_error_rates). The reference implementation yields -inf for
-        // any node that cannot explain an alt call; naive incremental scoring would
-        // compute (-inf) + (+inf) = NaN, which compares false against everything and
-        // would silently pin every read to node 0. The clamp keeps scores finite.
+        // fp = 0 is a supported CLI input (`--fp-rate 0`, passed through verbatim by lineage::resolve_error_rates).
         let matrix = BinaryMatrix {
             variants: vec!["m.100A>G".to_string(), "m.200C>T".to_string()],
             reads: vec!["r0".to_string()],
@@ -3934,20 +3367,13 @@ mod tests {
         let mut scratch = Vec::new();
         let (node, ll) = scorer.best_attachment(0, &tree, &layout, &mut scratch);
         assert!(ll.is_finite(), "score must stay finite with zero rates, got {ll}");
-        // Node 0 carries m.100A>G (observed alt) and not m.200C>T (observed ref):
-        // the only genotype that explains both calls.
+        // Node 0 carries m.100A>G (observed alt) and not m.200C>T (observed ref): the only genotype that explains both calls.
         assert_eq!(node, 0);
     }
 
     #[test]
     fn attachment_scorer_stores_one_byte_per_cell_in_a_single_allocation() {
-        // The per-cell term takes exactly three values for a given variant, so
-        // it is stored as a byte code into that variant's 3-entry table rather
-        // than as an f64 per cell. Pinned because nothing else would notice the
-        // day someone "simplifies" this back to a Vec<Vec<f64>>: every other
-        // test would still pass, and the cost — ~160MB instead of ~20MB at
-        // 100k reads x 200 variants, plus 100k separate allocations — is
-        // invisible at test sizes.
+        // The per-cell term takes exactly three values for a given variant.
         let (n_variants, n_reads) = (64usize, 256usize);
         let matrix = BinaryMatrix {
             variants: (0..n_variants).map(|i| format!("m.{}A>G", 100 + i)).collect(),
@@ -3960,8 +3386,7 @@ mod tests {
         assert_eq!(std::mem::size_of_val(&scorer.code[0]), 1, "one byte per cell");
         assert_eq!(scorer.code.len(), n_reads * n_variants, "flat, not nested");
         assert_eq!(scorer.n_variants, n_variants, "row stride is the variant count");
-        // Each variant has a 3-entry table; uncovered must cost zero. Uniform
-        // rates make every variant's table identical.
+        // Each variant has a 3-entry table; uncovered must cost zero.
         assert_eq!(scorer.delta.len(), n_variants);
         for table in &scorer.delta {
             assert_eq!(table[CODE_UNCOVERED as usize], 0.0);
@@ -3972,20 +3397,7 @@ mod tests {
 
     #[test]
     fn reference_and_scorer_agree_when_no_node_can_explain_the_read() {
-        // `attach_all_reads` scores through `AttachmentScorer` (rates clamped),
-        // while `write_read_lineage_newick` scores haplotype profiles through the
-        // reference `best_attachment`. If those two disagree, a haplotype tip in
-        // `read_lineage.nwk` lands on a different node than the reads that
-        // compose it in `cleaned_matrix.csv`.
-        //
-        // They diverge exactly when no node explains the read and `fp` is 0 (a
-        // supported CLI input): unclamped, every node scores exactly -inf, all
-        // comparisons against -inf are false or NaN, and `best_attachment` falls
-        // through to its initial value, the root. Clamped, the nodes stay ordered
-        // by how badly they fit and the least-bad one wins.
-        //
-        // Here root(2) has 0 and 1 as siblings and the read claims BOTH variants,
-        // which no single node's genotype can satisfy.
+        // `attach_all_reads` scores through `AttachmentScorer`.
         let matrix = BinaryMatrix {
             variants: vec!["m.100A>G".to_string(), "m.200C>T".to_string()],
             reads: vec!["r0".to_string()],
@@ -4020,7 +3432,6 @@ mod tests {
     #[test]
     fn attachment_scorer_scratch_is_reusable_across_reads_and_trees() {
         // The scratch buffer is caller-owned so a loop over reads allocates once.
-        // A stale buffer from a larger tree must not leak into a smaller one.
         let matrix = BinaryMatrix {
             variants: vec!["m.100A>G".into(), "m.200C>T".into(), "m.300G>A".into()],
             reads: vec!["r0".into(), "r1".into()],
@@ -4048,11 +3459,6 @@ mod tests {
 
     #[test]
     fn run_scite_pipeline_with_all_variants_homoplasmic_does_not_panic() {
-        // Two germline variants, correlated dropout on the last 5 reads: both
-        // land in the block, leaving zero informative variants. 5 absences,
-        // not 10: at fn = 0.05 the effect-size floor is 10, and 10 absences
-        // is already a significant excess (plan 2026-09-26 T2), so it would
-        // leave the block.
         let n_reads = 100usize;
         let mut row = vec![Some(1u8); 95];
         row.extend(vec![Some(0u8); 5]);
@@ -4103,13 +3509,10 @@ mod tests {
         assert!(!tsv.contains("ROOT_BLOCK"), "disabled must emit no block row");
     }
 
-    /// Spec requirement: an ENABLED run whose partition happens to be empty must
-    /// be indistinguishable from a disabled one. This is the guard that stops
-    /// the feature from perturbing data it was never meant to touch.
+    /// An enabled run with an empty partition must match a disabled run.
     #[test]
     fn enabled_run_with_empty_block_matches_disabled_run_exactly() {
-        // Both variants sit at HF 0.50, far below the 0.80 gate, so nothing is
-        // even a candidate.
+        // Both variants sit at HF 0.50, far below the 0.80 gate, so nothing is even a candidate.
         let n_reads = 100usize;
         let alternating: Vec<Option<u8>> =
             (0..n_reads).map(|r| Some(if r % 2 == 0 { 1u8 } else { 0u8 })).collect();
@@ -4121,9 +3524,7 @@ mod tests {
             data: vec![alternating, blocky],
         };
 
-        // Pin down the premise: this test is only meaningful if the partition
-        // actually produces an empty block. Without this, gutting `partition`
-        // to always return `disabled` would still pass.
+        // Pin down the premise: this test is only meaningful if the partition actually produces an empty block.
         let rb = rootblock::partition(&binary, &crate::rootblock::RootBlockConfig::default(), 0.05);
         assert!(rb.block.is_empty(), "test premise violated: partition must find no block here");
 
@@ -4138,8 +3539,6 @@ mod tests {
         ).unwrap();
         run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), 200, 1, 7, 1, None, false, &off).unwrap();
 
-        // Plan 2026-09-26 T3. debug is false on both runs, so
-        // cleaned_matrix.csv and raw_variant_cooccurrence.tsv are not written.
         for ext in [
             ".mutation_tree.tsv",
             ".read_lineage.nwk",
@@ -4152,16 +3551,10 @@ mod tests {
         }
     }
 
-    /// Spec requirement: the existing single-variant short circuit
-    /// (`scite.rs:1712`) must still fire when the block leaves exactly one
-    /// informative variant behind. Asserts only on the cleaned matrix here;
-    /// the `ROOT_BLOCK` row it also produces arrives in Task 5, which extends
-    /// this test rather than adding a second one.
+    /// Spec requirement: the existing single-variant short circuit must still fire.
     #[test]
     fn one_informative_variant_after_partition_still_takes_the_single_variant_path() {
         let n_reads = 100usize;
-        // 5 absences, not 10: 10/100 at fn = 0.05 clears the excess-absence
-        // floor and would leave the block (plan 2026-09-26 T2).
         let mut germline = vec![Some(1u8); 95];
         germline.extend(vec![Some(0u8); 5]);
         let real: Vec<Option<u8>> =
@@ -4180,9 +3573,6 @@ mod tests {
             Some(&crate::rootblock::RootBlockConfig::default()), false, &prefix,
         ).unwrap();
 
-        // Plan 2026-09-26 T3. The germline variant left the search but survives
-        // in the in-memory cleaned matrix (formerly cleaned_matrix.csv) as an
-        // all-present row.
         assert!(
             out.cleaned.variants.iter().any(|v| v == "m.750A>G"),
             "block variants stay in the cleaned matrix"
@@ -4196,9 +3586,7 @@ mod tests {
 
     #[test]
     fn resolve_span_conflicts_pulls_back_a_block_variant_overlapping_informative() {
-        // Same shape as the real failure: a blocked indel and an informative
-        // substitution both anchored at position 310, so their REF spans
-        // (both [310, 311)) overlap.
+        // Same shape as the real failure: a blocked indel and an informative substitution both anchored at position 310.
         let variants = vec!["m.310T>TC".to_string(), "m.310T>C".to_string()];
         let rb = rootblock::RootBlock {
             block: vec![0],
@@ -4222,13 +3610,7 @@ mod tests {
 
     #[test]
     fn resolve_span_conflicts_drains_a_three_allele_chain_in_one_pass() {
-        // P is informative. A overlaps P directly. B overlaps only A, not P.
-        // Under the old fixpoint-over-informative rule this needed two passes
-        // (pulling A back only newly conflicted B on a second sweep). Under
-        // the current rule each variant's fate depends on whether *anything
-        // in the full matrix* overlaps it, so A and B are both decided from
-        // the start — this test's job is to prove the whole chain drains,
-        // not that iteration was needed to get there.
+        // P is informative.
         let variants = vec![
             "m.300A>G".to_string(),   // P: informative, span [300, 301)
             "m.300AT>A".to_string(),  // A: block, span [300, 302), overlaps P
@@ -4260,11 +3642,7 @@ mod tests {
 
     #[test]
     fn resolve_span_conflicts_empties_a_mutually_overlapping_block_cluster() {
-        // Two block members overlap only each other (no informative variant
-        // involved). Neither may safely stay blocked: whichever one were
-        // kept would still be imputed present on every read, and the other's
-        // presence calls (now in the search) would assert two
-        // mutually-exclusive alleles on the same molecule. Both must go.
+        // Two block members overlap only each other (no informative variant involved).
         let variants = vec!["m.500A>G".to_string(), "m.500A>T".to_string()];
         let rb = rootblock::RootBlock {
             block: vec![0, 1],
@@ -4289,13 +3667,8 @@ mod tests {
 
     #[test]
     fn raw_cooccurrence_keeps_block_variants() {
-        // Block variants are not invariant in the RAW data — they carry
-        // exactly the dropout that made them candidates — so unlike the
-        // cleaned-matrix tables, the raw co-occurrence table must still
-        // report them.
+        // Block variants are not invariant in the RAW data — they carry exactly the dropout that made them candidates.
         let n_reads = 100usize;
-        // 5 absences, not 10: 10/100 at fn = 0.05 is an excess absence and
-        // would not be blocked (plan 2026-09-26 T2).
         let mut germline = vec![Some(1u8); 95];
         germline.extend(vec![Some(0u8); 5]);
         let real: Vec<Option<u8>> =
@@ -4321,18 +3694,10 @@ mod tests {
         );
     }
 
-    /// Doc claim (`docs/root-block-collapse.md`, Outputs section):
-    /// `write_variant_cooccurrence_upto` restricts to the first
-    /// `n_informative` columns before building any row, so a pair involving
-    /// a block variant is not printed with `NA` fields — its row is ABSENT
-    /// entirely. Assert that end-to-end, with the block non-empty AND two
-    /// informative variants surviving, so the table is non-empty and the
-    /// omission is not just "nothing left to pair".
+    /// `write_variant_cooccurrence_upto` restricts to the first `n_informative` columns before building rows.
     #[test]
     fn variant_cooccurrence_omits_block_variants_entirely() {
         let n_reads = 100usize;
-        // 5 absences, not 10: 10/100 at fn = 0.05 is an excess absence and
-        // would not be blocked (plan 2026-09-26 T2).
         let mut block_col = vec![Some(1u8); 95];
         block_col.extend(vec![Some(0u8); 5]);
         let informative_a: Vec<Option<u8>> =
@@ -4349,9 +3714,7 @@ mod tests {
             data: vec![block_col, informative_a, informative_b],
         };
 
-        // Pin the premise: the block is non-empty and two informative
-        // variants remain, so the pair table below is guaranteed non-empty
-        // and the omission assertion is not vacuous.
+        // Pin the premise: the block is non-empty and two informative variants remain.
         let rb = rootblock::partition(&binary, &crate::rootblock::RootBlockConfig::default(), 0.05);
         assert_eq!(rb.block, vec![0], "test premise violated: expected v0 alone to block");
         assert_eq!(
@@ -4380,8 +3743,7 @@ mod tests {
         );
     }
 
-    /// Plan 2026-09-26 T2. A rule-2 row (too few absences to test) must report
-    /// `high_raw_vaf`, and the old reason string must not appear in the file.
+    /// A rule-2 row must report `high_raw_vaf`, and the old reason string must not appear in the file.
     #[test]
     fn write_root_block_table_rule2_reason_is_high_raw_vaf() {
         let n_reads = 100usize;
@@ -4436,11 +3798,8 @@ mod tests {
                    "high_raw_vaf candidates report NA, not 0");
     }
 
-    /// A saturated tie (min_q == 1.0) means no candidate partner was ever
-    /// strictly better than the incumbent, so `partition`'s pass 3 leaves
-    /// whichever `u` happened to sit lowest in variant order — an index with
-    /// nothing to do with the decision. The table must not dress that up as
-    /// "the best-discriminating partner".
+    /// A saturated tie means no candidate partner was ever strictly better than the incumbent.
+    /// The table must not dress that up as "the best-discriminating partner".
     #[test]
     fn write_root_block_table_reports_na_partner_when_min_q_saturates() {
         use crate::rootblock::{BlockReason, RootBlockAudit};

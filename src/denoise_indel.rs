@@ -1,29 +1,13 @@
 //! Small-indel site model and length-changing read rewrite for the ONT denoiser.
-//!
-//! This file merges what were previously `denoise/indel.rs` and
-//! `denoise/rewrite.rs`. The two halves are separated by the banner comments
-//! below and remain conceptually distinct:
-//!
-//! * **Site model** - indels have no per-base quality analogue, so this half
-//!   supplies the missing per-read likelihood via a repeat-context-scaled error
-//!   rate `eps(L)`. That one function drives both the candidacy gate and the MAP
-//!   assignment.
-//! * **Read rewrite** - every transition preserves the read's total reference
-//!   consumption: `Ref->Ins` adds query only; `Ref->Del` converts M(n) to D(n)
-//!   (both consume n reference bases); reverting `Ins` removes query only;
-//!   reverting `Del` converts D(n) back to M(n). POS, reference end, and
-//!   coordinate-sort order are therefore invariant, so the output never needs
-//!   re-sorting or re-indexing.
+//! POS, reference end, and coordinate-sort order are therefore invariant, so the output never needs
+//! re-sorting or re-indexing.
 
 use std::collections::{HashMap, HashSet};
 
 use rust_htslib::bam::record::{Cigar, CigarString};
 
 // ===========================================================================
-// Site model  (was denoise/indel.rs)
-// ===========================================================================
-/// An indel allele at a normalized site, indexed conceptually by its net length
-/// change: `Ref` = 0, `Ins(s)` = +s.len(), `Del(n)` = -n.
+/// An indel allele at a normalized site, indexed conceptually by its net length change: `Ref` = 0.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Allele {
     Ref,
@@ -41,9 +25,7 @@ impl Allele {
         }
     }
 
-    /// True when both alleles are the same variety (both insertions, both deletions,
-    /// or both reference). Cross-kind reassignment is not supported by the rewrite
-    /// walk, so the assignment step uses this to refuse those transitions.
+    /// True when both alleles are the same variety (both insertions, both deletions, or both reference).
     pub fn kind_matches(&self, other: &Allele) -> bool {
         matches!(
             (self, other),
@@ -55,22 +37,13 @@ impl Allele {
 }
 
 /// Minimum plain match-context flank required on each side of an indel edit.
-/// Was `IndelOpts::flank`, a field no caller ever changed from 5 and every use
-/// site had to clamp to >= 1; as a constant it is >= 1 by construction. It is a
-/// quality bar (some flanking match context around every edit), not the
-/// no-truncation bound -- the gained-deletion run check `m + flank + 1` would be
-/// exact even at 0.
 pub const INDEL_FLANK: usize = 5;
 
-/// Tunable parameters for indel denoising. `Default` is DISABLED, so every existing
-/// caller that passes `IndelOpts::default()` keeps byte-identical v1 behavior.
+/// Tunable parameters for indel denoising.
 #[derive(Debug, Clone)]
 pub struct IndelOpts {
     pub enabled: bool,
-    /// Plan 2026-09-26 T8: treat a homopolymer as a single LENGTH variable, so any
-    /// kept length is reachable from any other -- including the `Ins -> Del` and
-    /// grow-a-deletion transitions the event-based model has to refuse. OFF by
-    /// default (CLI `--indel-hp-length-model`) until an eval shows it helps.
+    /// OFF by default (CLI `--indel-hp-length-model`) until an eval shows it helps.
     pub hp_length_model: bool,
     /// Exclusive upper bound: with 5, lengths 1..=4 are correctable.
     pub max_len: u32,
@@ -80,24 +53,10 @@ pub struct IndelOpts {
     pub err_cap: f64,
     pub floor_mult: f64,
     pub delta: f64,
-    /// An allele carried by at least this fraction of reads at a site is never
-    /// corrected away, regardless of candidacy. This guards against `vaf_floor`
-    /// exceeding 1.0 in deep repeat contexts (which would otherwise make it
-    /// impossible for ANY alt allele to clear candidacy, so a genuine
-    /// heteroplasmy would be silently rewritten to REF read by read). Applies
-    /// symmetrically: a substantial REF allele is equally protected from being
-    /// converted to an indel.
+    /// An allele carried by at least this fraction of reads at a site is never corrected away.
     pub protect_vaf: f64,
-    /// ONT-recall Phase2 T7: absolute VAF minimum for candidacy; the effective
-    /// minimum is `max(vaf_abs_min, 1.5 * eps)`.
-    ///
-    /// Plan default was 0.02, but on HapMap merge (~5,000×) that kept 31 indel
-    /// alts vs 6 before (>2× acceptance fail): mostly 2–4% one-base deletions
-    /// that are hugely "significant" at depth. 0.05 still keeps 8271AC>A (~8%)
-    /// while cutting the systematic ONT short-run noise.
+    /// Minimum VAF for an indel alt to be kept.
     pub vaf_abs_min: f64,
-    /// ONT-recall Phase2 T7: family-wise level of the binomial excess test
-    /// `P(X >= n | depth, eps)`, Bonferroni-split over the sites fitted in a pass.
     pub excess_alpha: f64,
 }
 
@@ -120,18 +79,12 @@ impl Default for IndelOpts {
     }
 }
 
-/// Shift an indel maximally left so the same biological event, however the aligner
-/// anchored it, collapses to one canonical `(anchor, allele)` key.
-///
-/// `anchor` is the reference position of the last base BEFORE the event, which is
-/// exactly where htslib's pileup reports it.
+/// Shift an indel maximally left so the same biological event, however the aligner anchored it.
 pub fn normalize_left(refseq: &[u8], anchor: u32, allele: &Allele) -> (u32, Allele) {
     match allele {
         Allele::Ref => (anchor, Allele::Ref),
 
-        // Deleted bases are refseq[a+1 ..= a+n]. Shifting the anchor left by one
-        // makes them refseq[a ..= a+n-1], which is the same edit exactly when the
-        // base entering the deletion equals the base leaving it.
+        // Deleted bases are refseq[a+1 ..= a+n].
         Allele::Del(n) => {
             let n = *n as usize;
             let mut a = anchor as usize;
@@ -144,9 +97,7 @@ pub fn normalize_left(refseq: &[u8], anchor: u32, allele: &Allele) -> (u32, Alle
             (a as u32, Allele::Del(n as u32))
         }
 
-        // `s` is inserted after refseq[a]. Shifting left by one puts refseq[a] after
-        // the insertion instead, which is the same edit exactly when the last base of
-        // `s` equals refseq[a]; the inserted string rotates right to stay equivalent.
+        // `s` is inserted after refseq[a].
         Allele::Ins(s) => {
             let mut a = anchor as usize;
             let mut s = s.clone();
@@ -175,10 +126,7 @@ fn primitive_period(unit: &[u8]) -> &[u8] {
     unit
 }
 
-/// Reference repeat context `L` at a normalized site: how many tandem copies of the
-/// event's primitive repeat unit surround it. For a 1bp event this is the homopolymer run
-/// length. Unique sequence gives 1. This is where ONT's indel error mass concentrates,
-/// so it scales both the error rate and the candidacy floor.
+/// Reference repeat context `L` at a normalized site.
 pub fn repeat_context(refseq: &[u8], norm_pos: u32, allele: &Allele) -> u32 {
     let unit: Vec<u8> = match allele {
         Allele::Ref => return 1,
@@ -194,7 +142,6 @@ pub fn repeat_context(refseq: &[u8], norm_pos: u32, allele: &Allele) -> u32 {
     if unit.is_empty() {
         return 1;
     }
-    // Review 2026-09-25 T1: count copies of the primitive repeat unit, not the whole event.
     let unit = primitive_period(&unit);
     let u = unit.len();
     let start = norm_pos as usize + 1;
@@ -206,9 +153,7 @@ pub fn repeat_context(refseq: &[u8], norm_pos: u32, allele: &Allele) -> u32 {
         copies += 1;
         p += u;
     }
-    // ...and leftward. (After left-normalization there is usually nothing to the
-    // left, but counting both directions keeps the measure independent of which
-    // end the aligner happened to anchor.)
+    // ...and leftward.
     let mut p = start;
     while p >= u && refseq.get(p - u..p).map_or(false, |w| w == unit) {
         copies += 1;
@@ -217,14 +162,7 @@ pub fn repeat_context(refseq: &[u8], norm_pos: u32, allele: &Allele) -> u32 {
     copies.max(1)
 }
 
-/// Review 2026-09-25 T3: exclusive reference end of the homopolymer run that starts
-/// right after `anchor` (i.e. at `anchor + 1`). Returns `anchor + 1` when there is no
-/// run, i.e. when that base does not repeat.
-///
-/// A read can only testify to a run's LENGTH if it covers the whole run: one that ends
-/// (or soft-clips) inside it looks like a shorter run, so it is evidence for neither
-/// the reference length nor any indel of it. Both denoiser passes use this to bound
-/// which reads may speak at a site.
+/// Returns `anchor + 1` when there is no run, i.e. when that base does not repeat.
 pub fn hp_tract_end(refseq: &[u8], anchor: u32) -> u32 {
     let start = anchor as usize + 1;
     let base = match refseq.get(start) {
@@ -235,8 +173,7 @@ pub fn hp_tract_end(refseq: &[u8], anchor: u32) -> u32 {
     while refseq.get(p) == Some(&base) {
         p += 1;
     }
-    // A lone base is not a run: fall back to `anchor + 1` so unique sequence imposes
-    // no extra span requirement beyond the event position itself.
+    // A lone base is not a run: fall back to `anchor + 1`.
     if p - start >= 2 {
         p as u32
     } else {
@@ -244,20 +181,7 @@ pub fn hp_tract_end(refseq: &[u8], anchor: u32) -> u32 {
     }
 }
 
-/// Plan 2026-09-26 T8: is `anchor` the normalized anchor of an HP site? If so,
-/// returns the run's exclusive reference end `e` and its base `b`, i.e. the run is
-/// `[anchor + 1, e)` with length `R = e - anchor - 1 >= 2`.
-///
-/// Three conditions, matching the definition in the task brief:
-/// * the repeat unit has period 1 -- automatic here, since `hp_tract_end` walks a
-///   run of one repeated base;
-/// * `hp_tract_end(refseq, anchor) - (anchor + 1) >= 2`, which `hp_tract_end`
-///   already enforces by returning `anchor + 1` for a lone base;
-/// * `anchor` is a NORMALIZED anchor, i.e. `refseq[anchor] != b`. Without this the
-///   8bp A-run in `REF29` would present as seven overlapping HP sites (anchors
-///   7..=13), each wanting to rewrite the same run; `normalize_left` collapses
-///   every indel in a run onto its leftmost anchor, and so does this. Position 0
-///   is exempt because `normalize_left` cannot shift below it either.
+/// If so, returns the run's exclusive reference end `e` and its base `b`.
 pub fn hp_site(refseq: &[u8], anchor: u32) -> Option<(u32, u8)> {
     let start = anchor as usize + 1;
     let e = hp_tract_end(refseq, anchor);
@@ -271,9 +195,6 @@ pub fn hp_site(refseq: &[u8], anchor: u32) -> Option<(u32, u8)> {
     Some((e, b))
 }
 
-/// Plan 2026-09-26 T8b: the `Allele` a homopolymer length change `k` corresponds to,
-/// so votes and assignments at an HP site share one vocabulary with the rest of the
-/// site model.
 pub fn hp_length_allele(k: i32, b: u8) -> Allele {
     match k {
         0 => Allele::Ref,
@@ -283,25 +204,17 @@ pub fn hp_length_allele(k: i32, b: u8) -> Allele {
 }
 
 /// Per-junction indel error probability, growing with repeat context and capped.
-/// This is the likelihood term that base quality supplies for substitutions and that
-/// indels have no equivalent for: without it, MAP assignment degenerates to
-/// "everything becomes the most frequent allele" and heteroplasmy is annihilated.
 pub fn error_rate(l: u32, o: &IndelOpts) -> f64 {
     let exp = (l as i32 - 1).max(0);
     (o.err0 * o.err_scale.powi(exp)).min(o.err_cap)
 }
 
-/// VAF floor for an allele in context `L`: an absolute minimum, raised to a
-/// multiple of the local error rate wherever that is higher. ONT-recall Phase2 T7:
-/// no longer the candidacy gate (see `fit_indel_site`); kept as the reference
-/// point `protect_vaf` is documented against.
+/// VAF floor for an allele in context `L`: an absolute minimum.
 #[cfg_attr(not(test), allow(dead_code))]
 pub fn vaf_floor(l: u32, o: &IndelOpts) -> f64 {
     o.vaf.max(o.floor_mult * error_rate(l, o))
 }
 
-/// ONT-recall Phase2 T7: `P(X >= n)` for `X ~ Binomial(depth, eps)`, the chance
-/// that context error alone puts `n` of `depth` reads on one allele.
 fn indel_excess_pvalue(n: u32, depth: u32, eps: f64) -> f64 {
     if n == 0 {
         return 1.0;
@@ -320,41 +233,12 @@ pub struct IndelSite {
     pub obs: HashMap<Allele, (u32, u32)>,
     /// Total reads spanning this site (the VAF denominator).
     pub depth: u32,
-    /// Column strand totals, used as the null for the strand-bias test. Mito coverage
-    /// is frequently asymmetric, so the null is the column's OWN forward fraction
-    /// rather than a library-wide constant.
+    /// Column strand totals, used as the null for the strand-bias test.
     pub col_fwd: u32,
     pub col_rev: u32,
-    /// Hashes of the qnames of reads that have already cast an ALT vote at this
-    /// site (see FIX 1 in the task-8 review round). Left-normalization can pull
-    /// two of one read's OWN events -- e.g. an insertion and a nearby deletion,
-    /// exactly what coexists in a short tandem repeat -- to the SAME site;
-    /// without this cap that read would contribute two ALT votes while depth
-    /// counts it once, letting `alt_total` exceed `depth`.
-    ///
-    /// Stores a 64-bit hash rather than an owned `Vec<u8>`: this set is kept
-    /// per (contig, normalized site) for the whole pileup pass, and retaining
-    /// every distinct qname verbatim for every site it spans would scale that
-    /// memory with (sites x reads x qname length) instead of a flat 8 bytes
-    /// per (site, read) entry (see FIX 5 in the task-9 review round). The
-    /// tradeoff: a hash collision between two DIFFERENT qnames at the same
-    /// site would drop the second read's genuinely distinct vote. This never
-    /// makes `alt_total` exceed `depth` (the invariant this cap exists to
-    /// protect still holds -- a dropped vote can only undercount); it can
-    /// only make the denoiser very rarely slightly more conservative at a
-    /// site, at collision-probability odds no realistic pileup will hit.
+    /// Hashes of the qnames of reads that have already cast an ALT vote at this site.
     voted: std::collections::HashSet<u64>,
-    /// Plan 2026-09-26 T8 (review fix 2): reads whose HP LENGTH allele is exactly
-    /// the reference length, i.e. `hp_allele == Some(0)`. At an HP site this, and
-    /// NOT `depth - alt_total`, is the reference support.
-    ///
-    /// The two differ because `hp_allele` returns `None` for a read that is
-    /// UNINFORMATIVE about the run's length -- an insertion of some base other than
-    /// `b`, an `N` across the run, or a read that clears pass 1's depth gate
-    /// (`hp_tract_end + 1`) but not the vote's wider flank gate
-    /// (`e + INDEL_FLANK`). Such a read observes neither the reference length nor
-    /// any alternative, so subtracting only the ALT votes from depth silently
-    /// booked it as evidence FOR the reference and diluted every real alt.
+    /// At an HP site this, and NOT `depth - alt_total`, is the reference support.
     hp_ref: u32,
 }
 
@@ -369,12 +253,6 @@ impl IndelSite {
     }
 
     /// Like `add`, but caps a single read to at most one ALT vote at this site.
-    /// Returns `false` (and drops the vote) if `qname` has already voted here.
-    ///
-    /// `add` above is private specifically so this cap cannot be bypassed by
-    /// some future caller reaching straight for the uncapped primitive (see
-    /// FIX 5 in the task-9 review round): callers outside this module have
-    /// exactly one way to record a vote, and it always enforces the cap.
     pub fn add_from_read(&mut self, qname: &[u8], allele: Allele, reverse: bool) -> bool {
         if !self.mark_voted(qname) {
             return false;
@@ -383,9 +261,7 @@ impl IndelSite {
         true
     }
 
-    /// Plan 2026-09-26 T8 (review fix 2): record that `qname` observes the HP site's
-    /// REFERENCE length. Shares the one-vote-per-read cap with `add_from_read`, so a
-    /// read counts once here or once there, never both.
+    /// Shares the one-vote-per-read cap with `add_from_read`, so a read counts once here or once there.
     pub fn add_hp_ref(&mut self, qname: &[u8]) -> bool {
         if !self.mark_voted(qname) {
             return false;
@@ -394,7 +270,7 @@ impl IndelSite {
         true
     }
 
-    /// Claim this read's single vote at this site. `false` if it already voted.
+    /// Claim this read's single vote at this site.
     fn mark_voted(&mut self, qname: &[u8]) -> bool {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -407,55 +283,26 @@ impl IndelSite {
     }
 }
 
-/// The decision for one site: which alleles are kept, their renormalized frequencies,
-/// and the context error rate used for MAP assignment.
+/// The decision for one site: which alleles are kept, their renormalized frequencies.
 #[derive(Debug, Clone)]
 pub struct IndelSiteModel {
     pub kept: Vec<(Allele, f64)>,
     pub eps: f64,
-    /// The repeat context length that produced `eps`; reported in
-    /// `reassignments_by_hp_length` so correction inside long runs is auditable.
+    /// The repeat context length that produced `eps`.
     pub context_len: u32,
     pub strand_biased: usize,
-    /// The RAW observed VAF of every allele at the site (kept or not), including
-    /// `Allele::Ref`. Unlike `kept`, this is never renormalized, so it is the
-    /// correct source for the `protect_vaf` substantiality check in
-    /// `assign_allele` -- candidacy rejection must not affect protection. Values
-    /// are clamped to 1.0 (an allele's count can exceed `depth` on corrupted or
-    /// overlapping input); the clamp bounds the raw VAF that the protection
-    /// comparison above reads and makes the floor check in `fit_indel_site`
-    /// slightly stricter on such input. It does not gate the near-homoplasmic
-    /// exemption: an unclamped VAF above 1.0 would already exceed
-    /// `homoplasmic_vaf`, so the exemption fires either way.
+    /// The RAW observed VAF of every allele at the site (kept or not), including `Allele::Ref`.
+    /// Unlike `kept`, this is never renormalized, so it is the correct source for the `protect_vaf`
+    /// substantiality check in `assign_allele` -- candidacy rejection must not affect protection.
     pub obs_vaf: Vec<(Allele, f64)>,
-    /// Alleles rejected specifically by a strand gate: the per-strand count check
-    /// (`min_strand`) or the strand-bias binomial test. These are suspected
-    /// single-strand artifacts -- exactly what those gates exist to catch -- so
-    /// `assign_allele` must not let `protect_vaf` shield them even at a
-    /// substantial VAF. An allele rejected only by the context floor (or one that
-    /// is kept) is not included here and remains eligible for protection. Sorted
-    /// for the same determinism reason as `kept` and `obs_vaf`.
+    /// Alleles rejected specifically by a strand gate.
+    /// Sorted for the same determinism reason as `kept` and `obs_vaf`.
     pub strand_rejected: Vec<Allele>,
-    /// Plan 2026-09-26 T8: `Some((e, b))` when the HP length model is ON and this
-    /// site is an HP site (see `hp_site`), i.e. its alleles are lengths of the
-    /// homopolymer run `[norm_pos + 1, e)` of base `b`. `None` otherwise -- both
-    /// when the model is off and when the site is not a homopolymer -- so one
-    /// `is_some()` is the "treat this site as a length" switch for `assign_allele`
-    /// and the write-back pass, and the model's off-by-default guarantee lives in
-    /// exactly one place (`fit_indel_site`).
+    /// `None` otherwise -- both when the model is off and when the site is not a homopolymer.
     pub hp_run: Option<(u32, u8)>,
 }
 
 /// Decide which alleles survive at a site and compute their frequencies.
-///
-/// REF is always kept, mirroring "the reference allele is always eligible" in the
-/// substitution model. A non-reference allele must clear three gates: per-strand
-/// counts, depth-aware context candidacy, and the strand-bias binomial test (with the
-/// same near-homoplasmic exemption the SNV model and `call::filter_strand_bias` use).
-///
-/// ONT-recall Phase2 T7: candidacy is `vaf >= max(vaf_abs_min, 1.5 * eps)` and
-/// `P(X >= n | depth, eps) <= excess_alpha / n_sites`, where `n_sites` is the number
-/// of sites fitted in this pass (the Bonferroni family).
 pub fn fit_indel_site(
     site: &IndelSite,
     refseq: &[u8],
@@ -474,10 +321,7 @@ pub fn fit_indel_site(
         site.col_fwd as f64 / col_total as f64
     };
 
-    // One eps per site. Alleles at the same site can in principle sit in different
-    // repeat contexts; take the deepest. Candidacy uses each allele's own context
-    // (ONT-recall Phase2 T7); this site eps is anti-conservative for ASSIGNMENT: the crossover threshold `eps/(1-eps)` grows with eps, so a
-    // higher eps makes MAP assignment MORE willing to move reads, not less.
+    // One eps per site.
     let context_len = site
         .obs
         .keys()
@@ -492,9 +336,7 @@ pub fn fit_indel_site(
         site.alt_total(),
         site.depth
     );
-    // Plan 2026-09-26 T8 (review fix 2): every HP vote, reference or alt, comes from
-    // a read that cleared the depth gate and votes at most once, so the two together
-    // can only ever be a SUBSET of depth. The slack is the uninformative reads.
+    // The slack is the uninformative reads.
     debug_assert!(
         site.hp_ref + site.alt_total() <= site.depth,
         "HP site accounting invariant violated: hp_ref ({}) + alt_total ({}) exceeds depth ({})",
@@ -503,20 +345,13 @@ pub fn fit_indel_site(
         site.depth
     );
 
-    // Plan 2026-09-26 T8: the single place the HP length model is switched on. Every
-    // downstream consumer keys off `hp_run.is_some()`, so with the flag off the
-    // whole feature is unreachable by construction.
+    // Every downstream consumer keys off `hp_run.is_some()`.
     let hp_run = if o.hp_length_model { hp_site(refseq, norm_pos) } else { None };
 
     let mut strand_biased = 0usize;
     // Raw counts over kept alleles.
     let mut raw: Vec<(Allele, f64)> = Vec::new();
-    // Plan 2026-09-26 T8 (review fix 2): at an HP site the reference is an OBSERVED
-    // length like any other, counted from the reads that actually showed it
-    // (`hp_allele == Some(0)`). Everywhere else REF still gets whatever depth the
-    // events did not claim. The difference is the uninformative reads: `depth` uses
-    // the spanning-read gate and so includes reads whose length could not be read
-    // off at all, and those are evidence for nothing.
+    // Everywhere else REF still gets whatever depth the events did not claim.
     let ref_support = if hp_run.is_some() {
         site.hp_ref
     } else {
@@ -524,9 +359,7 @@ pub fn fit_indel_site(
     };
     raw.push((Allele::Ref, ref_support as f64));
 
-    // RAW observed VAF for every allele, whether kept or not, for the protection
-    // check in `assign_allele` -- rejection by candidacy must not strip protection
-    // from an allele that a substantial fraction of reads actually carry.
+    // RAW observed VAF for every allele, whether kept or not.
     let mut obs_vaf: Vec<(Allele, f64)> = Vec::new();
     obs_vaf.push((Allele::Ref, (ref_support as f64 / depth as f64).min(1.0)));
     let mut strand_rejected: Vec<Allele> = Vec::new();
@@ -543,19 +376,13 @@ pub fn fit_indel_site(
         }
         let l = repeat_context(refseq, norm_pos, allele);
         let vaf = (n as f64 / depth as f64).min(1.0);
-        // ONT-recall Phase2 T7: a fixed multiple of eps erased real 8-10% alleles in
-        // 5-C runs at ~400x; demand an effect size AND a significant excess over eps.
         let eps_l = error_rate(l, o);
         if vaf < o.vaf_abs_min.max(1.5 * eps_l)
             || indel_excess_pvalue(n, depth, eps_l) > o.excess_alpha / n_sites.max(1) as f64
         {
             continue;
         }
-        // Near-homoplasmic exemption: a single-strand artifact is absent from the
-        // other strand's reads, so it can never reach a high apparent frequency.
-        // Testing an allele carried by most reads would correct away a real variant.
-        // ONT-recall R3-T4: at ~5000x a small skew is significant, so the p-value alone
-        // erases real alleles; require call's effect size as well.
+        // Near-homoplasmic exemption: a single-strand artifact is absent from the other strand's reads.
         if strand_bias_p > 0.0
             && vaf < homoplasmic_vaf
             && crate::call::strand_bias_pvalue(fwd as usize, rev as usize, expected_fwd_frac)
@@ -578,9 +405,7 @@ pub fn fit_indel_site(
         vec![(Allele::Ref, 1.0)]
     };
 
-    // Deterministic order: `site.obs` is a HashMap with a randomly-seeded hasher,
-    // so without this the two Vecs (and any downstream tie-break in
-    // `assign_allele`) would vary between runs on identical input.
+    // Deterministic order: `site.obs` is a HashMap with a randomly-seeded hasher.
     kept.sort_by(|(a, _), (b, _)| a.cmp(b));
     obs_vaf.sort_by(|(a, _), (b, _)| a.cmp(b));
     strand_rejected.sort();
@@ -595,34 +420,21 @@ pub enum Assignment {
     Keep,
     /// Reassign the read to this allele.
     Move(Allele),
-    /// The MAP allele is only reachable through a transition the rewrite walk does
-    /// not support (cross-kind, or growing a deletion). The read is left untouched,
-    /// but counted separately so the restriction's cost is auditable.
+    /// The MAP allele is only reachable through a transition the rewrite walk does not support.
     Refused,
 }
 
 /// Maximum-a-posteriori allele for a read observing `observed`.
-///
-/// The `eps` likelihood is what makes this safe to run in both directions. With
-/// frequency alone, `argmax_k f_k` is identical for every read and the whole site
-/// collapses to its most frequent allele, annihilating heteroplasmy. Here a read only
-/// leaves its own allele when `f_own / f_other < eps / (1 - eps)`.
 pub fn assign_allele(observed: &Allele, m: &IndelSiteModel, o: &IndelOpts) -> Assignment {
     let eps = m.eps.clamp(0.0, 0.5);
 
-    // Error mass spreads over the alleles that could have been observed given truth
-    // k, decaying in net-length distance.
+    // Error mass spreads over the alleles that could have been observed given truth k, decaying in net-length distance.
     let mut best: Option<(&Allele, f64)> = None;
     for (k, f) in &m.kept {
         let like = if k == observed {
             1.0 - eps
         } else {
-            // Z normalizes over the kept set PLUS the observed allele. The observed
-            // allele is very often NOT kept -- that is precisely the allele we are
-            // correcting away. Summing over kept-only makes Z zero whenever REF is
-            // the sole survivor, which is the single most common case in real data:
-            // one read carrying a lone spurious indel. That read must still be
-            // corrected, so it has to appear in its own normalization.
+            // Z normalizes over the kept set PLUS the observed allele.
             let mut z: f64 = m
                 .kept
                 .iter()
@@ -650,15 +462,7 @@ pub fn assign_allele(observed: &Allele, m: &IndelSiteModel, o: &IndelOpts) -> As
     if target == observed {
         return Assignment::Keep;
     }
-    // Restriction 1: the rewrite walk cannot turn an insertion into a deletion or
-    // vice versa. Restriction 2: growing a deletion would consume reference from the
-    // following CIGAR op. Both leave the read untouched, counted as Refused.
-    //
-    // Plan 2026-09-26 T8c: neither restriction applies at an HP site under the length
-    // model. Both are limits of `rewrite_read`, which edits ONE op in place;
-    // `rewrite_hp_run` replaces the whole run with a canonical form, so any kept
-    // length is reachable from any other. Everything after this point -- the
-    // `protect_vaf` protection and the strand-gate carve-out from it -- is unchanged.
+    // Restriction 1: the rewrite walk cannot turn an insertion into a deletion or vice versa.
     if m.hp_run.is_none() {
         match (observed, target) {
             (Allele::Ref, _) | (_, Allele::Ref) => {}
@@ -671,15 +475,7 @@ pub fn assign_allele(observed: &Allele, m: &IndelSiteModel, o: &IndelOpts) -> As
             }
         }
     }
-    // Protection: an allele carried by a substantial fraction of reads is never
-    // corrected away, even when it lost candidacy (e.g. `vaf_floor` exceeding 1.0
-    // in a deep repeat context, which would otherwise make every alt allele
-    // uncorrectable-into and let a genuine heteroplasmy be erased read by read).
-    // This is symmetric: it protects a substantial observed REF just as much as
-    // a substantial observed indel. It does NOT apply to an allele rejected by a
-    // strand gate (`min_strand` or the strand-bias test): that rejection means the
-    // allele is a suspected single-strand artifact, which is exactly what those
-    // gates exist to catch, so protection must not shield it.
+    // Protection: an allele carried by a substantial fraction of reads is never corrected away, even when it lost candidacy.
     let strand_rejected = m.strand_rejected.iter().any(|a| a == observed);
     let observed_vaf = m
         .obs_vaf
@@ -696,32 +492,13 @@ pub fn assign_allele(observed: &Allele, m: &IndelSiteModel, o: &IndelOpts) -> As
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadEvent {
     pub norm_pos: u32,
-    /// The reference position of the last aligned base BEFORE the event, exactly
-    /// as the read's own CIGAR places it (before any left-normalization). This is
-    /// the coordinate `rewrite_read` actually keys its `Ins`/`Del` lookups on, via
-    /// `last_ref` -- it is NOT necessarily `norm_pos`. Left-normalization only
-    /// ever moves an event left, so `anchor >= norm_pos`; they coincide only when
-    /// the aligner already left-aligned the indel (e.g. in unique sequence).
+    /// The reference position of the last aligned base BEFORE the event.
     pub anchor: u32,
-    /// `None` means the indel is at or above `max_len`: untouchable, and a marker
-    /// that this read must not be assigned at nearby sites either. Omitting it
-    /// entirely would make the read indistinguishable from a clean REF observation
-    /// and expose it to being "repaired" into an allele it cannot represent.
+    /// `None` means the indel is at or above `max_len`: untouchable.
     pub allele: Option<Allele>,
 }
 
-/// Length of the contiguous `M`/`=`/`X` run starting AT `target`, walking a read's
-/// own CIGAR from its POS. Returns 0 when `target` is not covered by such a run at
-/// all -- inside a `D`/`N`, before the read's start, or past its end.
-///
-/// This is the read's actual "aligned query base" test, and is stricter than
-/// checking only the read's overall `[pos, end_pos())` span: that span includes any
-/// `D`/`N` the read carries, but a read has no query base -- and hence no depth or
-/// rewrite context -- inside those. Used both to gate an ALT vote in pass 1 (FIX 2:
-/// a read that deletes the normalized column must not cast a vote there even though
-/// its overall span covers it) and to size-check a gained deletion's flank in pass 2
-/// (FIX 3: the deletion and its right-hand flank must fit inside ONE such run, not
-/// merely inside the read's overall span).
+/// Length of the contiguous `M`/`=`/`X` run starting AT `target`.
 pub fn match_run_len(pos: i64, cigar: &CigarString, target: u32) -> u32 {
     let mut rp = pos.max(0) as u32;
     for op in cigar.iter() {
@@ -745,11 +522,6 @@ pub fn match_run_len(pos: i64, cigar: &CigarString, target: u32) -> u32 {
 }
 
 /// Enumerate a read's own indel events straight from its CIGAR, left-normalized.
-///
-/// The pileup reports what a read has AT A COLUMN, which cannot answer "does this
-/// read carry the event belonging to the site normalization moved left to?" — at the
-/// normalized column the carrier reports `Indel::None` just like a non-carrier. Going
-/// through the read's own CIGAR answers it exactly, per record.
 pub fn read_events(
     pos: i64,
     cigar: &CigarString,
@@ -760,14 +532,7 @@ pub fn read_events(
     let mut out = Vec::new();
     let mut rp = pos.max(0) as u32; // next reference position
     let mut qp = 0usize; // next query position
-    // Reference position of the last ALIGNED (M/=/X) base seen so far. `D`/`N`
-    // consume reference without an aligned query base, so they must NOT move
-    // this: an `Ins` (or `Del`) immediately following a `D`/`N` still has to
-    // anchor to the last genuinely aligned base, not to wherever `rp` has
-    // advanced to (see FIX 2). `rewrite_read`'s `last_ref` follows the same
-    // rule (it is only updated in its Match arm), so this keeps `read_events`
-    // reporting exactly the anchor `rewrite_read` will actually key its
-    // lookup on.
+    // Reference position of the last ALIGNED (M/=/X) base seen so far.
     let mut last_aligned: Option<u32> = None;
 
     for op in cigar.iter() {
@@ -780,8 +545,7 @@ pub fn read_events(
                 }
             }
             Cigar::Ins(n) => {
-                // No aligned base has been seen yet (e.g. a leading insertion):
-                // there is no anchor to report, so skip the event entirely.
+                // No aligned base has been seen yet: there is no anchor to report, so skip the event entirely.
                 if let Some(anchor) = last_aligned {
                     if n < max_len {
                         let s = seq[qp..qp + n as usize].to_vec();
@@ -812,34 +576,12 @@ pub fn read_events(
     out
 }
 
-/// Size of the overlap between the half-open reference intervals `[s1, e1)` and
-/// `[s2, e2)`. Plan 2026-09-26 T8a.
+/// Size of the overlap between the half-open reference intervals `[s1, e1)` and `[s2, e2)`.
 fn overlap(s1: u32, e1: u32, s2: u32, e2: u32) -> u32 {
     e1.min(e2).saturating_sub(s1.max(s2))
 }
 
-/// Plan 2026-09-26 T8a: the read's HOMOPOLYMER-LENGTH allele at the HP site whose
-/// normalized anchor is `a` and whose run is `[a + 1, e)` with length `R = e - a - 1`
-/// and base `b = refseq[a + 1]`.
-///
-/// The value is the net length change the read applies to that run,
-/// `k = (#inserted b bases) - (#deleted bases)`, read straight off the read's own
-/// CIGAR. Unlike `read_events`, which reports one allele per CIGAR op and therefore
-/// cannot say what a read with BOTH an insertion and a deletion in one run actually
-/// carries (the "ambiguous carry" case, FIX 5), a length is always single-valued:
-/// `I(1)` plus `D(1)` inside the run is simply `Some(0)`.
-///
-/// `None` means the read is UNINFORMATIVE at this site -- not that it observes the
-/// reference length. That is the case when:
-/// * it does not span `[a, e + INDEL_FLANK)`, so it either never saw the run's full
-///   length or has no right-hand match context to anchor a rewrite against (the
-///   Review 2026-09-25 T3 gate, one flank wider than pass 1's depth gate, so a read
-///   that may vote here is always a read pass 1 already counted in depth);
-/// * it has no aligned query base at the anchor `a` itself (the canonical rewrite
-///   hangs off that base);
-/// * an inserted base inside the run is not `b` -- that breaks the run rather than
-///   changing its length, and the length model has nothing to say about it;
-/// * an `N` op crosses the run, where the read has no alignment at all.
+/// The value is the net length change the read applies to that run, `k = -`.
 pub fn hp_allele(
     pos: i64,
     cigar: &CigarString,
@@ -855,8 +597,7 @@ pub fn hp_allele(
     if (pos.max(0) as i64) > a as i64 {
         return None;
     }
-    // The canonical rewrite emits the anchor base first, so the read must actually
-    // have one there (same test pass 1 uses to gate a vote; see FIX 2).
+    // The canonical rewrite emits the anchor base first, so the read must actually have one there.
     if match_run_len(pos, cigar, a) == 0 {
         return None;
     }
@@ -876,9 +617,7 @@ pub fn hp_allele(
                 }
             }
             Cigar::Ins(n) => {
-                // An insertion belongs to this run when it is anchored on the anchor
-                // base itself (where left-normalization puts it) or on any base of
-                // the run. One anchored at `e` or beyond is a different event.
+                // An insertion belongs to this run when it is anchored on the anchor base itself or on any base of the run.
                 let inside = last_aligned.is_some_and(|l| l >= a && l < e);
                 if inside {
                     if seq.get(qp..qp + n as usize)?.iter().any(|&c| c != b) {
@@ -928,19 +667,16 @@ mod indel_tests {
     fn indel_opts_default_is_disabled() {
         let o = IndelOpts::default();
         assert!(!o.enabled, "indel correction must be opt-in");
-        // Plan 2026-09-26 T8f: and the generic HP length model is opt-in on top of it.
         assert!(!o.hp_length_model, "the HP length model must be opt-in");
         assert_eq!(o.max_len, 5);
     }
 
-    // ref:  0123456789
-    //       C A A A A A A A G   (index 0 = C, 1..=7 = A x7, 8 = G)
+    // ref:  0123456789.
     const HP_REF: &[u8] = b"CAAAAAAAG";
 
     #[test]
     fn deletion_in_homopolymer_normalizes_to_one_anchor() {
-        // A 1bp deletion of an A can be anchored anywhere in the run (1..=6);
-        // every placement must collapse to anchor 0 (the C before the run).
+        // A 1bp deletion of an A can be anchored anywhere in the run (1..=6); every placement must collapse to anchor 0.
         for anchor in 0..=6u32 {
             let (pos, allele) = normalize_left(HP_REF, anchor, &Allele::Del(1));
             assert_eq!(pos, 0, "anchor {anchor} did not normalize to 0");
@@ -960,10 +696,7 @@ mod indel_tests {
 
     #[test]
     fn insertion_rotates_when_shifting_left() {
-        // ref: C A T A T A T G ; inserting "TA" after index 1 (the A at 1) is the
-        // same event as inserting "AT" after index 0, reached by rotating right.
-        // (Verified by direct read reconstruction: ref[0..=1]+"TA"+ref[2..] ==
-        // ref[0..=0]+"AT"+ref[1..] == "CATATATATG".)
+        // ref: C A T A T A T G; inserting "TA" after index 1 is the same event as inserting "AT" after index 0.
         let r = b"CATATATG";
         let (pos, allele) = normalize_left(r, 1, &Allele::Ins(b"TA".to_vec()));
         assert_eq!(pos, 0);
@@ -1001,13 +734,9 @@ mod indel_tests {
         assert_eq!(repeat_context(HP_REF, 0, &Allele::Ins(b"A".to_vec())), 7);
     }
 
-    // Review 2026-09-25 T3: uses `REF29` (declared with the read_events tests
-    // below) -- the same reference the denoise wiring tests use, so the tract
-    // bound asserted here is the one those fixtures exercise end to end.
     #[test]
     fn hp_tract_end_spans_the_whole_run() {
-        // Anchor 7 is the base before the A-run; the run is 8..=15, so its
-        // exclusive end is 16.
+        // Anchor 7 is the base before the A-run; the run is 8..=15, so its exclusive end is 16.
         assert_eq!(hp_tract_end(REF29, 7), 16);
         // From inside the run the remaining tract still ends at 16.
         assert_eq!(hp_tract_end(REF29, 11), 16);
@@ -1080,8 +809,7 @@ mod indel_tests {
         }
     }
 
-    // Build a site: `events` is (allele, fwd_count, rev_count). REF support is
-    // whatever depth remains after the events, split evenly across strands.
+    // Build a site: `events` is (allele, fwd_count, rev_count).
     fn site(depth: u32, events: &[(Allele, u32, u32)]) -> IndelSite {
         let mut s = IndelSite { depth, ..Default::default() };
         let mut used_f = 0;
@@ -1120,8 +848,7 @@ mod indel_tests {
 
     #[test]
     fn same_indel_inside_long_homopolymer_is_rejected() {
-        // Identical evidence, but now in a 7-mer A-run: floor = 3 * eps(7) which is
-        // far above 0.20, so the context gate rejects it.
+        // Identical evidence, but now in a 7-mer A-run: floor = 3 * eps(7) which is far above 0.20.
         let del = Allele::Del(1);
         let s = site(100, &[(del.clone(), 10, 10)]);
         let o = IndelOpts::default();
@@ -1143,8 +870,7 @@ mod indel_tests {
 
     #[test]
     fn near_homoplasmic_indel_is_exempt_from_strand_bias() {
-        // 80% of the column, badly skewed -- but a single-strand artifact cannot
-        // reach 80%, so the exemption keeps it (mirrors the SNV model).
+        // 80% of the column, badly skewed -- but a single-strand artifact cannot reach 80%.
         let del = Allele::Del(1);
         let s = site(100, &[(del.clone(), 75, 5)]);
         let o = IndelOpts::default();
@@ -1155,8 +881,6 @@ mod indel_tests {
 
     #[test]
     fn deep_indel_with_small_strand_skew_is_kept() {
-        // ONT-recall R3-T4: the 7805A strand counts (328/196, 10%) against a column
-        // forward fraction of 2693/5240 = 0.514. p ~ 3e-7, effect only 0.11.
         let del = Allele::Del(1);
         let mut s = site(5240, &[(del.clone(), 328, 196)]);
         s.col_fwd = 2693;
@@ -1173,8 +897,6 @@ mod indel_tests {
 
     #[test]
     fn deep_single_strand_indel_artifact_is_still_rejected() {
-        // ONT-recall R3-T4: the 1598G>A artifact's counts (449/15) against a column
-        // forward fraction of 2171/4640 = 0.468, so the effect is 0.50.
         let del = Allele::Del(1);
         let mut s = site(4640, &[(del.clone(), 449, 15)]);
         s.col_fwd = 2171;
@@ -1195,14 +917,10 @@ mod indel_tests {
         assert!(kept_of(&m, &ins).is_none());
     }
 
-    // ONT-recall Phase2 T7: anchor A at index 1, then a 5-C run (rCRS 8271 context),
-    // so a 1bp deletion there sits in L=5: eps 0.0506, vaf_floor 0.152.
     const C5_REF: &[u8] = b"TACCCCCTCTA";
 
     #[test]
     fn ten_percent_deletion_in_c5_run_at_depth_431_survives() {
-        // ONT-recall Phase2 T7: 8271AC>A. 43/431 is below the old 0.152 floor but
-        // far in excess of the ~22 reads eps(5) predicts.
         let del = Allele::Del(1);
         assert_eq!(repeat_context(C5_REF, 1, &del), 5, "test premise: L=5");
         let o = IndelOpts::default();
@@ -1214,7 +932,6 @@ mod indel_tests {
 
     #[test]
     fn six_percent_deletion_in_c5_run_at_depth_60_is_rejected() {
-        // ONT-recall Phase2 T7: 4/60 is under 1.5 * eps(5) = 0.076.
         let del = Allele::Del(1);
         let s = site(60, &[(del.clone(), 2, 2)]);
         let o = IndelOpts::default();
@@ -1224,8 +941,6 @@ mod indel_tests {
 
     #[test]
     fn ten_percent_deletion_in_c5_run_at_depth_60_is_not_in_excess() {
-        // ONT-recall Phase2 T7: same 10% VAF as the depth-431 case, but 6 reads where
-        // eps(5) expects ~3 is not significant (P ~ 0.08).
         let del = Allele::Del(1);
         let s = site(60, &[(del.clone(), 3, 3)]);
         let o = IndelOpts::default();
@@ -1235,8 +950,6 @@ mod indel_tests {
 
     #[test]
     fn six_percent_deletion_in_unique_sequence_at_depth_60_is_rejected() {
-        // ONT-recall Phase2 T7: the old 0.05 floor kept 4/60, but P(X >= 4 | 60, 0.01)
-        // ~ 3e-3 is above excess_alpha.
         let del = Allele::Del(1);
         let s = site(60, &[(del.clone(), 2, 2)]);
         let o = IndelOpts::default();
@@ -1247,9 +960,6 @@ mod indel_tests {
 
     #[test]
     fn excess_test_is_bonferroni_corrected_over_n_sites() {
-        // ONT-recall Phase2 T7: 43/431 (P ~ 2.3e-5) clears 1e-3 / 1 but not
-        // 1e-3 / 16569 (one test per mito position). The real HG00097 8271 pileup,
-        // 419/5334, clears either.
         let del = Allele::Del(1);
         let o = IndelOpts::default();
         let s = site(431, &[(del.clone(), 22, 21)]);
@@ -1262,22 +972,14 @@ mod indel_tests {
 
     #[test]
     fn kept_and_obs_vaf_are_returned_in_deterministic_sorted_order() {
-        // Three alleles survive candidacy in unique sequence (L=1, floor 0.05): REF,
-        // an insertion, and a deletion. `site.obs` is a HashMap with a randomly
-        // seeded hasher, so without an explicit sort the emitted order (and any
-        // downstream `>` tie-break in `assign_allele`) would vary between runs on
-        // identical input, making the emitted BAM nondeterministic.
+        // Three alleles survive candidacy in unique sequence (L=1, floor 0.05): REF, an insertion, and a deletion.
         let ins = Allele::Ins(b"A".to_vec());
         let del = Allele::Del(1);
         let s = site(100, &[(ins.clone(), 10, 10), (del.clone(), 10, 10)]);
         let o = IndelOpts::default();
         let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert_eq!(m.kept.len(), 3, "REF, Ins, and Del must all survive candidacy here");
-        // Assert the EXACT expected sequence rather than comparing the list to a
-        // sorted copy of itself: `Ref` is always pushed first and is always the
-        // Ord-minimum, so the only HashMap-order variability is between the two
-        // remaining alleles, and one of those two permutations is already sorted --
-        // a self-comparison would only catch a missing `sort_by` about half the time.
+        // Assert the EXACT expected sequence rather than comparing the list to a sorted copy of itself.
         let alleles: Vec<&Allele> = m.kept.iter().map(|(a, _)| a).collect();
         assert_eq!(
             alleles,
@@ -1296,7 +998,7 @@ mod indel_tests {
 
     #[test]
     fn heteroplasmic_site_preserves_both_alleles() {
-        // 40% INS / 60% REF in a long homopolymer (large eps). Nothing may flip.
+        // 40% INS / 60% REF in a long homopolymer (large eps).
         let ins = Allele::Ins(b"A".to_vec());
         let s = site(100, &[(ins.clone(), 20, 20)]);
         let mut o = IndelOpts::default();
@@ -1324,11 +1026,7 @@ mod indel_tests {
 
     #[test]
     fn failed_allele_snaps_to_the_kept_allele_of_the_same_kind() {
-        // Site keeps a 1bp deletion at 80%; a stray 2bp deletion fails candidacy and
-        // must snap onto the kept 1bp allele rather than reverting all the way to REF.
-        // (The kept allele has to DOMINATE for snapping to beat reverting: at a site
-        // that is mostly REF, reverting a stray deletion to REF is the correct MAP
-        // answer, not a bug.)
+        // Site keeps a 1bp deletion at 80%; a stray 2bp deletion fails candidacy and must snap onto the kept 1bp allele.
         let d1 = Allele::Del(1);
         let d2 = Allele::Del(2);
         let s = site(100, &[(d1.clone(), 40, 40), (d2.clone(), 1, 1)]);
@@ -1341,8 +1039,7 @@ mod indel_tests {
 
     #[test]
     fn cross_kind_reassignment_is_refused() {
-        // Site keeps only an insertion; a failed deletion would MAP across kinds,
-        // which the rewrite walk does not support -- the read is left untouched.
+        // Site keeps only an insertion; a failed deletion would MAP across kinds.
         let ins = Allele::Ins(b"T".to_vec());
         let del = Allele::Del(1);
         let s = site(100, &[(ins.clone(), 45, 45), (del.clone(), 1, 1)]);
@@ -1351,16 +1048,13 @@ mod indel_tests {
         o.floor_mult = 0.0;
         let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
         assert!(kept_of(&m, &del).is_none());
-        // The MAP target here is Ins (it dominates the site), which is a cross-kind
-        // transition the rewrite walk does not support, so it must be Refused --
-        // not silently reinterpreted as Keep.
+        // The MAP target here is Ins, which is a cross-kind transition the rewrite walk does not support.
         assert_eq!(assign_allele(&del, &m, &o), Assignment::Refused);
     }
 
     #[test]
     fn growing_a_deletion_is_refused() {
-        // Site keeps a 3bp deletion; a read carrying a 1bp deletion would have to
-        // grow, consuming reference from the next CIGAR op. Refused.
+        // Site keeps a 3bp deletion; a read carrying a 1bp deletion would have to grow.
         let d1 = Allele::Del(1);
         let d3 = Allele::Del(3);
         let s = site(100, &[(d3.clone(), 45, 45), (d1.clone(), 1, 1)]);
@@ -1368,9 +1062,7 @@ mod indel_tests {
         o.vaf = 0.01;
         o.floor_mult = 0.0;
         let m = fit_indel_site(&s, UNIQ_REF, 1, 2, SB_P, HOM_VAF, 1, &o);
-        // d3 dominates the site and is the MAP target, but growing Del(1) into
-        // Del(3) is a transition the rewrite walk does not support -- Refused,
-        // not silently reinterpreted as Keep.
+        // d3 dominates the site and is the MAP target.
         assert_eq!(assign_allele(&d1, &m, &o), Assignment::Refused);
     }
 
@@ -1378,10 +1070,7 @@ mod indel_tests {
 
     #[test]
     fn hp_length_model_moves_an_insertion_onto_a_kept_deletion() {
-        // Plan 2026-09-26 T8c: `HP_REF`'s A-run (1..=7) makes anchor 0 an HP site.
-        // A site that keeps Del(1) at ~0.9 with a lone Ins("A") read: the event-based
-        // model must refuse the Ins -> Del transition and leave that read carrying a
-        // length nobody else has, while the length model just moves it.
+        // A site that keeps Del(1) at ~0.9 with a lone Ins("A") read.
         let ins = Allele::Ins(b"A".to_vec());
         let del = Allele::Del(1);
         let s = site(100, &[(del.clone(), 45, 45), (ins.clone(), 1, 1)]);
@@ -1402,10 +1091,7 @@ mod indel_tests {
 
     #[test]
     fn hp_length_model_can_grow_a_deletion() {
-        // The second half of "any kept length is reachable": Del(1) -> Del(3) is the
-        // transition `rewrite_read` cannot make, because it would consume reference
-        // from the following CIGAR op. `rewrite_hp_run` rewrites the whole run at
-        // once, so at an HP site it is reachable.
+        // The second half of "any kept length is reachable": Del(1) -> Del(3) is the transition `rewrite_read` cannot make.
         let d1 = Allele::Del(1);
         let d3 = Allele::Del(3);
         let s = site(100, &[(d3.clone(), 45, 45), (d1.clone(), 1, 1)]);
@@ -1423,16 +1109,9 @@ mod indel_tests {
 
     #[test]
     fn hp_length_model_leaves_protect_vaf_and_the_strand_gates_alone() {
-        // The HP length model widens which TRANSITIONS are reachable and nothing
-        // else. A substantial observed allele is still protected, and a strand-
-        // rejected one is still not shielded -- the two rules `assign_allele` applies
-        // after the transition check.
+        // The HP length model widens which TRANSITIONS are reachable and nothing else.
         let ins = Allele::Ins(b"A".to_vec());
         let del = Allele::Del(1);
-        // 30% of the column carries the insertion, strand-balanced: above
-        // `protect_vaf`, but below 1.5 * eps = 0.6 in this 12bp context (ONT-recall
-        // Phase2 T7: the 7bp run's 0.171 no longer rejects 30%), so it is rejected
-        // by candidacy alone and must still be shielded.
         let s = site(100, &[(del.clone(), 30, 30), (ins.clone(), 15, 15)]);
         let mut o = IndelOpts::default();
         o.hp_length_model = true;
@@ -1449,8 +1128,7 @@ mod indel_tests {
             "a 30% allele must stay protected at an HP site too"
         );
 
-        // Same allele, now single-stranded: rejected by `min_strand`, so protection
-        // must not shield it and the length model must move it.
+        // Same allele, now single-stranded: rejected by `min_strand`.
         let s = site(100, &[(del.clone(), 30, 30), (ins.clone(), 30, 0)]);
         let m = fit_indel_site(&s, DEEP_HP_REF, 0, 2, SB_P, HOM_VAF, 1, &o);
         assert!(m.strand_rejected.contains(&ins), "test premise: strand-gate rejection");
@@ -1462,11 +1140,7 @@ mod indel_tests {
 
     #[test]
     fn lone_spurious_indel_at_a_ref_only_site_is_still_corrected() {
-        // THE most common real case: a single read carries a random indel error, so
-        // no alt allele clears candidacy and REF is the sole survivor. The stray read
-        // must still be reverted. (An earlier design returned Keep whenever fewer
-        // than two alleles survived, which silently disabled the denoiser's primary
-        // job; the Z normalization must therefore include the observed allele.)
+        // THE most common real case: a single read carries a random indel error.
         let del = Allele::Del(1);
         let s = site(100, &[(del.clone(), 1, 1)]);
         let o = IndelOpts::default();
@@ -1483,19 +1157,12 @@ mod indel_tests {
         );
     }
 
-    // ref: C AAAAAAAAAAAA G (12 A's) -> a 1bp event here sits in L=12, where
-    // vaf_floor(12) = floor_mult(3.0) * err_cap(0.4) = 1.2 > 1.0: no alt allele can
-    // ever clear candidacy at this depth, regardless of true frequency.
+    // ref: C AAAAAAAAAAAA G -> a 1bp event here sits in L=12.
     const DEEP_HP_REF: &[u8] = b"CAAAAAAAAAAAAG";
 
     #[test]
     fn substantial_allele_erased_from_candidacy_is_still_protected_at_assignment() {
-        // A genuine 50/50 Del(1) heteroplasmy in a 12-mer homopolymer. Candidacy
-        // genuinely rejects the allele (that is fix 1's premise, not a bug to work
-        // around) -- but `protect_vaf` must stop `assign_allele` from rewriting
-        // every read carrying it back to REF, which would destroy a real 50/50
-        // heteroplasmy read by read (mirrors mtDNA's m.303-315 / m.16184-16193
-        // poly-C heteroplasmy hotspots).
+        // A genuine 50/50 Del(1) heteroplasmy in a 12-mer homopolymer.
         let del = Allele::Del(1);
         let o = IndelOpts::default();
         assert!(vaf_floor(12, &o) > 1.0, "test premise: floor must exceed 1.0 at L=12");
@@ -1511,10 +1178,7 @@ mod indel_tests {
 
     #[test]
     fn low_frequency_indel_below_protect_vaf_is_still_reverted() {
-        // Same deep-homopolymer context (candidacy rejects the allele for the same
-        // reason), but now the indel is a rare ~5% event, well below the default
-        // `protect_vaf` of 0.2. Protection must NOT kick in here, proving fix 1
-        // did not disable ordinary cleaning of spurious low-frequency indels.
+        // Same deep-homopolymer context, but now the indel is a rare ~5% event, well below the default `protect_vaf` of 0.2.
         let del = Allele::Del(1);
         let o = IndelOpts::default();
         let s = site(100, &[(del.clone(), 3, 2)]); // 5/100 = 0.05 < protect_vaf 0.2
@@ -1529,11 +1193,7 @@ mod indel_tests {
 
     #[test]
     fn strand_rejected_allele_is_not_shielded_by_protect_vaf() {
-        // 30% VAF in unique sequence, but entirely on the forward strand (0 reverse
-        // reads): a classic single-strand artifact, which `min_strand` exists to
-        // catch. 30% clears `protect_vaf` (0.2), but protection must NOT apply --
-        // shielding a suspected strand artifact would defeat the denoiser's main
-        // purpose of removing exactly this kind of error.
+        // 30% VAF in unique sequence, but entirely on the forward strand: a classic single-strand artifact.
         let ins = Allele::Ins(b"T".to_vec());
         let s = site(100, &[(ins.clone(), 30, 0)]);
         let o = IndelOpts::default();
@@ -1552,10 +1212,7 @@ mod indel_tests {
 
     #[test]
     fn floor_rejected_allele_in_deep_homopolymer_is_still_shielded_by_protect_vaf() {
-        // Same 30% VAF, but now strand-balanced (15f/15r) in a deep homopolymer
-        // where `vaf_floor` exceeds 1.0: candidacy rejects it purely on the context
-        // floor, not on a strand gate. This is not a suspected artifact, so
-        // `protect_vaf` must still shield it.
+        // Same 30% VAF, but now strand-balanced in a deep homopolymer where `vaf_floor` exceeds 1.0.
         let del = Allele::Del(1);
         let o = IndelOpts::default();
         assert!(vaf_floor(12, &o) > 1.0, "test premise: floor must exceed 1.0 at L=12");
@@ -1573,10 +1230,7 @@ mod indel_tests {
         );
     }
 
-    // Reference shared by the read_events tests. Index map:
-    //   0-7   ACGTACGT
-    //   8-15  AAAAAAAA   (an 8bp homopolymer run)
-    //   16-28 CGTACGTACGTAC
+    // Reference shared by the read_events tests.
     const REF29: &[u8] = b"ACGTACGTAAAAAAAACGTACGTACGTAC";
 
     fn cs(ops: Vec<Cigar>) -> CigarString {
@@ -1596,8 +1250,7 @@ mod indel_tests {
 
     #[test]
     fn match_run_len_is_zero_inside_a_deletion_or_refskip() {
-        // 5M 3D 5M: targets 5..8 fall inside the deletion, and have no aligned
-        // query base at all.
+        // 5M 3D 5M: targets 5..8 fall inside the deletion, and have no aligned query base at all.
         let c = cs(vec![Cigar::Match(5), Cigar::Del(3), Cigar::Match(5)]);
         for t in 5..8 {
             assert_eq!(match_run_len(0, &c, t), 0, "target {t} is inside the deletion");
@@ -1620,12 +1273,7 @@ mod indel_tests {
 
     #[test]
     fn match_run_len_skips_insertions_without_advancing_reference() {
-        // An insertion consumes no reference, so the two Match ops it splits are
-        // still contiguous in REFERENCE space -- but `rewrite_read`'s Match arm only
-        // sees ONE op at a time, so this helper (used by FIX 2/3, both of which
-        // reason about a single contiguous CIGAR M/=/X op) correctly reports the
-        // SECOND op's own length once the target falls past the insertion, not the
-        // combined length of both flanking runs.
+        // An insertion consumes no reference, so the two Match ops it splits are still contiguous in REFERENCE space.
         let c = cs(vec![Cigar::Match(5), Cigar::Ins(2), Cigar::Match(5)]);
         assert_eq!(match_run_len(0, &c, 5), 5, "second run's own length at its start");
         assert_eq!(match_run_len(0, &c, 4), 1, "first run's own remaining length");
@@ -1639,15 +1287,12 @@ mod indel_tests {
 
     #[test]
     fn insertion_event_is_normalized_out_of_the_homopolymer() {
-        // Read carries an extra A, anchored by the aligner at reference index 15
-        // (the last A of the run). Normalization must pull it back to index 7.
+        // Read carries an extra A, anchored by the aligner at reference index 15 (the last A of the run).
         let seq = b"ACGTACGTAAAAAAAAACGTACGTACGTAC"; // 30bp: 16 + 1 inserted + 13
         let cig = cs(vec![Cigar::Match(16), Cigar::Ins(1), Cigar::Match(13)]);
         let evs = read_events(0, &cig, seq, REF29, 5);
         assert_eq!(evs.len(), 1);
-        // The contrast this test exists for: the aligner's own CIGAR anchor (15)
-        // and the left-normalized site (7) genuinely differ. `rewrite_read` keys
-        // its Ins/Del lookups on `anchor`, not `norm_pos` -- see CRITICAL 1.
+        // The contrast this test exists for: the aligner's own CIGAR anchor (15) and the left-normalized site genuinely differ.
         assert_eq!(evs[0].anchor, 15, "the aligner's own CIGAR anchor must be reported");
         assert_eq!(evs[0].norm_pos, 7, "left-normalization must still pull the site to 7");
         assert_eq!(evs[0].allele, Some(Allele::Ins(b"A".to_vec())));
@@ -1655,8 +1300,7 @@ mod indel_tests {
 
     #[test]
     fn deletion_event_is_normalized_out_of_the_homopolymer() {
-        // Read is missing one A from the run; the aligner anchored the deletion at
-        // reference index 14, normalization pulls it to 7.
+        // Read is missing one A from the run; the aligner anchored the deletion at reference index 14.
         let seq = b"ACGTACGTAAAAAAACGTACGTACGTAC"; // 28bp: 29 ref bases minus one A
         let cig = cs(vec![Cigar::Match(15), Cigar::Del(1), Cigar::Match(13)]);
         let evs = read_events(0, &cig, seq, REF29, 5);
@@ -1668,13 +1312,12 @@ mod indel_tests {
 
     #[test]
     fn unique_sequence_insertion_keeps_its_anchor() {
-        // Insert "G" after reference index 18 (a T). Nothing to shift through.
+        // Insert "G" after reference index 18 (a T).
         let seq = b"ACGTACGTAAAAAAAACGTGACGTACGTAC"; // 30bp
         let cig = cs(vec![Cigar::Match(19), Cigar::Ins(1), Cigar::Match(10)]);
         let evs = read_events(0, &cig, seq, REF29, 5);
         assert_eq!(evs.len(), 1);
-        // In unique sequence anchor and normalized site coincide -- unlike the
-        // homopolymer fixtures above.
+        // In unique sequence anchor and normalized site coincide -- unlike the homopolymer fixtures above.
         assert_eq!(evs[0].anchor, 18);
         assert_eq!(evs[0].norm_pos, 18);
         assert_eq!(evs[0].allele, Some(Allele::Ins(b"G".to_vec())));
@@ -1682,10 +1325,7 @@ mod indel_tests {
 
     #[test]
     fn oversized_indel_is_reported_as_untouchable() {
-        // A 6bp insertion with max_len 5: recorded with allele None so the caller
-        // knows this read must not be assigned at nearby sites. Reporting nothing at
-        // all would make the read look like a clean REF observation and expose it to
-        // being "repaired" into some other allele.
+        // A 6bp insertion with max_len 5: recorded with allele None.
         let seq = b"ACGTACGTAAAAAAAACGTGGGGGGACGTACGTAC"; // 35bp
         let cig = cs(vec![Cigar::Match(19), Cigar::Ins(6), Cigar::Match(10)]);
         let evs = read_events(0, &cig, seq, REF29, 5);
@@ -1717,8 +1357,7 @@ mod indel_tests {
 
     #[test]
     fn soft_clips_do_not_shift_reference_coordinates() {
-        // Leading soft clip consumes query but no reference; the event must still
-        // land at reference index 18.
+        // Leading soft clip consumes query but no reference; the event must still land at reference index 18.
         let seq = b"TTTACGTACGTAAAAAAAACGTGACGTACGTAC"; // 3 clipped + 30
         let cig = cs(vec![
             Cigar::SoftClip(3),
@@ -1743,20 +1382,11 @@ mod indel_tests {
         assert_eq!(evs[0].allele, Some(Allele::Ins(b"G".to_vec())));
     }
 
-    // ---- FIX 2 regression: an insertion right after a D/N anchors at the
-    // last ALIGNED base, not the last DELETED one ----
+    // ---- an insertion right after a D/N anchors at the
 
     #[test]
     fn insertion_after_a_deletion_anchors_at_the_last_aligned_base_not_the_deleted_one() {
-        // `20M 2D 1I 20M` at POS 100. The OLD anchor computation was `rp - 1`
-        // at the point the `Ins` arm runs; since the preceding `Del` arm had
-        // already advanced `rp` by its own length, that landed on 121 -- the
-        // last DELETED reference base. `rewrite_read`'s `last_ref` is only
-        // updated in its Match arm, so at that `Ins` op it is still 119, and
-        // a lookup keyed at 121 would miss entirely: the edit gets emitted
-        // and counted while `rewrite_read` silently no-ops it. The insertion
-        // must anchor at 119, the last base the preceding 20M actually
-        // matched.
+        // `20M 2D 1I 20M` at POS 100.
         let refseq = vec![b'A'; 150];
         let seq = vec![b'A'; 41]; // 20 (M) + 1 (I) + 20 (M); the D consumes no query
         let cig = cs(vec![
@@ -1781,9 +1411,7 @@ mod indel_tests {
 
     #[test]
     fn hp_site_is_the_runs_leftmost_anchor_only() {
-        // REF29's A-run is 8..=15. Anchor 7 is its normalized anchor; 8..=13 each
-        // still have a >= 2bp A-run after them but are NOT normalized anchors, and
-        // admitting them would have the model rewrite one run through seven sites.
+        // REF29's A-run is 8..=15.
         assert_eq!(hp_site(REF29, 7), Some((16, b'A')));
         for anchor in 8..=14u32 {
             assert_eq!(hp_site(REF29, anchor), None, "anchor {anchor} is not normalized");
@@ -1792,8 +1420,7 @@ mod indel_tests {
 
     #[test]
     fn hp_site_rejects_unique_sequence_and_lone_bases() {
-        // A single following base is not a run (`hp_tract_end` says so), and the last
-        // base of the run has only unique sequence after it.
+        // A single following base is not a run, and the last base of the run has only unique sequence after it.
         assert_eq!(hp_site(REF29, 15), None, "REF29[16] = C is a lone base");
         assert_eq!(hp_site(REF29, 20), None);
         assert_eq!(hp_site(REF29, 28), None, "nothing follows the last base");
@@ -1807,8 +1434,6 @@ mod indel_tests {
     }
 
     // ---- Plan 2026-09-26 T8a: homopolymer-length allele ----
-    // REF29's A-run is 8..=15, so the HP site's normalized anchor is 7, its
-    // exclusive run end is 16, R = 8 and b = b'A'.
     const HP_A: u32 = 7;
     const HP_E: u32 = 16;
 
@@ -1839,9 +1464,7 @@ mod indel_tests {
 
     #[test]
     fn hp_allele_of_an_offsetting_insertion_and_deletion_is_zero() {
-        // 10M 1I 2M 1D 16M: one A gained and one A lost, both inside the run, so the
-        // run's LENGTH is unchanged. This is exactly the "ambiguous carry" shape that
-        // the event-based model has to refuse (FIX 5): as a length it is simply 0.
+        // 10M 1I 2M 1D 16M: one A gained and one A lost, both inside the run, so the run's LENGTH is unchanged.
         let mut seq = REF29[..10].to_vec();
         seq.push(b'A');
         seq.extend_from_slice(&REF29[10..12]);
@@ -1858,8 +1481,7 @@ mod indel_tests {
 
     #[test]
     fn hp_allele_is_undefined_when_the_inserted_base_is_not_the_run_base() {
-        // A G spliced into an A-run is not a length change at all -- it breaks the
-        // run, and the length model has nothing to say about it.
+        // A G spliced into an A-run is not a length change at all -- it breaks the run.
         let mut seq = REF29[..16].to_vec();
         seq.push(b'G');
         seq.extend_from_slice(&REF29[16..]);
@@ -1869,16 +1491,14 @@ mod indel_tests {
 
     #[test]
     fn hp_allele_is_undefined_for_a_read_ending_inside_the_run() {
-        // Ends at reference 13, five bases into the run: it cannot testify to the
-        // run's length, so it is uninformative rather than a REF observation.
+        // Ends at reference 13, five bases into the run: it cannot testify to the run's length.
         let cig = cs(vec![Cigar::Match(13)]);
         assert_eq!(hp_allele(0, &cig, &REF29[..13], REF29, HP_A, HP_E), None);
     }
 
     #[test]
     fn hp_allele_is_undefined_without_the_right_hand_flank() {
-        // Reaches the end of the run (16) but not `INDEL_FLANK` past it, so it has
-        // no match context to anchor a rewrite against.
+        // Reaches the end of the run (16) but not `INDEL_FLANK` past it, so it has no match context to anchor a rewrite against.
         let need = HP_E as usize + INDEL_FLANK;
         let cig = cs(vec![Cigar::Match(need as u32 - 1)]);
         assert_eq!(hp_allele(0, &cig, &REF29[..need - 1], REF29, HP_A, HP_E), None);
@@ -1888,8 +1508,7 @@ mod indel_tests {
 
     #[test]
     fn hp_allele_is_undefined_when_the_anchor_base_is_not_aligned() {
-        // 5M 5D 19M deletes REF29[5..10), which swallows the anchor (7): there is no
-        // aligned base to hang the canonical rewrite off.
+        // 5M 5D 19M deletes REF29[5..10), which swallows the anchor: there is no aligned base to hang the canonical rewrite off.
         let mut seq = REF29[..5].to_vec();
         seq.extend_from_slice(&REF29[10..]);
         let cig = cs(vec![Cigar::Match(5), Cigar::Del(5), Cigar::Match(19)]);
@@ -1906,35 +1525,16 @@ mod indel_tests {
 }
 
 // ===========================================================================
-// Read rewrite  (was denoise/rewrite.rs)
-// ===========================================================================
 /// One read's reassignment at one normalized indel site.
 #[derive(Debug, Clone)]
 pub struct IndelEdit {
-    /// The coordinate `rewrite_read` looks this edit up by. Direction-dependent,
-    /// NOT a single anchor convention: the left-normalized SITE position when
-    /// `from` is `Ref` (a gained indel has no CIGAR anchor of its own to key on
-    /// -- it is keyed to wherever the walk should splice it into plain match
-    /// context); the read's OWN CIGAR anchor (the last aligned base before its
-    /// own indel, exactly as htslib's pileup reports it) when `from` is `Ins` or
-    /// `Del` (reverting or replacing an indel the read already carries).
-    ///
-    /// Two edits for the SAME read can legitimately share a `ref_pos` while
-    /// differing in `from`'s kind -- e.g. a read's own insertion anchored at
-    /// position P that gets reverted, plus an unrelated gained deletion whose
-    /// normalized site also happens to be P. `rewrite_read` disambiguates by
-    /// keying its internal lookup on `(ref_pos, kind_of(from))`, not `ref_pos`
-    /// alone (see FIX 1).
+    /// The coordinate `rewrite_read` looks this edit up by.
     pub ref_pos: u32,
     pub from: Allele,
     pub to: Allele,
 }
 
 /// Which of the three edit varieties an `IndelEdit` is, discriminated by `from`.
-/// Used only to disambiguate `IndelEdit`s that share a `ref_pos` (see FIX 1):
-/// `rewrite_read`'s three lookup sites each want their OWN kind independently,
-/// so keying by `(ref_pos, EditKind)` instead of `ref_pos` alone makes those
-/// lookups mutually exclusive rather than ambiguous.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum EditKind {
     Ref,
@@ -1950,8 +1550,7 @@ pub(crate) fn edit_kind(a: &Allele) -> EditKind {
     }
 }
 
-/// All edits for one read, keyed by REFERENCE coordinate so substitutions and
-/// length-changing indel edits can be applied in a single ordered walk.
+/// All edits for one read, keyed by REFERENCE coordinate so substitutions.
 #[derive(Debug, Default, Clone)]
 pub struct ReadEdits {
     pub subs: Vec<(u32, u8)>,
@@ -1968,42 +1567,17 @@ pub struct RewriteResult {
     pub seq: Vec<u8>,
     pub qual: Vec<u8>,
     pub cigar: CigarString,
-    /// `true` iff at least one indel edit (gain/revert/replace `Ins`, or
-    /// gain/revert/shrink `Del`) was actually applied during the walk.
+    /// `true` iff at least one indel edit was actually applied during the walk.
     /// A substitution alone never sets this.
-    ///
-    /// Callers use this to decide whether to strip base-modification tags
-    /// (`MM`/`ML`/`MN`) and stale alignment tags (`NM`/`MD`/`cs`): any indel
-    /// edit shifts every query offset downstream of it and rewrites the
-    /// CIGAR, invalidating those tags even when they key off query position
-    /// rather than SEQ length.
-    ///
-    /// Comparing output SEQ length to input SEQ length is NOT a sound proxy:
-    /// a read with an offsetting 1bp insertion at one site and a 1bp deletion
-    /// at another has unchanged SEQ length but a changed CIGAR and shifted
-    /// offsets, so a length-based check would be a false negative.
     pub structure_changed: bool,
-    /// Keys of the edits this walk ACTUALLY applied -- gain/revert/replace
-    /// `Ins`, or gain/revert/shrink `Del` -- keyed exactly like the internal
-    /// lookup map (`ref_pos`, kind of `from`). A verbatim copy or an
-    /// unsupported-target fallthrough never adds its key here.
-    ///
-    /// Callers must drive reassignment statistics from THIS set, not from
-    /// the edit list they handed in: pass 2 predicts what this walk will do
-    /// with each edit, and that prediction can be wrong (a normalized site
-    /// vs. CIGAR-anchor mismatch, an insertion anchored inside the read's own
-    /// deletion, a site swallowed by an earlier gained deletion, ...). When
-    /// it is wrong this walk silently no-ops -- the reference-consumption
-    /// invariant still holds -- but counting the edit as applied anyway
-    /// would report a correction that never happened.
+    /// Keys of the edits this walk ACTUALLY applied -- gain/revert/replace `Ins`.
+    /// A verbatim copy or an unsupported-target fallthrough never adds its key here.
     pub applied: HashSet<(u32, EditKind)>,
 }
 
-/// Total reference bases consumed by a CIGAR (M/=/X/D/N). The rewrite invariant.
-///
-/// Test-only: the rewrite path maintains this invariant structurally, so nothing
-/// in production recomputes it. `rewrite_preserves_ref_consumption` and friends
-/// assert it explicitly, which is the whole point of keeping this around.
+/// Total reference bases consumed by a CIGAR (M/=/X/D/N).
+/// The rewrite invariant. Test-only: the rewrite path maintains this invariant structurally, so
+/// nothing in production recomputes it.
 #[cfg(test)]
 fn ref_consumed(c: &CigarString) -> u32 {
     c.iter()
@@ -2035,15 +1609,9 @@ fn push_op(ops: &mut Vec<Cigar>, op: Cigar) {
     ops.push(op);
 }
 
-/// Rewrite one read's SEQ/QUAL/CIGAR against `edits`, which are keyed by
-/// REFERENCE coordinate.
-///
-/// Contract: `refseq` MUST be the full contig the read is aligned to,
-/// indexed by absolute reference coordinate (not a windowed slice around the
-/// read). `pos` MUST be the read's absolute POS (0-based) into that same
-/// contig. Reverted deletions splice bases out of `refseq` at absolute
-/// coordinates; a windowed slice would silently splice in the wrong bases
-/// with no error.
+/// Rewrite one read's SEQ/QUAL/CIGAR against `edits`, which are keyed by REFERENCE coordinate.
+/// Contract: `refseq` MUST be the full contig the read is aligned to, indexed by absolute reference
+/// coordinate (not a windowed slice around the read).
 pub fn rewrite_read(
     pos: i64,
     cigar: &CigarString,
@@ -2054,9 +1622,6 @@ pub fn rewrite_read(
 ) -> RewriteResult {
     if edits.is_empty() {
         // Common fast path: no edits, so nothing about the read changes.
-        // Preserve the original CIGAR verbatim (including any `=`/`X` ops)
-        // rather than running it through the walk, which folds `=`/`X` into
-        // `M`.
         return RewriteResult {
             seq: seq.to_vec(),
             qual: qual.to_vec(),
@@ -2067,18 +1632,7 @@ pub fn rewrite_read(
     }
 
     if edits.indels.is_empty() {
-        // Substitutions-only fast path (FIX 2 in the final-review round):
-        // apply the subs directly to a copy of SEQ, resolving each `ref_pos`
-        // to a query offset by walking the CIGAR, and return the ORIGINAL
-        // CIGAR verbatim. This restores the actual v1 property -- a read that
-        // receives only a substitution must come out with its CIGAR UNCHANGED
-        // from the input -- which the general walk below breaks: it re-emits
-        // every aligned base as `Cigar::Match(1)`, folding any `=`/`X` ops
-        // into plain `M`, something v1 never did. `structure_changed` stays
-        // `false` and `applied` stays empty: a substitution alone never
-        // counts as an applied indel edit (see `RewriteResult::structure_changed`).
-        // This is also strictly faster than the general walk for the common
-        // case of a substitution-only correction.
+        // Substitutions-only fast path: apply the subs directly to a copy of SEQ.
         let subs: HashMap<u32, u8> = edits.subs.iter().copied().collect();
         let mut out_seq = seq.to_vec();
         let mut rp: u32 = pos.max(0) as u32;
@@ -2109,21 +1663,7 @@ pub fn rewrite_read(
     }
 
     let subs: HashMap<u32, u8> = edits.subs.iter().copied().collect();
-    // Keyed by (ref_pos, kind_of(from)), not ref_pos alone (see FIX 1): two edits
-    // for the same read can share a ref_pos while differing in `from`'s kind (a
-    // gained indel keyed at a normalized site can coincide with this read's own
-    // indel anchored at the same coordinate), and each of the three lookup sites
-    // below wants its OWN kind specifically.
-    //
-    // Two edits can also legitimately share the IDENTICAL (ref_pos, kind): pass
-    // 2's two independent per-site decisions can each decide to reassign the same
-    // one of this read's own CIGAR events (see `apply_corrections`'s FIX 2
-    // construction comment in denoise.rs). This is ordinary input, not a
-    // construction bug to panic on -- keep the FIRST one seen (the same order
-    // `apply_corrections` walks `edits.indels` in when it books statistics) and
-    // let the second surface harmlessly through the caller's
-    // `indel_edits_emitted_but_not_applied` diagnostic instead of silently
-    // overwriting the first or aborting the whole BAM conversion.
+    // Keyed by (ref_pos, kind_of(from)); on an identical key the first edit wins, the rest are reported as unapplied.
     let mut indels: HashMap<(u32, EditKind), &IndelEdit> = HashMap::new();
     for e in &edits.indels {
         let key = (e.ref_pos, edit_kind(&e.from));
@@ -2134,18 +1674,12 @@ pub fn rewrite_read(
     let mut out_qual: Vec<u8> = Vec::with_capacity(qual.len() + 8);
     let mut ops: Vec<Cigar> = Vec::new();
     let mut structure_changed = false;
-    // Edits genuinely applied, keyed exactly like `indels` above (see FIX 1
-    // in the task-9 review round). Populated at each of the six points below
-    // where an edit is actually acted on; a verbatim copy never touches this.
+    // Edits genuinely applied, keyed exactly like `indels` above.
     let mut applied: HashSet<(u32, EditKind)> = HashSet::new();
 
     let mut rp: u32 = pos.max(0) as u32; // reference position of the next ref-consuming base
     let mut qp: usize = 0; // query position of the next original base
-    // Ref position of the most recent *aligned* base emitted so far — the
-    // pileup anchor convention. `None` until the first aligned base is
-    // emitted, so a read whose first ref-relevant op is an `I` or `D` (no
-    // aligned base precedes it) cannot alias an edit anchored at some other,
-    // later site.
+    // Ref position of the most recent *aligned* base emitted so far — the pileup anchor convention.
     let mut last_ref: Option<u32> = None;
 
     // Quality assigned to synthesized bases: never more confident than the flanks.
@@ -2171,11 +1705,7 @@ pub fn rewrite_read(
                     last_ref = Some(cur);
                     k += 1;
 
-                    // An indel anchored on this aligned base? Look up the `Ref`
-                    // kind specifically: a gained indel is always keyed at the
-                    // normalized site with `from: Ref` (see FIX 1), independent
-                    // of any `Ins`/`Del`-kind edit that might share this same
-                    // `ref_pos` via the read's own CIGAR anchor.
+                    // An indel anchored on this aligned base?
                     if let Some(e) = indels.get(&(cur, EditKind::Ref)) {
                         match (&e.from, &e.to) {
                             (Allele::Ref, Allele::Ins(s)) => {
@@ -2189,16 +1719,6 @@ pub fn rewrite_read(
                             }
                             (Allele::Ref, Allele::Del(m)) => {
                                 // The following m reference bases become a deletion.
-                                // The flank guard in denoise.rs guarantees they lie
-                                // inside this same match run -- but if that guard
-                                // ever mispredicts (see FIX 3 in the final-review
-                                // round), refuse the edit outright rather than
-                                // truncating it into a SHORTER, different deletion
-                                // than the site decided: emitting a wrong edit is
-                                // worse than emitting none. The caller's
-                                // `indel_edits_emitted_but_not_applied` counter
-                                // records the miss, exactly like any other
-                                // guard-mispredicted edit.
                                 let m = *m;
                                 if k + m <= n {
                                     push_op(&mut ops, Cigar::Del(m));
@@ -2216,21 +1736,7 @@ pub fn rewrite_read(
             }
 
             Cigar::Ins(n) => {
-                // While `last_ref` is `None` there is no aligned base before
-                // this insertion to anchor an edit to, so skip the lookup
-                // entirely and copy the op verbatim (see FIX 3 above). The
-                // `Ins` kind is baked into the key (see FIX 1), so this can
-                // only ever find an edit whose `from` is this read's own
-                // carried insertion -- no separate `filter` needed.
-                //
-                // `remove`, not `get` (see FIX 1 in the task-10 review
-                // round): `last_ref` is only updated by the Match arm, so
-                // two `Ins` ops separated by nothing but a `D`/`N` share this
-                // SAME key. One `IndelEdit` represents one read's allele at
-                // one site and must be applied at MOST ONCE; removing it on
-                // first use makes a second op with the same key correctly
-                // find nothing and copy verbatim, instead of splicing the
-                // same edit in twice.
+                // While `last_ref` is `None` there is no aligned base before this insertion to anchor an edit to.
                 let key = last_ref.map(|lr| (lr, EditKind::Ins));
                 let e = key.and_then(|k| indels.remove(&k));
                 match e.map(|e| &e.to) {
@@ -2260,11 +1766,7 @@ pub fn rewrite_read(
             }
 
             Cigar::Del(n) => {
-                // See the `Ins` arm above: skip the lookup entirely while
-                // there is no preceding aligned base to anchor to. The `Del`
-                // kind is baked into the key (see FIX 1), so no separate
-                // `filter` is needed here either. `remove`, not `get`, for
-                // the same one-shot-application reason as the `Ins` arm.
+                // See the `Ins` arm above: skip the lookup entirely while there is no preceding aligned base to anchor to.
                 let key = last_ref.map(|lr| (lr, EditKind::Del));
                 let e = key.and_then(|k| indels.remove(&k));
                 let splice = |out_seq: &mut Vec<u8>, out_qual: &mut Vec<u8>, from: u32, count: u32| {
@@ -2295,8 +1797,7 @@ pub fn rewrite_read(
                         applied.insert(key.expect("key set whenever `e` matched"));
                         structure_changed = true;
                     }
-                    // Shrunk: left-aligned, so the shorter deletion comes first and
-                    // the freed reference bases follow as matches.
+                    // Shrunk: left-aligned, so the shorter deletion comes first and the freed reference bases follow as matches.
                     Some(Allele::Del(m)) if *m <= n => {
                         push_op(&mut ops, Cigar::Del(*m));
                         let back = n - *m;
@@ -2337,47 +1838,7 @@ pub fn rewrite_read(
     }
 }
 
-/// Plan 2026-09-26 T8d: replace a read's alignment over one homopolymer run with the
-/// canonical form of length `R + target_k`, where the run is `[a + 1, e)` and
-/// `R = e - a - 1`.
-///
-/// This is the rewrite primitive the generic HP length model needs and
-/// `rewrite_read` cannot provide: `rewrite_read` edits ONE CIGAR op in place, so it
-/// can neither turn an `I` into a `D` nor grow a `D`. Here the run's whole segment --
-/// every query base aligned to it, plus any `I`/`D` op inside it, plus any `I`
-/// anchored on the anchor base itself -- is discarded and re-emitted left-aligned:
-///
-/// * `target_k > 0` -> `I(target_k)` of the run base immediately after the anchor,
-///   then `M(R)`;
-/// * `target_k < 0` -> `D(-target_k)` then `M(R + target_k)`;
-/// * `target_k == 0` -> `M(R)`.
-///
-/// All three consume exactly `R` reference bases, which is what the run consumed
-/// before, so POS, reference end and coordinate-sort order are invariant -- the same
-/// guarantee `rewrite_read` gives, and the reason edits keyed by reference position
-/// elsewhere in the read still line up afterwards.
-///
-/// The surviving query bases are the read's OWN bases over the run, with the excess
-/// dropped from the LEFT (where the canonical deletion sits) or copies of `b`
-/// The emitted query bases over the run are `R + target_k` copies of `b` -- a pure
-/// homopolymer, never a slice of the read (Plan 2026-09-26 T8, review fix 3). The
-/// site decided the run's LENGTH, so the run is re-emitted at that length and
-/// whatever the read carried inside it does not survive; a substitution in there is
-/// dropped by `apply_corrections` for the same reason. QUALITY is not rewritten
-/// wholesale: the read's own qualities over the run are kept, and only positions
-/// that did not exist before take the minimum of their flanking qualities, exactly
-/// like `fill_qual`.
-///
-/// `b` is the run's base, passed in rather than read off the read (review fix 1).
-/// It is a property of the REFERENCE, so taking it from the query would both
-/// corrupt a run whose first read base is a substitution and make a run the read
-/// deleted entirely unrewritable -- there is no query base left to copy.
-///
-/// `None` (the read is left untouched) when:
-/// * `[a + 1, e)` is not a run of at least 2, or `target_k < -R`;
-/// * the read has no aligned query base at the anchor `a`, or does not cover the
-///   whole run -- it cannot testify to a length it never saw;
-/// * an `N` op crosses the run.
+/// This is the rewrite primitive the generic HP length model needs and `rewrite_read` cannot provide.
 pub fn rewrite_hp_run(
     pos: i64,
     cigar: &CigarString,
@@ -2399,29 +1860,22 @@ pub fn rewrite_hp_run(
         return None;
     }
 
-    // Everything strictly before the run (through the anchor base) and everything
-    // from `e` on is copied verbatim; the run's own content is accumulated apart so
-    // it can be re-emitted canonically between the two.
+    // Everything strictly before the run and everything from `e` on is copied verbatim.
     let mut pre_ops: Vec<Cigar> = Vec::new();
     let mut pre_seq: Vec<u8> = Vec::new();
     let mut pre_qual: Vec<u8> = Vec::new();
     let mut post_ops: Vec<Cigar> = Vec::new();
     let mut post_seq: Vec<u8> = Vec::new();
     let mut post_qual: Vec<u8> = Vec::new();
-    // Only the run's QUALITIES are accumulated. Its bases are not: the body is
-    // re-emitted as a pure run of `b` (review fix 3), so the read's own bases inside
-    // the run are read past for bounds-checking and then discarded.
+    // Only the run's QUALITIES are accumulated.
     let mut run_qual: Vec<u8> = Vec::new();
-    // Reference bases of the run the read actually accounts for. Must reach `run_len`
-    // or the read does not cover the whole run.
+    // Reference bases of the run the read actually accounts for.
     let mut run_ref: u32 = 0;
 
     let mut rp = pos.max(0) as u32;
     let mut qp = 0usize;
     let mut last_aligned: Option<u32> = None;
-    // True once a reference position at or past `e` has been reached: the run is a
-    // contiguous reference interval, so "past" is a one-way door and query-only ops
-    // after it belong to the tail.
+    // True once a reference position at or past `e` has been reached: the run is a contiguous reference interval.
     let mut past = false;
 
     for op in cigar.iter() {
@@ -2454,8 +1908,7 @@ pub fn rewrite_hp_run(
                 let n = n as usize;
                 let bases = seq.get(qp..qp + n)?;
                 let quals = qual.get(qp..qp + n)?;
-                // Anchored on the anchor base (where left-normalization puts it) or
-                // on any base of the run: part of the run's length, so absorbed.
+                // Anchored on the anchor base or on any base of the run: part of the run's length, so absorbed.
                 if last_aligned.is_some_and(|l| l >= a && l < e) {
                     run_qual.extend_from_slice(quals);
                 } else if past {
@@ -2470,8 +1923,7 @@ pub fn rewrite_hp_run(
                 qp += n;
             }
             Cigar::Del(n) => {
-                // A deletion can straddle the run's edges; each part goes where its
-                // reference positions do.
+                // A deletion can straddle the run's edges; each part goes where its reference positions do.
                 let (s, t) = (rp, rp + n);
                 let head = (a + 1).min(t).saturating_sub(s);
                 let inside = overlap(s, t, a + 1, e);
@@ -2527,23 +1979,9 @@ pub fn rewrite_hp_run(
     }
 
     // Canonical body: the run becomes exactly `run_len + target_k` copies of `b`.
-    //
-    // Plan 2026-09-26 T8 (review fix 3): a pure run of `b`, never a slice of the
-    // read. The body used to be "synthesized `b` x add, then the read's own run
-    // bases", which only holds when the read has at most `run_len` query bases in
-    // the run. A read that carries EXTRA bases there (its own insertion) needs
-    // fewer synthesized copies, so its own bases slid left into the `I(k)` stretch
-    // and the emitted insertion contained whatever the read had -- including a
-    // substitution, i.e. a homopolymer insertion of a base the run does not
-    // contain. The site decided a LENGTH, so the run is re-emitted wholesale at
-    // that length and the read's content inside it does not survive. That is the
-    // same premise under which `apply_corrections` drops substitution edits falling
-    // inside the run (`subs_dropped_in_hp_rewrite`).
     let target_len = (run_len + target_k) as usize;
     let body_seq: Vec<u8> = vec![b; target_len];
-    // QUALITY is not rewritten wholesale: the read's own qualities over the run are
-    // kept, and only the positions that did not exist before are synthesized, at the
-    // minimum of the flanking qualities exactly as `fill_qual` does.
+    // QUALITY is not rewritten wholesale: the read's own qualities over the run are kept.
     let mut body_qual: Vec<u8> = Vec::with_capacity(target_len);
     if let Some(add) = target_len.checked_sub(run_qual.len()).filter(|n| *n > 0) {
         let right = run_qual.first().copied().or_else(|| post_qual.first().copied());
@@ -2581,15 +2019,6 @@ pub fn rewrite_hp_run(
 }
 
 /// Remove tags invalidated by a structural change.
-///
-/// `MM`/`ML`/`MN` are base-modification tags indexed by the read's own base
-/// positions; any applied indel edit (see `RewriteResult::structure_changed`)
-/// silently desynchronizes them. Output length is not a sound proxy for this:
-/// an insertion at one site and a deletion at another can offset each other,
-/// leaving SEQ length unchanged while the CIGAR and every downstream query
-/// offset still shift. Stripping is safe here because methylation aggregation
-/// runs on the ORIGINAL mt BAM (see main.rs QuickStart), not the denoised
-/// one. `NM`/`MD`/`cs` describe the pre-edit alignment and are simply stale.
 pub fn strip_stale_tags(rec: &mut rust_htslib::bam::Record) {
     for tag in [
         b"MM".as_slice(),
@@ -2608,9 +2037,7 @@ pub fn strip_stale_tags(rec: &mut rust_htslib::bam::Record) {
 mod rewrite_tests {
     use super::*;
 
-    // Reference used by every test below (index 0-based):
-    //   0123456789...
-    //   A C G T A A A A A C G T A C G T
+    // Reference used by every test below (index 0-based): 0123456789...
     const REF: &[u8] = b"ACGTAAAAACGTACGT";
 
     fn cig(ops: Vec<Cigar>) -> CigarString {
@@ -2757,8 +2184,7 @@ mod rewrite_tests {
 
     #[test]
     fn shrinking_a_deletion_emits_del_then_match() {
-        // 3bp deletion shrinks to 1bp: Del(1) first (left-aligned), then the two
-        // reference bases that stop being deleted come back as matches.
+        // 3bp deletion shrinks to 1bp: Del(1) first, then the two reference bases that stop being deleted come back as matches.
         let c = cig(vec![Cigar::Match(4), Cigar::Del(3), Cigar::Match(2)]);
         let seq = b"ACGTAC".to_vec();
         let qual = vec![30u8; 6];
@@ -2778,8 +2204,7 @@ mod rewrite_tests {
 
     #[test]
     fn one_read_carrying_sub_insertion_and_deletion_edits() {
-        // 12M read: substitution at ref 1, gained insertion after ref 3, gained
-        // deletion after ref 8. All applied in a single walk, left to right.
+        // 12M read: substitution at ref 1, gained insertion after ref 3, gained deletion after ref 8.
         let c = cig(vec![Cigar::Match(12)]);
         let seq = b"ACGTAAAAACGT".to_vec();
         let qual = vec![30u8; 12];
@@ -2820,7 +2245,7 @@ mod rewrite_tests {
 
     #[test]
     fn read_starting_at_nonzero_pos_uses_absolute_reference_coordinates() {
-        // Read aligned at POS 4 (the AAAAA run). Edit anchored at absolute ref 5.
+        // Read aligned at POS 4 (the AAAAA run).
         let c = cig(vec![Cigar::Match(6)]);
         let seq = b"AAAAAC".to_vec();
         let qual = vec![30u8; 6];
@@ -2836,17 +2261,7 @@ mod rewrite_tests {
 
     #[test]
     fn two_edits_sharing_a_ref_pos_but_differing_in_kind_are_both_applied() {
-        // A single read can legitimately carry two IndelEdits with the SAME
-        // ref_pos: one keyed at the read's own CIGAR anchor (from: Ins,
-        // reverting an insertion the read itself carries), and one keyed at
-        // the normalized site (from: Ref, a gained insertion into plain match
-        // context) -- which happen to coincide at position 15 here. Before
-        // keying by (ref_pos, kind), a plain `HashMap<u32, &IndelEdit>` could
-        // only hold ONE of these two per read, so whichever was inserted
-        // second would silently overwrite the first.
-        //
-        // 16M read that also carries its own 1bp insertion right at the end
-        // (anchor 15, the read's last aligned base): REF[0..16] + inserted "A".
+        // A single read can legitimately carry two IndelEdits with the SAME ref_pos: one keyed at the read's own CIGAR anchor.
         let c = cig(vec![Cigar::Match(16), Cigar::Ins(1)]);
         let mut seq = REF.to_vec();
         seq.extend_from_slice(b"A");
@@ -2854,15 +2269,13 @@ mod rewrite_tests {
         let edits = ReadEdits {
             subs: vec![],
             indels: vec![
-                // Gained: at ref_pos 15 (from: Ref), splice in a 2bp consensus
-                // insertion "AT" right after the last matched base.
+                // Gained: at ref_pos 15 (from: Ref), splice in a 2bp consensus insertion "AT" right after the last matched base.
                 IndelEdit {
                     ref_pos: 15,
                     from: Allele::Ref,
                     to: Allele::Ins(b"AT".to_vec()),
                 },
-                // Reverted: this read's OWN carried insertion (from: Ins),
-                // also anchored at ref_pos 15, is dropped entirely.
+                // Reverted: this read's OWN carried insertion (from: Ins), also anchored at ref_pos 15, is dropped entirely.
                 IndelEdit {
                     ref_pos: 15,
                     from: Allele::Ins(b"A".to_vec()),
@@ -2871,9 +2284,7 @@ mod rewrite_tests {
             ],
         };
         let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
-        // The gained "AT" is spliced in (proving the Ref-kind lookup fired),
-        // AND the read's own inserted "A" is dropped (proving the Ins-kind
-        // lookup ALSO fired independently) -- not one overwriting the other.
+        // The gained "AT" is spliced in (proving the Ref-kind lookup fired).
         let mut expected_seq = REF.to_vec();
         expected_seq.extend_from_slice(b"AT");
         assert_eq!(r.seq, expected_seq);
@@ -2884,20 +2295,7 @@ mod rewrite_tests {
 
     #[test]
     fn duplicate_ref_pos_and_kind_keeps_the_first_edit_and_never_panics() {
-        // FIX 1 (final-review round): two edits with the IDENTICAL (ref_pos,
-        // kind) pair -- both `from: Ref` at position 3 -- are a LEGITIMATE
-        // input, not a construction bug: pass 2's two independent per-site
-        // decisions can produce exactly this (see `apply_corrections`'s
-        // construction comment in denoise.rs). A prior `debug_assert!` here
-        // claimed this could never happen and would panic mid-BAM in a debug
-        // build while release silently let the second edit clobber the
-        // first; this test proves the current behavior, which is now
-        // identical in both profiles: the FIRST edit is applied, and the
-        // second is simply never reached by the walk, so the caller sees its
-        // key absent from `applied` and reports it through
-        // `indel_edits_emitted_but_not_applied` (exercised end-to-end by
-        // `two_emitted_edits_sharing_ref_pos_and_kind_are_not_double_counted`
-        // in denoise.rs).
+        // two edits with the IDENTICAL pair -- both `from: Ref` at position 3 -- are a LEGITIMATE input.
         let c = cig(vec![Cigar::Match(8)]);
         let seq = b"ACGTAAAA".to_vec();
         let qual = vec![30u8; 8];
@@ -2912,8 +2310,7 @@ mod rewrite_tests {
         // The FIRST edit (Ref -> Ins) is the one applied...
         assert_eq!(r.seq, b"ACGTAAAAA".to_vec());
         assert_eq!(r.cigar, cig(vec![Cigar::Match(4), Cigar::Ins(1), Cigar::Match(4)]));
-        // ...and its key appears exactly once in `applied` -- the SECOND
-        // edit (Ref -> Del) never gets a chance to run at all.
+        // ...and its key appears exactly once in `applied` -- the SECOND edit (Ref -> Del) never gets a chance to run at all.
         assert_eq!(r.applied.len(), 1);
         assert!(r.applied.contains(&(3, EditKind::Ref)));
         assert!(r.structure_changed);
@@ -2922,21 +2319,13 @@ mod rewrite_tests {
 
     #[test]
     fn gained_deletion_overrunning_its_match_op_is_refused_not_truncated() {
-        // FIX 3 (final-review round): a gained deletion whose span runs past
-        // the remaining length of its Match op must be REFUSED outright, not
-        // silently truncated into a SHORTER deletion than the site decided.
-        // `apply_corrections`'s own flank guard (`run >= m + flank + 1`)
-        // normally prevents this state from ever reaching `rewrite_read`, so
-        // it is constructed directly here to exercise the walk's own
-        // defense against a mispredicted guard.
+        // a gained deletion whose span runs past the remaining length of its Match op must be REFUSED outright.
         let c = cig(vec![Cigar::Match(4)]);
         let seq = b"ACGT".to_vec();
         let qual = vec![30u8; 4];
         let edits = ReadEdits {
             subs: vec![],
-            // Anchored at ref 0, the first base of the only Match op: after
-            // that anchor base is emitted, only 3 bases remain in the op,
-            // but this edit asks for a 4bp deletion -- it cannot fit.
+            // Anchored at ref 0, the first base of the only Match op: after that anchor base is emitted.
             indels: vec![IndelEdit { ref_pos: 0, from: Allele::Ref, to: Allele::Del(4) }],
         };
         let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
@@ -2949,11 +2338,7 @@ mod rewrite_tests {
 
     #[test]
     fn substitution_only_with_equal_and_diff_ops_preserves_cigar_verbatim() {
-        // FIX 2 (final-review round): the substitutions-only fast path must
-        // return the ORIGINAL CIGAR byte-for-byte, `=`/`X` ops included.
-        // Without it, the general walk re-emits every aligned base as
-        // `Cigar::Match(1)`, folding `=`/`X` into plain `M` -- something v1
-        // never did.
+        // the substitutions-only fast path must return the ORIGINAL CIGAR byte-for-byte, `=`/`X` ops included.
         let c = cig(vec![Cigar::Equal(2), Cigar::Diff(1), Cigar::Equal(5)]);
         let seq = b"ACGTAAAA".to_vec();
         let qual = vec![30u8; 8];
@@ -2969,12 +2354,7 @@ mod rewrite_tests {
 
     #[test]
     fn one_edit_shared_by_two_ins_ops_separated_only_by_a_deletion_is_applied_once() {
-        // FIX 1 (CRITICAL, task-10 review round): CIGAR 10M 1I 2D 1I 10M --
-        // both insertions share the SAME lookup key (last_ref, EditKind::Ins)
-        // because `last_ref` is only updated by the Match arm, and nothing
-        // but a `D` separates the two `Ins` ops. Before this fix, a single
-        // emitted edit would be found (and applied) at BOTH lookups. A
-        // single emitted edit must be consumed by AT MOST ONE of them.
+        // CIGAR 10M 1I 2D 1I 10M -- both insertions share the SAME lookup key.
         let c = cig(vec![
             Cigar::Match(10),
             Cigar::Ins(1),
@@ -2993,9 +2373,7 @@ mod rewrite_tests {
         };
         let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
 
-        // The FIRST Ins op ("T") reaches the key first and is reverted
-        // (dropped entirely); the SECOND ("C") finds the key already
-        // consumed and is copied verbatim, untouched.
+        // The FIRST Ins op reaches the key first and is reverted.
         let mut expected_seq = vec![b'A'; 10];
         expected_seq.push(b'C');
         expected_seq.extend(vec![b'A'; 10]);
@@ -3019,11 +2397,7 @@ mod rewrite_tests {
 
     #[test]
     fn one_edit_shared_by_two_del_ops_separated_only_by_an_insertion_is_applied_once() {
-        // Mirror of the Ins-side test above: CIGAR 10M 2D 1I 2D 10M. Both
-        // deletions share the SAME lookup key (last_ref, EditKind::Del) for
-        // the same reason -- an intervening `Ins` op does not update
-        // `last_ref` either. A single emitted Del->Ref revert must be
-        // consumed by AT MOST ONE of the two deletions.
+        // Mirror of the Ins-side test above: CIGAR 10M 2D 1I 2D 10M.
         let c = cig(vec![
             Cigar::Match(10),
             Cigar::Del(2),
@@ -3041,9 +2415,7 @@ mod rewrite_tests {
         };
         let r = rewrite_read(0, &c, &seq, &qual, &edits, REF);
 
-        // The FIRST deletion is reverted: REF[10..12] ("GT") splices back in
-        // as matches. The SECOND deletion finds the key already consumed
-        // and remains a real, untouched deletion.
+        // The FIRST deletion is reverted: REF[10..12] ("GT") splices back in as matches.
         let mut expected_seq = vec![b'A'; 10];
         expected_seq.extend_from_slice(b"GT");
         expected_seq.push(b'T');
@@ -3068,12 +2440,7 @@ mod rewrite_tests {
 
     #[test]
     fn offsetting_insertion_and_deletion_leave_length_unchanged_but_set_structure_changed() {
-        // 12M read gains a 1bp insertion after ref index 3 and a 1bp
-        // deletion after ref index 8. The two length changes cancel out, so
-        // output SEQ length equals input SEQ length -- but the CIGAR changed
-        // and every offset after ref index 3 shifted. `structure_changed`
-        // must still be true: this is exactly the false-negative FIX 1
-        // closes (output-length comparison would wrongly say "unchanged").
+        // 12M read gains a 1bp insertion after ref index 3 and a 1bp deletion after ref index 8.
         let c = cig(vec![Cigar::Match(12)]);
         let seq = b"ACGTAAAAACGT".to_vec();
         let qual = vec![30u8; 12];
@@ -3100,10 +2467,7 @@ mod rewrite_tests {
 
     #[test]
     fn leading_insertion_is_unaffected_by_an_edit_anchored_before_any_aligned_base() {
-        // `last_ref` starts as `None`: a read whose first ref-relevant op is
-        // an insertion has no aligned base preceding it, so an edit
-        // anchored at the read's POS must not be mistaken for one anchored
-        // on this leading insertion (FIX 3).
+        // `last_ref` starts as `None`: a read whose first ref-relevant op is an insertion has no aligned base preceding it.
         let c = cig(vec![Cigar::Ins(2), Cigar::Match(10)]);
         let seq = b"GGACGTAAAAAC".to_vec();
         let qual = vec![30u8; 12];
@@ -3124,8 +2488,7 @@ mod rewrite_tests {
 
     #[test]
     fn no_edits_preserves_equal_and_diff_ops_verbatim() {
-        // FIX 4's fast path: with zero edits, the original CIGAR (including
-        // `=`/`X` ops) must come back byte-identical, not folded into `M`.
+        // 's fast path: with zero edits, the original CIGAR must come back byte-identical, not folded into `M`.
         let c = cig(vec![Cigar::Equal(4), Cigar::Diff(1), Cigar::Equal(3)]);
         let seq = b"ACGTAAAA".to_vec();
         let qual = vec![30u8; 8];
@@ -3138,15 +2501,11 @@ mod rewrite_tests {
     }
 
     // ---- Plan 2026-09-26 T8d: canonical homopolymer-run rewrite ----
-    // `REF`'s A-run is 4..=8, so the HP site's normalized anchor is 3, its exclusive
-    // run end is 9, R = 5 and b = b'A'.
     const HPR_A: u32 = 3;
     const HPR_E: u32 = 9;
     const HPR_B: u8 = b'A';
 
-    /// `rewrite_hp_run` returns the same three pieces `rewrite_read` does; wrap them
-    /// so the existing `assert_invariants` can check reference consumption and
-    /// SEQ/QUAL/CIGAR length agreement for this path too.
+    /// `rewrite_hp_run` returns the same three pieces `rewrite_read` does.
     fn hp_result(t: (CigarString, Vec<u8>, Vec<u8>)) -> RewriteResult {
         RewriteResult {
             cigar: t.0,
@@ -3173,8 +2532,7 @@ mod rewrite_tests {
 
     #[test]
     fn hp_rewrite_shrinks_a_reference_length_run_to_a_deletion() {
-        // Ref -> Del(1): the canonical form is left-aligned, so the deletion comes
-        // first and the remaining 4 run bases follow as matches.
+        // Ref -> Del(1): the canonical form is left-aligned.
         let c = cig(vec![Cigar::Match(16)]);
         let seq = REF.to_vec();
         let qual = vec![30u8; 16];
@@ -3203,8 +2561,6 @@ mod rewrite_tests {
     #[test]
     fn hp_rewrite_absorbs_the_reads_own_insertion() {
         // 9M 1I 6M: the extra A is anchored on REF[8], the last base of the run.
-        // Rewritten to the reference length, the insertion simply disappears and the
-        // CIGAR collapses back to a single match run.
         let c = cig(vec![Cigar::Match(9), Cigar::Ins(1), Cigar::Match(7)]);
         let mut seq = REF[..9].to_vec();
         seq.push(b'A');
@@ -3220,8 +2576,7 @@ mod rewrite_tests {
 
     #[test]
     fn hp_rewrite_turns_an_insertion_into_a_deletion() {
-        // The transition `rewrite_read` cannot make at all (cross-kind). The read
-        // carries a 6bp run; the target is 4bp, so two query bases leave.
+        // The transition `rewrite_read` cannot make at all (cross-kind).
         let c = cig(vec![Cigar::Match(9), Cigar::Ins(1), Cigar::Match(7)]);
         let mut seq = REF[..9].to_vec();
         seq.push(b'A');
@@ -3237,8 +2592,7 @@ mod rewrite_tests {
 
     #[test]
     fn hp_rewrite_grows_the_reads_own_deletion() {
-        // The other transition `rewrite_read` refuses: Del(1) -> Del(3) would consume
-        // reference from the following op there, but here the whole run is replaced.
+        // The other transition `rewrite_read` refuses: Del(1) -> Del(3) would consume reference from the following op there.
         let c = cig(vec![Cigar::Match(4), Cigar::Del(1), Cigar::Match(11)]);
         let mut seq = REF[..4].to_vec();
         seq.extend_from_slice(&REF[5..]);
@@ -3270,14 +2624,7 @@ mod rewrite_tests {
 
     #[test]
     fn hp_rewrite_grows_a_run_the_read_deleted_entirely() {
-        // Plan 2026-09-26 T8 (review fix 1): 4M 5D 7M deletes the whole A-run, so the
-        // read has NO query base left inside it. That used to make the rewrite
-        // decline, because the base to synthesize was taken from the read. The run's
-        // base is a property of the REFERENCE, so it is passed in instead and a fully
-        // deleted run is rewritable to any length like any other.
-        //
-        // This transition is not rare: on the T8f eval cell it accounted for 6096 of
-        // the 17570 misses, almost all in 2bp runs.
+        // The run's base is a property of the REFERENCE.
         let c = cig(vec![Cigar::Match(4), Cigar::Del(5), Cigar::Match(7)]);
         let mut seq = REF[..4].to_vec();
         seq.extend_from_slice(&REF[9..]);
@@ -3307,15 +2654,7 @@ mod rewrite_tests {
 
     #[test]
     fn hp_rewrite_synthesizes_the_run_base_not_whatever_the_read_carries() {
-        // Plan 2026-09-26 T8 (review fix 1): the read has a substitution at the FIRST
-        // base of the run (reference 4, A -> C). Growing the run used to copy
-        // `run_seq.first()`, which is that `C`, inventing a base the homopolymer does
-        // not contain. Every base the rewrite emits over the run must be `b`.
-        //
-        // Review fix 3 tightened this: the run comes out as a PURE run of `b`, so the
-        // read's `C` does not survive anywhere in it. Under fix 1 alone the `C` was
-        // merely displaced one position to the right, which is just as wrong -- the
-        // site decided a length, and a run of A with a C in the middle is not a run.
+        // Every base the rewrite emits over the run must be `b`.
         let c = cig(vec![Cigar::Match(16)]);
         let mut seq = REF.to_vec();
         seq[4] = b'C';
@@ -3335,17 +2674,7 @@ mod rewrite_tests {
 
     #[test]
     fn hp_rewrite_insertion_is_never_a_slice_of_the_read() {
-        // Plan 2026-09-26 T8 (review fix 3): 9M 1I 7M puts SIX query bases in the
-        // five-base run, and the first of them is a substitution (reference 4,
-        // A -> C). Building the body as "synthesized `b` x add, then the read's own
-        // run bases" then needs only `add = 7 - 6 = 1` synthesized base, so the
-        // read's `C` slid into the second position -- which is inside `I(2)`. The
-        // emitted insertion was `AC`: a homopolymer insertion carrying a base the
-        // homopolymer does not contain.
-        //
-        // The run is decided as a LENGTH and rewritten wholesale, so the whole
-        // stretch is `k + R` copies of `b` and the insertion cannot be a slice of
-        // the read no matter how many query bases the read had in the run.
+        // Building the body as "synthesized `b` x add.
         let c = cig(vec![Cigar::Match(9), Cigar::Ins(1), Cigar::Match(7)]);
         let mut seq = REF[..9].to_vec();
         seq[4] = b'C';
@@ -3389,8 +2718,7 @@ mod rewrite_tests {
 
     #[test]
     fn hp_rewrite_keeps_soft_clips_and_absolute_coordinates() {
-        // 2S 12M from POS 2: the clip is copied verbatim and the run (4..=8) still
-        // resolves by ABSOLUTE reference coordinate, not query offset.
+        // 2S 12M from POS 2: the clip is copied verbatim and the run still resolves by ABSOLUTE reference coordinate.
         let c = cig(vec![Cigar::SoftClip(2), Cigar::Match(12)]);
         let mut seq = b"NN".to_vec();
         seq.extend_from_slice(&REF[2..14]);
@@ -3408,9 +2736,7 @@ mod rewrite_tests {
 
     #[test]
     fn hp_rewrite_gives_synthesized_bases_the_minimum_flanking_quality() {
-        // Same rule as `fill_qual`: never more confident than the neighbours. The
-        // synthesized base is left-aligned, so its neighbours are the anchor base
-        // (reference 3) and the first surviving run base (reference 4).
+        // Same rule as `fill_qual`: never more confident than the neighbours.
         let c = cig(vec![Cigar::Match(16)]);
         let seq = REF.to_vec();
         let mut qual = vec![40u8; 16];

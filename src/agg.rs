@@ -99,20 +99,8 @@ impl GraphicalGenome {
     }
 
  
-    ///
     /// A Result containing the graphical genome of the single sample
-    ///
-    /// # Errors
-    ///
-    /// * The `df_single_sample` array has an invalid shape.
-    /// * The anchor or read indices are invalid.
-    /// * There is a memory allocation error.
-    /// * The JSON data is invalid.
-    /// * There is an unexpected data structure or other internal error.
-    ///
     /// # Panics
-    ///
-    /// If the edge do not have outgoing anchor
     pub fn extract_single_sample_graph(
         &self,
         df_single_sample: &Array2<f64>, 
@@ -125,8 +113,7 @@ impl GraphicalGenome {
         let mut new_incoming = HashMap::new();
         let mut new_outgoing = HashMap::new();
 
-        // be careful about the anchor and read index, 
-        // make sure it matches with the imputed data matrix
+        // be careful about the anchor and read index, make sure it matches with the imputed data matrix
         for (anchorindex, anchor) in anchorlist.iter().enumerate(){
             let mut d: HashMap<usize, String> = HashMap::new();
             if let Some(outgoinglist) = self.outgoing.get(anchor) {
@@ -143,7 +130,7 @@ impl GraphicalGenome {
                 #[allow(clippy::cast_possible_truncation)]#[allow(clippy::cast_sign_loss)]
                 let usize_index = edgeindex as usize;
                 let edgename = d.get(&usize_index);
-                // println!("usize_index: {}, d: {:?}, edgename: {:?}", usize_index, &d, edgename); // Assuming new_edges is a HashMap<String, SomeType>
+                // println!("usize_index: {}, d: {:?}, edgename: {:?}", usize_index, &d, edgename).
                 new_edges.entry(edgename.unwrap().to_string()).or_insert_with(|| serde_json::json!({}));
                 if let Some(edge_value) = self.edges.get(&(*edgename.as_ref().unwrap()).to_string()) {
                     if let Some(seq_value) = edge_value.get("seq") {

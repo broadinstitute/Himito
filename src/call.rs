@@ -210,11 +210,7 @@ fn edge_reads(graph: &GraphicalGenome, edge: &str) -> HashSet<String> {
 fn get_graph_intervals(graph:&GraphicalGenome, length: i64) -> HashMap<&String, (i64, i64)>{
     let mut graph_intervals_dict = HashMap::new();
     for edge in graph.edges.keys() {
-        // Edges with no computed variant record were never CIGAR-processed
-        // (get_variant skips them via this same empty-cigar check) - a read
-        // reaching a bubble only through such an edge was never genotyped
-        // there, and must not be credited as "covering" it, or it later
-        // defaults to a false ref (0) call instead of the correct NaN.
+        // Edges without a variant record were never genotyped; a read crossing a bubble only via one does not cover it.
         let has_variant = graph.edges[edge]
             .get("variants")
             .and_then(|v| v.as_str())
@@ -224,10 +220,7 @@ fn get_graph_intervals(graph:&GraphicalGenome, length: i64) -> HashMap<&String, 
         }
         let src = graph.edges[edge].get("src").unwrap().as_array().unwrap()[0].as_str().unwrap();
         let dst = graph.edges[edge].get("dst").unwrap().as_array().unwrap()[0].as_str().unwrap();
-        // SOURCE/SINK have no anchor coordinate, and get_variant skips those edges
-        // outright. Defaulting the missing endpoint to 0/length instead would hand
-        // them a genome-scale interval, crediting their reads as "covering" every
-        // variant in the graph.
+        // SOURCE/SINK have no anchor coordinate, and get_variant skips those edges outright.
         let anchor_pos = |name: &str| {
             graph
                 .anchor
@@ -238,14 +231,7 @@ fn get_graph_intervals(graph:&GraphicalGenome, length: i64) -> HashMap<&String, 
         let (Some(startpos), Some(endpos)) = (anchor_pos(src), anchor_pos(dst)) else {
             continue;
         };
-        // The graph is circular: the final anchor links straight back to the first,
-        // so the closing bubble has `endpos < startpos` (e.g. A016544 -> A000022 on
-        // rCRS). Unwrap its end past the origin rather than dropping the edge --
-        // dropping it left every variant in that bubble with no covering reads, so
-        // origin-spanning variants could be emitted to the VCF yet never genotyped
-        // in the matrix. Variant positions on this edge are raw/unwrapped for the
-        // same reason (circuliarize_variants folds them back afterwards), so the
-        // unwrapped interval is exactly what bubble_cover_reads is queried with.
+        // The graph is circular: the final anchor links straight back to the first.
         let end_unwrapped = if endpos > startpos {
             endpos
         } else if endpos < startpos {
@@ -273,13 +259,8 @@ fn bubble_cover_reads(graph_intervals_dict: &HashMap<&String, (i64, i64)>, pos: 
 }
 
 /// Populates `read_record`/`cover_record` for one edge's variants.
-///
-/// `graph_intervals_dict` holds raw (unwrapped) anchor coordinates: the closing
-/// bubble that crosses the origin is stored as `[src.pos, dst.pos + ref_length)`
-/// so it stays ordered and half-open. `variants` carries that same raw position,
-/// while `variants_circular` carries the wrapped position used to key/name the
-/// variant. The bubble lookup must use the raw position - using the wrapped one
-/// would look up the wrong bubble (or none) for any variant past the origin.
+/// `graph_intervals_dict` holds raw (unwrapped) anchor coordinates: the closing bubble that crosses
+/// the origin is stored as `[src.pos, dst.pos + ref_length)` so it stays ordered and half-open.
 fn record_variant_reads(
     variants: &[Variant],
     variants_circular: &[Variant],
@@ -300,9 +281,7 @@ fn record_variant_reads(
     }
 }
 
-/// `left_align` carries the reference sequence when `--left-align` is on, and is
-/// `None` otherwise: left-alignment is impossible without the reference, so the
-/// dependency is expressed in the type rather than as a separate bool.
+/// `left_align` carries the reference sequence when `--left-align` is on, and is `None` otherwise.
 pub fn get_variant(
     graph: &mut GraphicalGenome,
     k: usize,
@@ -381,14 +360,7 @@ pub fn get_variant(
             refstart as usize,
             allele_count,
         );
-        // Align BEFORE `var` is extended and before the read records are keyed, so
-        // the returned variants and the `read_record`/`cover_record` keys are
-        // generated from the same tuples -- `construct_matrix` looks its rows up by
-        // name, so a mismatch here would silently produce an all-NaN matrix.
-        //
-        // Alignment runs on the CIRCULARIZED positions, which are guaranteed to lie
-        // in [0, ref_length) and so are always valid reference indices; the raw
-        // positions of a wrap-around bubble are not.
+        // Align BEFORE `var` is extended and before the read records are keyed.
         let variants_circular = circuliarize_variants(variants.clone(), ref_length);
         let variants_circular = match left_align {
             Some(refseq) => left_align_variants(&variants_circular, refseq),
@@ -424,16 +396,7 @@ pub fn get_variant(
     (var, coverage, read_record, cover_record)
 }
 
-/// Shift every indel maximally leftward so that, however the aligner happened to
-/// anchor it, equivalent spellings of one event share a single canonical
-/// representation -- the canonicalization `bcftools norm` performs. SNPs pass
-/// through untouched, and the alleles are already parsimonious (one anchor base
-/// plus the event), so no trimming step is needed.
-///
-/// This is an order- and length-preserving 1:1 map. `record_variant_reads` zips
-/// the raw and circularized variant vectors BY INDEX -- the raw position selects
-/// the covering bubble while the aligned one becomes the matrix key -- so a
-/// variant that cannot be aligned must be returned in place, never dropped.
+/// Shift every indel maximally leftward so equivalent alignments get one canonical representation.
 fn left_align_variants(variants: &[Variant], refseq: &[u8]) -> Vec<Variant> {
     variants
         .iter()
@@ -442,12 +405,7 @@ fn left_align_variants(variants: &[Variant], refseq: &[u8]) -> Vec<Variant> {
 }
 
 fn left_align_variant(variant: &Variant, refseq: &[u8]) -> Variant {
-    // `normalize_left` indexes an indel by its anchor: the last reference base
-    // BEFORE the event. `pos` here is the 0-based first inserted/deleted base,
-    // so the anchor is at `pos - 1`. A variant with no anchor base -- an
-    // insertion at a bubble start, where `get_variants_from_cigar` writes REF
-    // "-", or an event circularization folded onto position 0 -- has nothing to
-    // shift relative to and comes back unchanged.
+    // `normalize_left` indexes an indel by its anchor: the last reference base BEFORE the event.
     if variant.pos == 0
         || variant.ref_allele.is_empty()
         || variant.alt_allele.is_empty()
@@ -471,10 +429,7 @@ fn left_align_variant(variant: &Variant, refseq: &[u8]) -> Variant {
     let (anchor, normalized) = normalize_left(refseq, (variant.pos - 1) as u32, &allele);
     let anchor = anchor as usize;
 
-    // Rebuild both alleles from the reference at the NEW anchor rather than
-    // editing the old strings, so the anchor base is always the true reference
-    // base there. A shift that ran off the end of the reference leaves the
-    // variant alone rather than emitting a truncated allele.
+    // Rebuild both alleles from the reference at the NEW anchor rather than editing the old strings.
     let anchor_base = match refseq.get(anchor..anchor + 1) {
         Some(base) => String::from_utf8_lossy(base).to_string(),
         None => return variant.clone(),
@@ -554,8 +509,7 @@ fn format_vcf_record(variant: &Variant, coverage: HashMap<usize, usize>, indel_f
 
     let indel_len = (variant.ref_allele.len() as i32 - variant.alt_allele.len() as i32).abs();
     let is_small_indel = variant.variant_type != "SNP" && indel_len < 5;
-    // Combine any upstream flag (e.g. Strand_bias) with the indel-artifact check here, rather
-    // than letting one filter suppress the other, so a call can carry multiple FILTER reasons.
+    // Combine any upstream flag with the indel-artifact check here, rather than letting one filter suppress the other.
     let mut filters: Vec<String> = Vec::new();
     if let Some(existing) = variant.filter.as_deref() {
         if !existing.is_empty() {
@@ -631,10 +585,7 @@ fn filter_vcf_record(
     filtered_var
 }
 
-/// ONT-recall R3-T2 (R3-7). Folds accepted linkage calls into the graph calls.
-/// A graph SNV of the same allele that is already PASS is left alone; a filtered
-/// one gets its FILTER cleared. Returns the updated graph calls and the linkage
-/// calls that still need a record of their own.
+/// Folds accepted linkage calls into the graph calls.
 pub(crate) fn merge_link_calls(variants: &[Variant], links: &[LinkCall]) -> (Vec<Variant>, Vec<LinkCall>) {
     let key = |pos: usize, r: &str, a: &str| (pos, r.to_ascii_uppercase(), a.to_ascii_uppercase());
     let by_allele: HashMap<(usize, String, String), &LinkCall> = links
@@ -666,7 +617,7 @@ pub(crate) fn merge_link_calls(variants: &[Variant], links: &[LinkCall]) -> (Vec
     (merged, new_calls)
 }
 
-/// ONT-recall R3-T2. A rescued SNV as a matrix/genotyping `Variant`.
+/// A rescued SNV as a matrix/genotyping `Variant`.
 fn link_variant(l: &LinkCall) -> Variant {
     Variant {
         pos: l.pos,
@@ -678,7 +629,7 @@ fn link_variant(l: &LinkCall) -> Variant {
     }
 }
 
-/// ONT-recall R3-T2 (R3-7). A rescued SNV record; DP/AD/HF are pileup counts.
+/// A rescued SNV record; DP/AD/HF are pileup counts.
 fn format_link_record(l: &LinkCall) -> String {
     let hf = if l.dp == 0 { 0.0 } else { l.ac as f32 / l.dp as f32 };
     format!(
@@ -765,9 +716,6 @@ pub(crate) fn write_vcf(
             .then(a.alt_allele.cmp(&b.alt_allele))
     });
 
-    // Graph records sorted by internal pos are also sorted by VCF POS (an indel's
-    // internal pos is its VCF POS, a SNP's is POS - 1), so linkage records merge
-    // in by POS, after any graph record at the same POS (ONT-recall R3-T2).
     let mut sorted_links: Vec<&LinkCall> = links.unwrap_or(&[]).iter().collect();
     sorted_links.sort_by(|a, b| a.pos.cmp(&b.pos).then(a.alt_allele.cmp(&b.alt_allele)));
     let vcf_pos = |v: &Variant| if v.variant_type == "SNP" { v.pos + 1 } else { v.pos };
@@ -854,34 +802,19 @@ pub fn construct_matrix(
         }
     }
 
-    // Every covered read is kept. There used to be a column filter here dropping
-    // reads with `alt_count <= minimal_ac` ALT calls, but `minimal_ac` is a
-    // per-variant allele-count gate ("a variant needs >= N supporting reads"),
-    // not a per-read one, and reusing it that way removed ~91% of reads on a
-    // real ONT run. Worse, it selected on noise: `alt_count` is summed over ALL
-    // raw variants, which on ONT are mostly indel artifacts, so retention was
-    // flat (~9%) regardless of how many true mutations a read carried and the
-    // reference-like reads that anchor the lineage root were dropped wholesale.
-    // Downstream SCITE models missing data explicitly via its FN rate, so sparse
-    // reads cost it far less than a biased subsample does.
+    // Every covered read is kept.
     (matrix, var_vec, read_vec)
 }
 
 // ---- BAM genotyping (Plan 2026-10-11) ----
 
-/// Plan 2026-10-11 T1. `(start0, ref, alt)` where `start0` is the 0-based index
-/// of REF's first base on the reference. SNP: `v.pos`. INS/DEL: `v.pos - 1`,
-/// because REF carries the anchor base. Mirrors `parse_name` in the oracle
-/// (`m.{start0 + 1}...`, see `generate_variant_name`).
+/// `(start0, ref, alt)` where `start0` is the 0-based index of REF's first base on the reference.
 fn allele_span(v: &Variant) -> (usize, &str, &str) {
     let start0 = if v.variant_type == "SNP" { v.pos } else { v.pos - 1 };
     (start0, v.ref_allele.as_str(), v.alt_allele.as_str())
 }
 
-/// Plan 2026-10-11 T1. Mirrors `site_window` in the oracle. Expands the site
-/// span `[lo, hi)` by `flank`, pushes each boundary out of any homopolymer it
-/// lands in, then pads by 2. `None` if the window leaves `[0, refseq.len())`
-/// (it crosses the circular origin; left NaN in phase 1).
+/// Mirrors `site_window` in the oracle.
 fn genotype_window(
     refseq: &[u8],
     sites_span: (usize, usize),
@@ -904,14 +837,7 @@ fn genotype_window(
     }
 }
 
-/// Plan 2026-10-11 T2. Mirrors `group_sites` in the oracle: indices into
-/// `variants`, grouped into genotyping sites. Alleles group only within the same
-/// CLASS: SNPs with SNPs whose REF base overlaps, indels with overlapping
-/// indels. A SNP and an overlapping indel are deliberately scored apart: on ONT
-/// the indel is usually the deletion ERROR of the SNP base itself (e.g.
-/// `m.8170AT>A` over `m.8171T>A`), and scoring them jointly hands every read
-/// whose SNP base was deleted to the artifact, a false 0 for the SNP.
-/// SNP sites come first, then indel sites, each ordered by start.
+/// Mirrors `group_sites` in the oracle: indices into `variants`, grouped into genotyping sites.
 fn group_sites(variants: &[Variant]) -> Vec<Vec<usize>> {
     let mut sites: Vec<Vec<usize>> = Vec::new();
     for want_indel in [false, true] {
@@ -945,7 +871,7 @@ fn group_sites(variants: &[Variant]) -> Vec<Vec<usize>> {
     sites
 }
 
-/// Plan 2026-10-11 T3. Outcome of scoring one read segment at one site.
+/// Outcome of scoring one read segment at one site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SegCall {
     /// Best distance exceeds `max_ed`: the read is too noisy here to say.
@@ -969,10 +895,7 @@ thread_local! {
     );
 }
 
-/// Plan 2026-10-11 T3. Infix edit distance of each haplotype against `seg`: the
-/// haplotype is aligned end to end, the segment's leading/trailing bases are
-/// free (`semiglobal(hap, seg)`; unit costs, gap open 0 / extend -1, so the
-/// distance is `-score`). Mirrors the edlib `HW` call in the oracle.
+/// Infix edit distance of each haplotype against `seg`: the haplotype is aligned end to end.
 fn score_segment(haps: &[(String, Vec<u8>)], seg: &[u8], margin: u32, max_ed: u32) -> SegCall {
     if haps.is_empty() {
         return SegCall::TooNoisy;
@@ -997,7 +920,7 @@ fn score_segment(haps: &[(String, Vec<u8>)], seg: &[u8], margin: u32, max_ed: u3
     )
 }
 
-/// Plan 2026-10-11 T4. Knobs of BAM genotyping (oracle: `--flank/--slack/--margin/--max-ed`).
+/// Knobs of BAM genotyping (oracle: `--flank/--slack/--margin/--max-ed`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenotypeOpts {
     /// Bases added on each side of a site before the homopolymer push-out.
@@ -1030,8 +953,7 @@ pub fn linkage_rescue_enabled(data_type: &str, no_linkage_rescue: bool) -> bool 
     matches!(data_type, "ont-r9" | "ont-r10" | "ont-denoised") && !no_linkage_rescue
 }
 
-/// One genotyping site: a window on the reference and the haplotypes scored
-/// inside it. `haps[0]` is REF; `haps[1 + j]` is the allele of `members[j]`.
+/// One genotyping site: a window on the reference and the haplotypes scored inside it.
 struct GenoSite {
     left: usize,
     right: usize,
@@ -1039,8 +961,7 @@ struct GenoSite {
     haps: Vec<(String, Vec<u8>)>,
 }
 
-/// Plan 2026-10-11 T4. Per (site, read) evidence merged over all of the read's
-/// alignments (primary + supplementary pieces).
+/// Per (site, read) evidence merged over all of the read's alignments.
 #[derive(Default)]
 struct SiteAcc {
     any_usable: bool,
@@ -1115,17 +1036,7 @@ fn score_record_at_sites(
     out
 }
 
-/// Plan 2026-10-11 T4. Re-genotype `variants` in every read of `bam` by local
-/// realignment against the REF and allele haplotypes of each site (see
-/// `bam_genotype_matrix.py`, the oracle). Returns `(read_record, cover_record)`
-/// keyed by `generate_variant_name`: the shapes `construct_matrix` consumes.
-/// cover = reads with a decisive call (1 or 0) plus `ref_name`, the reference
-/// pseudo-read (an all-0 column); alt (`read_record`) = reads called 1.
-///
-/// Skips unmapped, secondary and empty-SEQ records, and records whose contig
-/// is not `ref_name` (the FASTA header id). WGS-header BAMs often put chrM at
-/// tid ≠ 0; matching by name keeps those reads. Supplementary records are
-/// kept: they are mostly pieces of reads that cross the origin.
+/// Re-genotype `variants` in every read of `bam` by local realignment against the REF.
 pub fn genotype_from_bam(
     bam: &Path,
     refseq: &[u8],
@@ -1145,7 +1056,6 @@ pub fn genotype_from_bam(
         eprintln!("Error: cannot open genotyping BAM {}: {}", bam.display(), e);
         std::process::exit(1);
     });
-    // ONT-recall R3-T1: resolve contig by name (GRCh38 BAMs put chrM at tid ≠ 0).
     // Unknown name → empty genotype maps (ref pseudo-read only), no exit.
     let target_tid: Option<i32> = match reader.header().tid(ref_name.as_bytes()) {
         Some(t) => Some(t as i32),
@@ -1205,8 +1115,7 @@ pub fn genotype_from_bam(
     }
     flush(&mut batch);
 
-    // Merge per (site, qname): decisive calls that disagree -> NaN; with none
-    // decisive, a 0 only for alleles outside every best set.
+    // Merge per (site, qname): decisive calls that disagree -> NaN; with none decisive.
     let mut read_record: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
     let mut cover_record: HashMap<String, HashSet<String>> = HashMap::new();
     for v in variants {
@@ -1338,9 +1247,7 @@ fn genotype_jaccard_similarity(a: &[f64], b: &[f64]) -> f64 {
     intersection_count as f64 / union_count as f64
 }
 
-/// Sum of Jaccard coefficients between one genotype vector and every OTHER variant's
-/// row. Rows are compared by index rather than by `generate_variant_name`, so two
-/// variants that happen to render to the same name cannot silently exclude each other.
+/// Sum of Jaccard coefficients between one genotype vector and every OTHER variant's row.
 fn sum_jaccard_against_others(vector_data: &[f64], self_index: usize, rows: &[Vec<f64>]) -> f64 {
     rows.iter()
         .enumerate()
@@ -1349,23 +1256,7 @@ fn sum_jaccard_against_others(vector_data: &[f64], self_index: usize, rows: &[Ve
         .sum()
 }
 
-/// Generate a PER-VARIANT null distribution through permutation testing, keyed by
-/// `generate_variant_name`.
-///
-/// The summary statistic is a SUM of Jaccard coefficients over every other variant, so
-/// it scales with how many reads carry the variant. Pooling all variants' draws into one
-/// null (as this did originally) therefore turned the test into a depth filter: a
-/// variant supported by 5 reads was z-scored against a null dominated by variants
-/// supported by hundreds, landing far below the pooled mean and yielding p ~ 1 no matter
-/// how tightly it co-segregated. Conversely a high-depth artifact cleared the pooled bar
-/// on read count alone. Since `shuffle_genotypes` permutes a variant's own values among
-/// its own covered reads, it already preserves that variant's alt count -- so each
-/// variant's draws are the correct null FOR THAT VARIANT and simply need to be kept
-/// apart rather than concatenated.
-///
-/// Variants whose alt frequency exceeds `threshold` are near-homoplasmic: they are the
-/// co-occurrence backbone the candidates are scored against, not candidates themselves,
-/// and are omitted from the returned map (as before).
+/// Generate a PER-VARIANT null distribution through permutation testing.
 fn get_null_distribution(
     filtered_var: &Vec<Variant>,
     matrix: &Array2<f64>,
@@ -1374,9 +1265,7 @@ fn get_null_distribution(
 ) -> HashMap<String, Vec<f64>> {
 
     let bar = ProgressBar::new(filtered_var.len() as u64);
-    // Materialize the rows ONCE. The inner loop compares against every other row on
-    // every round, and re-collecting each `ArrayView1` per comparison made the
-    // allocation count scale with rounds x variants^2.
+    // Materialize the rows ONCE.
     let rows: Vec<Vec<f64>> = (0..filtered_var.len())
         .map(|j| matrix.slice(s![j, ..]).iter().copied().collect())
         .collect();
@@ -1421,26 +1310,9 @@ fn calculate_observation_statistics(
     sum_jaccard_against_others(&rows[index], index, &rows)
 }
 
-/// One-sided empirical (rank) p-value: the fraction of `null` draws that reach or
-/// exceed `observation`, with the standard add-one correction in both numerator and
-/// denominator.
-///
-/// This replaces a z-score against a normal CDF. The statistic is a sum of Jaccard
-/// coefficients bounded below by zero and strongly right-skewed -- for a scattered
-/// artifact most draws are exactly 0.0 -- so a normal approximation is a poor fit and
-/// its degenerate cases needed a NaN guard (sigma == 0 whenever every draw ties, which
-/// is the COMMON case for a low-VAF variant, not a rare one). A rank p-value is exact
-/// under the permutation null and needs no distributional assumption.
-///
-/// The add-one makes the smallest attainable p-value `1 / (R + 1)`, which is the honest
-/// floor: R permutations cannot supply evidence beyond that. It also means R must be
-/// large enough for the floor to sit below the significance threshold with room for the
-/// Benjamini-Hochberg correction -- at R = 100 the floor is 0.0099, which leaves no
-/// resolution at all against a 0.01 threshold.
-///
-/// An empty null carries no evidence, so it yields 1.0. Callers must treat that as
-/// "untestable" rather than feeding it to BH, where a p-value of 1.0 reads as a
-/// confirmed artifact.
+/// This replaces a z-score against a normal CDF.
+/// Callers must treat that as "untestable" rather than feeding it to BH, where a p-value of 1.0 reads
+/// as a confirmed artifact.
 pub(crate) fn empirical_p_value(null: &[f64], observation: f64) -> f64 {
     if null.is_empty() {
         return 1.0;
@@ -1449,9 +1321,7 @@ pub(crate) fn empirical_p_value(null: &[f64], observation: f64) -> f64 {
     (at_or_above + 1) as f64 / (null.len() + 1) as f64
 }
 
-/// Build a map from read name (BAM qname) to strand (true = reverse, false = forward),
-/// using primary, mapped alignments only. Also returns the library-wide forward-strand
-/// fraction, which is the expected forward proportion for an unbiased allele.
+/// Build a map from read name (BAM qname) to strand, using primary, mapped alignments only.
 fn build_strand_map(bam_file: &Path) -> (HashMap<String, bool>, f64) {
     let mut bam = BamReader::from_path(bam_file)
         .unwrap_or_else(|e| panic!("Failed to open BAM {:?}: {}", bam_file, e));
@@ -1477,10 +1347,7 @@ fn build_strand_map(bam_file: &Path) -> (HashMap<String, bool>, f64) {
     (strand_map, fwd_frac)
 }
 
-/// Two-sided binomial-tail p-value that a variant's alt-supporting reads' forward/reverse
-/// split deviates from the library's expected forward fraction. A small p-value means the
-/// allele is strand-skewed, which is characteristic of systematic (e.g. homopolymer) errors
-/// rather than true heteroplasmies, which should be roughly strand-balanced.
+/// Two-sided binomial p-value that the alt reads' fwd/rev split deviates from the expected forward fraction.
 pub(crate) fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64) -> f64 {
     let n = (fwd + rev) as u64;
     if n == 0 {
@@ -1498,19 +1365,12 @@ pub(crate) fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64)
 /// What `filter_strand_bias` does with a variant it finds strand-skewed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StrandBiasAction {
-    /// Set `FILTER=Strand_bias` but keep the call in the VCF (historical behaviour).
     Flag,
     /// Additionally REMOVE strand-skewed low-VAF SNPs outright.
     Drop,
 }
 
 /// Resolve the strand-bias action for a data type, honouring an explicit CLI choice.
-///
-/// Only `ont-denoised` defaults to dropping. Its SNPs are the ones with no other
-/// discriminative filter, and denoising has already erased the strictly single-strand
-/// artifacts (`fit_site`'s per-strand candidacy gate maps them to reference), so a call
-/// that is STILL strand-skewed after denoising has survived a filter designed to catch
-/// it. PacBio and raw ONT keep flag-only behaviour.
 pub fn resolve_strand_bias_action(
     data_type: &str,
     explicit: Option<StrandBiasAction>,
@@ -1522,20 +1382,7 @@ pub fn resolve_strand_bias_action(
     })
 }
 
-/// Flag (and, under `StrandBiasAction::Drop`, remove) variants whose alt-supporting reads are significantly strand-skewed
-/// relative to the forward/reverse composition of the non-alt reads covering the site (library
-/// composition when fewer than `STRAND_LOCAL_MIN_READS` covering reads are strand-resolved)
-/// AND by at least `min_effect` in forward fraction (ONT-recall T3); flagged variants get
-/// `filter = Some("Strand_bias")` so the call survives in the VCF with FILTER set accordingly.
-/// Variants with fewer than `min_reads`
-/// strand-resolved supporting reads are kept (too little evidence to judge). Near-homoplasmic
-/// variants (heteroplasmic frequency >= `homoplasmic_frequency_threshold`) are also kept
-/// without testing: a real single-strand-only sequencing artifact can only ever produce a
-/// low-to-moderate apparent frequency (it's absent from the unaffected strand's reads), so an
-/// allele present in nearly every read at the locus cannot be explained by strand-specific
-/// error and any measured strand skew there reflects fragmented read attribution across
-/// near-duplicate graph edges, not a real signal. Returns the kept variants together with the
-/// matrix subset to the corresponding rows.
+/// Variants with fewer than `min_reads` strand-resolved supporting reads are kept.
 fn filter_strand_bias(
     variants: &[Variant],
     matrix: &Array2<f64>,
@@ -1593,17 +1440,10 @@ fn filter_strand_bias(
             continue;
         }
 
-        // ONT-recall T3: the null is the forward fraction of the reads covering THIS
-        // column (when enough are strand-resolved), not the library's; and a p-value
-        // alone is not enough, the alt's forward fraction must also differ by at least
-        // `min_effect` from that null.
         let (mut cfwd, mut crev) = (0usize, 0usize);
         if let Some(cover) = cover_record.get(&name) {
             for read_name in cover {
-                // The null describes the reads that did NOT carry the alt. `cover_record`
-                // is per graph edge and contains the alt reads, so for a low-coverage
-                // edge it is mostly the artifact itself (33CG>C: 34 of 38) and would
-                // make the artifact define its own null.
+                // The null describes the reads that did NOT carry the alt.
                 if seen.contains(read_name) {
                     continue;
                 }
@@ -1624,9 +1464,6 @@ fn filter_strand_bias(
         let p_value = strand_bias_pvalue(fwd, rev, null_frac);
         if p_value < p_threshold && effect >= min_effect {
             // The drop is deliberately narrow: SNPs only, and only below `drop_max_hf`.
-            // Indels already have `Potential_Artifact` to catch them, and above the
-            // ceiling a skew is likelier to be fragmented read attribution across
-            // near-duplicate graph edges than a single-strand sequencing artifact.
             if action == StrandBiasAction::Drop
                 && variant.variant_type == "SNP"
                 && hf < drop_max_hf
@@ -1637,8 +1474,7 @@ fn filter_strand_bias(
                 );
                 continue;
             }
-            // flag but keep: downstream FILTER combines this with other filters (e.g.
-            // Potential_Artifact) instead of dropping the call
+            // flag but keep: downstream FILTER combines this with other filters instead of dropping the call
             variant.filter = Some("Strand_bias".to_string());
             println!(
                 "Strand-biased (flagged, kept), {:?}, fwd={}, rev={}, alt_frac={:.3}, null_frac={:.3}, p={:.3e}",
@@ -1653,14 +1489,7 @@ fn filter_strand_bias(
     (kept, filtered_matrix)
 }
 
-/// ONT-recall R3-T3. Retest `Strand_bias`-flagged indels with alt/cover reads from
-/// BAM genotyping (`genotype_from_bam` shapes) instead of graph edges, which can
-/// split an indel's alt reads unevenly by strand. Same column-local null and
-/// effect gate as `filter_strand_bias`; the flag is cleared when
-/// `p >= p_threshold || effect < min_effect`. Fewer than `min_reads`
-/// strand-resolved BAM alt reads keep the graph verdict. SNVs and other filters
-/// are returned unchanged. `graph_counts` (graph fwd/rev per variant name) is
-/// only logged.
+/// Retest `Strand_bias`-flagged indels with alt/cover reads from BAM genotyping.
 #[allow(clippy::too_many_arguments)]
 fn recount_indel_strand_bias(
     variants: &[Variant],
@@ -1731,11 +1560,7 @@ fn recount_indel_strand_bias(
     out
 }
 
-/// ONT-recall R3-T3. Genotype only the `Strand_bias`-flagged indels in `bam` (the
-/// raw, pre-denoise BAM) and recount them with `recount_indel_strand_bias`. The
-/// strand map and library fraction come from `bam` itself, since its reads are
-/// the ones genotyped. `graph_read_record`/`graph_strand_map` are the inputs of
-/// `filter_strand_bias`, used only to log the graph counts alongside.
+/// Genotype only the `Strand_bias`-flagged indels in `bam`.
 #[allow(clippy::too_many_arguments)]
 fn recount_flagged_indels_from_bam(
     variants: &[Variant],
@@ -1791,19 +1616,15 @@ fn recount_flagged_indels_from_bam(
 
 // ---- adaptive permutation (ONT-recall T1) ----
 
-/// How `permutation_test` draws its null. The CLI always runs `Adaptive`; `Fixed`
-/// stays for the characterization tests.
+/// How `permutation_test` draws its null.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermutationMode {
-    /// Draw `--permutation-rounds` per tested variant, extending the variants that sit
-    /// at the p-value floor until Benjamini-Hochberg can resolve them (default).
+    /// Draw `--permutation-rounds` per tested variant.
     Adaptive,
-    /// Exactly `--permutation-rounds` draws for every tested variant (historical).
     Fixed,
 }
 
-/// A genotype row as bitsets over reads. Value `> 0.5` is alt, NaN is uncovered and
-/// 0 is covered-reference, so `alt` is always a subset of `cov`.
+/// A genotype row as bitsets over reads.
 pub(crate) struct BitRow {
     pub alt: Vec<u64>,
     pub cov: Vec<u64>,
@@ -1834,9 +1655,7 @@ impl BitRow {
     }
 }
 
-/// Jaccard of a (possibly shuffled) row `x` against row `y`, identical to
-/// `genotype_jaccard_similarity` on the f64 rows: reads uncovered in either row are
-/// ignored, and the union is 0 when neither row has an alt among shared reads.
+/// Jaccard of a (possibly shuffled) row `x` against row `y`.
 #[inline]
 pub(crate) fn jaccard_bits(x_alt: &[u64], x_cov: &[u64], y: &BitRow) -> f64 {
     let mut inter = 0u32;
@@ -1864,9 +1683,7 @@ fn sum_jaccard_bits(x_alt: &[u64], x_cov: &[u64], self_index: usize, rows: &[Bit
     sum
 }
 
-/// Bitset analogue of `shuffle_genotypes`: place `row.n_alt` alts on a uniform random
-/// subset of the covered reads (partial Fisher-Yates on `scratch`), writing the
-/// result into `out_alt`. Coverage is unchanged, so only the alt bits move.
+/// Bitset analogue of `shuffle_genotypes`.
 pub(crate) fn shuffle_bits(
     row: &BitRow,
     scratch: &mut Vec<u32>,
@@ -1885,15 +1702,13 @@ pub(crate) fn shuffle_bits(
     }
 }
 
-/// Materialize the matrix rows once, as the permutation code compares each row
-/// against every other.
+/// Materialize the matrix rows once, as the permutation code compares each row against every other.
 fn matrix_rows(matrix: &Array2<f64>) -> Vec<Vec<f64>> {
     (0..matrix.nrows())
         .map(|j| matrix.slice(s![j, ..]).iter().copied().collect())
         .collect()
 }
 
-/// FNV-1a 64-bit, used to derive a per-variant RNG seed from the variant name.
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &b in bytes {
@@ -1911,7 +1726,6 @@ pub(crate) struct PermOutcome {
 }
 
 impl PermOutcome {
-    /// Empirical p with the add-one correction, `(exceed + 1) / (draws + 1)`.
     pub(crate) fn p_value(&self) -> f64 {
         (self.exceed + 1) as f64 / (self.draws + 1) as f64
     }
@@ -1920,8 +1734,7 @@ impl PermOutcome {
 pub(crate) struct AdaptiveResult {
     /// One outcome per entry of `tested`, in the same order.
     pub outcomes: Vec<PermOutcome>,
-    /// Final per-variant round target of the floor-resolving stage (stage 1's
-    /// `min_rounds` when no variant was at the floor).
+    /// Final per-variant round target of the floor-resolving stage.
     pub r_target: usize,
     pub total_draws: u64,
 }
@@ -1937,20 +1750,7 @@ struct PermState {
     draws: u32,
 }
 
-/// Adaptive, floor-aware permutation test (ONT-recall T1).
-///
-/// Stage 1 draws up to `min_rounds` per tested variant, stopping a variant once it has
-/// `PERM_STOP_AFTER` exceedances (its p is then clearly above any BH threshold).
-/// Stage 2 resolves the floor: the `k0` variants with zero exceedances sit at
-/// `p = 1/(draws+1)`, and BH over `m` tests can only call them at `alpha` if that
-/// floor is below `alpha * k0 / m`. They are extended to
-/// `R_target = ceil(PERM_HEADROOM * m / (alpha * k0))` (capped at `PERM_MAX_ROUNDS`),
-/// repeating while the target grows. Mirrors `scripts/ont_recall/perm_retest.py
-/// --mode adaptive`, the oracle.
-///
-/// `rows` is every matrix row (the Jaccard sum runs over all of them), `tested`
-/// indexes the rows that get a null, and `names[i]` seeds row `i`'s RNG, so the result
-/// is deterministic regardless of how rayon schedules the work.
+/// Stage 1 draws up to `min_rounds` per tested variant.
 pub(crate) fn adaptive_permutation(
     rows: &[Vec<f64>],
     tested: &[usize],
@@ -2069,11 +1869,9 @@ fn permutation_test(
     let bar = ProgressBar::new(filtered_var.len() as u64);
 
     // Admission: which variants are candidates for the permutation test at all.
-    // (The matrix-frequency gate below is applied on top, per mode.)
     let admitted = |i: usize| -> bool {
         let current_variant = &filtered_var[i];
-        // A variant whose position carries no coverage entry cannot be scored; the
-        // original `.unwrap()` here panicked on that instead of leaving it untested.
+        // A variant whose position carries no coverage entry cannot be scored.
         let depth = coverage.get(&current_variant.pos).copied().unwrap_or(0);
         let frequency = if depth == 0 {
             0.0
@@ -2091,13 +1889,7 @@ fn permutation_test(
 
         let is_snp = current_variant.ref_allele.len() == 1 && current_variant.alt_allele.len() == 1;
 
-        // ONT-recall T4: a strong SNP with a clean strand flag is not tested. The
-        // Jaccard co-occurrence statistic punishes a variant that lives on the
-        // MAJORITY lineage -- its reads overlap every other lineage's markers
-        // poorly -- so a real heteroplasmy there looks like a scattered artifact
-        // (HapMap ONT 12969C>T: q 0.99). The strand flag (T3) already screens the
-        // systematic single-strand artifacts, so a SNP with `filter == None`, HF >=
-        // COOC_EXEMPT_HF and AC >= COOC_EXEMPT_MIN_AC is kept untested.
+        // Jaccard co-occurrence penalizes variants on the majority lineage, so exempt high-HF, high-AC variants.
         if is_snp
             && current_variant.filter.is_none()
             && frequency >= crate::COOC_EXEMPT_HF
@@ -2106,21 +1898,11 @@ fn permutation_test(
             return false;
         }
 
-        // PacBio: exclude SNPs from the permutation test -- its SNP accuracy is high
-        // enough that the co-occurrence test costs more true low-VAF heteroplasmies
-        // than it saves false positives.
-        //
-        // ONT, INCLUDING `ont-denoised`: test SNPs. Denoising is a per-base quality
-        // model, so it strips the RANDOM error it can see and leaves the SYSTEMATIC
-        // error -- which carries high base qualities -- untouched. Exempting denoised
-        // SNPs here left them with no discriminative filter anywhere in the pipeline:
-        // `filter_strand_bias` only flagged, and `Potential_Artifact` is indel-only.
-        // That gap is exactly where the residual low-VAF SNP false positives came from.
+        // PacBio: exclude SNPs from the permutation test (SNP accuracy is high enough).
         !(is_snp && data_type == "pacbio")
     };
 
     // Fixed: a per-variant null of `permutation_round` draws for every variant.
-    // Adaptive (ONT-recall T1): p-values by row index from the staged draws.
     let precomputed_p = mode == PermutationMode::Adaptive;
     let (nulls, adaptive_p): (HashMap<String, Vec<f64>>, HashMap<usize, f64>) = match mode {
         PermutationMode::Fixed => (
@@ -2130,8 +1912,7 @@ fn permutation_test(
         PermutationMode::Adaptive => {
             let rows = matrix_rows(matrix);
             let names: Vec<String> = filtered_var.iter().map(generate_variant_name).collect();
-            // No null for a variant above `permutation_frequency_threshold` by MATRIX
-            // alt frequency (the same gate `get_null_distribution` applies).
+            // No null for a variant above `permutation_frequency_threshold` by MATRIX alt frequency.
             let tested: Vec<usize> = (0..filtered_var.len())
                 .filter(|&i| {
                     admitted(i)
@@ -2161,10 +1942,7 @@ fn permutation_test(
             return adaptive_p.get(&i).map(|&p| (p, index));
         }
 
-        // No null draws for this variant (it sits above `permutation_frequency_threshold`
-        // by MATRIX alt frequency even though allele_count/coverage admitted it here --
-        // the two denominators can disagree). Absent evidence is not evidence of an
-        // artifact: leave it untested rather than handing BH a p-value of 1.0.
+        // No null draws for this variant.
         let null = match nulls.get(&index) {
             Some(n) if !n.is_empty() => n,
             _ => return None,
@@ -2252,8 +2030,6 @@ pub fn resolve_thresholds(
     )
 }
 
-/// Resolve `--indel-false-threshold`: an explicit value always wins; otherwise ONT data
-/// types default to 0.015 and everything else (pacbio) to 0.1. // ONT-recall T5
 pub fn resolve_indel_false_threshold(data_type: &str, explicit: Option<f64>) -> f64 {
     explicit.unwrap_or(match data_type {
         "ont-r9" | "ont-r10" | "ont-denoised" => 0.015,
@@ -2272,8 +2048,7 @@ pub fn start(
     data_type: &str,
     p_value_threshold: f64,
     heteroplasmic_frequency_threshold: f64,
-    // Raw (pre-denoise) BAM of the same reads: strand map, linkage rescue and the
-    // matrix. None: no strand filter, no linkage, graph matrix (with a warning).
+    // Raw (pre-denoise) BAM of the same reads: strand map, linkage rescue and the matrix.
     bam: Option<&Path>,
     strand_bias_threshold: f64,
     indel_false_threshold: f64,
@@ -2316,23 +2091,7 @@ pub fn start(
     let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
     let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
 
-    // // use matrix information to filter vcf
-    // Use stricter thresholds for ONT data due to higher error rates
-    // let (p_value_threshold, frequency_threshold) = if data_type == "ont" {
-    //     (0.0001, 0.15)  // Stricter: lower p-value threshold, lower frequency threshold
-    // } else {
-    //     (0.001, 0.2)    // PacBio: original thresholds
-    // };
-    // Strand-bias filtering runs BEFORE the permutation test, not after.
-    //
-    // The permutation test scores a variant by how strongly it co-segregates with the
-    // OTHER variants in the matrix. Error-prone ONT reads carry many errors at once, so
-    // systematic artifacts co-occur with each other on the same bad reads and produce a
-    // high Jaccard sum that is indistinguishable from a real lineage. Leaving known
-    // strand-skewed artifacts in the matrix therefore fed them into both the null and
-    // every observation, teaching the test that artifacts are real evidence. Removing
-    // them first means the co-occurrence backbone is built only from calls that already
-    // survived an independent, read-level check.
+    // Strand-bias filtering runs before the permutation test so artifacts do not feed its null.
     let action = resolve_strand_bias_action(data_type, strand_bias_action);
     // The matrix gate must not move the VCF, so the indel recount below is ungated.
     let recount_opts = GenotypeOpts { flank: crate::GENOTYPE_FLANK, ..GenotypeOpts::default() };
@@ -2357,8 +2116,6 @@ pub fn start(
                 strand_bias_drop_max_hf,
                 crate::STRAND_BIAS_MIN_EFFECT,
             );
-            // ONT-recall R3-T3: retest flagged indels from the BAM's reads before
-            // the permutation test; ONT only, otherwise the graph verdict stands.
             let sb_var = match linkage_bam {
                 Some(raw) => recount_flagged_indels_from_bam(
                     &sb_var,
@@ -2379,7 +2136,6 @@ pub fn start(
 
     let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&sb_matrix, p_value_threshold, heteroplasmic_frequency_threshold, permutation_rounds, &sb_filtered_var, &coverage, permutation_frequency_threshold, data_type, permutation_mode);
 
-    // ONT-recall R3-T2: read-linkage rescue (R3-7 merge, R3-8 matrix rows).
     let link_calls: Option<Vec<LinkCall>> = linkage_bam.and_then(|bam| {
         match linkage::rescue(bam, ref_seq.as_bytes(), &ref_header, &linkage::LinkOpts::default()) {
             Ok((calls, _summary)) => Some(calls),
@@ -2451,9 +2207,7 @@ enum MatrixSource {
 const GRAPH_MATRIX_WARNING: &str =
     "Warning: no --bam given; matrix.csv comes from the graph, not from re-genotyped reads.";
 
-/// Writes `<output>.matrix.csv`: re-genotyped from the BAM, or the graph matrix with a
-/// warning when there is no BAM. `rescued` (linkage) has no graph rows, so only the BAM
-/// matrix holds it.
+/// Writes `<output>.matrix.csv`: re-genotyped from the BAM.
 fn write_final_matrix(
     output_file: &Path,
     graph_matrix: &Array2<f64>,
@@ -2492,9 +2246,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Two bubbles: a normal one spanning raw positions [0, 5), and a
-    /// wrap-around bubble spanning raw positions [8, 12) - i.e. it crosses
-    /// the circular origin for a 10bp reference.
+    /// Two bubbles: a normal one and a wrap-around one crossing the circular origin.
     fn wraparound_test_graph() -> GraphicalGenome {
         let mut anchor = HashMap::new();
         anchor.insert("A1".to_string(), json!({"pos": 0}));
@@ -2534,8 +2286,7 @@ mod tests {
         let ref_length = 10usize;
         let graph_intervals_dict = get_graph_intervals(&graph, ref_length as i64);
 
-        // Raw position 11 lies on the wrap-around bubble [8, 12) and
-        // circularizes down to wrapped position 1.
+        // Raw position 11 lies on the wrap-around bubble [8, 12) and circularizes down to wrapped position 1.
         let raw_variant = Variant {
             pos: 11,
             ref_allele: "A".to_string(),
@@ -2566,18 +2317,11 @@ mod tests {
         let mut cover: Vec<String> = cover_record.get(&key).cloned().unwrap_or_default().into_iter().collect();
         cover.sort();
 
-        // The wrap-around bubble's true reads are r4/r5. Using the wrapped
-        // position (1) instead of the raw one (11) would incorrectly match
-        // the unrelated bubble at [0, 5), pulling in r1/r2/r3 instead.
+        // The wrap-around bubble's true reads are r4/r5.
         assert_eq!(cover, vec!["r4".to_string(), "r5".to_string()]);
     }
 
-    /// A bubble at raw positions [0, 10) carries the real variant (edge
-    /// `E_real`, cigar `5=1X4=`), with reads r1/r2. A read that couldn't be
-    /// assembled through the fine-grained anchor chain instead crosses the
-    /// same span via a private "skip-over" edge with no computed CIGAR
-    /// (`E_private`, read r3) - mirroring what Himito's own graph does for
-    /// reads it can't cleanly anchor (see e.g. E00001050 in a real run).
+    /// A bubble carrying the real variant, plus a read that crosses it via a skip-over edge with no CIGAR.
     fn skip_edge_test_graph() -> GraphicalGenome {
         let mut anchor = HashMap::new();
         anchor.insert("A1".to_string(), json!({"pos": 0}));
@@ -2610,18 +2354,11 @@ mod tests {
         let mut cover: Vec<String> = cover.into_iter().collect();
         cover.sort();
 
-        // r3 only reaches this span via E_private, which was never CIGAR-
-        // processed (get_variant would skip it via the empty-cigar check).
-        // It must not be credited as "covering" the variant - crediting it
-        // as covered-but-not-alt would wrongly call it ref (0) in the
-        // matrix instead of the correct NaN (unassembled/unknown).
+        // r3 only reaches this span via E_private, which was never CIGAR-processed.
         assert_eq!(cover, vec!["r1".to_string(), "r2".to_string()]);
     }
 
-    /// A genuinely circular graph: the last anchor links straight back to the
-    /// first, so the closing bubble has `dst.pos < src.pos`. Real Himito graphs
-    /// look like this (e.g. A016544 -> A000022 on rCRS); they do NOT carry a
-    /// duplicated anchor span past `ref_length`.
+    /// A genuinely circular graph: the last anchor links straight back to the first.
     fn circular_test_graph() -> GraphicalGenome {
         let mut anchor = HashMap::new();
         anchor.insert("A_first".to_string(), json!({"pos": 2}));
@@ -2658,9 +2395,7 @@ mod tests {
             "the origin-spanning bubble must not be dropped; variants there become uncallable"
         );
 
-        // get_variants_from_cigar walks forward from the src anchor, so a variant
-        // in this bubble carries a RAW position past ref_length (8 + 2 = 10),
-        // which circuliarize_variants folds back to wrapped position 0.
+        // get_variants_from_cigar walks forward from the src anchor.
         let raw_pos = 10usize;
         let mut cover: Vec<String> =
             bubble_cover_reads(&dict, raw_pos, &graph).into_iter().collect();
@@ -2691,9 +2426,7 @@ mod tests {
             "E_real".to_string(),
             json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1"], "variants": "5=1X4="}),
         );
-        // SOURCE/SINK have no anchor coordinate. Defaulting the missing endpoint
-        // to 0/ref_length would give these edges a whole-genome interval and
-        // credit their reads as covering every variant in the graph.
+        // SOURCE/SINK have no anchor coordinate.
         edges.insert(
             "E_source".to_string(),
             json!({"src": ["SOURCE"], "dst": ["A2"], "reads": ["rs"], "variants": "5="}),
@@ -2723,9 +2456,7 @@ mod tests {
 
     #[test]
     fn construct_matrix_keeps_reads_with_few_alt_calls() {
-        // Reads are the cells SCITE reasons over; dropping the ones carrying few
-        // ALT calls deletes the reference-like reads that anchor the root of the
-        // lineage, and on noisy data selects on error load rather than lineage.
+        // Reads are the cells SCITE reasons over.
         let variants: Vec<Variant> = ["A", "C"]
             .iter()
             .enumerate()
@@ -2775,8 +2506,6 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Per-variant permutation null + empirical p-value
-    // ---------------------------------------------------------------------
 
     fn snp(pos: usize, alt: &str, allele_count: usize) -> Variant {
         Variant {
@@ -2802,8 +2531,7 @@ mod tests {
 
     #[test]
     fn empirical_p_value_counts_null_at_or_above_observation() {
-        // (1 + #{null >= obs}) / (R + 1): the +1 keeps p strictly positive, so a
-        // variant can never be credited with more evidence than R rounds can supply.
+        // p = (1 + #{null >= obs}) / (rounds + 1): the +1 keeps p strictly positive.
         let null = vec![0.0, 1.0, 2.0, 3.0];
         // 3 of 4 null draws reach 1.0 => (1 + 3) / 5
         assert!((empirical_p_value(&null, 1.0) - 0.8).abs() < 1e-12);
@@ -2821,13 +2549,7 @@ mod tests {
 
     #[test]
     fn null_distribution_is_keyed_per_variant_and_preserves_alt_count() {
-        // The summary statistic is a SUM of Jaccard coefficients, so it scales with a
-        // variant's alt-read count. Pooling every variant's draws into one null makes
-        // the test a depth filter: a low-count variant is scored against a null built
-        // mostly from high-count variants. Each variant must get its own null.
-        // Three variants, so each null is a SUM over two comparisons. With only two
-        // variants the two nulls would each reduce to the single symmetric Jaccard
-        // J(v0, v1) and be equal by construction, testing nothing.
+        // The summary statistic is a SUM of Jaccard coefficients, so it scales with a variant's alt-read count.
         let variants = vec![snp(100, "A", 8), snp(200, "C", 2), snp(300, "G", 10)];
         let n_reads = 20;
         let mut matrix = Array2::<f64>::zeros((3, n_reads));
@@ -2846,8 +2568,7 @@ mod tests {
         assert_eq!(nulls[&n0].len(), rounds, "one draw per round for v0");
         assert_eq!(nulls[&n1].len(), rounds, "one draw per round for v1");
 
-        // Shuffling preserves each variant's own alt count, so the two nulls live on
-        // different scales -- exactly the confound that pooling them destroyed.
+        // Shuffling preserves each variant's own alt count.
         let mean = |v: &Vec<f64>| v.iter().sum::<f64>() / v.len() as f64;
         assert!(
             mean(&nulls[&n0]) > mean(&nulls[&n1]),
@@ -2857,8 +2578,7 @@ mod tests {
 
     #[test]
     fn null_distribution_skips_variants_above_the_frequency_threshold() {
-        // Near-homoplasmic variants are the co-occurrence backbone, not candidates;
-        // they are excluded from the null exactly as before the per-variant rewrite.
+        // Near-homoplasmic variants are the co-occurrence backbone, not candidates.
         let variants = vec![snp(100, "A", 9), snp(200, "C", 2)];
         let mut matrix = Array2::<f64>::zeros((2, 10));
         for j in 0..10 {
@@ -2876,11 +2596,8 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // SNP admission into the permutation test
-    // ---------------------------------------------------------------------
 
-    /// Two co-segregating variants carried by the same 3 of 30 reads (a real lineage),
-    /// plus one SNP scattered across 3 reads that share no lineage (an artifact).
+    /// Two co-segregating variants carried by the same 3 of 30 reads.
     fn lineage_and_artifact() -> (Vec<Variant>, Array2<f64>, HashMap<usize, usize>) {
         let variants = vec![
             snp(100, "A", 3),                 // lineage member
@@ -2904,10 +2621,7 @@ mod tests {
 
     #[test]
     fn permutation_test_evaluates_snps_for_ont_denoised() {
-        // Denoising strips the RANDOM error its quality model can see and leaves the
-        // SYSTEMATIC error behind, so a denoised ONT SNP still needs the co-occurrence
-        // test. Skipping SNPs here left `ont-denoised` with no SNP filter at all:
-        // `filter_strand_bias` only flags, and `Potential_Artifact` is indel-only.
+        // Denoising strips the RANDOM error its quality model can see and leaves the SYSTEMATIC error behind.
         let (variants, matrix, coverage) = lineage_and_artifact();
         let artifact = generate_variant_name(&variants[2]);
 
@@ -2925,8 +2639,7 @@ mod tests {
 
     #[test]
     fn permutation_test_still_exempts_snps_for_pacbio() {
-        // PacBio SNP accuracy is high enough that the co-occurrence test costs more
-        // real low-VAF heteroplasmies than it saves false positives. Unchanged.
+        // PacBio SNPs are excluded from the permutation test.
         let (variants, matrix, coverage) = lineage_and_artifact();
         let artifact = generate_variant_name(&variants[2]);
 
@@ -2942,11 +2655,7 @@ mod tests {
         );
     }
 
-    /// Mirrors HapMap ONT 12969C>T: X is a real heteroplasmy living on the MAJORITY
-    /// lineage. 300 reads in three exclusive lineages -- A (240 reads, 3 markers,
-    /// HF 0.8, above the null threshold so untested), B (36 reads, 15 markers) and
-    /// C (24 reads, 15 markers). X is a SNP on 45 random A reads (HF 0.15, AC 45).
-    /// Returns (variants, matrix, coverage); X is variant index 0.
+    /// X is a real heteroplasmy on the majority lineage (three exclusive lineages A, B, C).
     fn majority_lineage_heteroplasmy(x: Variant) -> (Vec<Variant>, Array2<f64>, HashMap<usize, usize>) {
         let n_reads = 300;
         let mut rng = StdRng::seed_from_u64(12969);
@@ -3003,9 +2712,7 @@ mod tests {
 
     #[test]
     fn cooccurrence_test_exempts_strong_balanced_snps() {
-        // ONT-recall T4. The co-occurrence statistic punishes a variant that sits on
-        // the MAJORITY lineage (12969C>T, q 0.99 on HapMap), so a strong SNP whose
-        // strand flag is clean is exempt from it.
+        // The co-occurrence statistic punishes a variant that sits on the MAJORITY lineage.
         let x = |filter: Option<&str>| {
             let mut v = snp(500, "C", 45);
             v.filter = filter.map(String::from);
@@ -3033,20 +2740,15 @@ mod tests {
 
     #[test]
     fn permutation_test_keeps_a_variant_with_no_null_draws() {
-        // `get_null_distribution` filters on the MATRIX alt frequency while the test
-        // loop filters on allele_count/coverage. The two can disagree, leaving a
-        // tested variant with an empty null. That is missing evidence, not evidence
-        // of an artifact, so the variant must be kept untested rather than dropped.
+        // `get_null_distribution` filters on the MATRIX alt frequency while the test loop filters on allele_count/coverage.
         let variants = vec![snp(100, "A", 2), snp(200, "C", 2)];
         let mut matrix = Array2::<f64>::zeros((2, 10));
         for j in 0..10 {
-            // Both variants are alt in 9/10 reads => matrix frequency 0.9, above the
-            // 0.7 null threshold, so neither gets a null...
+            // Both variants are alt in 9/10 reads => matrix frequency 0.9, above the 0.7 null threshold, so neither gets a null...
             matrix[[0, j]] = if j < 9 { 1.0 } else { 0.0 };
             matrix[[1, j]] = if j < 9 { 1.0 } else { 0.0 };
         }
-        // ...but allele_count/coverage is 2/100 = 0.02, well under the test's own
-        // 0.5 heteroplasmic threshold, so both are admitted for testing.
+        // ...but allele_count/coverage is 2/100 = 0.02, well under the test's own 0.5 heteroplasmic threshold.
         let coverage: HashMap<usize, usize> = [(100, 100), (200, 100)].into_iter().collect();
 
         let (kept, _m, _names) = permutation_test(
@@ -3057,8 +2759,6 @@ mod tests {
         assert_eq!(kept.len(), 2, "variants with an empty null must be kept, not dropped");
     }
 
-    // ---------------------------------------------------------------------
-    // Adaptive, floor-aware permutation test (ONT-recall T1)
     // ---------------------------------------------------------------------
 
     use rand::rngs::StdRng;
@@ -3111,9 +2811,7 @@ mod tests {
         }
     }
 
-    /// 10 identical lineage rows (alt in the same 24 of 400 reads) plus 120
-    /// independent noise rows (8 random alts each). The 10 lineage rows sit at the
-    /// permutation p-value floor, which fixed R = 1000 cannot get through BH.
+    /// 10 identical lineage rows (alt in the same 24 of 400 reads) plus 120 independent noise rows.
     fn floor_matrix() -> (Vec<Variant>, Array2<f64>, HashMap<usize, usize>) {
         let n_reads = 400;
         let mut rng = StdRng::seed_from_u64(2026);
@@ -3174,7 +2872,6 @@ mod tests {
         let tested: Vec<usize> = (0..variants.len()).collect();
         let names: Vec<String> = variants.iter().map(generate_variant_name).collect();
         let res = adaptive_permutation(&rows, &tested, &names, 1000, 0.01);
-        // ONT-recall T1 tune: R_target = ceil(PERM_HEADROOM * m / (alpha * k0))
         let expected =
             (crate::PERM_HEADROOM * 130.0 / (0.01 * 10.0)).ceil() as usize;
         assert!(
@@ -3226,12 +2923,8 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Summed-Jaccard limit on a small lineage (ONT-recall Phase2 T8 finding)
-    // ---------------------------------------------------------------------
 
-    /// HG002-style minority lineage: two private alleles on 6 reads each, 4 shared,
-    /// among 120 noise rows (8 random alts each) over 200 reads. The noise drowns the
-    /// pair's summed Jaccard.
+    /// The noise drowns the pair's summed Jaccard.
     fn small_lineage_matrix() -> (Vec<Variant>, Array2<f64>, HashMap<usize, usize>) {
         let (n_reads, n_noise) = (200, 120);
         let mut rng = StdRng::seed_from_u64(2002);
@@ -3274,11 +2967,8 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Strand-bias filter: drop vs flag
-    // ---------------------------------------------------------------------
 
-    /// One low-VAF SNP supported by 10 reads, all on the forward strand, against a
-    /// library that is 50/50 -- the signature of a systematic ONT artifact.
+    /// One low-VAF SNP supported by 10 reads, all on the forward strand.
     fn strand_skewed_snp() -> (
         Vec<Variant>,
         Array2<f64>,
@@ -3329,10 +3019,7 @@ mod tests {
 
     #[test]
     fn strand_bias_drop_action_spares_indels_and_higher_vaf_snps() {
-        // The drop is deliberately narrow: it targets the low-VAF SNPs that denoising
-        // leaves behind. Indels already have `Potential_Artifact`, and a SNP above the
-        // drop ceiling is common enough that strand skew is likelier to be fragmented
-        // read attribution than a single-strand artifact.
+        // The drop is deliberately narrow: it targets the low-VAF SNPs that denoising leaves behind.
         let (_v, _m, read_record_snp, strand_map, _c) = strand_skewed_snp();
 
         // Same evidence, but the call sits at 10/50 = 0.20 VAF, above the 0.10 ceiling.
@@ -3362,8 +3049,7 @@ mod tests {
 
     // ---- column-local strand-bias null (ONT-recall T3) ----
 
-    /// Build a one-SNP scenario: `fwd`/`rev` alt reads (names `a*`), and covering
-    /// reads (`c*`) in addition to the alt reads, which `cover_record` also holds with `cover_fwd`/`cover_rev` strand split.
+    /// Build a one-SNP scenario: `fwd`/`rev` alt reads, and covering reads in addition to the alt reads.
     #[allow(clippy::type_complexity)]
     fn local_null_case(
         variant: Variant,
@@ -3431,8 +3117,7 @@ mod tests {
 
     #[test]
     fn strand_bias_uses_column_local_null() {
-        // 7805G>A: alt 45F/27R (62.5% fwd), column 54% fwd, library 0.498.
-        // vs library p=0.034 would flag at 0.05 but the alt matches its column.
+        // 7805G>A: alt 45F/27R, column 54% fwd.
         let case = local_null_case(snp(7805, "A", 72), 45, 27, 54, 46, 1000);
         let local_p = strand_bias_pvalue(45, 27, 0.54);
         assert!(local_p >= 0.01, "local null p={local_p}");
@@ -3468,8 +3153,7 @@ mod tests {
 
     // ---- BAM recount of flagged indels (ONT-recall R3-T3) ----
 
-    /// Flag `v` from graph counts 10/0 against a balanced column, then recount it
-    /// from BAM-genotyped alt reads `bam_fwd`/`bam_rev` against a balanced column.
+    /// Flag `v` from graph counts 10/0 against a balanced column.
     fn graph_flagged_then_bam_recount(v: Variant, bam_fwd: usize, bam_rev: usize) -> Vec<Variant> {
         let graph = local_null_case(v.clone(), 10, 0, 50, 50, 1000);
         let flagged = run_sb(&graph, 0.5, StrandBiasAction::Flag);
@@ -3518,10 +3202,7 @@ mod tests {
 
     #[test]
     fn strand_bias_local_null_excludes_the_alt_reads_themselves() {
-        // 33CG>C on HapMap r10: the edge's cover set was 38 reads, 34 of them the
-        // reverse-only alt reads. Counting them made the "local" null 0.05 and the
-        // artifact looked normal. Without them only 4 covering reads remain (< 20),
-        // so the library fraction is the null and the artifact is flagged.
+        // The edge's cover set can be dominated by reverse-only alt reads.
         let case = local_null_case(indel(33, "CG", "C", 34), 0, 34, 2, 2, 302);
         assert_eq!(case.4.values().next().unwrap().len(), 38);
         let kept = run_sb(&case, 0.498, StrandBiasAction::Flag);
@@ -3530,26 +3211,18 @@ mod tests {
 
     #[test]
     fn strand_bias_falls_back_to_library_fraction_with_few_covering_reads() {
-        // Only 10 strand-resolved covering reads (< STRAND_LOCAL_MIN_READS): the
-        // local fraction is ignored and the library fraction (0.5) is the null.
-        // Covering reads are all forward, which would make 10/0 look unremarkable
-        // if the local null were wrongly used.
+        // Only 10 strand-resolved covering reads: the local fraction is ignored and the library fraction is the null.
         let case = local_null_case(snp(100, "A", 10), 10, 0, 10, 0, 200);
         let kept = run_sb(&case, 0.5, StrandBiasAction::Flag);
         assert_eq!(kept[0].filter.as_deref(), Some("Strand_bias"));
     }
 
     // ===================================================================
-    // Left-alignment (--left-align)
-    // ===================================================================
 
-    /// `TCAAAAGCTT` - a 4bp A-run at indices 2..6 preceded by a C, so a 1bp
-    /// deletion anywhere in the run has room to shift left and a definite
-    /// stopping point that is not the contig start.
+    /// `TCAAAAGCTT` - a 4bp A-run at indices 2..6 preceded by a C.
     const HOMOPOLYMER_REF: &[u8] = b"TCAAAAGCTT";
 
-    /// Build a DEL the way `get_variants_from_cigar` does: `pos` is the 0-based
-    /// first deleted base and REF carries the preceding anchor base.
+    /// Build a DEL the way `get_variants_from_cigar` does.
     fn del_at(refseq: &[u8], pos: usize, len: usize, allele_count: usize) -> Variant {
         Variant {
             pos,
@@ -3561,9 +3234,7 @@ mod tests {
         }
     }
 
-    /// Build an INS the way `get_variants_from_cigar` does: `pos` is the 0-based
-    /// position the inserted bases sit before, REF is the anchor base at `pos-1`
-    /// and ALT is that anchor base followed by the inserted sequence.
+    /// Build an INS the way `get_variants_from_cigar` does.
     fn ins_at(refseq: &[u8], pos: usize, inserted: &str, allele_count: usize) -> Variant {
         let anchor = String::from_utf8(refseq[pos - 1..pos].to_vec()).unwrap();
         Variant {
@@ -3578,8 +3249,7 @@ mod tests {
 
     #[test]
     fn left_align_shifts_homopolymer_deletion_to_start_of_run() {
-        // The aligner put the deleted A at the END of the run (index 5). bcftools
-        // norm reports this at the base before the run: POS 2, REF CA, ALT C.
+        // The aligner put the deleted A at the END of the run. bcftools norm reports this at the base before the run: POS 2.
         let v = del_at(HOMOPOLYMER_REF, 5, 1, 3);
         let aligned = left_align_variants(&[v], HOMOPOLYMER_REF);
 
@@ -3592,8 +3262,7 @@ mod tests {
 
     #[test]
     fn left_align_shifts_homopolymer_insertion_to_start_of_run() {
-        // An extra A appended to the run: REF A, ALT AA at pos 6. Shifting left
-        // re-anchors it on the C, so the reported anchor base changes to C.
+        // An extra A appended to the run: REF A, ALT AA at pos 6.
         let v = ins_at(HOMOPOLYMER_REF, 6, "A", 3);
         let aligned = left_align_variants(&[v], HOMOPOLYMER_REF);
 
@@ -3605,10 +3274,7 @@ mod tests {
 
     #[test]
     fn left_align_rotates_multi_base_insertion_across_a_tandem_repeat() {
-        // `TTAGAGAGC`: an AG dinucleotide repeat at 2..8. Inserting a further AG
-        // unit at the end of the run is the same event as inserting it at the
-        // start, but only if the inserted string rotates as the anchor moves --
-        // a naive shift that kept ALT as "TAG" spelled backwards would corrupt it.
+        // `TTAGAGAGC`: an AG dinucleotide repeat at 2..8.
         let refseq: &[u8] = b"TTAGAGAGC";
         let v = ins_at(refseq, 8, "AG", 2);
         let aligned = left_align_variants(&[v], refseq);
@@ -3620,8 +3286,7 @@ mod tests {
 
     #[test]
     fn left_align_leaves_indels_in_unique_sequence_untouched() {
-        // Deleting the G of ...TTGCA... has nowhere to go: the base entering the
-        // deletion (T) differs from the base leaving it (G).
+        // Deleting the G of...TTGCA... has nowhere to go: the base entering the deletion differs from the base leaving it (G).
         let refseq: &[u8] = b"ACGTTGCA";
         let v = del_at(refseq, 5, 1, 4);
         let aligned = left_align_variants(&[v.clone()], refseq);
@@ -3651,14 +3316,7 @@ mod tests {
 
     #[test]
     fn left_align_preserves_length_and_order_for_anchorless_variants() {
-        // `record_variant_reads` zips the raw and circularized variant vectors BY
-        // INDEX, so dropping or reordering an unalignable variant here would
-        // silently attribute one variant's cover-reads to another -- no panic,
-        // just a wrong matrix. Anchorless variants must pass through in place.
-        //
-        // Two cannot be aligned: an insertion at the start of a bubble, where
-        // `get_variants_from_cigar` writes REF "-" because there is no preceding
-        // base, and a deletion that circularization folded onto position 0.
+        // `record_variant_reads` zips the raw and circularized variant vectors BY INDEX.
         let anchorless_ins = Variant {
             pos: 3,
             ref_allele: "-".to_string(),
@@ -3692,10 +3350,7 @@ mod tests {
 
     #[test]
     fn left_align_does_not_shift_past_the_reference_start() {
-        // `AAAAC`: the run reaches the start of the reference, so the shift runs
-        // out of room and stops with the anchor on the very first base (POS 1)
-        // rather than underflowing or wrapping around the circular origin.
-        // bcftools behaves the same way at a contig start.
+        // `AAAAC`: the run reaches the start of the reference.
         let refseq: &[u8] = b"AAAAC";
         let v = del_at(refseq, 3, 1, 2);
         let aligned = left_align_variants(&[v], refseq);
@@ -3707,9 +3362,7 @@ mod tests {
 
     #[test]
     fn left_align_lets_collapse_merge_equivalent_spellings_and_sum_evidence() {
-        // This is the point of doing alignment before collapsing: the same 1bp
-        // deletion anchored at two different bases of the run is one event with
-        // 7 supporting reads, not two events with 3 and 4.
+        // This is the point of doing alignment before collapsing.
         let spelling_a = del_at(HOMOPOLYMER_REF, 5, 1, 3);
         let spelling_b = del_at(HOMOPOLYMER_REF, 3, 1, 4);
         let ref_length = HOMOPOLYMER_REF.len();
@@ -3732,11 +3385,7 @@ mod tests {
 
     #[test]
     fn matrix_keys_follow_the_aligned_variant_not_the_raw_one() {
-        // The read/cover records are keyed by `generate_variant_name` of the
-        // circularized (and, with --left-align, aligned) variant, while the RAW
-        // position still selects the covering bubble. `construct_matrix` looks
-        // rows up by the same name, so the key must be the aligned one or every
-        // matrix lookup misses and the matrix goes all-NaN.
+        // The read/cover records are keyed by `generate_variant_name` of the circularized variant.
         let graph = wraparound_test_graph();
         let dict = get_graph_intervals(&graph, 10);
 
@@ -3770,10 +3419,7 @@ mod tests {
         assert_eq!(cover, vec!["r4".to_string(), "r5".to_string()]);
     }
 
-    /// One bubble over `TCAAAAGCTT` (k=3) carrying two alt edges that spell the
-    /// SAME 1bp deletion from the A-run at different anchors -- exactly the
-    /// aligner ambiguity left-alignment exists to canonicalize. `E_alt1` deletes
-    /// the last A of the run, `E_alt2` an earlier one; both produce `TCAAAG`.
+    /// One bubble with two alt edges spelling the same 1bp deletion at different anchors.
     fn homopolymer_bubble_graph() -> GraphicalGenome {
         let mut anchor = HashMap::new();
         anchor.insert("A1".to_string(), json!({"pos": 0, "seq": "TCA"}));
@@ -3816,11 +3462,7 @@ mod tests {
 
     #[test]
     fn get_variant_keys_read_records_by_the_left_aligned_name() {
-        // `construct_matrix` looks each row up in `read_record`/`cover_record` by
-        // `generate_variant_name` of the returned variant. So the keys those maps
-        // were built with and the variants returned alongside them must agree --
-        // if alignment were applied after the returned vector was populated, every
-        // lookup would miss and the whole matrix would come out NaN.
+        // `construct_matrix` looks rows up by `generate_variant_name` of the returned variant.
         let mut graph = homopolymer_bubble_graph();
         let (variants, _coverage, read_record, cover_record) =
             get_variant(&mut graph, 3, "chrM_ref", HOMOPOLYMER_REF.len(), Some(HOMOPOLYMER_REF));
@@ -3838,8 +3480,7 @@ mod tests {
             assert!(names.contains(key), "cover_record key {key} has no matching variant");
         }
 
-        // Merging the spellings also merges their evidence: all seven alt reads
-        // land under the one canonical key.
+        // Merging the spellings also merges their evidence: all seven alt reads land under the one canonical key.
         let mut alt_reads: Vec<String> = read_record["m.2CA>C"]
             .iter()
             .filter_map(|r| r.as_str().map(str::to_string))
@@ -3850,8 +3491,7 @@ mod tests {
 
     #[test]
     fn get_variant_without_left_align_keeps_both_raw_spellings() {
-        // The flag is opt-in: with `None` the two spellings stay separate records
-        // at their original anchors, exactly as before this feature existed.
+        // The flag is opt-in: with `None` the two spellings stay separate records at their original anchors.
         let mut graph = homopolymer_bubble_graph();
         let (variants, _coverage, read_record, _cover) =
             get_variant(&mut graph, 3, "chrM_ref", HOMOPOLYMER_REF.len(), None);
@@ -3864,24 +3504,14 @@ mod tests {
         }
     }
 
-    /// rCRS 560..=580 (1-based), covering the poly-C run at 568-573. Slice index
-    /// `i` is 1-based reference coordinate `RCRS_OFFSET + i`.
+    /// rCRS 560..=580 (1-based), covering the poly-C run at 568-573.
+    /// Slice index `i` is 1-based reference coordinate `RCRS_OFFSET + i`.
     const RCRS_560_580: &[u8] = b"CAAAGACACCCCCCACAGTTT";
     const RCRS_OFFSET: usize = 560;
 
     #[test]
     fn left_align_matches_bcftools_norm_on_the_rcrs_poly_c_run() {
-        // Cross-checked against `bcftools norm -f rCRS.fasta`, which turns both
-        // right-anchored spellings below into the calls asserted here:
-        //   chrM 572 CC  > C   ->  chrM 567 AC > A
-        //   chrM 573 C   > CC  ->  chrM 567 A  > AC
-        // 567 AC>A is also exactly what Himito emits from the real test graph, so
-        // this pins the aligned form to both the reference tool and observed output.
-        // A `Variant.pos` is a 0-based index whose value, in genome coordinates,
-        // is also the 1-based coordinate of the indel's anchor base -- which is
-        // what `format_vcf_record` emits as POS. So a slice-local `pos` maps to
-        // the VCF POS it would carry genome-wide by adding the slice's offset and
-        // stepping back over the 0-based/1-based difference.
+        // Cross-checked against `bcftools norm -f rCRS.fasta`.
         let to_vcf_pos = |slice_pos: usize| slice_pos + RCRS_OFFSET - 1;
         // Slice index of the last C of the poly-C run (1-based 573).
         let last_c = 573 - RCRS_OFFSET;
@@ -3913,9 +3543,7 @@ mod tests {
 
     #[test]
     fn vcf_header_records_that_indels_were_left_aligned() {
-        // Whether a VCF is normalized changes how it may be compared or merged, so
-        // the output has to say so itself rather than relying on the command line
-        // being remembered.
+        // Whether a VCF is normalized changes how it may be compared or merged.
         let vcf = write_vcf_to_temp("himito_left_align_on.vcf", true);
         assert!(
             vcf.contains("##HimitoNormalization=left-aligned"),
@@ -3931,8 +3559,6 @@ mod tests {
 
     #[test]
     fn resolve_strand_bias_action_drops_only_for_denoised_ont() {
-        // PacBio and raw ONT keep the historical flag-only behaviour; the drop is
-        // opt-in for the one data type whose SNPs have no other filter.
         assert_eq!(resolve_strand_bias_action("ont-denoised", None), StrandBiasAction::Drop);
         assert_eq!(resolve_strand_bias_action("pacbio", None), StrandBiasAction::Flag);
         assert_eq!(resolve_strand_bias_action("ont-r10", None), StrandBiasAction::Flag);
@@ -3944,10 +3570,7 @@ mod tests {
     }
 
     // ===================================================================
-    // BAM genotyping (Plan 2026-10-11)
-    // ===================================================================
 
-    // Plan 2026-10-11 T1
     #[test]
     fn allele_span_snp_uses_pos_as_start() {
         let v = snp(100, "A", 5);
@@ -3956,7 +3579,6 @@ mod tests {
         assert!(generate_variant_name(&v).starts_with(&format!("m.{}", 100 + 1)));
     }
 
-    // Plan 2026-10-11 T1
     #[test]
     fn allele_span_del_starts_at_anchor() {
         let v = del_at(HOMOPOLYMER_REF, 5, 1, 3);
@@ -3965,7 +3587,6 @@ mod tests {
         assert!(generate_variant_name(&v).starts_with(&format!("m.{}", start0 + 1)));
     }
 
-    // Plan 2026-10-11 T1
     #[test]
     fn allele_span_ins_starts_at_anchor() {
         let v = ins_at(HOMOPOLYMER_REF, 6, "A", 3);
@@ -3974,7 +3595,6 @@ mod tests {
         assert!(generate_variant_name(&v).starts_with(&format!("m.{}", start0 + 1)));
     }
 
-    // Plan 2026-10-11 T1
     #[test]
     fn genotype_window_in_unique_sequence_is_flank_plus_two() {
         // 40 distinct-neighbour bases: no homopolymer anywhere.
@@ -3983,11 +3603,9 @@ mod tests {
         assert_eq!(genotype_window(&refseq, (20, 21), 3), Some((15, 26)));
     }
 
-    // Plan 2026-10-11 T1
     #[test]
     fn genotype_window_pushes_out_of_homopolymer_then_pads() {
-        // DEL span (4, 6), flank 1: left starts at 3 inside the A-run (2..6),
-        // is pushed to 2, then 2 more are subtracted -> 0. right = 7 sits on C.
+        // DEL span, flank 1: left starts at 3 inside the A-run, is pushed to 2.
         let v = del_at(HOMOPOLYMER_REF, 5, 1, 3);
         let (start0, r, _) = allele_span(&v);
         assert_eq!(
@@ -3996,7 +3614,6 @@ mod tests {
         );
     }
 
-    // Plan 2026-10-11 T1
     #[test]
     fn genotype_window_outside_reference_is_none() {
         let refseq: Vec<u8> = b"ACGT".iter().cycle().take(40).copied().collect();
@@ -4004,7 +3621,6 @@ mod tests {
         assert_eq!(genotype_window(&refseq, (36, 37), 10), None);
     }
 
-    // Plan 2026-10-11 T2
     fn sites_as_names(vs: &[Variant], sites: &[Vec<usize>]) -> Vec<Vec<String>> {
         sites
             .iter()
@@ -4012,7 +3628,6 @@ mod tests {
             .collect()
     }
 
-    // Plan 2026-10-11 T2
     #[test]
     fn group_sites_merges_snps_at_the_same_base() {
         let vs = vec![snp(100, "A", 5), snp(100, "C", 4)];
@@ -4020,7 +3635,6 @@ mod tests {
         assert_eq!(sites, vec![vec![0, 1]]);
     }
 
-    // Plan 2026-10-11 T2
     #[test]
     fn group_sites_merges_overlapping_indels() {
         // m.302A>AC and m.302A>ACC: both anchored on base 302.
@@ -4033,11 +3647,9 @@ mod tests {
         assert_eq!(sites, vec![vec![0, 1]]);
     }
 
-    // Plan 2026-10-11 T2
     #[test]
     fn group_sites_never_groups_a_snp_with_an_overlapping_indel() {
-        // The real ONT case: m.8170AT>A is the deletion ERROR of the very T in
-        // m.8171T>A. They must be scored apart.
+        // The real ONT case: m.8170AT>A is the deletion ERROR of the very T in m.8171T>A.
         let del = Variant {
             pos: 8170, ref_allele: "AT".into(), alt_allele: "A".into(),
             variant_type: "DEL".into(), allele_count: 9, filter: None,
@@ -4053,7 +3665,6 @@ mod tests {
         assert!(sites.contains(&vec![0]) && sites.contains(&vec![1]));
     }
 
-    // Plan 2026-10-11 T2
     #[test]
     fn group_sites_keeps_adjacent_non_overlapping_variants_apart() {
         let vs = vec![snp(100, "A", 5), snp(101, "A", 5)];
@@ -4070,7 +3681,6 @@ mod tests {
         assert_eq!(group_sites(&[d1, d2]), vec![vec![0], vec![1]]);
     }
 
-    // Plan 2026-10-11 T3
     const SCORE_REF: &[u8] = b"GATCCTAGGCATTGCAAGTCCGATAC";
 
     /// (REF, ALT) haplotypes: ALT carries a SNP at index 12 (T -> A).
@@ -4091,7 +3701,6 @@ mod tests {
         v
     }
 
-    // Plan 2026-10-11 T3
     #[test]
     fn score_segment_exact_ref_with_junk_ends_is_ref_only() {
         let haps = score_haps();
@@ -4102,7 +3711,6 @@ mod tests {
         );
     }
 
-    // Plan 2026-10-11 T3
     #[test]
     fn score_segment_alt_segment_is_alt_only() {
         let haps = score_haps();
@@ -4113,7 +3721,6 @@ mod tests {
         );
     }
 
-    // Plan 2026-10-11 T3
     #[test]
     fn score_segment_deleted_snp_base_ties_ref_and_alt() {
         let haps = score_haps();
@@ -4127,7 +3734,6 @@ mod tests {
         );
     }
 
-    // Plan 2026-10-11 T3
     #[test]
     fn score_segment_gates_on_max_ed() {
         let haps = score_haps();
@@ -4142,7 +3748,6 @@ mod tests {
         assert!(matches!(score_segment(&haps, &seg, 1, u32::MAX), SegCall::Best(_)));
     }
 
-    // Plan 2026-10-11 T3
     #[test]
     fn score_segment_margin_widens_the_best_set() {
         let haps = score_haps();
@@ -4154,7 +3759,6 @@ mod tests {
         );
     }
 
-    // Plan 2026-10-11 T4
     const GENO_REF: &str = "GCTAGACATACATACATACACGTCAGCACGACTGTGCAGTGTGATCGCTAGTAGTAGTGT";
 
     fn geno_snp() -> Variant {
@@ -4182,7 +3786,6 @@ mod tests {
         rr.get(name).map(|v| v.iter().map(|x| x.as_str().unwrap().to_string()).collect()).unwrap_or_default()
     }
 
-    // Plan 2026-10-11 T4
     #[test]
     fn genotype_from_bam_calls_ref_alt_and_leaves_ambiguous_reads_missing() {
         let v = geno_snp();
@@ -4202,7 +3805,6 @@ mod tests {
         assert!(cover.contains("chrM") && !alt.contains("chrM"));
     }
 
-    // Plan 2026-10-11 T4
     #[test]
     fn genotype_from_bam_disagreeing_alignments_of_one_read_are_missing() {
         let v = geno_snp();
@@ -4213,7 +3815,6 @@ mod tests {
         assert!(cr[&name].contains("chrM"));
     }
 
-    // Plan 2026-10-11 T4
     #[test]
     fn genotype_from_bam_scores_an_indel_site_and_feeds_construct_matrix() {
         let refb = GENO_REF.as_bytes();
@@ -4239,7 +3840,6 @@ mod tests {
         assert_eq!(m[[row(&dname), col("chrM")]], 0.0);
     }
 
-    // Plan 2026-10-11 T4
     #[test]
     fn genotype_from_bam_variant_without_a_window_is_only_the_ref_column() {
         // Window would cross the origin: no read can call it.
@@ -4253,7 +3853,6 @@ mod tests {
         assert_eq!(cr[&name], ["chrM".to_string()].into_iter().collect());
     }
 
-    // ONT-recall R3-T1: WGS-header BAMs put chrM after nuclear contigs (tid != 0).
     #[test]
     fn genotype_from_bam_matches_ref_name_when_chrm_is_not_tid_zero() {
         let v = geno_snp();
@@ -4271,7 +3870,6 @@ mod tests {
         assert_eq!(cr[&name], cr0[&name]);
     }
 
-    // ONT-recall R3-T1: unknown contig → ref pseudo-read only, no exit.
     #[test]
     fn genotype_from_bam_unknown_ref_name_returns_ref_column_only() {
         let v = geno_snp();
@@ -4287,7 +3885,6 @@ mod tests {
         assert_eq!(cr[&name], ["not_a_contig".to_string()].into_iter().collect());
     }
 
-    // Plan 2026-10-11 T5
     fn tmp_out(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("himito_geno_{}_{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
@@ -4301,7 +3898,6 @@ mod tests {
         (m, vec![v.clone()], vec!["g1".to_string(), "g2".to_string()])
     }
 
-    // Plan 2026-10-11 T5
     #[test]
     fn write_final_matrix_without_genotype_bam_is_unchanged() {
         let out = tmp_out("none");
@@ -4309,7 +3905,6 @@ mod tests {
         let (m, vars, reads) = graph_matrix_fixture(&v);
         let source = write_final_matrix(&out, &m, &vars, &[], &reads, None).unwrap();
 
-        // Cleanup C1 (D2): no `--bam` falls back to the graph matrix and warns.
         assert_eq!(source, MatrixSource::Graph);
         assert!(GRAPH_MATRIX_WARNING.contains("--bam"), "{GRAPH_MATRIX_WARNING}");
         let text = std::fs::read_to_string(out.with_extension("matrix.csv")).unwrap();
@@ -4317,7 +3912,6 @@ mod tests {
         assert!(!out.with_extension("graph_matrix.csv").exists());
     }
 
-    // Cleanup C1 (D1): replaces the T5 test that kept `graph_matrix.csv` (intended change).
     #[test]
     fn write_final_matrix_with_bam_writes_no_graph_copy() {
         let out = tmp_out("swap");
@@ -4329,15 +3923,13 @@ mod tests {
         };
         let source = write_final_matrix(&out, &m, &vars, &[], &reads, Some(&src)).unwrap();
 
-        // matrix.csv is BAM-genotyped: reads sorted by name, ref pseudo-read all 0,
-        // r_del / r_short missing (they are not in the matrix at all: never covered).
+        // matrix.csv is BAM-genotyped: reads sorted by name, ref pseudo-read all 0, r_del / r_short missing.
         assert_eq!(source, MatrixSource::Bam);
         let text = std::fs::read_to_string(out.with_extension("matrix.csv")).unwrap();
         assert_eq!(text, "variant,chrM,r_alt,r_ref,r_split\nm.31A>T,0,1,0,1\n");
         assert!(!out.with_extension("graph_matrix.csv").exists());
     }
 
-    // Cleanup C1 (D3)
     #[test]
     fn resolve_genotype_opts_gates_ont_noise_only() {
         for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
@@ -4350,7 +3942,6 @@ mod tests {
         assert_eq!((o.flank, o.margin), (10, 1));
     }
 
-    // Cleanup C1 (R3-6): linkage rescue is on for ONT unless disabled; PacBio stays off.
     #[test]
     fn linkage_rescue_is_on_for_ont_only() {
         for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
@@ -4360,7 +3951,6 @@ mod tests {
         assert!(!linkage_rescue_enabled("pacbio", false));
     }
 
-    // ONT-recall T5
     #[test]
     fn indel_false_threshold_preset_by_data_type() {
         for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
@@ -4373,7 +3963,6 @@ mod tests {
         }
     }
 
-    // ONT-recall T5
     #[test]
     fn small_indel_at_ont_threshold_passes_above_and_is_artifact_below() {
         let del = indel(100, "GA", "G", 18);

@@ -530,7 +530,7 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
         .collect();
     summary.accepted = calls.len();
     println!(
-        "Linkage rescue (ONT-recall R3-T2): {} reads ({} above error {:.3} dropped), {} candidates, {} pairs tested, {} pairs passing, {} accepted, {:.1} s",
+        "Linkage rescue: {} reads ({} above error {:.3} dropped), {} candidates, {} pairs tested, {} pairs passing, {} accepted, {:.1} s",
         summary.reads,
         summary.bad_reads,
         err_cut,

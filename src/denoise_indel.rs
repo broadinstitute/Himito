@@ -1066,7 +1066,7 @@ mod indel_tests {
         assert_eq!(assign_allele(&d1, &m, &o), Assignment::Refused);
     }
 
-    // ---- Plan 2026-09-26 T8c: at an HP site every kept length is reachable ----
+    // ---- at an HP site every kept length is reachable ----
 
     #[test]
     fn hp_length_model_moves_an_insertion_onto_a_kept_deletion() {
@@ -1407,7 +1407,7 @@ mod indel_tests {
         );
     }
 
-    // ---- Plan 2026-09-26 T8b: HP site recognition ----
+    // ---- HP site recognition ----
 
     #[test]
     fn hp_site_is_the_runs_leftmost_anchor_only() {
@@ -1433,7 +1433,7 @@ mod indel_tests {
         assert_eq!(hp_length_allele(-3, b'A'), Allele::Del(3));
     }
 
-    // ---- Plan 2026-09-26 T8a: homopolymer-length allele ----
+    // ---- homopolymer-length allele ----
     const HP_A: u32 = 7;
     const HP_E: u32 = 16;
 
@@ -2500,7 +2500,7 @@ mod rewrite_tests {
         assert_invariants(&c, &r);
     }
 
-    // ---- Plan 2026-09-26 T8d: canonical homopolymer-run rewrite ----
+    // ---- canonical homopolymer-run rewrite ----
     const HPR_A: u32 = 3;
     const HPR_E: u32 = 9;
     const HPR_B: u8 = b'A';

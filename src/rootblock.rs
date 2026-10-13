@@ -1,8 +1,4 @@
-//! Partition variants into an unordered root block (homoplasmic: the molecules
-//! lacking them are not distinguished by any other allele) and an informative
-//! set (everything the mutation-tree search should actually order).
-//!
-//! See `docs/root-block-collapse.md` for why HF alone cannot make this call.
+//! Partition variants into an unordered root block and an informative set.
 
 use crate::lineage::BinaryMatrix;
 use crate::scite::fisher_greater;
@@ -10,19 +6,13 @@ use crate::scite::CleanedMatrix;
 use adjustp::{adjust, Procedure};
 use std::collections::HashMap;
 
-/// `min_hf` is a candidate *gate*, not the decision — the decision is the
-/// absence-structure test in [`partition`].
+/// `min_hf` is a candidate *gate*, not the decision.
 #[derive(Debug, Clone)]
 pub struct RootBlockConfig {
     pub min_hf: f64,
     pub max_q: f64,
     pub min_absent: usize,
-    /// Effect-size floor for rule 3: a partner's enrichment odds ratio must
-    /// reach this before its absences count as *structured*. A one-sided Fisher
-    /// p shrinks with read count, so significance alone would move true
-    /// homoplasmies into the search as coverage rises; demanding a real odds
-    /// ratio (which a genuine subclone produces but dropout does not) decouples
-    /// the call from depth.
+    /// Effect-size floor for rule 3: the partner's enrichment odds ratio must reach this.
     pub min_or: f64,
 }
 
@@ -32,36 +22,19 @@ impl Default for RootBlockConfig {
     }
 }
 
-/// Why a candidate ended up on its side of the partition, for the audit
-/// table's `reason` column. Purely descriptive — records an existing
-/// decision, it never participates in making one.
+/// Why a candidate ended up on its side of the partition, for the audit table's `reason` column.
+/// Purely descriptive — records an existing decision, it never participates in making one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockReason {
-    /// Admitted without a partner test, reported as `high_raw_vaf`. Two
-    /// distinct causes reach this: rule 2 (too few jointly-covered absences
-    /// to test at all), and no candidate partner offering a testable alt call
-    /// (`partition`'s pass 3, `best.get(&v) == None`). Both mean the raw HF
-    /// cleared the gate and structure could not be assessed, so the variant
-    /// is admitted to the block. Both print `NA` for `min_q`/`partner`, so
-    /// the audit row does not distinguish them.
-    /// Plan 2026-09-26 T2.
+    /// Admitted without a partner test, reported as `high_raw_vaf`.
     HighRawVaf,
-    /// Tested: every partner's q exceeded `max_q`. No evidence the absences
-    /// are structured, so blocked.
+    /// Tested: every partner's q exceeded `max_q`.
     UnstructuredAbsences,
-    /// Tested: some partner's q was at or below `max_q`. The absences are
-    /// structured, so kept in the search.
+    /// Tested: some partner's q was at or below `max_q`.
     StructuredAbsences,
-    /// Absences exceed what dropout explains. The one-sided binomial tail
-    /// `P(X >= n_absent)` for `X ~ Binomial(covered, dropout_rate)` is at or
-    /// below `max_q`, and `n_absent` clears the `min_or` effect-size floor.
-    /// Kept in the search with `partner = None` and `min_q` equal to that
-    /// tail. Checked before the partner test, and skipped entirely when
-    /// `dropout_rate == 0`.
-    /// Plan 2026-09-26 T2.
+    /// Absences exceed what dropout explains.
     ExcessAbsences,
-    /// Would have been blocked, but pulled back because its REF span
-    /// overlaps another variant (`resolve_span_conflicts` in `scite.rs`).
+    /// Would have been blocked, but pulled back because its REF span overlaps another variant.
     SpanConflict,
 }
 
@@ -77,8 +50,8 @@ impl BlockReason {
     }
 }
 
-/// One row per candidate, i.e. per variant clearing `min_hf`. Variants below the
-/// gate are never candidates and produce no row.
+/// One row per candidate, i.e. per variant clearing `min_hf`.
+/// Variants below the gate are never candidates and produce no row.
 #[derive(Debug, Clone)]
 pub struct RootBlockAudit {
     pub variant: usize,
@@ -86,8 +59,7 @@ pub struct RootBlockAudit {
     pub n_absent: usize,
     /// `None` when admitted without testing (too few absences).
     pub min_q: Option<f64>,
-    /// The variant achieving `min_q`; `None` for `HighRawVaf` and for
-    /// `ExcessAbsences` (that reason stores the binomial tail in `min_q`).
+    /// The variant achieving `min_q`; `None` for `HighRawVaf` and for `ExcessAbsences`.
     pub partner: Option<usize>,
     pub in_block: bool,
     pub reason: BlockReason,
@@ -103,15 +75,13 @@ pub struct RootBlock {
 }
 
 impl RootBlock {
-    /// The partition that leaves every variant in the search — what
-    /// `--no-root-block` produces.
+    /// The partition that leaves every variant in the search — what `--no-root-block` produces.
     pub fn disabled(n_variants: usize) -> Self {
         RootBlock { block: Vec::new(), informative: (0..n_variants).collect(), audit: Vec::new() }
     }
 }
 
-/// Heteroplasmic frequency and absent-call count for one variant, over covered
-/// reads only. Mirrors `lineage.rs:515` so the two stages agree.
+/// Heteroplasmic frequency and absent-call count for one variant, over covered reads only.
 pub(crate) fn hf_and_absent(matrix: &BinaryMatrix, v: usize) -> (f64, usize) {
     let present = matrix.data[v].iter().filter(|c| **c == Some(1)).count();
     let absent = matrix.data[v].iter().filter(|c| **c == Some(0)).count();
@@ -120,29 +90,7 @@ pub(crate) fn hf_and_absent(matrix: &BinaryMatrix, v: usize) -> (f64, usize) {
     (hf, absent)
 }
 
-/// One-sided Fisher p for "reads absent at `v` are enriched for alt calls at
-/// `u`", over reads jointly covered at both.
-///
-/// The 2x2, with `a` as the enriched cell `fisher_greater` tests:
-///
-/// |             | `u` alt | `u` ref |
-/// |-------------|---------|---------|
-/// | `v` absent  | a       | b       |
-/// | `v` present | c       | d       |
-///
-/// The question is whether the molecules that LACK `v` are distinguished by
-/// carrying some other allele. A real subclone at `1 - HF` answers yes; dropout
-/// answers no.
-///
-/// Deliberately tested against `u`'s ALT calls rather than `u`'s absences:
-/// dropout is partly read-level, so two germline variants drop out on the same
-/// poor-quality reads and an absence-vs-absence test would call that a subclone.
-/// Demanding positive distinguishing evidence is what dropout cannot fake. See
-/// `read_level_dropout_confounder_still_joins_block`.
-///
-/// `None` when the pair carries no information: no jointly-covered absence at
-/// `v`, or no alt call at `u` among jointly-covered reads. Otherwise
-/// `Some((odds_ratio, p))` for the enrichment of the `v`-absent / `u`-alt cell.
+/// One-sided Fisher p for "reads absent at `v` are enriched for alt calls at `u`".
 fn absence_vs_alt(matrix: &BinaryMatrix, v: usize, u: usize) -> Option<(f64, f64)> {
     let (mut a, mut b, mut c, mut d) = (0usize, 0usize, 0usize, 0usize);
     for r in 0..matrix.reads.len() {
@@ -162,34 +110,21 @@ fn absence_vs_alt(matrix: &BinaryMatrix, v: usize, u: usize) -> Option<(f64, f64
     Some(fisher_greater(a, b, c, d))
 }
 
-/// `dropout_rate` is the per-read dropout (false-negative) rate used to make the
-/// HF gate depth-relative: expected dropout absences (`dropout_rate x covered`)
-/// are discounted before the gate is judged. `0.0` reproduces the absolute,
-/// coverage-sensitive behaviour. It is a parameter rather than a
-/// `RootBlockConfig` field because it is not a root-block knob: it is the SCITE
-/// false-negative rate, and taking it from the one place that owns it
-/// (`run_scite_pipeline`) means the two can never disagree.
+/// `0.0` reproduces the absolute, coverage-sensitive behaviour.
 pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64) -> RootBlock {
     let n = matrix.variants.len();
     let mut block = Vec::new();
     let mut informative = Vec::new();
     let mut audit = Vec::new();
 
-    // Pass 1: apply rules 1 and 2, and collect the candidates needing the
-    // excess-absence check and rule 3. `pending` holds
-    // (variant, hf, n_absent, covered) in ascending variant order.
+    // Pass 1: apply rules 1 and 2, and collect the candidates needing the excess-absence check and rule 3.
     let mut pending: Vec<(usize, f64, usize, usize)> = Vec::new();
     for v in 0..n {
         let present = matrix.data[v].iter().filter(|c| **c == Some(1)).count();
         let (hf, n_absent) = hf_and_absent(matrix, v);
         let covered = present + n_absent;
 
-        // Dropout inflates the absent count, which drags observed HF below the
-        // gate as depth grows and sheds true homoplasmies with coverage.
-        // Discount the absences a pure-dropout homoplasmy would produce before
-        // judging the HF gate. With `dropout_rate == 0` `corrected_hf == hf`.
-        // Review 2026-09-25 T4: rule 2 uses raw `min_absent`; testability is a
-        // sample-size question, not depth-relative.
+        // Dropout inflates the absent count, which drags observed HF below the gate as depth grows.
         let expected_dropout = dropout_rate * covered as f64;
         let corrected_absent = (n_absent as f64 - expected_dropout).max(0.0);
         let denom = present as f64 + corrected_absent;
@@ -208,11 +143,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64
         }
     }
 
-    // Plan 2026-09-26 T2. Excess absences versus dropout, before any partner
-    // test. A significant tail alone is not enough: `n_absent` must also clear
-    // `min_or * dropout_rate * covered`, so a tiny excess that only becomes
-    // significant at high depth stays blocked. `dropout_rate == 0` skips the
-    // rule entirely, which is what the zero-dropout tests rely on.
+    // Excess absences versus dropout, before any partner test.
     let pending: Vec<(usize, f64, usize)> = if dropout_rate > 0.0 {
         let mut rest = Vec::new();
         for (v, hf, n_absent, covered) in pending {
@@ -238,8 +169,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64
         pending.into_iter().map(|(v, hf, n_absent, _covered)| (v, hf, n_absent)).collect()
     };
 
-    // Pass 2: every (candidate, partner) p-value and odds ratio, then ONE
-    // Benjamini-Hochberg correction across all p-values together.
+    // Pass 2: every p-value and odds ratio, then ONE Benjamini-Hochberg correction across all p-values together.
     let mut pairs: Vec<(usize, usize, f64, f64)> = Vec::new();
     for &(v, _, _) in &pending {
         for u in 0..n {
@@ -258,14 +188,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64
         adjust(&pvals, Procedure::BenjaminiHochberg)
     };
 
-    // Two best-partner tables, both built in ascending `u` order with strict-<
-    // updates so ties resolve to the lowest partner index deterministically:
-    //   `best`          — smallest q over ALL partners, for the audit's min_q.
-    //   `best_material`  — smallest q among partners whose odds ratio clears
-    //                      `min_or`, for the decision. Only a materially large
-    //                      enrichment (which a real subclone produces and
-    //                      dropout cannot) can pull a variant out of the block,
-    //                      so the call no longer tightens with coverage.
+    // Two best-partner tables, both built in ascending `u` order with strict-< updates.
     let mut best: HashMap<usize, (f64, usize)> = HashMap::new();
     let mut best_material: HashMap<usize, (f64, usize)> = HashMap::new();
     for (idx, &(v, u, or, _)) in pairs.iter().enumerate() {
@@ -290,9 +213,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64
             None => (None, None, true, BlockReason::HighRawVaf),
             Some(&(bq, bu)) => {
                 if structured {
-                    // Report the partner that carried the structured signal, not
-                    // merely the smallest-q one (they coincide unless a
-                    // sub-`min_or` partner happens to have an even smaller q).
+                    // Report the partner that carried the structured signal, not merely the smallest-q one.
                     let &(mq, mu) = best_material.get(&v).unwrap();
                     (Some(mq), Some(mu), false, BlockReason::StructuredAbsences)
                 } else {
@@ -314,7 +235,7 @@ pub fn partition(matrix: &BinaryMatrix, cfg: &RootBlockConfig, dropout_rate: f64
     RootBlock { block, informative, audit }
 }
 
-/// A `BinaryMatrix` holding only `keep`, in the order given. All reads survive.
+/// A `BinaryMatrix` holding only `keep`, in the order given.
 pub fn restrict(matrix: &BinaryMatrix, keep: &[usize]) -> BinaryMatrix {
     BinaryMatrix {
         variants: keep.iter().map(|&v| matrix.variants[v].clone()).collect(),
@@ -323,16 +244,7 @@ pub fn restrict(matrix: &BinaryMatrix, keep: &[usize]) -> BinaryMatrix {
     }
 }
 
-/// Append the root-block variants to a cleaned matrix as all-present columns,
-/// and return the number of informative columns that preceded them.
-///
-/// Block variants are homoplasmic by construction, so every read carries them —
-/// which is the point: the block designation corrects exactly the dropout that
-/// flagged the variant in the first place.
-///
-/// They go at the END because `write_mutation_tree` resolves node labels with
-/// `variants[node_id]` (`scite.rs:1246`) and node ids index the informative
-/// matrix. Prepending would silently relabel every node.
+/// Append the root-block variants to a cleaned matrix as all-present columns.
 pub fn append_block_to_cleaned(cleaned: &mut CleanedMatrix, block_names: &[String]) -> usize {
     let n_informative = cleaned.variants.len();
     let n_reads = cleaned.reads.len();
@@ -348,7 +260,7 @@ mod tests {
     use super::*;
     use crate::lineage::BinaryMatrix;
 
-    /// `data` is `[variant][read]`. `1` = alt, `0` = ref, `-1` = uncovered.
+    /// `data` is `[variant][read]`.
     fn matrix(rows: Vec<Vec<i8>>) -> BinaryMatrix {
         let n_reads = rows[0].len();
         BinaryMatrix {
@@ -394,10 +306,8 @@ mod tests {
         assert!(rb.audit.is_empty(), "sub-gate variants produce no audit row");
     }
 
-    /// At high depth, depth-inflated `min_absent` wrongly skips the structure
-    /// test for a real subclone below the dropout rate. Rule 2 must use raw
-    /// `min_absent`; dropout correction applies to the HF gate only.
-    /// Review 2026-09-25 T4.
+    /// Fixed `min_absent` would skip the structure test for real subclones at high depth, so it scales.
+    /// Rule 2 must use raw `min_absent`; dropout correction applies to the HF gate only.
     #[test]
     fn subclone_below_dropout_rate_is_tested_when_min_absent_met() {
         let n = 1000;
@@ -423,13 +333,10 @@ mod tests {
         assert_eq!(rb.audit[0].reason, BlockReason::HighRawVaf);
     }
 
-    /// A germline variant whose absences are scattered: the reads lacking it
-    /// are not distinguished by carrying anything else.
+    /// A germline variant whose absences are scattered.
     #[test]
     fn germline_with_scattered_absences_joins_block() {
-        // v0: 90 alt then 10 ref -> hf 0.90, n_absent 10 (testable).
-        // v1: alt on every even-indexed read -> among v0's absent reads
-        //     (90..100) exactly 5 are even, matching the global rate.
+        // v0: 90 alt then 10 ref -> hf 0.90, n_absent 10. v1.
         let v0 = run(90, 10);
         let v1: Vec<i8> = (0..100).map(|r| if r % 2 == 0 { 1 } else { 0 }).collect();
         let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.0);
@@ -444,8 +351,7 @@ mod tests {
     /// A real subclone: the reads lacking v0 all carry a private allele.
     #[test]
     fn true_subclone_with_private_allele_stays_informative() {
-        // v0: 90 alt then 10 ref -> hf 0.90, n_absent 10 (testable).
-        // v1: ref on 0..90, alt on 90..100 -> perfectly marks v0's absences.
+        // v0: 90 alt then 10 ref -> hf 0.90, n_absent 10. v1: ref on 0..90, alt on 90..100 -> perfectly marks v0's absences.
         let v0 = run(90, 10);
         let v1: Vec<i8> = (0..100).map(|r| if r >= 90 { 1 } else { 0 }).collect();
         let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.0);
@@ -458,12 +364,7 @@ mod tests {
         assert_eq!(a.reason, BlockReason::StructuredAbsences);
     }
 
-    /// The effect-size floor is what stops coverage from eroding the homoplasmy
-    /// set. At high depth a one-sided Fisher p reaches significance on a *small*
-    /// enrichment, so q alone would move a true homoplasmy into the search. Here
-    /// the absences are enriched for a partner allele (q well below `max_q`) but
-    /// the odds ratio is only ~1.56: with the default `min_or = 2.0` the variant
-    /// stays blocked; drop the floor to 1.0 and the same data reclassifies it.
+    /// The effect-size floor is what stops coverage from eroding the homoplasmy set.
     #[test]
     fn effect_size_floor_keeps_significant_but_weak_enrichment_in_block() {
         let n = 3000;
@@ -473,8 +374,7 @@ mod tests {
         }
         // v0: hf 0.90, n_absent 300 (well past min_absent, so it is tested).
         let mut v1 = vec![0i8; n];
-        // Among v0's present reads (0..2700): 540 alt. Among v0's absent reads
-        // (2700..3000): 84 alt. -> a=84, b=216, c=540, d=2160: OR 1.556, p ~1e-3.
+        // Among v0's present reads (0..2700): 540 alt.
         for r in 0..540 {
             v1[r] = 1;
         }
@@ -503,12 +403,7 @@ mod tests {
         assert_eq!(rb.audit[0].reason, BlockReason::StructuredAbsences);
     }
 
-    /// Read-level dropout makes two germline variants drop out on the SAME bad
-    /// reads. An absence-vs-absence test would read that as a subclone and keep
-    /// both in the search. Testing against the partner's ALT calls does not.
-    ///
-    /// DO NOT "simplify" absence_vs_alt into an absence-vs-absence test; this
-    /// test is the reason it is written the way it is.
+    /// Read-level dropout makes two germline variants drop out on the SAME bad reads.
     #[test]
     fn read_level_dropout_confounder_still_joins_block() {
         // Reads 90..100 are poor quality: both variants drop out there.
@@ -523,28 +418,20 @@ mod tests {
         );
     }
 
-    /// A candidate with no partner offering any alt call among jointly-covered
-    /// reads cannot be tested, and is admitted rather than left in the search.
+    /// A candidate with no partner offering any alt call among jointly-covered reads cannot be tested.
     #[test]
     fn candidate_with_no_testable_partner_joins_block() {
-        // v1 is all-ref, so cell `a` (v0 absent & v1 alt) can never be non-zero
-        // and the pair is skipped entirely.
+        // v1 is all-ref, so cell `a` (v0 absent & v1 alt) can never be non-zero and the pair is skipped entirely.
         let v0 = run(90, 10);
         let v1 = vec![0i8; 100];
         let rb = partition(&matrix(vec![v0, v1]), &RootBlockConfig::default(), 0.0);
         assert_eq!(rb.block, vec![0]);
         assert!(rb.audit[0].min_q.is_none());
-        // Untestable for lack of a partner, not for too few absences (v0 has
-        // 10, clearing `min_absent`) — both are grouped under the same
-        // admitted-without-test reason; see `BlockReason::HighRawVaf`.
-        // Plan 2026-09-26 T2.
+        // Untestable for lack of a partner, not for too few absences.
         assert_eq!(rb.audit[0].reason, BlockReason::HighRawVaf);
     }
 
-    /// Plan 2026-09-26 T2. 150 absences in 1000 reads at dropout 0.05 is far
-    /// above the expected 50 and above the effect-size floor
-    /// `min_or * dropout_rate * covered` = 100. No partner marks the absent
-    /// reads, so only the excess-absence rule can keep `v0` informative.
+    /// No partner marks the absent reads, so only the excess-absence rule can keep `v0` informative.
     #[test]
     fn excess_absences_keep_variant_informative_without_a_partner() {
         let n = 1000;
@@ -561,8 +448,6 @@ mod tests {
         assert!(q <= 0.05, "min_q was {q}");
     }
 
-    /// Plan 2026-09-26 T2. 55 absences in the same 1000 reads (floor 100) are
-    /// not a significant excess over dropout 0.05, so `v0` stays blocked.
     #[test]
     fn modest_absence_count_stays_blocked() {
         let n = 1000;
@@ -575,9 +460,7 @@ mod tests {
         assert_ne!(rb.audit[0].reason.as_str(), "excess_absences");
     }
 
-    /// Plan 2026-09-26 T2. `dropout_rate == 0` skips the excess-absence rule,
-    /// so the 150-absent matrix stays blocked exactly as the partner test
-    /// decides it.
+    /// `dropout_rate == 0` skips the excess-absence rule.
     #[test]
     fn zero_dropout_skips_the_excess_absence_rule() {
         let n = 1000;
@@ -590,20 +473,7 @@ mod tests {
         assert_eq!(rb.audit[0].reason, BlockReason::HighRawVaf);
     }
 
-    /// Regression guard for "one Benjamini-Hochberg correction across ALL
-    /// pairs together", not per-candidate. `v0` and `v1` each have exactly
-    /// one partner producing a moderate, non-trivial p (~0.0255 — neither
-    /// ~1.0 nor a vanishing extreme). In isolation (m=1 each) that p survives
-    /// BH untouched and both would stay informative. `v2` contributes three
-    /// more pairs, all non-significant (p = 1.0), that carry no signal of
-    /// their own but enlarge the pool to m=5, which is enough to push q for
-    /// v0 and v1 above `max_q`.
-    ///
-    /// If a refactor ever moved the `adjust` call inside the per-candidate
-    /// loop (pooling only each candidate's own partners), this test would
-    /// start failing: v0 and v1 would wrongly stay informative. Every other
-    /// fixture in this file has m=1 either way, or ties at p=1.0 exactly, so
-    /// none of them would catch that regression.
+    /// `v0` and `v1` each have exactly one partner producing a moderate, non-trivial p.
     #[test]
     fn pooled_bh_blocks_what_per_candidate_bh_would_keep_informative() {
         let n_reads = 300;
@@ -616,15 +486,14 @@ mod tests {
         for r in 90..100 {
             rows[0][r] = 0;
         }
-        // v1 (row 1): block B, reads 100..200. Same shape as v0.
+        // v1 (row 1): block B, reads 100..200.
         for r in 100..190 {
             rows[1][r] = 1;
         }
         for r in 190..200 {
             rows[1][r] = 0;
         }
-        // v2 (row 2): block C, reads 200..300. Same shape; exists only to
-        // supply padding pairs below.
+        // v2 (row 2): block C, reads 200..300.
         for r in 200..290 {
             rows[2][r] = 1;
         }
@@ -632,11 +501,7 @@ mod tests {
             rows[2][r] = 0;
         }
 
-        // u0 (row 3): v0's only partner. Among v0's 10 absent reads (90..100):
-        // 5 alt, 5 ref. Among v0's 90 present reads (0..90): 15 alt, 75 ref.
-        // -> a=5, b=5, c=15, d=75, fisher_greater p = 0.02546 (moderate).
-        // u0's own hf = 20/100 = 0.20, below the gate, so it is never itself
-        // a candidate and contributes no row of its own.
+        // u0 (row 3): v0's only partner.
         for r in 0..15 {
             rows[3][r] = 1;
         }
@@ -663,9 +528,7 @@ mod tests {
             rows[4][r] = 0;
         }
 
-        // u_p1..u_p3 (rows 5,6,7): padding partners for v2. a=0, b=10, c=10,
-        // d=80 -> p = 1.0 exactly (a=0 saturates the one-sided Fisher test).
-        // Their own hf = 10/100 = 0.10, below the gate.
+        // u_p1..u_p3 (rows 5,6,7): padding partners for v2. a=0, b=10, c=10, d=80 -> p = 1.0 exactly.
         for k in 5..8 {
             for r in 200..210 {
                 rows[k][r] = 1;
@@ -685,10 +548,7 @@ mod tests {
         let q1 = rb.audit[1].min_q.unwrap();
         assert!(q0 > 0.05, "q0 was {q0}");
         assert!(q1 > 0.05, "q1 was {q1}");
-        // Confirms the underlying per-pair p-value really is moderate, not
-        // one of the trivial extremes (~0 or exactly 1.0) used elsewhere in
-        // this file — this test is about BH pooling, not about the Fisher
-        // test itself.
+        // Confirms the underlying per-pair p-value really is moderate.
         assert!(q0 < 0.5, "q0 was {q0}, expected a moderate (not saturated) value");
     }
 
@@ -732,8 +592,7 @@ mod tests {
 
     #[test]
     fn append_block_preserves_index_alignment_with_tree_node_ids() {
-        // write_mutation_tree does `variants[node_id]`; node ids index the
-        // INFORMATIVE matrix, so appending must not move them.
+        // write_mutation_tree does `variants[node_id]`, so node ids must index the appended block.
         let mut c = CleanedMatrix {
             variants: vec!["m.1A>G".to_string(), "m.2A>G".to_string()],
             reads: vec!["r0".to_string()],
@@ -747,8 +606,7 @@ mod tests {
 
     #[test]
     fn default_config_matches_the_documented_values() {
-        // These four numbers are quoted in docs/root-block-collapse.md and in
-        // the CLI help. Changing one without the others is a bug.
+        // These four numbers are quoted in docs/root-block-collapse.md and in the CLI help.
         let c = RootBlockConfig::default();
         assert!((c.min_hf - 0.80).abs() < 1e-12);
         assert!((c.max_q - 0.05).abs() < 1e-12);

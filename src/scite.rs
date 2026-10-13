@@ -1570,7 +1570,7 @@ pub fn run_scite_pipeline(
     }
     // Partition before anything else looks at the matrix: everything below searches.
     let rb = match root_block {
-        // TODO(plan T6): dropout_rate is still the global fn, not the HP-tract fn.
+        // TODO: dropout_rate is still the global fn, not the HP-tract fn.
         Some(cfg) => rootblock::partition(binary, cfg, fn_rate),
         None => rootblock::RootBlock::disabled(binary.variants.len()),
     };

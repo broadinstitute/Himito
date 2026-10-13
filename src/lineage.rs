@@ -1083,15 +1083,9 @@ pub fn write_haplotype_map(hap_matrix: &HaplotypeMatrix, path: &str) -> Result<(
 /// The defaults come from the fp/fn sweeps in `lineage_eval`
 /// (`sweep_fpfn.sh`, scored by `score_lineage.py`):
 ///
-/// * `pacbio` (HiFi) - every cell of the 5x6 grid (fp 0.0005-0.02,
-///   fn 0.01-0.2) reached `ad_f1 == 1.0`, so HiFi is insensitive here and any
-///   in-grid value works. `fp = 0.005` / `fn = 0.05` sits comfortably inside.
-/// * `ont-denoised` - denoising removes most per-read noise, so the rates drop
-///   accordingly.
-/// * `ont-r9` / `ont-r10` - the raw-ONT sweep is driven almost entirely by
-///   `fn`: `ad_f1` holds at its 0.375 plateau for `fn <= 0.05` and collapses to
-///   0.118 at `fn >= 0.1`, while `fp` is near-irrelevant across 0-0.02. The
-///   default therefore sits at the top of the safe `fn` range.
+/// * `pacbio` (HiFi) — fp 0.005 / fn 0.05 (flat grid; unchanged).
+/// * ONT (`ont-r9` / `ont-r10` / `ont-denoised`) — fp 0.005 / fn 0.02 for the
+///   raw-BAM matrix (cleanup C2; all three share one preset).
 pub fn resolve_error_rates(
     data_type: &str,
     fp_rate: Option<f64>,
@@ -1099,13 +1093,9 @@ pub fn resolve_error_rates(
 ) -> (f64, f64) {
     let (default_fp, default_fn) = match data_type {
         "pacbio" => (0.005, 0.05),
-        "ont-denoised" => (0.0001, 0.01),
-        // ont-r9 / ont-r10 and anything else: raw long-read noise levels. The
-        // two raw-ONT chemistries shared this tuple with the fallback arm, so
-        // they are folded into it here. They stay distinct elsewhere —
-        // `call::resolve_thresholds` gives them different p-value/frequency
-        // defaults — which is why both remain in `main.rs`'s `DATA_TYPES`.
-        _ => (0.001, 0.05),
+        "ont-r9" | "ont-r10" | "ont-denoised" => (0.005, 0.02),
+        // Unknown data types fall back to the ONT BAM-matrix rates.
+        _ => (0.005, 0.02),
     };
 
     (
@@ -1373,11 +1363,12 @@ mod tests {
 
     #[test]
     fn resolve_error_rates_presets_differ_per_data_type() {
+        // Intended (cleanup C2 / D4): all ONT types share the raw-BAM preset.
         assert_eq!(resolve_error_rates("pacbio", None, None), (0.005, 0.05));
-        assert_eq!(resolve_error_rates("ont-denoised", None, None), (0.0001, 0.01));
-        assert_eq!(resolve_error_rates("ont-r10", None, None), (0.001, 0.05));
-        assert_eq!(resolve_error_rates("ont-r9", None, None), (0.001, 0.05));
-        // pacbio and ont-denoised must not collapse onto the raw-ONT fallback.
+        let ont = (0.005, 0.02);
+        assert_eq!(resolve_error_rates("ont-denoised", None, None), ont);
+        assert_eq!(resolve_error_rates("ont-r10", None, None), ont);
+        assert_eq!(resolve_error_rates("ont-r9", None, None), ont);
         assert_ne!(
             resolve_error_rates("pacbio", None, None),
             resolve_error_rates("ont-r10", None, None)

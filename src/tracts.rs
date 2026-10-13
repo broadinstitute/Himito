@@ -1,18 +1,8 @@
 //! Known hypervariable homopolymer / short-tandem tracts of the rCRS.
-//!
-//! Plan 2026-09-26 T5. Calls inside one of these runs are spelled in several
-//! equivalent ways against the reference (`m.16183A>AC` and `m.16189T>TC` are
-//! the same C-run length once `m.16189T>C` is in the background), so they are
-//! collapsed to a single sequence-level allele per read before the tree search.
 
 use crate::scite::VariantSpan;
 
 /// A hypervariable tract on rCRS, 1-based inclusive.
-///
-/// `ref_seq` is the rCRS sequence over `[start, end]`; it is checked against
-/// every variant's REF before collapsing, so a non-rCRS reference silently
-/// disables this. `start` is the anchor base *before* the run, so left-aligned
-/// insertions (`m.302A>AC`, `m.16183A>AC`, `m.513G>GCA`) fall inside.
 pub struct Tract {
     pub name: &'static str,
     pub start: u64,
@@ -26,8 +16,7 @@ pub const KNOWN_TRACTS: &[Tract] = &[
     Tract { name: "CA514", start: 513, end: 525, ref_seq: "GCACACACACACC" },
 ];
 
-/// A tract as a half-open interval, matching [`VariantSpan`] conventions: the
-/// REF interval of a variant at the last base of the tract is `[end, end + 1)`.
+/// A tract as a half-open interval, matching [`VariantSpan`] conventions.
 fn tract_span(tract: &Tract) -> VariantSpan {
     VariantSpan { start: tract.start, end: tract.end + 1 }
 }
@@ -52,17 +41,11 @@ pub fn overlaps_tract_in(tracts: &[Tract], span: &VariantSpan) -> bool {
 }
 
 /// Whether `span` overlaps any [`KNOWN_TRACTS`] entry.
-///
-/// Plan 2026-09-26 T6 uses this to assign the higher HP-tract SCITE rates.
 pub fn overlaps_tract(span: &VariantSpan) -> bool {
     overlaps_tract_in(KNOWN_TRACTS, span)
 }
 
 /// The matrix row name for tract allele `alt`: `m.<start><ref_seq>><alt>`.
-///
-/// `scite::variant_spans` parses this as `[start, end + 1)`, i.e. the whole
-/// tract, so two alleles of one tract are automatically mutually exclusive in
-/// the tree search.
 pub fn tract_allele_name(tract: &Tract, alt: &str) -> String {
     format!("m.{}{}>{}", tract.start, tract.ref_seq, alt)
 }
@@ -105,8 +88,7 @@ mod tests {
 
     #[test]
     fn containing_tract_accepts_variants_inside_and_rejects_those_outside() {
-        // Anchor insertion at the first base, SNV in the middle, SNV at the
-        // last base: all inside HVS1-C (index 1).
+        // Anchor insertion at the first base, SNV in the middle, SNV at the last base: all inside HVS1-C (index 1).
         assert_eq!(containing_tract(&span("m.16183A>AC")), Some(1));
         assert_eq!(containing_tract(&span("m.16189T>C")), Some(1));
         assert_eq!(containing_tract(&span("m.16193C>T")), Some(1));

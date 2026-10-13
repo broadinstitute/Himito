@@ -806,7 +806,7 @@ pub fn construct_matrix(
     (matrix, var_vec, read_vec)
 }
 
-// ---- BAM genotyping (Plan 2026-10-11) ----
+// ---- BAM genotyping ----
 
 /// `(start0, ref, alt)` where `start0` is the 0-based index of REF's first base on the reference.
 fn allele_span(v: &Variant) -> (usize, &str, &str) {
@@ -980,7 +980,7 @@ fn build_geno_sites(refseq: &[u8], variants: &[Variant], opts: &GenotypeOpts) ->
         let hi = spans.iter().map(|s| s.0 + s.1.len()).max().unwrap();
         let (left, right) = match genotype_window(refseq, (lo, hi), opts.flank) {
             Some(w) => w,
-            None => continue, // crosses the circular origin: left NaN (plan decision 5)
+            None => continue, // crosses the circular origin: left NaN
         };
         let mut haps: Vec<(String, Vec<u8>)> = vec![("REF".to_string(), refseq[left..right].to_vec())];
         for (&i, &(s, r, a)) in members.iter().zip(&spans) {
@@ -1614,7 +1614,7 @@ fn recount_flagged_indels_from_bam(
     )
 }
 
-// ---- adaptive permutation (ONT-recall T1) ----
+// ---- adaptive permutation ----
 
 /// How `permutation_test` draws its null.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3047,7 +3047,7 @@ mod tests {
         assert_eq!(ikept.len(), 1, "indels are never dropped by the strand-bias filter");
     }
 
-    // ---- column-local strand-bias null (ONT-recall T3) ----
+    // ---- column-local strand-bias null ----
 
     /// Build a one-SNP scenario: `fwd`/`rev` alt reads, and covering reads in addition to the alt reads.
     #[allow(clippy::type_complexity)]
@@ -3151,7 +3151,7 @@ mod tests {
         assert!(run_sb(&case, 0.5, StrandBiasAction::Drop).is_empty());
     }
 
-    // ---- BAM recount of flagged indels (ONT-recall R3-T3) ----
+    // ---- BAM recount of flagged indels ----
 
     /// Flag `v` from graph counts 10/0 against a balanced column.
     fn graph_flagged_then_bam_recount(v: Variant, bam_fwd: usize, bam_rev: usize) -> Vec<Variant> {

@@ -9,22 +9,11 @@ use rust_htslib::bam::record::CigarString;
 
 use crate::denoise_indel::{rewrite_read, strip_stale_tags};
 
-// The site model and the read rewrite now live in one flat module. This alias
-// keeps the `indel::`-qualified call sites below reading as they always have.
 use crate::denoise_indel as indel;
 
 pub(crate) const NQ: usize = 94; // Phred qualities 0..=93
 
-/// Ceiling on the per-base error probability. Phred 0 literally means P(error) = 1,
-/// which would make P(observed | truth = observed) = 1 - e = 0: the model would assert
-/// the observed base is impossible and `map_allele` would rewrite EVERY base to some
-/// other allele, corrupting reads instead of correcting them. With four alleles the
-/// most error a base can carry is uniform-over-4, so e is capped at 3/4. At the cap the
-/// likelihood is flat (1 - e == e/3 == 0.25), i.e. the base carries no evidence and
-/// correction falls back to the site's frequency prior.
-///
-/// This is reachable in practice: pbsim3's errhmm models (and any BAM with QUAL '*')
-/// emit an all-Q0 quality string.
+/// Ceiling on the per-base error probability.
 pub(crate) const E_MAX: f64 = 0.75;
 
 #[inline]
@@ -82,12 +71,9 @@ impl ColumnCounts {
 pub(crate) struct SiteModel {
     freq: [f64; 4],
     kept: [bool; 4],
-    /// ONT-recall Phase2 T6b: eligible non-ref alleles with `PENDING_FLOOR <= f < vaf`.
-    /// Not kept (map_allele still corrects them), but `compute_corrections` defers
-    /// their corrections until linkage to a kept minor allele has been tested.
+    /// Not kept; `compute_corrections` defers their correction until linkage to a kept minor allele is tested.
     pending: [bool; 4],
-    /// Non-ref alleles that cleared the per-strand count gate but were rejected as
-    /// strand-biased; surfaced in DenoiseStats so the gate's impact is auditable.
+    /// Non-ref alleles that cleared the per-strand count gate but were rejected as strand-biased.
     strand_biased_alts: usize,
 }
 
@@ -106,10 +92,7 @@ fn fit_site(
     strand_bias_p: f64,
     homoplasmic_vaf: f64,
 ) -> SiteModel {
-    // The null for the strand-bias test is this column's OWN forward fraction, not a
-    // library-wide constant: mito coverage is frequently asymmetric, and a locally
-    // skewed column would otherwise make every allele in it look biased. Empty columns
-    // fall back to a balanced null (the test is vacuous there anyway).
+    // The null for the strand-bias test is this column's OWN forward fraction, not a library-wide constant.
     let (col_fwd, col_rev) = c.strand_totals();
     let col_total = col_fwd + col_rev;
     let expected_fwd_frac = if col_total == 0 {
@@ -118,10 +101,7 @@ fn fit_site(
         col_fwd as f64 / col_total as f64
     };
 
-    // Eligibility: reference always eligible; a non-ref allele needs >= min_strand
-    // observations on EACH strand (baldur's strand-balance candidacy) AND must not be
-    // significantly strand-skewed by the same binomial test call.rs applies to variants
-    // (call::strand_bias_pvalue), which catches skews the raw count gate lets through.
+    // Eligibility: reference always eligible.
     let mut eligible = [false; 4];
     let mut strand_biased_alts = 0usize;
     for a in 0..4 {
@@ -133,17 +113,12 @@ fn fit_site(
         if !(fwd >= min_strand && rev >= min_strand) {
             continue;
         }
-        // Mirrors call::filter_strand_bias's near-homoplasmic exemption: a single-strand
-        // artifact is absent from the other strand's reads, so it can never reach a high
-        // apparent frequency. Skew in an allele carried by most reads at the locus is not
-        // evidence of artifact, and testing it would correct away a real variant.
+        // Mirrors call::filter_strand_bias's near-homoplasmic exemption.
         let prop = if col_total == 0 {
             0.0
         } else {
             (fwd + rev) as f64 / col_total as f64
         };
-        // ONT-recall R3-T4: at ~5000x a small skew is significant, so the p-value alone
-        // erases real alleles; require call's effect size as well.
         if strand_bias_p > 0.0
             && prop < homoplasmic_vaf
             && crate::call::strand_bias_pvalue(fwd as usize, rev as usize, expected_fwd_frac)
@@ -182,8 +157,7 @@ fn fit_site(
         }
     }
 
-    // EM. Observations of non-eligible alleles (errors) contribute their
-    // responsibility to the eligible alleles; frequencies normalize over all obs.
+    // EM.
     if total_obs > 0.0 {
         for _iter in 0..100 {
             let mut newf = [0.0f64; 4];
@@ -236,7 +210,6 @@ fn fit_site(
         } else if eligible[a] && f[a] >= vaf {
             kept[a] = true;
         } else if eligible[a] && f[a] >= crate::PENDING_FLOOR {
-            // ONT-recall Phase2 T6b
             pending[a] = true;
         }
     }
@@ -257,14 +230,7 @@ fn fit_site(
 }
 
 fn map_allele(observed: usize, q: u8, m: &SiteModel) -> usize {
-    // An observation of an allele the site model already kept is evidence FOR that
-    // allele, so it stands as observed. Re-scoring it by freq * P(obs | truth) would
-    // resolve ties by the frequency prior, and since a heteroplasmy's prior is by
-    // definition much smaller than reference's, that reverts every low-quality minor
-    // observation to ref while never converting ref the other way. The asymmetry both
-    // shrinks the minor allele and, because sites are corrected independently,
-    // multiplicatively destroys co-occurrence between heteroplasmies on the same read
-    // -- which is the linkage the lineage step needs to order nested mutations.
+    // An observation of an allele the site model already kept is evidence FOR that allele, so it stands as observed.
     if m.kept.get(observed).copied().unwrap_or(false) {
         return observed;
     }
@@ -288,8 +254,7 @@ fn map_allele(observed: usize, q: u8, m: &SiteModel) -> usize {
 
 pub type Corrections = HashMap<Vec<u8>, indel::ReadEdits>;
 
-/// Decided indel sites, per contig, SORTED ASCENDING BY POSITION so the write-back
-/// pass can binary-search the sites a read spans.
+/// Decided indel sites, per contig.
 pub type IndelModels = HashMap<Vec<u8>, Vec<(u32, indel::IndelSiteModel)>>;
 
 #[derive(Default, Debug, serde::Serialize)]
@@ -303,8 +268,6 @@ pub struct DenoiseStats {
     pub columns_skipped: u64,
     pub alt_sites_preserved: u64,
     pub alt_alleles_strand_biased: u64,
-    /// ONT-recall Phase2 T6b: pending alleles kept because they co-occur with a kept
-    /// minor allele more than 20 bp away.
     pub alt_alleles_rescued_by_linkage: u64,
     pub substitution_matrix: [[u64; 4]; 4], // [from][to]
     // --- indel denoising (all zero unless --indels is enabled) ---
@@ -314,39 +277,17 @@ pub struct DenoiseStats {
     /// Non-reference ALLELES (not sites) rejected specifically as strand-biased.
     pub indel_alt_alleles_strand_biased: u64,
     pub indel_events_examined: u64,
-    /// Votes dropped in pass 1 because the read that cast them has no ALIGNED QUERY
-    /// BASE at the column its event left-normalized into -- not merely because that
-    /// column falls outside the read's overall `[pos, end_pos())` span (see
-    /// CRITICAL 2), but also when the read's span covers the column only through
-    /// its OWN `D`/`N` there, where depth was never incremented for this read
-    /// either (see FIX 2). Depth already excludes both cases, so this only tracks
-    /// the ALT side.
+    /// Votes dropped in pass 1: the read has no aligned query base at the normalized column.
     pub indel_events_out_of_span: u64,
-    /// Review 2026-09-25 T3: votes dropped in pass 1 because the read ENDS (or
-    /// soft-clips) inside the HOMOPOLYMER RUN at the site the event normalized
-    /// into, so it cannot testify to that run's length at all. The gate is applied
-    /// at the LEFT-NORMALIZED position, which is where depth for the site is
-    /// counted -- the observed column is a different, laxer anchor (see the
-    /// `tract_need_end` comment below and
-    /// `alt_vote_is_gated_at_the_normalized_site_not_the_observed_column`).
-    ///
-    /// Scope: `hp_tract_end` measures a single-base run only, so this counter
-    /// covers homopolymers. Tandem repeats whose unit is longer than one base are
-    /// OUT OF SCOPE here and get no span requirement beyond the event position.
+    /// The gate is applied at the LEFT-NORMALIZED position.
+    /// Tandem repeats whose unit is longer than one base are OUT OF SCOPE here and get no span
+    /// requirement beyond the event position.
     pub indel_events_not_spanning_repeat: u64,
-    /// Votes dropped in pass 1 because the SAME read already cast an ALT vote at
-    /// this normalized site via a different one of its own events (see FIX 1 in
-    /// the task-8 review round) -- e.g. an insertion and a nearby deletion that
-    /// both left-normalize to one site, exactly what coexists in a short tandem
-    /// repeat. Without this cap the read would contribute two ALT votes while
-    /// depth counts it once, letting `alt_total` exceed `depth`.
+    /// Votes dropped in pass 1: the same read already cast an ALT vote at this normalized site.
     pub indel_events_duplicate_site: u64,
-    /// Review 2026-09-25 T3: normalized indel sites that had at least one ALT
-    /// event dropped by the homopolymer span gate and ended with no spanning
-    /// depth. A column no such event reached is ordinary missing coverage and
-    /// is not counted here. Booked after the pileup from keys remembered at the
-    /// gate, not from `sites`: a site is inserted there only after a vote
-    /// clears the same gate depth uses, so this state never appears in `sites`.
+    /// A column no such event reached is ordinary missing coverage and is not counted here.
+    /// Booked after the pileup from keys remembered at the gate, not from `sites`: a site is inserted
+    /// there only after a vote clears the same gate depth uses, so this state never appears in `sites`.
     pub indel_sites_dropped_no_spanning_depth: u64,
     pub reads_reassigned_ref_to_ins: u64,
     pub reads_reassigned_ref_to_del: u64,
@@ -355,51 +296,20 @@ pub struct DenoiseStats {
     pub indel_bases_inserted: u64,
     pub indel_bases_removed: u64,
     /// Index = repeat-context length L; audits how much correction fired in long runs.
-    /// An HP-length move (Plan 2026-09-26 T8d) books against its run length `R`,
-    /// which is the same number `repeat_context` reports for a 1bp allele there.
     pub reassignments_by_hp_length: Vec<u64>,
-    /// Plan 2026-09-26 T8d: substitution corrections dropped because they fell inside
-    /// a homopolymer run the HP length model rewrote wholesale. The run's query
-    /// offsets no longer mean what pass 1 recorded them against, so the only honest
-    /// options are to drop the substitution or to refuse the length move; dropping is
-    /// the conservative one. Zero unless `--indel-hp-length-model` is on.
-    ///
-    /// Like the substitution counters booked in pass 1, `bases_modified` has already
-    /// counted these at decision time -- the same known, diagnostic-only over-count
-    /// documented there, never a difference in the emitted SEQ.
+    /// Zero unless `--indel-hp-length-model` is on.
     pub subs_dropped_in_hp_rewrite: u64,
-    /// (read, site) PAIRS skipped because the read lacks the match-context flank
-    /// the rewrite walk needs on one side or the other of the edit.
+    /// (read, site) pairs skipped: the read lacks the match-context flank the rewrite walk needs.
     pub assignments_skipped_span_guard: u64,
-    /// (read, site) PAIRS skipped because the MAP target is only reachable through
-    /// a transition the rewrite walk does not support (cross-kind, or growing a
-    /// deletion).
+    /// (read, site) pairs skipped: the MAP target needs an unsupported transition.
     pub assignments_skipped_unsupported_transition: u64,
-    /// (read, site) PAIRS skipped because the read carries its own untouchable
-    /// oversized indel close enough to this site that its alignment in this
-    /// window cannot be represented by the site's alleles. Filed separately from
-    /// the span guard: a distinct cause, not a coordinate-flank failure.
+    /// (read, site) pairs skipped: an untouchable oversized indel of the read lies too close to the site.
     pub assignments_skipped_oversized_neighbor: u64,
-    /// (read, site) PAIRS skipped because this read's own CIGAR carries TWO
-    /// events that normalize to this SAME site (see FIX 5): which one to treat
-    /// as "carried" is ambiguous, and a read whose alignment is ambiguous at a
-    /// site is exactly the case where doing nothing is right.
+    /// (read, site) pairs skipped: two CIGAR events of the read normalize to this site (ambiguous).
     pub assignments_skipped_ambiguous_carry: u64,
-    /// (read, site) PAIRS skipped because an earlier, already-emitted GAINED
-    /// deletion for this SAME read consumed the reference span this site falls
-    /// in (see FIX 6): `rewrite_read`'s Match arm advances past the whole
-    /// deletion in one step, so a second edit inside that span is never visited.
+    /// (read, site) PAIRS skipped because an earlier.
     pub assignments_skipped_swallowed_by_gained_deletion: u64,
-    /// DIAGNOSTIC, should normally be zero. Indel edits pass 2 emitted that
-    /// `rewrite_read` reports it never actually applied (see FIX 1 in the
-    /// task-9 review round): pass 2's guards PREDICT what the rewrite walk
-    /// will do with an edit, and every instance where that prediction turned
-    /// out wrong (a normalized-site vs. CIGAR-anchor mismatch, an insertion
-    /// anchored on a deleted base, a site swallowed by an earlier gained
-    /// deletion, ...) surfaces here instead of silently inflating
-    /// `reads_reassigned_*`/`indel_bases_*`. A nonzero value means some guard
-    /// upstream failed to predict the walk correctly; it does NOT mean the
-    /// BAM was corrupted -- the read in question is simply left untouched.
+    /// DIAGNOSTIC, should normally be zero.
     pub indel_edits_emitted_but_not_applied: u64,
 }
 
@@ -420,26 +330,14 @@ fn compute_corrections(
     let mut corrections: Corrections = HashMap::new();
     let mut stats = DenoiseStats::default();
 
-    // ALT event counts per left-normalized site. Normalization can move an event into
-    // a column the loop has already passed, so sites are decided after it closes.
+    // ALT event counts per left-normalized site.
     let mut sites: HashMap<(Vec<u8>, u32), indel::IndelSite> = HashMap::new();
-    // Per-column (depth, fwd, rev). This -- NOT a tally of observations -- is the VAF
-    // denominator: a read carrying an event reports Indel::None at the normalized
-    // column as well as its event at the anchor column, so counting observations
-    // would count that read twice and halve every real indel's apparent frequency.
+    // Per-column (depth, fwd, rev).
     let mut depths: HashMap<(Vec<u8>, u32), (u32, u32, u32)> = HashMap::new();
-    // Review 2026-09-25 T3: normalized sites where an ALT vote was dropped by the
-    // homopolymer span gate. Remembered here because `sites` only receives votes
-    // that cleared that gate, so a site whose every ALT died on it never appears
-    // there and cannot be counted from the deferred `depth == 0` branch.
+    // Remembered here because `sites` only receives votes that cleared that gate.
     let mut span_gated_sites: HashSet<(Vec<u8>, u32)> = HashSet::new();
 
-    // ONT-recall Phase2 T6b: alleles are keyed (tid, refpos, allele) and reads by a
-    // dense index assigned in pileup order, so the rescue below is deterministic.
-    // `deferred` holds each pending allele's would-be corrections (qname, refpos,
-    // base); `carriers` maps every minor allele (kept below homoplasmic_vaf, or
-    // pending) to the reads observing it; `spans` is each read's (tid, min, max)
-    // refpos over the columns where it has a base.
+    // `deferred` holds each pending allele's would-be corrections.
     type AlleleKey = (u32, u32, usize);
     let mut deferred: HashMap<AlleleKey, Vec<(Vec<u8>, u32, u8)>> = HashMap::new();
     let mut carriers: HashMap<AlleleKey, HashSet<usize>> = HashMap::new();
@@ -465,49 +363,20 @@ fn compute_corrections(
         let mut obs: Vec<(Vec<u8>, usize, u8, usize)> = Vec::new(); // (qname, allele, qual, read idx)
         let tid = col.tid();
 
-        // Indel collection MUST happen here, before the `non_ref() == 0` skip below:
-        // that gate is about non-reference SUBSTITUTIONS, and a column with a
-        // perfectly clean base composition can still carry indel events. Collecting
-        // after it would silently lose every indel at a substitution-clean column.
+        // Indel collection MUST happen here, before the `non_ref() == 0` skip below.
         let mut col_depth = 0u32;
         let mut col_fwd = 0u32;
         let mut col_rev = 0u32;
-        // (qname, allele, reverse, read's own POS, read's own CIGAR, read's exclusive
-        // reference end). Everything the ALT-vote gates need travels with the event,
-        // because BOTH of those gates can only be evaluated AFTER normalization, once
-        // we know which column the event actually folds into: the CIGAR for
-        // `indel::match_run_len` (see CRITICAL 2 / FIX 2), and the reference end for
-        // the run-span check (Review 2026-09-25 T3). qname travels too so a read
-        // carrying two of its OWN events that normalize to the same site casts at most
-        // one vote there (see FIX 1).
+        // (qname, allele, reverse, read's own POS, read's own CIGAR, read's exclusive reference end).
         let mut col_events: Vec<(Vec<u8>, indel::Allele, bool, i64, CigarString, i64)> =
             Vec::new();
-        // Review 2026-09-25 T3: the exclusive reference end a read must reach to be
-        // counted in THIS column's depth -- the whole homopolymer run starting right
-        // after it, PLUS one right-hand anchoring base. A read that ends (or
-        // soft-clips) inside the run cannot show the run's length: it is evidence for
-        // neither the reference length nor any indel of it, so counting it as a plain
-        // REF observation only dilutes every real alt's VAF. Depends solely on the
-        // reference and this column, so it is hoisted out of the alignment loop.
-        //
-        // This bound is the DEPTH gate for this column and nothing more. It must NOT
-        // be reused to admit an ALT vote, because left-normalization moves the vote to
-        // a different column with its own, possibly stricter, bound -- see the gate
-        // beside the `match_run_len` check further down.
-        //
-        // Scope: `hp_tract_end` walks a single-base run, so only homopolymers get a
-        // span requirement. Tandem repeats with a unit longer than one base are out of
-        // scope and are bounded by the event position alone, as before.
+        // A read that ends inside the run cannot show the run's length.
         let tract_need_end = if iopts.enabled {
             indel::hp_tract_end(refseq, refpos as u32) as i64 + 1
         } else {
             0
         };
-        // Plan 2026-09-26 T8b: `Some((e, b))` when the HP length model is on and THIS
-        // column is the normalized anchor of a homopolymer run. Then the column casts
-        // one LENGTH vote per spanning read (below), and the event-based votes that
-        // normalize here are skipped instead -- one read, one vote, whatever mixture
-        // of `I`/`D` ops its CIGAR happens to use inside the run.
+        // Then the column casts one LENGTH vote per spanning read.
         let hp_votes_here = if iopts.enabled && iopts.hp_length_model {
             indel::hp_site(refseq, refpos as u32)
         } else {
@@ -515,9 +384,7 @@ fn compute_corrections(
         };
         // (qname, length allele, reverse) for this column's HP-length ALT votes.
         let mut hp_col_votes: Vec<(Vec<u8>, indel::Allele, bool)> = Vec::new();
-        // Plan 2026-09-26 T8 (review fix 2): qnames of the reads that observe the
-        // run's REFERENCE length here (`hp_allele == Some(0)`). Kept apart from the
-        // ALT votes because reference support is not an entry in `IndelSite::obs`.
+        // Kept apart from the ALT votes because reference support is not an entry in `IndelSite::obs`.
         let mut hp_col_ref: Vec<Vec<u8>> = Vec::new();
 
         for a in col.alignments() {
@@ -528,28 +395,13 @@ fn compute_corrections(
 
             if iopts.enabled && !a.is_refskip() {
                 if let Some(q) = a.qpos() {
-                    // Review 2026-09-25 T3: `reference_end` is exclusive. This decides
-                    // only whether the read joins THIS column's depth. The event's ALT
-                    // vote is gated separately, against the column it normalizes into.
+                    // This decides only whether the read joins THIS column's depth.
                     let reference_end = rec.reference_end();
                     if reference_end >= tract_need_end {
                         col_depth += 1;
                         if rec.is_reverse() { col_rev += 1 } else { col_fwd += 1 }
 
-                        // Plan 2026-09-26 T8b: one HP-LENGTH vote per read at an HP
-                        // site, cast here at the site's own column rather than
-                        // wherever the aligner happened to place an op. `hp_allele`'s
-                        // span gate is one flank STRICTER than `tract_need_end`, so a
-                        // read that votes here is always a read this depth counted --
-                        // `alt_total <= depth` still holds.
-                        //
-                        // Review fix 2: all THREE outcomes of `hp_allele` are
-                        // distinct and must stay distinct. `Some(k != 0)` is an ALT
-                        // observation, `Some(0)` is a REFERENCE observation, and
-                        // `None` is no observation at all -- the read is in depth but
-                        // said nothing about this run's length, so it must not be
-                        // folded into either. Deriving REF from `depth - alt_total`
-                        // silently made `None` and `Some(0)` the same thing.
+                        // `hp_allele`'s span gate is one flank STRICTER than `tract_need_end`.
                         if let Some((hp_e, b)) = hp_votes_here {
                             let cigar = rec.cigar().take();
                             let seq = rec.seq().as_bytes();
@@ -566,12 +418,7 @@ fn compute_corrections(
                             }
                         }
                     }
-                    // Decide the event's allele first, WITHOUT touching the CIGAR;
-                    // `rec.cigar()` re-parses and allocates the whole CIGAR from raw
-                    // bytes on every call, so it must be hoisted to a single call
-                    // site reached at most once per alignment (only when this
-                    // alignment actually carries a correctable event), not called
-                    // separately from each of the two (mutually exclusive) arms.
+                    // Decide the event's allele first, WITHOUT touching the CIGAR.
                     let ev_allele = match a.indel() {
                         bam::pileup::Indel::Ins(n) if n < iopts.max_len => {
                             let s: Vec<u8> =
@@ -581,15 +428,11 @@ fn compute_corrections(
                         bam::pileup::Indel::Del(n) if n < iopts.max_len => {
                             Some(indel::Allele::Del(n))
                         }
-                        // Indel::None contributes depth only; an indel at or above
-                        // max_len contributes depth and is never corrected.
+                        // Indel::None contributes depth only; an indel at or above max_len contributes depth and is never corrected.
                         _ => None,
                     };
                     if let Some(allele) = ev_allele {
                         stats.indel_events_examined += 1;
-                        // Collected unconditionally: whether this read may vote depends
-                        // on the NORMALIZED column, not on this one (Review 2026-09-25
-                        // T3), and normalization has not happened yet.
                         col_events.push((
                             rec.qname().to_vec(),
                             allele,
@@ -637,16 +480,7 @@ fn compute_corrections(
 
         if iopts.enabled {
             depths.insert((name.to_vec(), refpos as u32), (col_depth, col_fwd, col_rev));
-            // Plan 2026-09-26 T8b: the HP-length votes for this column, if it is an
-            // HP site. `add_from_read` still enforces one ALT vote per read per site,
-            // so a read that also reaches this site through some event elsewhere
-            // cannot double-vote.
-            //
-            // Review fix 2: the reference observers are recorded alongside them, but
-            // only when some read actually carries a DIFFERENT length here. A site
-            // where every spanning read agrees on the reference length has nothing to
-            // correct, so it is still not materialized and `indel_sites_examined`
-            // still counts only sites with a candidate ALT.
+            // `add_from_read` still enforces one ALT vote per read per site.
             if !hp_col_votes.is_empty() {
                 let site = sites.entry((name.to_vec(), refpos as u32)).or_default();
                 for (qname, allele, reverse) in hp_col_votes {
@@ -661,53 +495,23 @@ fn compute_corrections(
             for (qname, allele, reverse, rpos, cigar, reference_end) in col_events {
                 let (norm_pos, norm_allele) =
                     indel::normalize_left(refseq, refpos as u32, &allele);
-                // Plan 2026-09-26 T8b: at an HP site the length vote cast at the
-                // site's own column REPLACES the event-based votes -- the whole point
-                // is that one read contributes one length, not one allele per CIGAR
-                // op. Dropped silently: the read has already spoken at this site (or
-                // was found uninformative there by `hp_allele`'s stricter gate), so
-                // none of the drop counters below describes what happened.
+                // Dropped silently: the read has already spoken at this site.
                 if iopts.hp_length_model && indel::hp_site(refseq, norm_pos).is_some() {
                     continue;
                 }
-                // `normalize_left` walks the reference with no knowledge of read
-                // boundaries: a read whose alignment starts (or ends) inside a
-                // repeat can normalize an event to a column outside its own
-                // aligned span -- or even to a column its span covers only through
-                // this SAME read's own `D`/`N`, where depth was never incremented
-                // for this read either (depth only counts
-                // `!is_refskip() && qpos().is_some()`; see FIX 2). Either way,
-                // counting the ALT vote would let alt_total exceed depth at that
-                // column -- see CRITICAL 2. The correct test is whether the read
-                // has an actual ALIGNED QUERY BASE at norm_pos, i.e. a nonzero
-                // contiguous M/=/X run starting there.
+                // `normalize_left` walks the reference with no knowledge of read boundaries.
                 if indel::match_run_len(rpos, &cigar, norm_pos) == 0 {
                     stats.indel_events_out_of_span += 1;
                     continue;
                 }
-                // Review 2026-09-25 T3: the run-span gate belongs HERE, at `norm_pos`,
-                // not at the column the event was observed in. The two anchors really
-                // do disagree: `hp_tract_end` reports `anchor + 1` when only a single
-                // base follows, so an insertion sitting on the penultimate base of a
-                // homopolymer sees a laxer bound at its observed column than at the
-                // column it normalizes into. Depth for this site was counted at
-                // `norm_pos` under `norm_pos`'s own bound, so the vote must clear that
-                // same bound or `alt_total` exceeds `depth` (the `debug_assert!` in
-                // `fit_indel_site`). Scope is homopolymers only; a tandem repeat with a
-                // unit longer than one base imposes nothing beyond `norm_pos` itself.
+                // The two anchors really do disagree: `hp_tract_end` reports `anchor + 1` when only a single base follows.
                 if reference_end < indel::hp_tract_end(refseq, norm_pos) as i64 + 1 {
                     stats.indel_events_not_spanning_repeat += 1;
-                    // Review 2026-09-25 T3: one entry per site, however many votes
-                    // died here. Counted after the pileup, once depth is final.
+                    // Counted after the pileup, once depth is final.
                     span_gated_sites.insert((name.to_vec(), norm_pos));
                     continue;
                 }
-                // A read carrying two of ITS OWN events (e.g. an insertion and a
-                // nearby deletion, exactly what coexists in a short tandem
-                // repeat) that both normalize to this same site must contribute
-                // at most one ALT vote here -- depth counts that read once (see
-                // FIX 1). `add_from_read` enforces the cap and reports whether
-                // this vote was the read's first at this site.
+                // A read with two events normalizing to this site contributes at most one ALT vote.
                 let voted = sites
                     .entry((name.to_vec(), norm_pos))
                     .or_default()
@@ -744,7 +548,6 @@ fn compute_corrections(
                 carriers.entry(key).or_default().insert(ri);
             }
             if model.pending[allele] {
-                // ONT-recall Phase2 T6b: decided after the pileup by linkage rescue.
                 deferred.entry(key).or_default().push((qname, refpos as u32, idx_to_base(corr)));
                 continue;
             }
@@ -754,17 +557,7 @@ fn compute_corrections(
                     .or_default()
                     .subs
                     .push((refpos as u32, idx_to_base(corr)));
-                // KNOWN LIMITATION (diagnostic only, never affects output SEQ):
-                // these two counters are booked eagerly here, at decision time,
-                // whereas the indel counters are booked from what `rewrite_read`
-                // actually applied. A gained deletion makes the rewrite walk skip
-                // the reference positions it consumes, so a substitution this read
-                // has inside that span is never written while already counted here
-                // -- an over-count reachable only with --indels enabled. Closing it
-                // means widening `ReadEdits.subs` to carry the original allele and
-                // deferring these stats to the write-back pass, which ripples
-                // through every caller and every test asserting them off
-                // `compute_corrections` alone. Deliberately not done.
+                // KNOWN LIMITATION: these two counters are booked eagerly here, at decision time.
                 stats.bases_modified += 1;
                 stats.substitution_matrix[allele][corr] += 1;
                 changed = true;
@@ -795,15 +588,12 @@ fn compute_corrections(
         }
     }
     stats.columns_corrected = corrected_cols.len() as u64;
-    // Deferred substitutions land after the pileup, so subs must be re-sorted
-    // whether or not indels are enabled.
+    // Deferred substitutions land after the pileup, so subs must be re-sorted whether or not indels are enabled.
     for edits in corrections.values_mut() {
         edits.subs.sort_by_key(|&(p, _)| p);
     }
 
-    // Review 2026-09-25 T3: once per site that lost an ALT vote to the homopolymer
-    // span gate. Missing `depths` and an explicit zero are the same outcome: no
-    // read spanned the run, so the site was dropped for lack of spanning depth.
+    // Missing `depths` and an explicit zero are the same outcome: no read spanned the run.
     for key in &span_gated_sites {
         let depth = depths.get(key).map(|(d, _, _)| *d).unwrap_or(0);
         if depth == 0 {
@@ -814,7 +604,6 @@ fn compute_corrections(
     // ---- deferred indel site decisions ----
     let mut models: IndelModels = HashMap::new();
     if iopts.enabled {
-        // ONT-recall Phase2 T7: Bonferroni family for the indel excess test.
         let n_sites = sites.len();
         for ((contig, norm_pos), mut site) in sites.into_iter() {
             let refseq = match refs.get(&contig) {
@@ -827,11 +616,7 @@ fn compute_corrections(
                 .copied()
                 .unwrap_or((0, 0, 0));
             if depth == 0 {
-                // Nothing spans this site, so there is nothing to decide. The
-                // homopolymer-span site counter is not booked here: a site enters
-                // this map only after a vote cleared the same gate depth uses, so
-                // this branch cannot see a site whose every ALT was dropped.
-                // Review 2026-09-25 T3
+                // Nothing spans this site, so there is nothing to decide.
                 continue;
             }
             site.depth = depth;
@@ -858,19 +643,12 @@ fn compute_corrections(
     Ok((corrections, models, stats))
 }
 
-/// ONT-recall Phase2 T6b: minimum distance (bp) between a pending allele and a
-/// partner whose co-occurrence can rescue it; closer pairs can share one error event.
 const RESCUE_MIN_DIST: u32 = 20;
 const RESCUE_MIN_SHARED: u32 = 3;
 const RESCUE_ALPHA: f64 = 1e-4;
 const RESCUE_ROUNDS: usize = 3;
 
-/// ONT-recall Phase2 T6b: pending alleles whose carriers are enriched for some
-/// partner's carriers. Partners start as the kept minor alleles; each round adds
-/// what the previous one rescued. For a pending P and partner M more than
-/// `RESCUE_MIN_DIST` away, the population is the reads spanning both, and P is
-/// rescued if `a = |P ∧ M| >= RESCUE_MIN_SHARED` and the hypergeometric upper tail
-/// `P(X >= a)`, Bonferroni'd over the partners tested, is `<= RESCUE_ALPHA`.
+/// Partners start as the kept minor alleles; each round adds what the previous one rescued.
 fn rescue_linked_pending<V>(
     pending: &HashMap<(u32, u32, usize), V>,
     carriers: &HashMap<(u32, u32, usize), HashSet<usize>>,
@@ -941,11 +719,8 @@ fn rescue_linked_pending<V>(
 }
 
 /// Book the read and base counters for ONE reassignment that was actually applied.
-///
-/// Extracted (Plan 2026-09-26 T8d) so the two write-back paths -- `rewrite_read` for
-/// event-based edits and `rewrite_hp_run` for HP-length moves -- count identically.
 /// Callers must only reach this for an edit the rewrite reports it really made; see
-/// `RewriteResult::applied` and FIX 1 in the task-9 review round.
+/// `RewriteResult::applied`.
 fn book_reassignment(stats: &mut DenoiseStats, from: &indel::Allele, to: &indel::Allele) {
     match (from, to) {
         (indel::Allele::Ref, indel::Allele::Ins(s)) => {
@@ -957,8 +732,7 @@ fn book_reassignment(stats: &mut DenoiseStats, from: &indel::Allele, to: &indel:
             stats.indel_bases_removed += *n as u64;
         }
         (indel::Allele::Ins(from_s), indel::Allele::Ref) => {
-            // Reverting a spurious insertion removes the bases it added -- the
-            // single most common correction this feature makes.
+            // Reverting a spurious insertion removes the bases it added -- the single most common correction this feature makes.
             stats.reads_reassigned_indel_to_ref += 1;
             stats.indel_bases_removed += from_s.len() as u64;
         }
@@ -977,24 +751,15 @@ fn book_reassignment(stats: &mut DenoiseStats, from: &indel::Allele, to: &indel:
         }
         (indel::Allele::Del(from_n), indel::Allele::Del(to_n)) => {
             stats.reads_reassigned_indel_to_indel += 1;
-            // FIX 3: shrinking a deletion splices reference bases BACK INTO the read
-            // (an insertion of read bases relative to what the read had before),
-            // e.g. Del(3) -> Del(1) restores 2 bases.
+            // shrinking a deletion splices reference bases BACK INTO the read, e.g. Del(3) -> Del(1) restores 2 bases.
             if to_n < from_n {
                 stats.indel_bases_inserted += (from_n - to_n) as u64;
             } else if to_n > from_n {
-                // Plan 2026-09-26 T8d: growing a deletion used to be unreachable --
-                // `assign_allele` refused it, because `rewrite_read` cannot grow a
-                // deletion into the following CIGAR op. `rewrite_hp_run` replaces the
-                // whole run at once, so at an HP site it now happens and the freed
-                // query bases have to be counted.
+                // `rewrite_hp_run` replaces the whole run at once.
                 stats.indel_bases_removed += (to_n - from_n) as u64;
             }
         }
-        // Plan 2026-09-26 T8d: the cross-kind transitions, likewise reachable only
-        // through `rewrite_hp_run`. Both the read's own indel and the target's are
-        // charged: Ins(1) -> Del(1) drops the inserted base AND deletes a reference
-        // base, so the read loses two.
+        // Both the read's own indel and the target's are charged.
         (indel::Allele::Ins(from_s), indel::Allele::Del(to_n)) => {
             stats.reads_reassigned_indel_to_indel += 1;
             stats.indel_bases_removed += from_s.len() as u64 + *to_n as u64;
@@ -1003,8 +768,7 @@ fn book_reassignment(stats: &mut DenoiseStats, from: &indel::Allele, to: &indel:
             stats.reads_reassigned_indel_to_indel += 1;
             stats.indel_bases_inserted += *from_n as u64 + to_s.len() as u64;
         }
-        // Ref -> Ref: not a reassignment at all. `assign_allele` returns `Keep` when
-        // the target equals the observed allele, so no caller can produce this.
+        // Ref -> Ref: not a reassignment at all.
         (indel::Allele::Ref, indel::Allele::Ref) => {}
     }
 }
@@ -1027,10 +791,7 @@ fn apply_corrections(
 
     let mut reads_processed = 0u64;
     let mut reads_modified = 0u64;
-    // Contigs referenced by a correctable, edit-bearing record but absent from
-    // `refs`, and how many such records were affected. Tracked so a missing
-    // reference contig is loud (one warning) rather than silently splicing
-    // filler bases once indel edits exist (see FIX 1).
+    // Contigs referenced by a correctable, edit-bearing record but absent from `refs`.
     let mut missing_ref_contigs: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     let mut missing_ref_reads = 0u64;
 
@@ -1041,39 +802,20 @@ fn apply_corrections(
             !(rec.is_secondary() || rec.is_supplementary() || rec.is_unmapped());
         if correctable {
             reads_processed += 1;
-            // A mapped-but-contig-less record (tid == -1) is a degenerate BAM
-            // state. Casting -1 to u32 before calling `tid2name` is an unchecked
-            // pointer offset in rust-htslib (see IMPORTANT 4); guard it exactly
-            // like the missing-reference-contig case below and skip straight to
-            // the unconditional write at the bottom of the loop.
+            // A mapped-but-contig-less record (tid == -1) is a degenerate BAM state.
             if rec.tid() >= 0 {
                 let contig = header_view.tid2name(rec.tid() as u32).to_vec();
                 match refs.get(&contig) {
                     Some(refseq) => {
                         let mut edits = corrections.get(rec.qname()).cloned().unwrap_or_default();
-                        // (ref_pos, kind_of(from)) -> the repeat-context length that
-                        // decided this edit. Kept alongside `edits` (not inside
-                        // `IndelEdit` itself) so `reassignments_by_hp_length` can be
-                        // booked AFTER `rewrite_read` reports which edits it actually
-                        // applied (see FIX 1 in the task-9 review round).
+                        // (ref_pos, kind_of(from)) -> the repeat-context length that decided this edit.
                         let mut edit_context_len: HashMap<(u32, indel::EditKind), usize> = HashMap::new();
-                        // Plan 2026-09-26 T8d: HP-length moves for this read, as
-                        // (anchor, run end, observed length, target length). They are
-                        // deliberately NOT `IndelEdit`s: `rewrite_read` edits one
-                        // CIGAR op in place and cannot express them, so they are
-                        // applied first, by `rewrite_hp_run`, below.
-                        // (anchor, run end, run base, observed length, target length).
-                        // The run base travels with the move: `rewrite_hp_run`
-                        // synthesizes added bases from it, and it is a property of the
-                        // REFERENCE, not of whatever the read carries inside the run.
+                        // They are deliberately NOT `IndelEdit`s: `rewrite_read` edits one.
                         let mut hp_moves: Vec<(u32, u32, u8, indel::Allele, indel::Allele)> =
                             Vec::new();
 
                         if iopts.enabled {
-                            // `end_pos()` (exclusive alignment end on the reference) is only
-                            // defined on `CigarStringView`, which carries the record's POS;
-                            // it must be read before `.take()` discards that view down to a
-                            // plain `CigarString`.
+                            // `end_pos()` is only defined on `CigarStringView`, which carries the record's POS.
                             let view = rec.cigar();
                             let rstart = rec.pos();
                             let rend = view.end_pos();
@@ -1081,20 +823,10 @@ fn apply_corrections(
                             let seq = rec.seq().as_bytes();
                             let evs = indel::read_events(rstart, &cigar, &seq, refseq, iopts.max_len);
 
-                            // What this read carries at each normalized site -- the allele
-                            // AND the CIGAR anchor where that allele actually lives, since
-                            // `rewrite_read` keys its Ins/Del lookups on the anchor, not the
-                            // normalized site (see CRITICAL 1) -- and where it has an indel
-                            // too large to represent.
+                            // What this read carries at each normalized site -- the allele.
                             let mut carried: HashMap<u32, (indel::Allele, u32)> = HashMap::new();
                             let mut blocked: Vec<i64> = Vec::new();
-                            // Sites where this read's OWN CIGAR carries two DIFFERENT events
-                            // that both normalize here (see FIX 5): `carried.insert` above
-                            // would silently keep only the last one, leaving the read treated
-                            // as carrying an allele it doesn't unambiguously carry. A read
-                            // whose alignment is ambiguous at a site is exactly the case
-                            // where doing nothing is right, so such sites are tracked here
-                            // and skipped below rather than arbitrarily picking one event.
+                            // Sites where this read's OWN CIGAR carries two DIFFERENT events that both normalize here.
                             let mut ambiguous: std::collections::HashSet<u32> = std::collections::HashSet::new();
                             for e in &evs {
                                 match &e.allele {
@@ -1109,39 +841,20 @@ fn apply_corrections(
 
                             // Fixed flank (>= 1 by construction; see `INDEL_FLANK`).
                             let flank = indel::INDEL_FLANK as i64;
-                            // A gained deletion consumes up to max_len reference bases to the
-                            // right, so the right-hand requirement is larger than the left.
+                            // A gained deletion consumes up to max_len reference bases to the right.
                             let reach = flank + iopts.max_len as i64;
-                            // Furthest reference position already consumed by a GAINED
-                            // deletion emitted earlier in this loop for this same read (see
-                            // FIX 6). Sites are visited in ascending order (`list` is sorted
-                            // and `list[lo..]` preserves that), so tracking only the running
-                            // maximum is sufficient to detect a later site falling inside an
-                            // earlier gained deletion's span.
+                            // Furthest reference position already consumed by a GAINED deletion emitted earlier in this loop for this same read.
                             let mut consumed_until: i64 = -1;
 
                             if let Some(list) = models.get(&contig) {
                                 let lo = list.partition_point(|(p, _)| (*p as i64) < rstart);
                                 for (pos, model) in &list[lo..] {
                                     let s = *pos as i64;
-                                    // `rend` is EXCLUSIVE, so `s == rend` is a site the
-                                    // read does not span at all; admitting it here only
-                                    // inflates the span-guard counter below with sites
-                                    // that were never real candidates for this read.
+                                    // `rend` is EXCLUSIVE, so `s == rend` is a site the read does not span at all.
                                     if s >= rend {
                                         break;
                                     }
-                                    // Plan 2026-09-26 T8d: an HP site is decided as a
-                                    // LENGTH, so what this read carries there comes
-                                    // from `hp_allele` -- the same single-valued
-                                    // reading pass 1 voted with -- and not from
-                                    // `carried`, which has one entry per CIGAR op and
-                                    // is what makes the FIX 5 ambiguity possible in
-                                    // the first place. `hp_allele` already enforces
-                                    // the right-hand tract span and an aligned base at
-                                    // the anchor, so only the left-hand flank, the
-                                    // oversized neighbour and the swallowed-site
-                                    // guards remain to apply here.
+                                    // The tract is keyed by LENGTH, so the read's allele there comes from `hp_allele`, as in pass 1.
                                     if let Some((hp_e, hp_b)) = model.hp_run {
                                         let observed_k = match indel::hp_allele(
                                             rstart, &cigar, &seq, refseq, *pos, hp_e,
@@ -1156,10 +869,7 @@ fn apply_corrections(
                                             stats.assignments_skipped_span_guard += 1;
                                             continue;
                                         }
-                                        // An earlier gained deletion for this read
-                                        // already consumed the anchor or part of the
-                                        // run, so the two rewrites would fight over
-                                        // the same reference bases (see FIX 6).
+                                        // An earlier gained deletion for this read already consumed the anchor or part of the run.
                                         if s <= consumed_until {
                                             stats
                                                 .assignments_skipped_swallowed_by_gained_deletion += 1;
@@ -1174,9 +884,7 @@ fn apply_corrections(
                                             &observed, model, iopts,
                                         ) {
                                             indel::Assignment::Keep => continue,
-                                            // Unreachable at an HP site (T8c), but
-                                            // counted rather than silently dropped if
-                                            // that ever changes.
+                                            // Unreachable at an HP site (T8c), but counted rather than silently dropped if that ever changes.
                                             indel::Assignment::Refused => {
                                                 stats
                                                     .assignments_skipped_unsupported_transition += 1;
@@ -1187,10 +895,7 @@ fn apply_corrections(
                                         hp_moves.push((*pos, hp_e, hp_b, observed, target));
                                         continue;
                                     }
-                                    // FIX 5: this read's own CIGAR carries two DIFFERENT
-                                    // events that both normalize to this site, so which one
-                                    // it "carries" here is ambiguous -- leave it untouched
-                                    // rather than arbitrarily picking one.
+                                    // this read's own CIGAR carries two DIFFERENT events that both normalize to this site.
                                     if ambiguous.contains(pos) {
                                         stats.assignments_skipped_ambiguous_carry += 1;
                                         continue;
@@ -1199,16 +904,7 @@ fn apply_corrections(
                                         .get(pos)
                                         .cloned()
                                         .unwrap_or((indel::Allele::Ref, *pos));
-                                    // FIX 6: an earlier gained deletion already emitted for
-                                    // this read consumed this site's reference position, so
-                                    // `rewrite_read`'s Match arm will never visit it. This can
-                                    // only apply when the read is a plain Ref observer here
-                                    // (see FIX 3 in the task-9 review round): a read that
-                                    // CARRIES its own indel at this site is keyed at its own
-                                    // CIGAR anchor, and the run bound above guarantees that
-                                    // anchor lies beyond the consumed span, so it remains
-                                    // genuinely reachable -- checking `s <= consumed_until`
-                                    // unconditionally would over-skip legitimate reversions.
+                                    // an earlier gained deletion already emitted for this read consumed this site's reference position.
                                     if observed == indel::Allele::Ref && s <= consumed_until {
                                         stats.assignments_skipped_swallowed_by_gained_deletion += 1;
                                         continue;
@@ -1221,41 +917,16 @@ fn apply_corrections(
                                         }
                                         indel::Assignment::Move(t) => t,
                                     };
-                                    // Left-normalization only ever moves an event LEFT, so the
-                                    // read's own CIGAR anchor (where an observed indel actually
-                                    // lives) is always >= the normalized site position. The
-                                    // rewrite walk needs plain match context flanking whichever
-                                    // coordinate it will actually touch.
+                                    // Left-normalization only ever moves an event LEFT.
                                     let far = (anchor as i64).max(s);
-                                    // Review 2026-09-25 T3: `flank + max_len` past the
-                                    // site is not enough in a run LONGER than that: the
-                                    // read could be rewritten on the strength of a
-                                    // homopolymer whose length it never actually saw.
-                                    // Require the whole tract plus the usual flank of
-                                    // match context beyond it.
+                                    // Require the whole tract plus the usual flank of match context beyond it.
                                     let tract_need =
                                         indel::hp_tract_end(refseq, s as u32) as i64 + flank;
                                     if s - flank < rstart || (far + reach).max(tract_need) > rend {
                                         stats.assignments_skipped_span_guard += 1;
                                         continue;
                                     }
-                                    // FIX 2 / FIX 4: the check above bounds only the read's
-                                    // OVERALL span, which can pass even when the read's own
-                                    // alignment breaks up into several Match/=/X runs -- e.g.
-                                    // an unrelated `D`/`N` shortly after this site -- or even
-                                    // when the target column is only reachable through this
-                                    // SAME read's own `D`/`N` (a "Ref" observation is also
-                                    // reported there; see FIX 2 in pass 1 for the same
-                                    // reasoning). A GAINED indel (observed == Ref) is spliced
-                                    // into `rewrite_read`'s Match arm at the normalized site,
-                                    // so the read needs an ACTUAL ALIGNED QUERY BASE there: a
-                                    // gained insertion needs at least the anchor base itself
-                                    // (`run >= 1`); a gained deletion needs the anchor base
-                                    // FIRST (`rewrite_read` emits it before the deletion),
-                                    // then `m` deleted bases, then `flank` genuine right-hand
-                                    // flank matches -- all inside that ONE contiguous run, or
-                                    // the walk truncates it to the wrong length (debug_assert
-                                    // in debug, silent truncation in release).
+                                    // the check above bounds only the read's.
                                     if observed == indel::Allele::Ref {
                                         let run = indel::match_run_len(rstart, &cigar, s as u32) as i64;
                                         let need = match &target {
@@ -1267,47 +938,22 @@ fn apply_corrections(
                                             continue;
                                         }
                                     }
-                                    // An oversized indel nearby means this read's alignment in
-                                    // this window cannot be represented by the site's alleles.
+                                    // An oversized indel nearby means this read's alignment in this window cannot be represented by the site's alleles.
                                     if blocked.iter().any(|b| (b - s).abs() <= reach) {
                                         stats.assignments_skipped_oversized_neighbor += 1;
                                         continue;
                                     }
-                                    // FIX 6: a GAINED deletion (observed Ref -> Del(m))
-                                    // consumes reference positions (s, s+m] once applied by
-                                    // `rewrite_read`'s Match arm, which advances past all of
-                                    // them in a single step. Any other decided site that
-                                    // falls in that span would therefore never be visited if
-                                    // an edit were emitted for it -- record the furthest
-                                    // position this read's gained deletions have consumed so
-                                    // later sites (visited in ascending order) can detect and
-                                    // skip landing inside it, instead of silently emitting an
-                                    // edit that `rewrite_read` would never apply.
+                                    // A gained deletion consumes reference positions (s, s+m]; later sites inside that span are skipped.
                                     if let (indel::Allele::Ref, indel::Allele::Del(m)) = (&observed, &target) {
                                         consumed_until = consumed_until.max(s + *m as i64);
                                     }
 
-                                    // Direction determines which coordinate `rewrite_read`
-                                    // will actually look this edit up by (see CRITICAL 1):
-                                    // reverting/replacing an indel the read itself carries is
-                                    // found via `last_ref`, which is the CIGAR anchor; gaining
-                                    // an indel where the read has plain match context is found
-                                    // by walking that Match run at the normalized site.
+                                    // Direction determines which coordinate `rewrite_read` will actually look this edit up by.
                                     let ref_pos = match &observed {
                                         indel::Allele::Ref => *pos,
                                         _ => anchor,
                                     };
-                                    // Reassignment/base-count/hp-length statistics are NOT
-                                    // booked here (see FIX 1 in the task-9 review round):
-                                    // every guard above PREDICTS what `rewrite_read`'s walk
-                                    // will do with this edit once emitted, and three rounds
-                                    // of review have each found one instance of that
-                                    // prediction being wrong (CRITICAL 1, FIX 2, FIX 6).
-                                    // Stash the context length now, keyed exactly like
-                                    // `rewrite_read`'s internal lookup, and book every
-                                    // counter afterward from what it reports as ACTUALLY
-                                    // APPLIED -- making any future instance of that class a
-                                    // harmless missed correction with honest statistics.
+                                    // Reassignment/base-count/hp-length statistics are NOT booked here.
                                     edit_context_len.insert(
                                         (ref_pos, indel::edit_kind(&observed)),
                                         model.context_len as usize,
@@ -1329,13 +975,7 @@ fn apply_corrections(
                             let seq = rec.seq().as_bytes();
                             let qual = rec.qual().to_vec();
 
-                            // Plan 2026-09-26 T8d: HP-length moves go first, one run at
-                            // a time. Each `rewrite_hp_run` preserves reference
-                            // consumption, so the reference coordinates every later
-                            // edit is keyed by are unchanged and the runs (one per
-                            // normalized anchor) never overlap. Stats are booked from
-                            // what it actually returned, exactly as the event path
-                            // books from `RewriteResult::applied`.
+                            // Each `rewrite_hp_run` preserves reference consumption.
                             let mut hp_cigar: Option<CigarString> = None;
                             let mut hp_seq: Option<Vec<u8>> = None;
                             let mut hp_qual: Option<Vec<u8>> = None;
@@ -1363,15 +1003,11 @@ fn apply_corrections(
                                         }
                                         stats.reassignments_by_hp_length[l] += 1;
                                     }
-                                    // Same accounting as an event edit the walk never
-                                    // reached: a harmless missed correction, honestly
-                                    // reported rather than counted as applied.
+                                    // Same accounting as an event edit the walk never reached: a harmless missed correction.
                                     None => stats.indel_edits_emitted_but_not_applied += 1,
                                 }
                             }
                             if !hp_runs.is_empty() {
-                                // The run was rewritten wholesale, so a substitution
-                                // inside it no longer refers to a base that survived.
                                 let before = edits.subs.len();
                                 edits.subs.retain(|&(p, _)| {
                                     !hp_runs.iter().any(|&(lo, hi)| p >= lo && p < hi)
@@ -1385,32 +1021,10 @@ fn apply_corrections(
                             let in_qual = hp_qual.as_ref().unwrap_or(&qual);
                             let out =
                                 rewrite_read(rec.pos(), in_cigar, in_seq, in_qual, &edits, refseq);
-                            // A non-empty edit list does not guarantee `rewrite_read`
-                            // actually changed anything -- CRITICAL 1's bug is exactly a
-                            // case where it silently didn't. Compare the real output
-                            // against the record as it came in, HP rewrites included.
+                            // A non-empty edit list does not guarantee `rewrite_read` changed anything.
                             let changed = out.seq != seq || out.cigar != cigar;
 
-                            // FIX 1 (task-9 review round): the reassignment, base-count,
-                            // and hp-length counters are booked HERE, and only here, from
-                            // `out.applied` -- what `rewrite_read` reports it actually did
-                            // -- never from the edits pass 2 merely emitted. An edit whose
-                            // key is absent from `out.applied` was a silent no-op (the walk
-                            // never reached its `ref_pos`); counting it would report a
-                            // correction that never happened.
-                            //
-                            // FIX 2 (task-10 review round): consult `out.applied` with a
-                            // ONE-SHOT `remove`, not `contains`. `out.applied` is a set of
-                            // KEYS, not a per-edit outcome -- if `edits.indels` ever holds
-                            // two entries sharing the same (ref_pos, kind) (pass 2's two
-                            // independent per-site decisions can legitimately produce this
-                            // for a read whose own two same-kind CIGAR ops share one anchor,
-                            // exactly CRITICAL 1's shape, when BOTH sites independently
-                            // decide to reassign it), a plain `.contains()` would find the
-                            // key present for BOTH iterations and double-book the
-                            // reassignment even though `rewrite_read` only ever physically
-                            // applied one of them. Consuming the key here mirrors the
-                            // one-shot semantics FIX 1 gave the internal Ins/Del lookups.
+                            // the reassignment, base-count, and hp-length counters are booked HERE, and only here.
                             let mut applied = out.applied;
                             for edit in &edits.indels {
                                 let key = (edit.ref_pos, indel::edit_kind(&edit.from));
@@ -1427,10 +1041,7 @@ fn apply_corrections(
                             }
 
                             rec.set(&qname, Some(&out.cigar), &out.seq, &out.qual);
-                            // An HP-length move shifts every query offset downstream
-                            // of the run just as an event edit does, so it invalidates
-                            // the same tags -- and `rewrite_read` cannot report it,
-                            // having never seen it.
+                            // An HP-length move shifts every query offset downstream of the run just as an event edit does.
                             if out.structure_changed || !hp_runs.is_empty() {
                                 strip_stale_tags(&mut rec);
                             }
@@ -1440,11 +1051,7 @@ fn apply_corrections(
                         }
                     }
                     None => {
-                        // Contig not in the supplied reference: do not rewrite
-                        // this record. Writing it through unchanged is safe;
-                        // fabricating a reference slice is not (it would let
-                        // the deletion-reversion path splice `N` filler into
-                        // real reads).
+                        // Contig not in the supplied reference: do not rewrite this record.
                         if corrections.get(rec.qname()).is_some_and(|e| !e.is_empty()) {
                             missing_ref_contigs.insert(contig.clone());
                             missing_ref_reads += 1;
@@ -1481,9 +1088,7 @@ pub fn start(
     indels: &indel::IndelOpts,
     stats_out: Option<&PathBuf>,
 ) -> Result<()> {
-    // The per-strand count gate and the strand-bias p are fixed crate constants
-    // (no caller ever varied them); `fit_site`/`compute_corrections` keep them as
-    // parameters only so their unit tests can exercise other values.
+    // The per-strand count gate and the strand-bias p are fixed crate constants.
     let (min_strand, strand_bias_p) = (crate::DENOISE_MIN_STRAND, crate::DENOISE_STRAND_BIAS_P);
     // PacBio (and anything non-ONT) is a byte-identical passthrough.
     if !data_type.starts_with("ont") {
@@ -1563,9 +1168,7 @@ mod tests {
 
     #[test]
     fn phred_to_e_clamps_degenerate_qualities() {
-        // Q0 nominally means P(error) = 1, which would make P(obs | truth = obs) zero
-        // and invert every base. With 4 alleles the most error a base can carry is
-        // uniform-over-4, i.e. 0.75, so everything at or below Q1 clamps there.
+        // Q0 nominally means P(error) = 1, which would make P(obs | truth = obs) zero and invert every base.
         assert!((phred_to_e(0) - E_MAX).abs() < 1e-12);
         assert!((phred_to_e(1) - E_MAX).abs() < 1e-12);
         for q in 0..=93u8 {
@@ -1575,25 +1178,18 @@ mod tests {
 
     #[test]
     fn zero_quality_observations_are_never_inverted() {
-        // ref A(0) at 60%, alt G(2) at 40%, both strand-balanced, ALL bases at Q0 --
-        // the shape pbsim's errhmm models emit (quality string of all '!').
+        // ref A(0) at 60%, alt G(2) at 40%, both strand-balanced, ALL bases at Q0 -- the shape pbsim's errhmm models emit.
         let mut obs = vec![];
         for i in 0..60 { obs.push((0usize, q(0), i % 2 == 0)); }
         for i in 0..40 { obs.push((2usize, q(0), i % 2 == 0)); }
         let c = column(0, &obs);
         let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
 
-        // Before the clamp, like(k == observed) was 0 while like(k != observed) was
-        // e/3 > 0, so an A read was rewritten to some OTHER base -- corrupting the
-        // read instead of correcting it. A ref observation must stay ref.
+        // Before the clamp, like(k == observed) was 0 while like(k != observed) was e/3 > 0.
         assert_eq!(map_allele(0, q(0), &m), 0);
-        // At the clamp the likelihood is flat (1 - e == e/3 == 0.25), so a Q0 base
-        // carries no evidence of its own. Both A and G were kept, so each stands as
-        // observed rather than collapsing to the more frequent one -- deciding a kept
-        // heteroplasmy by the frequency prior is what erases minor alleles.
+        // At the clamp the likelihood is flat (1 - e == e/3 == 0.25), so a Q0 base carries no evidence of its own.
         assert_eq!(map_allele(2, q(0), &m), 2);
-        // The alleles the model rejected have no evidence and no prior, so they fall
-        // back to the most frequent kept allele. Nothing ever invents a third base.
+        // The alleles the model rejected have no evidence and no prior, so they fall back to the most frequent kept allele.
         for observed in 0..4 {
             let got = map_allele(observed, q(0), &m);
             let want = if m.kept[observed] { observed } else { 0 };
@@ -1603,19 +1199,7 @@ mod tests {
 
     #[test]
     fn low_quality_observations_of_a_kept_alt_are_not_reverted_to_ref() {
-        // A ~8% heteroplasmy in ONT-quality reads: the alt clears the keep rule, so
-        // the site model has already ruled it real. Reads carrying it must keep it.
-        //
-        // Scoring each observation by freq * P(obs | truth) instead reverts the alt
-        // whenever freq[ref] * e/3 > freq[alt] * (1 - e) -- with 0.92/0.08 that is
-        // every base under Q7. Real ONT qualities at these sites center on Q4-Q9, so
-        // this silently deletes ~40% of the evidence for every minor allele. Worse,
-        // it is applied per site independently, so a read spanning two heteroplasmies
-        // keeps both only ~0.6^2 of the time: co-occurrence counts collapse and
-        // nested variants look mutually exclusive, which breaks lineage ordering.
-        // Qualities span Q3-Q20 for both alleles, the spread pbsim's ONT model emits
-        // at these sites; a single flat quality would make an 8% alt indistinguishable
-        // from the error rate and the keep rule would (correctly) reject it.
+        // A ~8% heteroplasmy in ONT-quality reads: the alt clears the keep rule, so the site model has already ruled it real.
         let quals = [3u8, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 18, 20];
         let mut obs = vec![];
         for i in 0..736 { obs.push((0usize, q(quals[i % quals.len()]), i % 2 == 0)); }
@@ -1710,9 +1294,7 @@ mod tests {
 
     #[test]
     fn strand_biased_candidate_passing_min_strand_is_rejected() {
-        // ref A(0) 40fwd/40rev; alt G(2) 18fwd/2rev. min_strand=2 is satisfied on BOTH
-        // strands, so the count gate alone lets this through -- but against the column's
-        // own composition (58/100 fwd) an 18/2 split has p = 4.3e-3 < 0.01.
+        // ref A(0) 40fwd/40rev; alt G(2) 18fwd/2rev. min_strand=2 is satisfied on BOTH strands.
         let mut obs = vec![];
         for i in 0..80 { obs.push((0usize, q(30), i % 2 == 0)); }
         for _ in 0..18 { obs.push((2usize, q(30), false)); }
@@ -1734,10 +1316,7 @@ mod tests {
 
     #[test]
     fn near_homoplasmic_allele_is_exempt_from_strand_bias_test() {
-        // ref A(0) 0fwd/25rev; alt G(2) 73fwd/2rev -> alt is 75% of the column. Against
-        // the column composition (73/100 fwd) that split is significant with an effect
-        // of 0.24 (>= STRAND_BIAS_MIN_EFFECT, ONT-recall R3-T4), but an allele in 75% of
-        // reads cannot be a single-strand artifact, so it is kept untested.
+        // ref A(0) 0fwd/25rev; alt G(2) 73fwd/2rev -> alt is 75% of the column.
         let mut obs = vec![];
         for _ in 0..25 { obs.push((0usize, q(30), true)); }
         for _ in 0..73 { obs.push((2usize, q(30), false)); }
@@ -1749,15 +1328,12 @@ mod tests {
         assert_eq!(m.strand_biased_alts, 0);
         assert_eq!(map_allele(2, q(30), &m), 2);
 
-        // Raising the exemption bar above the allele's frequency re-enables the test,
-        // which then rejects it -- confirming the exemption is what saved it above.
+        // Raising the exemption bar above the allele's frequency re-enables the test.
         let m_strict = fit_site(&c, 2, 0.01, SB_P, 0.95);
         assert!(!m_strict.kept[2]);
         assert_eq!(m_strict.strand_biased_alts, 1);
     }
 
-    // ONT-recall R3-T4: build a column with `ref_f/ref_r` reference and `alt_f/alt_r`
-    // G(2) observations, all Q30.
     fn strand_column(ref_f: u32, ref_r: u32, alt_f: u32, alt_r: u32) -> ColumnCounts {
         let mut obs = vec![];
         for _ in 0..ref_f { obs.push((0usize, q(30), false)); }
@@ -1769,9 +1345,7 @@ mod tests {
 
     #[test]
     fn deep_allele_with_small_strand_skew_stays_eligible() {
-        // ONT-recall R3-T4: 7805A in merge215k. Alt 328/196 at 10% in a column whose
-        // forward fraction is 2693/5240 = 0.514. At ~5000x that is p ~ 3e-7, but the
-        // effect is only 0.626 - 0.514 = 0.11 < STRAND_BIAS_MIN_EFFECT.
+        // Alt 328/196 at 10% in a column whose forward fraction is 2693/5240 = 0.514.
         let c = strand_column(2365, 2351, 328, 196);
         assert!(
             crate::call::strand_bias_pvalue(328, 196, 2693.0 / 5240.0) < SB_P,
@@ -1785,8 +1359,7 @@ mod tests {
 
     #[test]
     fn deep_single_strand_artifact_is_still_rejected() {
-        // ONT-recall R3-T4: the 1598G>A artifact. Alt 449/15 in a column whose forward
-        // fraction is 2171/4640 = 0.468, so the effect is 0.968 - 0.468 = 0.50.
+        // Alt 449/15 in a column whose forward fraction is 2171/4640 = 0.468, so the effect is 0.968 - 0.468 = 0.50.
         let c = strand_column(1722, 2454, 449, 15);
         let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
         assert!(!m.kept[2], "a 0.50 strand effect is still an artifact");
@@ -1796,8 +1369,7 @@ mod tests {
 
     #[test]
     fn empty_column_falls_back_to_reference_only() {
-        // No observations at all: expected-fwd-fraction fallback must not panic and the
-        // model must degenerate to reference-only.
+        // No observations at all: expected-fwd-fraction fallback must not panic and the model must degenerate to reference-only.
         let c = column(0, &[]);
         let m = fit_site(&c, 2, 0.01, SB_P, HOM_VAF);
         assert!(m.kept[0]);
@@ -1805,8 +1377,6 @@ mod tests {
         assert!((m.freq[0] - 1.0).abs() < 1e-12);
     }
 
-    // ONT-recall Phase2 T6b: an eligible allele in [PENDING_FLOOR, vaf) is pending,
-    // not kept; kept, sub-floor and strand-biased alleles are never pending.
     #[test]
     fn eligible_allele_between_floor_and_keep_vaf_is_pending() {
         let c = strand_column(486, 486, 14, 14); // 2.8%
@@ -1826,9 +1396,7 @@ mod tests {
         assert!(!biased.pending[2]);
     }
 
-    // ONT-recall Phase2 T6b: 400 full-length reads over a 100 bp all-A reference.
-    // Reads in `m_reads` carry C at `m_pos`, reads in `p_reads` carry G at `p_pos`;
-    // `extra` adds (read index, pos, base) substitutions. Strands alternate.
+    // Reads in `m_reads` carry C at `m_pos`, reads in `p_reads` carry G at `p_pos`; `extra` adds substitutions.
     fn linkage_bam(
         path: &Path,
         m_pos: usize,
@@ -1865,8 +1433,6 @@ mod tests {
 
     #[test]
     fn pending_allele_riding_on_a_kept_minor_is_preserved() {
-        // ONT-recall Phase2 T6b: the 9540/9545 shape. 3.5% C at 10 is kept; 2.75% G at
-        // 60 sits on a subset of the same reads and is rescued by linkage.
         let dir = std::env::temp_dir().join("himito_denoise_t6b_linked");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -1885,9 +1451,6 @@ mod tests {
 
     #[test]
     fn unlinked_pending_allele_is_still_corrected_and_subs_stay_sorted() {
-        // ONT-recall Phase2 T6b: the same 2.75% G on reads that do NOT carry the kept C.
-        // r100 also has a fwd-only error at 80 that is corrected inside the pileup loop,
-        // before the deferred 60 substitution is applied.
         let dir = std::env::temp_dir().join("himito_denoise_t6b_unlinked");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -1912,8 +1475,6 @@ mod tests {
 
     #[test]
     fn linked_partner_within_20bp_does_not_rescue() {
-        // ONT-recall Phase2 T6b: a partner 15 bp away can share reads through a single
-        // error process, so it is not evidence.
         let dir = std::env::temp_dir().join("himito_denoise_t6b_near");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -1931,7 +1492,6 @@ mod tests {
 
     #[test]
     fn linkage_rescue_is_deterministic() {
-        // ONT-recall Phase2 T6b: one linked pending (G@60) and one unlinked (T@85).
         let dir = std::env::temp_dir().join("himito_denoise_t6b_det");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -1956,8 +1516,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // Build a tiny coordinate-sorted BAM. Reads are full-length matches at `pos`.
-    // Each read: (qname, pos, seq bytes, reverse). Quality fixed at Q30.
+    // Build a tiny coordinate-sorted BAM.
     fn write_test_bam(path: &Path, contig: &str, contig_len: usize, reads: &[(&str, i64, &[u8], bool)]) {
         let mut header = Header::new();
         let mut sq = HeaderRecord::new(b"SQ");
@@ -1983,7 +1542,7 @@ mod tests {
         let dir = std::env::temp_dir().join("himito_denoise_t2");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
-        // Reference AAAAAA at chrM. Ten reads all "AAAAAA" except one with a G at pos 2.
+        // Reference AAAAAA at chrM.
         let refseq = b"AAAAAA".to_vec();
         let mut reads: Vec<(&str, i64, &[u8], bool)> = vec![];
         let clean = b"AAAAAA";
@@ -2029,9 +1588,7 @@ mod tests {
             rec.set(b"rerr", Some(&CigarString(vec![Cigar::Match(6)])), seq, &quals);
             rec.set_tid(0);
             rec.set_pos(0);
-            // Record::new() initializes as unmapped (see rust-htslib set_unmapped() in
-            // Record::new()); set_tid/set_pos alone do not clear that flag, so we must
-            // explicitly mark this record mapped to make it a candidate primary read.
+            // Record::new() initializes as unmapped (see rust-htslib set_unmapped() in Record::new()).
             rec.unset_unmapped();
             rec.push_aux(b"XY", Aux::I32(7)).unwrap();
             w.write(&rec).unwrap();
@@ -2105,10 +1662,7 @@ mod tests {
         }
         assert!(modified_ok);
         let json = std::fs::read_to_string(&statsf).unwrap();
-        // serde_json::to_string_pretty (used by `start`, per spec) inserts a space
-        // after the colon, unlike compact serialization; the brief's literal
-        // "\"bases_modified\":1" assumes compact output and never matches pretty
-        // JSON, so this assertion matches the actual (and required) pretty format.
+        // serde_json::to_string_pretty inserts a space after the colon, unlike compact serialization.
         assert!(json.contains("\"bases_modified\": 1"));
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -2116,8 +1670,6 @@ mod tests {
     #[test]
     fn corrections_are_keyed_by_reference_position() {
         // The single G error sits at reference position 2 (reads start at POS 0).
-        // Recording it in reference coordinates is what lets Task 7 mix
-        // length-changing indel edits into the same per-read payload (Task 8).
         let dir = std::env::temp_dir().join("himito_denoise_refcoord");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2143,14 +1695,7 @@ mod tests {
 
     #[test]
     fn corrections_use_reference_position_not_query_offset() {
-        // Reads aligned at POS 10 (not 0): the erroneous base sits at read/query
-        // offset 2, which maps to REFERENCE position 12 (10 + 2). At POS 0 those
-        // two numbers coincide (2 == 2), so a fixture like
-        // `corrections_are_keyed_by_reference_position` above cannot distinguish
-        // a reference-keyed implementation from a query-offset-keyed one -- both
-        // would record the key as 2. With a nonzero POS the two coordinate
-        // systems disagree (12 != 2), so asserting the recorded key is 12 (not
-        // 2) actually exercises the reference-coordinate semantics.
+        // Reads aligned at POS 10 (not 0): the erroneous base sits at read/query offset 2, which maps to REFERENCE position 12.
         let dir = std::env::temp_dir().join("himito_denoise_refcoord_nonzero_pos");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2172,18 +1717,14 @@ mod tests {
                 .unwrap();
 
         let edits = corr.get(&b"rerr".to_vec()).expect("rerr must be corrected");
-        // The recorded key must be the REFERENCE position (12), not the query
-        // offset (2) at which the erroneous base actually occurs in the read.
+        // The recorded key must be the REFERENCE position.
         assert_eq!(edits.subs, vec![(12u32, b'A')]);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn apply_corrections_missing_contig_writes_through_unchanged() {
-        // A record on a contig absent from `refs`, with a correction registered
-        // for its qname, must NOT be rewritten: fabricating a reference slice
-        // for a missing contig is unsafe once indel edits exist (the
-        // deletion-reversion path would splice `N` filler into real reads).
+        // A record on a contig absent from `refs`, with a correction registered for its qname, must NOT be rewritten.
         let dir = std::env::temp_dir().join("himito_denoise_missing_contig");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -2196,8 +1737,7 @@ mod tests {
             b"rerr".to_vec(),
             indel::ReadEdits { subs: vec![(2u32, b'A')], indels: vec![] },
         );
-        // Deliberately do NOT insert "chrM" -- simulates a BAM whose contig is
-        // missing from the supplied reference FASTA.
+        // Deliberately do NOT insert "chrM" -- simulates a BAM whose contig is missing from the supplied reference FASTA.
         let refs: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 
         let models = IndelModels::new();
@@ -2219,16 +1759,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // Reference shared by the indel wiring tests. Index map:
-    //   0-7   ACGTACGT
-    //   8-15  AAAAAAAA   (an 8bp homopolymer run)
-    //   16-28 CGTACGTACGTAC
-    // Long enough that the shipped default flank of 5 is satisfiable at the
-    // sites used below (normalized positions 7 and 19).
+    // Reference shared by the indel wiring tests.
     const REF29: &[u8] = b"ACGTACGTAAAAAAAACGTACGTACGTAC";
 
-    // Build a BAM whose reads carry explicit CIGARs, so indel-bearing reads can be
-    // constructed directly. Each read: (qname, pos, seq, cigar ops, reverse).
+    // Build a BAM whose reads carry explicit CIGARs, so indel-bearing reads can be constructed directly.
     fn write_cigar_bam(
         path: &Path,
         contig: &str,
@@ -2263,20 +1797,17 @@ mod tests {
         indel::IndelOpts { enabled: true, ..Default::default() }
     }
 
-    /// Plan 2026-09-26 T8: the same options with the generic HP length model on.
     fn indels_hp_on() -> indel::IndelOpts {
         indel::IndelOpts { enabled: true, hp_length_model: true, ..Default::default() }
     }
 
     const CLEAN_SEQ: &[u8] = b"ACGTACGTAAAAAAAACGTACGTACGTAC"; // == REF29, 29bp
-    // An extra A inside the run: 16M 1I 13M. Aligner anchors at index 15;
-    // normalization pulls the site to index 7.
+    // An extra A inside the run: 16M 1I 13M.
     const HP_INS_SEQ: &[u8] = b"ACGTACGTAAAAAAAAACGTACGTACGTAC"; // 30bp
     // A spurious G after index 18, in unique sequence: 19M 1I 10M.
     const UNIQ_INS_SEQ: &[u8] = b"ACGTACGTAAAAAAAACGTGACGTACGTAC"; // 30bp
 
-    // One A missing from the run: 8M 1D 20M. The deletion is already anchored on
-    // REF29[7], the run's normalized anchor. Plan 2026-09-26 T8e.
+    // One A missing from the run: 8M 1D 20M.
     const HP_DEL_SEQ: &[u8] = b"ACGTACGTAAAAAAACGTACGTACGTAC"; // 28bp
 
     fn clean_cigar() -> Vec<Cigar> { vec![Cigar::Match(29)] }
@@ -2311,9 +1842,7 @@ mod tests {
 
     #[test]
     fn site_depth_counts_each_spanning_read_exactly_once() {
-        // The double-count trap: a read carrying the insertion reports Indel::None at
-        // the normalized column (7) AND its insertion at the anchor column (15).
-        // Depth at site 7 must be 10 -- the number of spanning reads -- not 19.
+        // Double-count trap: the read reports Indel::None at the normalized column and its insertion at the anchor.
         let dir = std::env::temp_dir().join("himito_denoise_indel_depth");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2331,7 +1860,7 @@ mod tests {
         let (_, model) = list.iter().find(|(p, _)| *p == 7).expect("site at 7");
         let ins = indel::Allele::Ins(b"A".to_vec());
         let f_ins = model.kept.iter().find(|(a, _)| *a == ins).expect("insertion kept").1;
-        // 9 of 10 reads carry it. A double-counted denominator would give ~0.47.
+        // 9 of 10 reads carry it.
         assert!(
             (f_ins - 0.9).abs() < 1e-9,
             "insertion frequency should be 0.9, got {f_ins} (depth double-counted?)"
@@ -2342,12 +1871,7 @@ mod tests {
 
     #[test]
     fn hp_length_votes_give_the_same_site_frequencies_as_the_event_votes() {
-        // Plan 2026-09-26 T8b: with the HP length model on, pass 1 casts ONE vote per
-        // spanning read per HP site from `hp_allele` and skips the event-based votes
-        // that normalize there. Depth is untouched (it already uses the T3 gate), so
-        // the fixture from `site_depth_counts_each_spanning_read_exactly_once` -- 9
-        // reads carrying an extra A plus one clean read -- must produce the identical
-        // model: Ins("A") at 0.9 in an 8bp context.
+        // Depth is untouched: the model stays Ins("A") at 0.9 in an 8bp context.
         let dir = std::env::temp_dir().join("himito_denoise_indel_hp_votes");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2376,9 +1900,7 @@ mod tests {
             Some((16u32, b'A')),
             "site 7 must be recognized as the HP site of REF29's A-run"
         );
-        // Site 7 is the run's only normalized anchor: positions 8..=13 also have a
-        // >= 2bp A-run after them, but they are not left-normalized anchors, so
-        // admitting them would have the model rewrite one run through six sites.
+        // Site 7 is the run's only normalized anchor: positions 8..=13 also have a >= 2bp A-run after them.
         let hp_sites: Vec<u32> =
             list.iter().filter(|(_, m)| m.hp_run.is_some()).map(|(p, _)| *p).collect();
         assert_eq!(hp_sites, vec![7], "the A-run must yield exactly one HP site");
@@ -2387,18 +1909,7 @@ mod tests {
 
     #[test]
     fn an_undefined_hp_allele_does_not_count_as_reference_support() {
-        // Plan 2026-09-26 T8 (review fix 2): reference support at an HP site is the
-        // reads that actually testify to the REFERENCE length, i.e. `hp_allele ==
-        // Some(0)` -- not "everything depth counted that did not vote ALT".
-        // `hp_allele` returns `None` for a read that is UNINFORMATIVE about the run's
-        // length, and uninformative is not the same as reference.
-        //
-        // The two `rflank*` reads below are exactly that case, and they are the case
-        // the depth gate cannot catch: the A-run ends at 16, so pass 1's depth gate
-        // wants reference end >= 17 while `hp_allele`'s vote gate wants
-        // >= 16 + INDEL_FLANK = 21. A read ending at 18 sits between the two -- it is
-        // in depth, but it never saw enough of the right flank to have its length
-        // read off. Counting it as REF diluted the real insertion from 0.9 to 0.75.
+        // `hp_allele` returns `None` for a read that is UNINFORMATIVE about the run's length.
         let dir = std::env::temp_dir().join("himito_denoise_indel_hp_ref_support");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2409,7 +1920,6 @@ mod tests {
         // The ONLY read that observes the reference length.
         reads.push(("rdrop", 0, CLEAN_SEQ, clean_cigar(), false));
         // Reference end 18: past the depth gate (17), short of the vote gate (21).
-        // Strand balanced so they cannot perturb the strand-bias null.
         reads.push(("rflank0", 0, &CLEAN_SEQ[..18], vec![Cigar::Match(18)], false));
         reads.push(("rflank1", 0, &CLEAN_SEQ[..18], vec![Cigar::Match(18)], true));
         write_cigar_bam(&bam, "chrM", 29, &reads);
@@ -2442,15 +1952,7 @@ mod tests {
 
     #[test]
     fn site_depth_excludes_reads_that_end_inside_the_homopolymer() {
-        // Review 2026-09-25 T3: a read that ends INSIDE the A-run (8..=15) cannot
-        // testify to the run's length -- it is evidence for neither the reference
-        // length nor any indel of it -- yet pass 1 used to count it as a plain REF
-        // observation, diluting every real alt's VAF. Here 11 such reads are added
-        // to the same 9-carrier + `rdrop` fixture as
-        // `site_depth_counts_each_spanning_read_exactly_once`; the insertion's
-        // frequency at site 7 must stay 0.9. Before the fix it fell to 0.476, which
-        // in this 8bp context is below `vaf_floor(8)` (~0.513) -- so the real
-        // insertion was not merely diluted, it lost candidacy and was annihilated.
+        // Adding 11 such reads must keep the insertion frequency at site 7 at 0.9.
         let dir = std::env::temp_dir().join("himito_denoise_indel_depth_short");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2459,16 +1961,12 @@ mod tests {
             reads.push((n, 0, HP_INS_SEQ, hp_ins_cigar(), i % 2 == 0));
         }
         reads.push(("rdrop", 0, CLEAN_SEQ, clean_cigar(), false));
-        // Reference end 13: five bases into the run, so the run's true length is
-        // invisible to these reads. Strands balanced so they cannot perturb the
-        // strand-bias test either way.
+        // Reference end 13: five bases into the run, so the run's true length is invisible to these reads.
         const SHORT: [&str; 10] = ["s0","s1","s2","s3","s4","s5","s6","s7","s8","s9"];
         for (i, n) in SHORT.iter().enumerate() {
             reads.push((n, 0, &CLEAN_SEQ[..13], vec![Cigar::Match(13)], i % 2 == 0));
         }
-        // One non-spanning read that also CARRIES an extra A (13M 1I 1M, reference
-        // end 14): its ALT vote must be dropped by the same gate that drops its
-        // depth, and that drop must be booked in the new counter.
+        // One non-spanning read that also CARRIES an extra A (13M 1I 1M, reference end 14).
         let sins_seq: Vec<u8> = {
             let mut s = CLEAN_SEQ[..13].to_vec();
             s.push(b'A');
@@ -2513,18 +2011,7 @@ mod tests {
 
     #[test]
     fn alt_vote_is_gated_at_the_normalized_site_not_the_observed_column() {
-        // Review 2026-09-25 T3: the depth gate and the ALT-vote gate are anchored at
-        // DIFFERENT columns, because left-normalization moves the vote. `15M 1I 1M`
-        // from POS 0 anchors its insertion on REF29[14] -- the PENULTIMATE base of
-        // the A-run (8..=15) -- and reaches exclusive reference end 16. At the
-        // OBSERVED column 14 the following run is the lone A at 15, which
-        // `hp_tract_end` declines to call a run, so that column asks only for end
-        // >= 16: satisfied, and the read is counted in depth there. But the event
-        // left-normalizes to site 7, whose requirement is 16 + 1 = 17, so this read
-        // was NEVER in depth at 7. Charging the vote to 7 anyway makes `alt_total`
-        // exceed `depth` there -- tripping the `debug_assert!` in `fit_indel_site`
-        // under `cargo test`, and in release silently fabricating an insertion out
-        // of reads that never saw the run's length.
+        // `15M 1I 1M` from POS 0 anchors its insertion on REF29[14] -- the PENULTIMATE base of the A-run.
         let dir = std::env::temp_dir().join("himito_denoise_indel_vote_gate_norm_pos");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2571,13 +2058,7 @@ mod tests {
 
     #[test]
     fn indel_site_with_only_nonspanning_alt_votes_counts_dropped_depth() {
-        // Review 2026-09-25 T3: `15M 1I 1M` from POS 0 ends at exclusive reference
-        // coordinate 16. The inserted A left-normalizes onto site 7, and that
-        // site's A-run (REF29[8..=15]) requires end >= 17, so every vote is
-        // dropped. No read in this BAM reaches 17, so site 7 also has no spanning
-        // depth. The site counter must record that drop. It used to stay 0,
-        // because a site is inserted into `sites` only after a vote clears the
-        // same gate that depth uses, and the counter only looked there.
+        // The inserted A left-normalizes onto site 7, and that site's A-run requires end >= 17, so every vote is dropped.
         let dir = std::env::temp_dir().join("himito_denoise_indel_site_no_span");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2616,20 +2097,14 @@ mod tests {
 
     #[test]
     fn models_are_sorted_by_position_within_each_contig() {
-        // The record walk binary-searches this list; unsorted input silently drops
-        // sites from every read's span.
+        // The record walk binary-searches this list; unsorted input silently drops sites from every read's span.
         let dir = std::env::temp_dir().join("himito_denoise_indel_sorted");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
         let both: Vec<Cigar> = vec![
             Cigar::Match(16), Cigar::Ins(1), Cigar::Match(4), Cigar::Ins(1), Cigar::Match(9),
         ];
-        // Extra A in the run (site 7) AND a spurious G after index 19 (site 19).
-        // 16M consumes ref[0..16] (query "ACGTACGT"+"AAAAAAAA", 16bp) then Ins(1)
-        // inserts the extra A (anchor 15 -> normalizes to 7); 4M consumes ref[16..20]
-        // = "CGTA" (query); Ins(1) inserts the spurious G right after ref index 19
-        // (anchor 19, no normalization: refseq[19] == 'A' != 'G'); 9M consumes
-        // ref[20..29] = "CGTACGTAC". Query length = 16+1+4+1+9 = 31.
+        // Extra A in the run and a spurious G after index 19.
         let both_seq: &[u8] = b"ACGTACGTAAAAAAAAACGTAGCGTACGTAC"; // 31bp
         let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
         for (i, n) in NAMES.iter().enumerate() {
@@ -2641,13 +2116,7 @@ mod tests {
         let (_corr, models, _stats) =
             compute_corrections(&bam, &indel_refs(), 2, 0.01, SB_P, HOM_VAF, &indels_on()).unwrap();
         let list = models.get(&b"chrM".to_vec()).expect("chrM must have sites");
-        // Assert the exact expected positions rather than checking ascending order
-        // pairwise (the old form: `list.windows(2).all(|w| w[0].0 <= w[1].0)`):
-        // with only two elements, an unsorted 2-element list still satisfies
-        // pairwise ascending order about half the time by pure chance (whichever
-        // of the two orderings HashMap iteration happens to produce), so that
-        // check would pass about half the time even with the `sort_by_key`
-        // deleted.
+        // Assert the exact expected positions rather than checking ascending order pairwise: with only two elements.
         let positions: Vec<u32> = list.iter().map(|(p, _)| *p).collect();
         assert_eq!(positions, vec![7, 19], "sites must be exactly [7, 19], in that order");
         std::fs::remove_dir_all(&dir).ok();
@@ -2655,11 +2124,7 @@ mod tests {
 
     #[test]
     fn lone_spurious_insertion_is_removed_from_a_substitution_clean_column() {
-        // Every aligned base matches the reference, so `counts.non_ref() == 0` at
-        // every column and the SNV path skips them all. The lone spurious insertion
-        // must STILL be collected and corrected -- this is the early-continue trap.
-        // It is also the REF-only-site case: no alt allele clears candidacy, so the
-        // site keeps REF alone and the stray read must still be reverted.
+        // Every aligned base matches the reference, so `counts.non_ref() == 0` at every column and the SNV path skips them all.
         let dir = std::env::temp_dir().join("himito_denoise_indel_cleancol");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2693,16 +2158,14 @@ mod tests {
         }
         assert!(seen);
         assert_eq!(stats.reads_reassigned_indel_to_ref, 1);
-        // FIX 4: reverting a 1bp insertion removes 1 base from the read.
+        // reverting a 1bp insertion removes 1 base from the read.
         assert_eq!(stats.indel_bases_removed, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn homoplasmic_indel_survives_and_repairs_the_read_that_dropped_it() {
-        // 9 of 10 reads carry a 1bp insertion inside the 8bp A-run, so eps is large
-        // enough for the repair direction to fire (in unique sequence eps is 0.01 and
-        // a 10% REF allele correctly would NOT flip).
+        // 9 of 10 reads carry a 1bp insertion inside the 8bp A-run, so eps is large enough for the repair direction to fire.
         let dir = std::env::temp_dir().join("himito_denoise_indel_repair");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2738,9 +2201,7 @@ mod tests {
 
     #[test]
     fn read_ending_too_close_to_a_site_is_skipped_by_the_flank_guard() {
-        // Same 90%-insertion site (normalized position 7), but the read that dropped
-        // the insertion is aligned 0..14 -- it ends before 7 + flank(5) + max_len(5)
-        // = 17, so the rewrite walk would lack the match context it needs.
+        // Same site, but the read that dropped the insertion ends before the needed match context.
         let dir = std::env::temp_dir().join("himito_denoise_indel_guard");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2773,26 +2234,12 @@ mod tests {
 
     #[test]
     fn read_carrying_an_oversized_indel_is_not_assigned_nearby() {
-        // IMPORTANT 3: the original version of this fixture placed the site in
-        // UNIQUE sequence (context_len = 1, eps = 0.01). There, for a Ref-observing
-        // read MAP already returns Keep on the arithmetic alone (0.1 * 0.99 = 0.099
-        // beats 0.9 * 0.01 = 0.009), so the `blocked` mask is never even reached --
-        // the assertion held identically with the mask deleted.
-        //
-        // This version places the site inside the 8bp A-run (site 7), where eps is
-        // large enough that a Ref-observing read WOULD genuinely be repaired into
-        // the kept 90% insertion without the mask: eps(8) ~= 0.171, and
-        // 0.9 * 0.171 = 0.154 beats 0.1 * 0.829 = 0.083 (identical arithmetic to
-        // `near_homoplasmic_site_repairs_reads_that_dropped_the_indel` in
-        // indel.rs). `rbig` observes plain Ref at site 7 (its own event is
-        // elsewhere), so only the oversized-neighbor mask -- not the assignment
-        // math -- can be what leaves it untouched.
+        // IMPORTANT 3: the original version of this fixture placed the site in UNIQUE sequence (context_len = 1, eps = 0.01).
         let dir = std::env::temp_dir().join("himito_denoise_indel_large");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
         let outb = dir.join("out.bam");
-        // ref[0..9] + 6 spurious G's (oversized, anchor = 8, inside the run) +
-        // ref[9..29]. `rbig` carries no event of its own at site 7.
+        // ref[0..9] + 6 spurious G's (oversized, anchor = 8, inside the run) + ref[9..29].
         let mut big_seq: Vec<u8> = Vec::new();
         big_seq.extend_from_slice(&REF29[0..9]);
         big_seq.extend_from_slice(b"GGGGGG");
@@ -2837,23 +2284,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- CRITICAL 1 regression: normalized position vs CIGAR anchor mismatch ----
+    // ---- normalized position vs CIGAR anchor mismatch ----
 
     #[test]
     fn spurious_homopolymer_insertion_is_reverted_using_its_own_cigar_anchor() {
-        // 9 clean reads plus one (`rspur`) carrying a lone extra A inside the 8bp
-        // A-run, anchored by the aligner at reference index 15 (`HP_INS_SEQ`),
-        // which left-normalizes to site 7. The aligner's own CIGAR anchor (15)
-        // and the normalized site (7) genuinely differ here -- unlike every other
-        // pre-existing rewrite fixture, which sits in unique sequence where the
-        // two coincide.
-        //
-        // Before CRITICAL 1's fix, `apply_corrections` emitted the `IndelEdit`
-        // keyed at the NORMALIZED position (7). `rewrite_read` looks an `Ins`
-        // reversion up via `last_ref` -- the read's own CIGAR anchor (15) -- so
-        // the lookup at 7 found nothing and the `Ins` op was copied verbatim: a
-        // silent no-op that still incremented `reads_reassigned_indel_to_ref`.
-        // This test asserts the actual SEQ/CIGAR, not just the counter.
+        // 9 clean reads plus one carrying a lone extra A inside the 8bp A-run, anchored by the aligner at reference index 15.
         let dir = std::env::temp_dir().join("himito_denoise_indel_anchor_mismatch");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -2891,34 +2326,22 @@ mod tests {
         }
         assert!(seen);
         assert_eq!(stats.reads_reassigned_indel_to_ref, 1);
-        // FIX 4: this revert removes the 1 spurious base from the read; before
-        // FIX 4 `indel_bases_removed` stayed 0 for exactly this transition.
+        // this revert removes the 1 spurious base from the read.
         assert_eq!(stats.indel_bases_removed, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- CRITICAL 2 regression: depth/ALT sourced inconsistently across span ----
+    // ---- depth/ALT sourced inconsistently across span ----
 
     #[test]
     fn indel_event_normalizing_outside_its_own_span_is_not_fabricated_into_a_site() {
-        // Four reads start at POS 10 -- inside the 8bp A-run (ref idx 8..=15) --
-        // and each carries an extra A anchored at ref idx 10 (inside their own
-        // aligned span). `normalize_left` walks the reference with no knowledge
-        // of read boundaries and pulls the event back to site 7, which lies
-        // BEFORE these reads' own start (10). Without the span check, this
-        // fabricates ALT support at site 7 for reads that never covered it: the
-        // per-column depth at site 7 (contributed only by the one fully-spanning
-        // read below) stays small while alt_total grows unbounded, letting
-        // alt_total exceed depth (the `debug_assert!` CRITICAL 2's probe tripped)
-        // and, in release, fabricating a homoplasmic insertion that would splice
-        // into the one genuinely reference-matching read.
+        // Four reads start at POS 10 -- inside the 8bp A-run -- and each carries an extra A anchored at ref idx 10.
         let dir = std::env::temp_dir().join("himito_denoise_indel_out_of_span");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
         let outb = dir.join("out.bam");
 
-        // seq = ref[10] + inserted 'A' + ref[11..29]; anchor = 10, inside this
-        // read's own span [10, 29) -- but normalizes to site 7, outside it.
+        // seq = ref[10] + inserted 'A' + ref[11..29]; anchor = 10.
         let mut seq: Vec<u8> = Vec::new();
         seq.push(REF29[10]);
         seq.push(b'A');
@@ -2926,10 +2349,7 @@ mod tests {
         let cigar = vec![Cigar::Match(1), Cigar::Ins(1), Cigar::Match(18)];
 
         let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
-        // One read spanning the WHOLE contig, clean, reference-matching -- this
-        // is the read that must come out unchanged. Written first: the pileup
-        // requires coordinate-sorted input, and this read's POS (0) precedes
-        // the others' (10).
+        // One read spanning the WHOLE contig, clean, reference-matching -- this is the read that must come out unchanged.
         reads.push(("rfull", 0, CLEAN_SEQ, clean_cigar(), false));
         for (i, n) in ["r0", "r1", "r2", "r3"].iter().enumerate() {
             reads.push((n, 10, seq.as_slice(), cigar.clone(), i % 2 == 0));
@@ -2945,11 +2365,7 @@ mod tests {
             stats.indel_events_out_of_span, 4,
             "all four out-of-span votes must be dropped and counted"
         );
-        // This fixture's only would-be evidence for site 7 is the four dropped
-        // votes above, so with them correctly rejected "chrM" has no entry in
-        // `models` at all -- assert that absence explicitly instead of nesting
-        // the check inside an `if let Some(list)` that never runs (and so never
-        // exercises this assertion) on this fixture.
+        // This fixture's only would-be evidence for site 7 is the four dropped votes above.
         let no_site_7 = models
             .get(&b"chrM".to_vec())
             .map_or(true, |list| list.iter().all(|(p, _)| *p != 7));
@@ -2970,30 +2386,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- task-8 review round: closing fixes ----
+    // ---- pass-2 per-read vote cap and edit guards ----
 
-    // A read whose own insertion (anchor 8) and deletion (anchor 12) BOTH
-    // left-normalize to site 7 -- short tandem repeats (the mito CA/poly-C
-    // tracts this feature targets) are exactly where an insertion and a
-    // deletion coexist in one read's own CIGAR. `dup_cigar`'s net length
-    // change is zero (a +1bp insertion offset by a -1bp deletion in the same
-    // A-run), so its SEQ is byte-identical to CLEAN_SEQ even though its CIGAR
-    // is not a plain 29M.
+    // A read whose own insertion and deletion BOTH left-normalize to site 7 -- short tandem repeats are exactly.
     fn dup_cigar() -> Vec<Cigar> {
         vec![Cigar::Match(9), Cigar::Ins(1), Cigar::Match(4), Cigar::Del(1), Cigar::Match(15)]
     }
 
     #[test]
     fn read_casting_two_events_that_normalize_to_the_same_site_votes_once() {
-        // FIX 1: without a per-read cap, `rdup` would cast TWO ALT votes at
-        // site 7 (one for its Ins("A"), one for its Del(1)) while depth counts
-        // it once, letting `alt_total` exceed `depth` -- the invariant probed
-        // by `debug_assert!(site.alt_total() <= site.depth)` in indel.rs. With
-        // this fixture's depth (10) that assert would NOT fire even with the
-        // cap removed (alt_total tops out at 2, well under depth), so merely
-        // completing in a debug build proves nothing either way; the obs_vaf
-        // assertions below are the real proof, verifying the SECOND vote
-        // (Del(1)) never landed at all, not merely that some counter moved.
+        // without a per-read cap, `rdup` would cast TWO ALT votes at site 7 (one for its Ins("A"), one for its Del(1)).
         let dir = std::env::temp_dir().join("himito_denoise_indel_dup_site_vote");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -3029,12 +2431,7 @@ mod tests {
 
     #[test]
     fn read_with_ambiguous_carried_events_at_one_site_is_left_untouched() {
-        // FIX 5: in pass 2 (the per-read record walk), `rdup`'s own CIGAR
-        // produces TWO different events (Ins("A") and Del(1)) that both
-        // normalize to site 7. Before FIX 5, `carried.insert` silently kept
-        // only the second one, so the read would be treated as carrying an
-        // allele it did not unambiguously carry. The read must instead be
-        // left completely untouched at this site.
+        // In pass 2, `rdup`'s CIGAR yields two different events that both normalize to site 7.
         let dir = std::env::temp_dir().join("himito_denoise_indel_ambiguous_carry");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -3076,16 +2473,7 @@ mod tests {
 
     #[test]
     fn gained_insertion_at_a_column_the_read_deletes_is_rejected() {
-        // FIX 2: `rdel3`'s own D(3) is anchored at 9; this fixture's reference
-        // is a 30bp homopolymer, so left-normalization pulls it all the way to
-        // 0. Either way `carried` has no entry at the decided site 12 -- the
-        // read is treated as observing plain Ref there. Before FIX 2, the
-        // contiguous-match-run check fired only for a gained DELETION target;
-        // a gained INSERTION at ref pos 12 sailed through even though `rdel3`
-        // has NO aligned query base at 12 at all (it falls inside `rdel3`'s own
-        // deletion). `rewrite_read`'s Match arm never visits cur == 12 for this
-        // read, so the edit would be a silent no-op while the reassignment and
-        // base-inserted counters still climbed.
+        // `rdel3`'s own D(3) is anchored at 9; this fixture's reference is a 30bp homopolymer.
         let dir = std::env::temp_dir().join("himito_denoise_indel_gained_ins_in_own_del");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -3099,11 +2487,6 @@ mod tests {
         let mut refs = HashMap::new();
         refs.insert(b"chrM".to_vec(), vec![b'A'; 30]);
 
-        // Hand-built decided site at position 12 (inside `rdel3`'s own
-        // deletion): Ins("A") dominates 90/10 over Ref, with eps large enough
-        // that MAP assignment genuinely wants to move a Ref-observing read to
-        // the insertion (same arithmetic shape used by the other hand-built
-        // guard-regression fixtures in this module).
         let model = indel::IndelSiteModel {
             kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
             eps: 0.15,
@@ -3111,7 +2494,6 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
             strand_rejected: vec![],
-            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
             hp_run: None,
         };
         let mut models = IndelModels::new();
@@ -3140,11 +2522,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // Review 2026-09-25 T3: hand-built decided site shared by the two siblings
-    // below. Site 7 sits before REF29's 8bp A-run; Ins("A") dominates 90/10 over
-    // Ref, and `obs_vaf(Ref) = 0.1` is below `protect_vaf`, so MAP assignment
-    // genuinely wants to move a Ref-observing read onto the insertion. Whether it
-    // may is then decided purely by the span guard.
+    // Site 7 sits before REF29's 8bp A-run; Ins("A") dominates 90/10 over Ref.
     fn hp_ins_site_model() -> indel::IndelSiteModel {
         indel::IndelSiteModel {
             kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
@@ -3153,16 +2531,12 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
             strand_rejected: vec![],
-            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
             hp_run: None,
         }
     }
 
-    /// Plan 2026-09-26 T8d: hand-built HP site at REF29's A-run. Del(1) dominates
-    /// 0.89/0.11 over Ref, `Ins("A")` is a lone single-stranded observation that the
-    /// per-strand gate rejected (so `protect_vaf` does not shield it), and `hp_run`
-    /// marks the site as a length. The event-based model refuses `Ins -> Del`; the
-    /// length model must move it.
+    /// Del(1) dominates 0.89/0.11 over Ref.
+    /// The event-based model refuses `Ins -> Del`; the length model must move it.
     fn hp_del_site_model() -> indel::IndelSiteModel {
         let ins = indel::Allele::Ins(b"A".to_vec());
         indel::IndelSiteModel {
@@ -3182,12 +2556,7 @@ mod tests {
 
     #[test]
     fn hp_site_move_rewrites_the_run_and_drops_substitutions_inside_it() {
-        // Plan 2026-09-26 T8d: an `Ins(1)` read at an HP site keeping `Del(1)`. The
-        // rewrite is done by `rewrite_hp_run` BEFORE `rewrite_read` and never enters
-        // `edits.indels`, so reference coordinates are unchanged and the read comes
-        // out as the canonical left-aligned 8M 1D 20M. A substitution correction
-        // inside the run is dropped -- the run is rewritten wholesale, so its query
-        // offsets no longer mean what pass 1 recorded them against.
+        // The rewrite is done by `rewrite_hp_run` BEFORE `rewrite_read` and never enters `edits.indels`.
         let dir = std::env::temp_dir().join("himito_denoise_indel_hp_move");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -3261,10 +2630,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Plan 2026-09-26 T8e: 8 reads carrying `Del(1)` in REF29's A-run (strand
-    /// balanced 4/4), one carrying `Ins(1)`, one clean. The site keeps `Del(1)`, so
-    /// the lone `Ins(1)` read carries a length nobody else has and a ±1 miscall "in
-    /// the wrong direction" is exactly what it is.
+    /// The site keeps `Del(1)`, so the lone `Ins(1)` read carries a length nobody else has.
     fn hp_wrong_direction_reads() -> Vec<(&'static str, i64, &'static [u8], Vec<Cigar>, bool)> {
         let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
         for (i, n) in NAMES[..8].iter().enumerate() {
@@ -3275,8 +2641,7 @@ mod tests {
         reads
     }
 
-    /// The read's SEQ length must equal the query consumption of its CIGAR -- the
-    /// check `samtools quickcheck`/`view` applies to every record.
+    /// SEQ length must equal the CIGAR's query consumption, as `samtools quickcheck` requires.
     fn assert_samtools_valid(rec: &Record) {
         let query: u32 = rec
             .cigar()
@@ -3322,8 +2687,7 @@ mod tests {
 
     #[test]
     fn hp_wrong_direction_read_is_refused_with_the_model_off() {
-        // Today's behaviour, pinned: `Ins(1)` -> `Del(1)` is cross-kind, which
-        // `rewrite_read` cannot express, so the read is left untouched and counted.
+        // Today's behaviour, pinned: `Ins(1)` -> `Del(1)` is cross-kind, which `rewrite_read` cannot express.
         let dir = std::env::temp_dir().join("himito_denoise_indel_hp_e2e_off");
         let (stats, out) = run_denoise_pair(&dir, &indels_on());
 
@@ -3340,10 +2704,7 @@ mod tests {
 
     #[test]
     fn hp_wrong_direction_read_is_corrected_with_the_model_on() {
-        // Plan 2026-09-26 T8e: the same fixture, with `--indel-hp-length-model`. The
-        // `Ins(1)` read is rewritten to the site's kept length, in canonical
-        // left-aligned form, and the clean read -- which the site also wants at
-        // `Del(1)` -- comes out identical to it.
+        // The `Ins(1)` read is rewritten to the site's kept length, in canonical left-aligned form.
         let dir = std::env::temp_dir().join("himito_denoise_indel_hp_e2e_on");
         let (stats, out) = run_denoise_pair(&dir, &indels_hp_on());
 
@@ -3376,12 +2737,7 @@ mod tests {
 
     #[test]
     fn gained_insertion_is_rejected_when_the_read_stops_short_of_the_run_plus_flank() {
-        // Review 2026-09-25 T3: `rshort` ends at reference 18 -- only 2 bases past
-        // the A-run (8..=15). The OLD guard asked only for `flank + max_len` past
-        // the site (7 + 10 = 17 <= 18), so this read was rewritten on the strength
-        // of a run it barely saw the end of and has no flank beyond. The tract
-        // bound requires the whole run plus the usual 5bp of match context
-        // (16 + 5 = 21 > 18), so it must now be skipped.
+        // The OLD guard asked only for `flank + max_len` past the site.
         let dir = std::env::temp_dir().join("himito_denoise_indel_short_of_tract");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -3424,11 +2780,7 @@ mod tests {
 
     #[test]
     fn gained_insertion_is_applied_when_the_read_spans_the_run_plus_flank() {
-        // Review 2026-09-25 T3: positive control for the sibling above -- the tract
-        // bound must block reads that stop short, not every read. `rspan` ends at
-        // reference 22 >= 16 + 5, so the SAME decided site still rewrites it.
-        // It needs its own `apply_corrections` call: put both reads in one BAM and
-        // `reads_modified` is nonzero, so the sibling's assertion could not hold.
+        // `rspan` ends at reference 22 >= 16 + 5, so the SAME decided site still rewrites it.
         let dir = std::env::temp_dir().join("himito_denoise_indel_spans_tract");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -3467,13 +2819,7 @@ mod tests {
 
     #[test]
     fn gained_deletion_needing_exactly_the_old_bound_is_now_rejected() {
-        // FIX 4: the match-run bound for a gained Del(m) must be `m + flank + 1`
-        // (anchor base emitted first, then `m` deleted bases, then `flank`
-        // genuine right-hand flank matches) -- the OLD bound `m + flank` was one
-        // short. Here `rguard`'s first Match run has length exactly 25, so from
-        // site 18 the remaining run is exactly 7 == m(2) + flank(5): the OLD
-        // bound (>= 7) would have let this through with one fewer flank base
-        // than the design requires; the NEW bound (>= 8) correctly rejects it.
+        // the match-run bound for a gained Del(m) must be `m + flank + 1` -- the OLD bound `m + flank` was one short.
         let dir = std::env::temp_dir().join("himito_denoise_indel_offbyone_bound");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -3493,7 +2839,6 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(2), 0.9)],
             strand_rejected: vec![],
-            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
             hp_run: None,
         };
         let mut models = IndelModels::new();
@@ -3522,9 +2867,7 @@ mod tests {
 
     #[test]
     fn shrinking_a_deletion_is_counted_as_bases_inserted_not_removed() {
-        // FIX 3: `Del(3) -> Del(1)` splices 2 reference bases BACK INTO the
-        // read (an insertion of read bases), so it must be booked as
-        // `indel_bases_inserted += 2`, not `indel_bases_removed`.
+        // `Del(3) -> Del(1)` splices 2 reference bases BACK INTO the read.
         let dir = std::env::temp_dir().join("himito_denoise_indel_shrink_counter");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -3535,18 +2878,12 @@ mod tests {
         let cigar = vec![Cigar::Match(10), Cigar::Del(3), Cigar::Match(10)];
         write_cigar_bam(&inb, "chrM", 40, &[("rshrink", 0, seq.as_slice(), cigar.clone(), false)]);
 
-        // NOT a uniform-base reference: a homopolymer run would left-normalize
-        // this read's own Del(3) all the way to position 0 (refseq[a] ==
-        // refseq[a+3] at every a), moving it away from anchor 9 entirely and
-        // breaking this fixture's premise. A repeating ACGT reference keeps
-        // refseq[9] ('C') != refseq[12] ('A'), so normalization halts immediately.
+        // NOT a uniform-base reference: a homopolymer run would left-normalize this read's own Del(3) all the way to position 0.
         let refseq: Vec<u8> = (0..40).map(|i| b"ACGT"[i % 4]).collect();
         let mut refs = HashMap::new();
         refs.insert(b"chrM".to_vec(), refseq);
 
-        // Decided site at 9 (this read's own anchor): Del(1) dominates 90/10
-        // over Ref, so the read's carried Del(3) snaps down to the kept Del(1)
-        // -- a shrink, not a revert to Ref.
+        // Decided site at 9: Del(1) dominates 90/10 over Ref.
         let model = indel::IndelSiteModel {
             kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(1), 0.9)],
             eps: 0.15,
@@ -3554,7 +2891,6 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(1), 0.9)],
             strand_rejected: vec![],
-            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
             hp_run: None,
         };
         let mut models = IndelModels::new();
@@ -3592,15 +2928,7 @@ mod tests {
 
     #[test]
     fn gained_deletion_swallows_a_decided_site_inside_its_own_span() {
-        // FIX 6: a GAINED Del(3) at site 5 consumes reference positions 6..=8
-        // once `rewrite_read` applies it (the Match arm jumps `k += m` past
-        // them in one step). A second decided site at 7 -- inside that span --
-        // must not get an edit emitted for `rboth`: before FIX 6, the edit
-        // would be silently dropped by `rewrite_read` anyway (the invariant is
-        // preserved), but `reads_reassigned_ref_to_ins` and
-        // `indel_bases_inserted` would still have climbed for an edit that was
-        // never actually written -- the same "silent no-op, inflated counters"
-        // signature as CRITICAL 1.
+        // A gained Del(3) at site 5 consumes reference positions 6..=8 once applied.
         let dir = std::env::temp_dir().join("himito_denoise_indel_swallowed_span");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -3610,15 +2938,7 @@ mod tests {
         let cigar = vec![Cigar::Match(30)];
         write_cigar_bam(&inb, "chrM", 40, &[("rboth", 0, seq.as_slice(), cigar.clone(), false)]);
 
-        // Review 2026-09-25 T3: this fixture used a uniform 40bp `A` reference, which
-        // is one 40bp homopolymer -- and `rboth` ends at 30, INSIDE it. The tract span
-        // guard now (correctly) refuses to rewrite a read that cannot see the end of
-        // the run it would be edited in, which would make this fixture unreachable
-        // rather than testing FIX 6. A repeating ACGT reference keeps every run 1bp
-        // long, so the tract bound is satisfied and the swallowed-site behavior under
-        // test is exercised exactly as before. (`rboth`'s SEQ deliberately stays all
-        // `A`: the rewrite walk is driven by the CIGAR, not base identity, same as the
-        // sibling fixture above.)
+        // The tract span guard refuses to rewrite a read that cannot see the end of the run.
         let refseq: Vec<u8> = (0..40).map(|i| b"ACGT"[i % 4]).collect();
         let mut refs = HashMap::new();
         refs.insert(b"chrM".to_vec(), refseq);
@@ -3631,13 +2951,9 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(3), 0.9)],
             strand_rejected: vec![],
-            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
             hp_run: None,
         };
-        // Site 7 (inside site 5's Del(3) span, 6..=8): Ref -> Ins("A")
-        // dominates 90/10. If reached, MAP assignment would genuinely want to
-        // move this read here too -- the point of FIX 6 is that it must never
-        // be reached at all for this read.
+        // Site 7 (inside site 5's Del(3) span, 6..=8): Ref -> Ins("A") dominates 90/10.
         let ins_model = indel::IndelSiteModel {
             kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
             eps: 0.15,
@@ -3645,7 +2961,6 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Ins(b"A".to_vec()), 0.9)],
             strand_rejected: vec![],
-            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
             hp_run: None,
         };
         let mut models = IndelModels::new();
@@ -3668,9 +2983,7 @@ mod tests {
         let rec = r.records().next().unwrap().unwrap();
         assert_eq!(
             rec.cigar().take(),
-            // `rewrite_read`'s Match arm emits the anchor base itself (ref pos
-            // 5) as part of the preceding Match run BEFORE splicing in the
-            // deletion, so positions 0..=5 (6 bases) merge into one Match op.
+            // The Match arm emits the anchor base in the preceding Match run before splicing in the deletion.
             CigarString(vec![Cigar::Match(6), Cigar::Del(3), Cigar::Match(21)]),
             "only the site-5 deletion may appear; no insertion from site 7"
         );
@@ -3689,20 +3002,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- FIX 2 regression: a read's own D/N covering the normalized column ----
+    // ---- a read's own D/N covering the normalized column ----
 
     #[test]
     fn read_deleting_the_normalized_column_does_not_cast_a_phantom_alt_vote() {
-        // Depth is only incremented where a read has qpos().is_some() -- never
-        // inside that SAME read's own D/N. `rdel` deletes reference column 7
-        // (Match(7) + Del(1)) and, separately, carries a spurious insertion
-        // inside the downstream A-run (anchor 15) that left-normalizes to
-        // that very column 7. `rdel`'s own [pos, end_pos()) span covers
-        // column 7 (via the deletion), so the OLD span check would have
-        // accepted this as an ALT vote there with no matching depth --
-        // alt_total could exceed depth in miniature, CRITICAL 2's failure
-        // mode reappearing. The new contiguous-match-run check must reject
-        // it, because `rdel` has no aligned M/=/X base at column 7 at all.
+        // Depth is only incremented where a read has qpos().is_some() -- never inside that SAME read's own D/N.
         let dir = std::env::temp_dir().join("himito_denoise_indel_deletes_own_norm_col");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -3736,19 +3040,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- FIX 3 regression: a gained deletion must fit inside ONE match run ----
+    // ---- a gained deletion must fit inside ONE match run ----
 
     #[test]
     fn gained_deletion_is_skipped_when_its_own_match_run_is_too_short() {
         // The span/flank guard bounds only the read's OVERALL alignment span.
-        // Read `rguard`'s alignment is 0..33 overall -- comfortably inside
-        // flank(5)+reach(10) of the decided site at 18 -- but its FIRST
-        // Match run ends at ref pos 20, only 2 bases past the site, because
-        // of an unrelated RefSkip further along. A gained Del(2) at 18 needs
-        // a contiguous match run of at least m(2)+flank(5)=7 bases from the
-        // site; this read only has 2, so it must be skipped, not truncated
-        // (the old guard alone would have let `rewrite_read`'s Match arm
-        // walk `k + m` past its op length).
         let dir = std::env::temp_dir().join("himito_denoise_indel_shortrun");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -3761,12 +3057,7 @@ mod tests {
         let mut refs = HashMap::new();
         refs.insert(b"chrM".to_vec(), vec![b'A'; 40]);
 
-        // Hand-built decided site at position 18: Del(2) dominates 90/10 over
-        // Ref, with eps large enough that MAP assignment genuinely wants to
-        // move a Ref-observing read to Del(2) (same arithmetic shape as
-        // `near_homoplasmic_site_repairs_reads_that_dropped_the_indel` in
-        // indel.rs). Hand-building this model bypasses the pileup/candidacy
-        // machinery entirely, which is irrelevant to what this test checks.
+        // Hand-built decided site at position 18: Del(2) dominates 90/10 over Ref.
         let model = indel::IndelSiteModel {
             kept: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(2), 0.9)],
             eps: 0.15,
@@ -3774,7 +3065,6 @@ mod tests {
             strand_biased: 0,
             obs_vaf: vec![(indel::Allele::Ref, 0.1), (indel::Allele::Del(2), 0.9)],
             strand_rejected: vec![],
-            // Plan 2026-09-26 T8: these fixtures exercise the EVENT-based model.
             hp_run: None,
         };
         let mut models = IndelModels::new();
@@ -3805,18 +3095,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- FIX 4 regression: revert-direction base counts ----
+    // ---- revert-direction base counts ----
 
     #[test]
     fn lone_spurious_deletion_is_reverted_and_counted_as_bases_inserted() {
-        // `Del(n)->Ref` restores n bases to the read but was not being counted
-        // in `indel_bases_inserted`. Mirrors
-        // `lone_spurious_insertion_is_removed_from_a_substitution_clean_column`
-        // but with a deletion: a single read carries a spurious 1bp deletion in
-        // unique sequence; candidacy rejects it (a lone single-strand
-        // observation fails min_strand), but the stray read must still be
-        // repaired back to REF, and that repair must show up as 1 restored
-        // (inserted) base.
+        // `Del(n)->Ref` restores n bases to the read but was not being counted in `indel_bases_inserted`.
         let dir = std::env::temp_dir().join("himito_denoise_indel_lone_del");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -3825,9 +3108,7 @@ mod tests {
         for (i, n) in NAMES.iter().enumerate() {
             reads.push((n, 0, CLEAN_SEQ, clean_cigar(), i % 2 == 0));
         }
-        // ref[0..7) + (skip ref[7]) + ref[8..29): a 1bp deletion anchored at 6,
-        // in the unique prefix, far enough from both read ends to clear the
-        // span/flank guard.
+        // ref[0..7) + ref[8..29): a 1bp deletion anchored at 6.
         let mut del_seq: Vec<u8> = Vec::new();
         del_seq.extend_from_slice(&REF29[0..7]);
         del_seq.extend_from_slice(&REF29[8..29]);
@@ -3863,10 +3144,7 @@ mod tests {
 
     #[test]
     fn apply_corrections_treats_mapped_record_with_no_contig_like_missing_ref() {
-        // A mapped record with tid == -1 is a degenerate BAM state. Casting -1 to
-        // u32 and calling `tid2name` on it is an unchecked pointer offset in
-        // rust-htslib; it must be guarded and the record written through
-        // unchanged, exactly like the missing-reference-contig path.
+        // A mapped record with tid == -1 is a degenerate BAM state.
         let dir = std::env::temp_dir().join("himito_denoise_tidless");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -3882,8 +3160,7 @@ mod tests {
             let seq = b"AAAAAA";
             let quals = vec![30u8; 6];
             rec.set(b"rtidless", Some(&CigarString(vec![Cigar::Match(6)])), seq, &quals);
-            // Deliberately do NOT set_tid: tid stays -1 (Record::new()'s default),
-            // but clearing the unmapped flag makes this record "correctable".
+            // Deliberately do NOT set_tid: tid stays -1 (Record::new()'s default).
             rec.unset_unmapped();
             w.write(&rec).unwrap();
         }
@@ -3902,22 +3179,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- FIX 1 (task-9 review round): drive statistics from what was
-    // APPLIED, not what was intended ----
+    // ---- drive statistics from what was
 
     #[test]
     fn edit_emitted_for_an_unreachable_ref_pos_is_a_harmless_missed_correction() {
-        // The regression guard for the whole class of bugs FIX 1 closes: pass
-        // 2 must PREDICT what `rewrite_read`'s walk will do with an edit, and
-        // three separate review rounds each found one instance of that
-        // prediction being wrong (CRITICAL 1, FIX 2, FIX 6). Rather than trust
-        // that every future instance will be caught by name, this test
-        // bypasses pass 2's own guards entirely and hand-feeds
-        // `apply_corrections` an edit keyed at a reference position that the
-        // walk can NEVER visit: ref_pos 11, inside `rvictim`'s own deletion
-        // span [10, 13) (`10M 3D 10M`). The Match arm's walk only ever visits
-        // `cur` in 0..10 and 13..23, so this edit is unreachable by
-        // construction, no matter which guard would normally have caught it.
+        // Rather than trust that every future instance will be caught by name.
         let dir = std::env::temp_dir().join("himito_denoise_indel_unreachable_edit");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -3964,26 +3230,13 @@ mod tests {
         assert_eq!(stats.reads_reassigned_indel_to_indel, 0);
         assert_eq!(stats.indel_bases_inserted, 0);
         assert_eq!(stats.indel_bases_removed, 0);
-        // `.iter().all(|&c| c == 0)` on an EMPTY vector is vacuously true --
-        // this test's edit is hand-fed straight into `apply_corrections`,
-        // bypassing pass 2's own assignment loop entirely, so the
-        // `reassignments_by_hp_length` resize-and-increment (which only runs
-        // once an edit is booked as APPLIED) never executes and the vector
-        // never grows past its `DenoiseStats::default()` length of 0. Assert
-        // that length directly so a future regression that starts booking
-        // this edit (and pushes SOME nonzero bucket) is actually caught,
-        // instead of trivially passing an `all()` over nothing (FIX 3).
+        // The edit is hand-fed to `apply_corrections`, so the by-length vector stays empty.
         assert_eq!(
             stats.reassignments_by_hp_length.len(),
             0,
             "no hp-length bucket may exist -- none may have been touched"
         );
-        // FIX 3: also confirm this edit bypassed EVERY pass-2 guard, not just
-        // that the net reassignment counters are zero -- proving it was
-        // rejected by `rewrite_read` itself (unreachable `ref_pos`), rather
-        // than by one of pass 2's own skip counters, which this hand-fed
-        // edit never passes through at all (this test calls
-        // `apply_corrections` directly with an empty `IndelModels`).
+        // also confirm this edit bypassed EVERY pass-2 guard.
         assert_eq!(stats.assignments_skipped_span_guard, 0);
         assert_eq!(stats.assignments_skipped_unsupported_transition, 0);
         assert_eq!(stats.assignments_skipped_oversized_neighbor, 0);
@@ -3996,29 +3249,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- FIX 2 (task-10 review round): duplicate emitted edits must not be
-    // double-counted ----
+    // ---- duplicate emitted edits must not be
 
     #[test]
     fn two_emitted_edits_sharing_ref_pos_and_kind_are_not_double_counted() {
-        // Same CIGAR shape as CRITICAL 1's regression test in rewrite.rs --
-        // 10M 1I 2D 1I 10M, where both `Ins` ops share ONE lookup key because
-        // nothing but a `D` separates them and `last_ref` is only updated by
-        // the Match arm -- but here pass 2's OWN construction is bypassed
-        // (via a hand-fed `Corrections` + empty `IndelModels`, exactly like
-        // the test above) to feed `apply_corrections` TWO real `IndelEdit`s
-        // that legitimately share `(ref_pos, kind)`: this is exactly what
-        // pass 2 emits when a read's two same-anchor events normalize to two
-        // DIFFERENT sites that BOTH independently decide to revert.
-        //
-        // FIX 1 (final-review round): `rewrite_read`'s internal map
-        // construction keeps the FIRST of the two entries and lets the
-        // second surface through `indel_edits_emitted_but_not_applied` --
-        // deterministically, in BOTH profiles, now that the debug-only
-        // panic that used to guard this exact collision is gone (see the
-        // sibling `duplicate_ref_pos_and_kind_keeps_the_first_edit_and_never_panics`
-        // test in rewrite.rs, which this test used to be split against by
-        // `#[cfg(debug_assertions)]` / `#[cfg(not(debug_assertions))]`).
         let dir = std::env::temp_dir().join("himito_denoise_indel_duplicate_emitted_edit");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -4070,9 +3304,7 @@ mod tests {
         assert_eq!(proc, 1);
         assert_eq!(modified, 1, "one of the two Ins ops must actually be reverted");
 
-        // Exactly one of the two duplicate-keyed edits is booked as applied;
-        // the other must be correctly reported as not applied, NOT double
-        // booked as a second reassignment for the same physical correction.
+        // Exactly one of the two duplicate-keyed edits is booked as applied.
         assert_eq!(
             stats.reads_reassigned_indel_to_ref, 1,
             "only ONE of the two duplicate-keyed edits may be booked as applied"
@@ -4086,13 +3318,7 @@ mod tests {
 
     #[test]
     fn start_with_indels_disabled_is_deterministic_across_runs() {
-        // NOTE (FIX 2a, final-review round): this only proves DETERMINISM --
-        // two independent runs of the SAME (current) code produce identical
-        // bytes. It does NOT prove byte-identity with the pre-branch v1
-        // behavior, because both runs go through the same (possibly
-        // CIGAR-folding) code path. See
-        // `start_with_indels_disabled_preserves_v1_cigar_on_substitution_reads`
-        // below for the actual v1 property that matters.
+        // NOTE: this only proves DETERMINISM -- two independent runs of the SAME code produce identical bytes.
         let dir = std::env::temp_dir().join("himito_denoise_optin");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -4129,14 +3355,7 @@ mod tests {
 
     #[test]
     fn start_with_indels_disabled_preserves_v1_cigar_on_substitution_reads() {
-        // FIX 2a/2b (final-review round): the opt-in guarantee that actually
-        // matters is not "two runs give the same bytes" (mere determinism --
-        // see the test above) but the real v1 property: with indels
-        // disabled, a read that receives a substitution must come out with
-        // its CIGAR UNCHANGED from the input. The error read's CIGAR uses
-        // `=`/`X` ops deliberately -- a bug that folds them into plain `M`
-        // (the general rewrite walk's behavior before the FIX 2
-        // substitutions-only fast path) is invisible on an all-`M` fixture.
+        // a/2b: the opt-in guarantee that actually matters is not "two runs give the same bytes" but the real v1 property.
         let dir = std::env::temp_dir().join("himito_denoise_v1_cigar_identity");
         std::fs::create_dir_all(&dir).unwrap();
         let inb = dir.join("in.bam");
@@ -4144,8 +3363,7 @@ mod tests {
         let reff = dir.join("ref.fa");
         std::fs::write(&reff, ">chrM\nAAAAAA\n").unwrap();
 
-        // "AAGAAA" against ref "AAAAAA": one substitution at ref pos 2,
-        // encoded with `=`/`X` ops exactly as a real aligner might emit.
+        // "AAGAAA" against ref "AAAAAA": one substitution at ref pos 2.
         let err_cigar = vec![Cigar::Equal(2), Cigar::Diff(1), Cigar::Equal(3)];
         let clean: &[u8] = b"AAAAAA";
         let clean_names: [&str; 9] = ["r0","r1","r2","r3","r4","r5","r6","r7","r8"];
@@ -4213,40 +3431,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ---- FIX 5 (final-review round): a genuine heteroplasmic indel must
-    // SURVIVE end-to-end, not just in a hand-built `IndelSiteModel` unit test ----
+    // ---- a genuine heteroplasmic indel must
 
     #[test]
     fn genuine_heteroplasmic_indel_survives_end_to_end_via_candidacy_not_the_protect_vaf_backstop() {
-        // Every "heteroplasmy is preserved" assertion elsewhere in this suite
-        // is a unit test against a hand-constructed `IndelSiteModel` --
-        // exactly the layer a prior Critical proved can be handed an
-        // inverted VAF by pass 1. This is the end-to-end version: a real
-        // BAM, run through the real pileup and record-walk passes, asserting
-        // nothing fires on a genuine mixed site.
-        //
-        // Hand-verified against the design's eps(L)/floor(L) formulas at the
-        // 8bp homopolymer's context length (site 7, context_len 8, default
-        // IndelOpts):
-        //   error_rate(8) = min(0.01 * 1.5^7, 0.4) = 0.170859375
-        //   vaf_floor(8)  = max(0.05, 3.0 * 0.170859375) = 0.512578125
-        // A literal "4 of 10 reads" (40%) does NOT clear that floor
-        // (0.4 < 0.5126) -- at that VAF the site would only be rescued by
-        // the `--indel-protect-vaf` backstop, which is already covered by
-        // `substantial_allele_erased_from_candidacy_is_still_protected_at_assignment`
-        // in indel.rs, and relying on it here would be "passing for the
-        // wrong reason": it would not prove candidacy+MAP genuinely
-        // preserves heteroplasmy, only that the backstop does. 6 of 10
-        // (60%) DOES clear the floor while staying below `homoplasmic_vaf`
-        // (0.7 in this test module, so the strand-bias test still runs
-        // rather than being exempted) -- so this test uses 6 of 10, and the
-        // insertion genuinely enters `kept`, mirroring the design's own
-        // worked example (design doc, section 3.5: "40% INS / 60% REF...
-        // nothing flips", here as 60% INS / 40% REF).
-        //
-        // ONT-recall Phase2 T7: candidacy also needs a significant excess over
-        // eps(8). 6 of 10 gives P ~ 2.8e-3 > excess_alpha, so the same 60% is
-        // built from 12 of 20 reads (P ~ 2e-5).
+        // End-to-end check that heteroplasmy is preserved; other tests use hand-built `IndelSiteModel`s.
         let dir = std::env::temp_dir().join("himito_denoise_e2e_genuine_heteroplasmy");
         std::fs::create_dir_all(&dir).unwrap();
         let bam = dir.join("in.bam");
@@ -4254,10 +3443,7 @@ mod tests {
 
         let names20: Vec<String> = (0..20).map(|i| format!("r{i:02}")).collect();
         let mut reads: Vec<(&str, i64, &[u8], Vec<Cigar>, bool)> = vec![];
-        // 12 reads carrying the insertion (6 forward / 6 reverse) plus 8
-        // clean reads (4 forward / 4 reverse) -- both groups individually
-        // strand-balanced so neither can be rejected by a strand gate,
-        // isolating exactly the context-floor arithmetic this test checks.
+        // 12 reads carrying the insertion plus 8 clean reads -- both groups individually strand-balanced.
         for i in 0..12 {
             reads.push((&names20[i], 0, HP_INS_SEQ, hp_ins_cigar(), i % 2 == 0));
         }

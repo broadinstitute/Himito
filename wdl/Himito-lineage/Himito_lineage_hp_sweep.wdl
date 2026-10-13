@@ -4,6 +4,7 @@ import "https://raw.githubusercontent.com/broadinstitute/Himito/hs_lineage_poste
 
 workflow HimitoLineageHpSweep {
     input {
+        # Each seed runs one lineage job per (hp_fp, hp_fn) grid cell: 30 seeds x a 5x6 grid is 900 runs.
         Array[Int] seeds
         Int n_mutations
         Int depth
@@ -35,9 +36,6 @@ workflow HimitoLineageHpSweep {
         String secondary = "ad_f1"
         Int mcmc_iterations = 2000
         Int mcmc_chains = 2
-
-        # 30 seeds times a 5x6 grid is 900 lineage runs. The inputs JSON uses 1-10.
-        String first_pass_note = "seeds 1-10: 30 x 30 cells is too expensive for a first pass"
 
         String docker = "us.gcr.io/broad-dsp-lrma/hangsuunc/himito-lineage-sim:dev"
     }
@@ -144,7 +142,6 @@ workflow HimitoLineageHpSweep {
             metrics = CombineMetrics.combined,
             objective = objective,
             secondary = secondary,
-            first_pass_note = first_pass_note,
             docker = docker
     }
 
@@ -199,7 +196,7 @@ task SimulateCell {
         export PBSIM_MODEL_DIR="/opt/lineage_sim/pbsim3_models"
         export REF="~{reference_fa}"
 
-        # Plan 2026-09-27 T11. Stops after sim.matrix.csv and sim.vcf. truth/ stays.
+        # Stops after sim.matrix.csv and sim.vcf. truth/ stays.
         /opt/lineage_sim/run_eval.sh \
             --outdir "~{cell}" \
             --profile "~{profile}" \
@@ -362,13 +359,11 @@ task PickBestHpRates {
         File metrics
         String objective
         String secondary
-        String first_pass_note
         String docker
     }
 
     command <<<
         set -euxo pipefail
-        echo "~{first_pass_note}" >&2
         python3 /opt/lineage_sim/pick_best_hp_rates.py \
             --metrics "~{metrics}" \
             --summary hp_sweep_summary.tsv \

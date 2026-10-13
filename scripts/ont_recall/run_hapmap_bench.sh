@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# HapMap ONT mito benchmark for Himito quick-start. Plan ONT-recall T0.
+# HapMap ONT mito benchmark for Himito quick-start.
 #
-# Runs quick-start, then scores THE VCF THIS RUN WROTE (<prefix>.vcf). The old
-# ont_benchmark/benchmarking.sh always scored HG00097_ont.vcf, so a run with any
-# other -o prefix silently re-scored the previous denoised output.
+# Runs quick-start, then scores the VCF this run wrote (<prefix>.vcf).
 #
 # usage (from ont_benchmark/):
 #   ../scripts/ont_recall/run_hapmap_bench.sh MODE PREFIX [extra quick-start flags...]
@@ -11,7 +9,7 @@
 #   ../scripts/ont_recall/run_hapmap_bench.sh ont-r10 r10_perm10k --permutation-rounds 10000
 # env overrides: HIMITO RTG REF SDF TRUTH BAM OUT
 set -euo pipefail
-[[ $# -ge 2 ]] || { sed -n 2,13p "$0"; exit 1; }
+[[ $# -ge 2 ]] || { sed -n 2,10p "$0"; exit 1; }
 MODE=$1; PREFIX=$2; shift 2
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HIMITO=${HIMITO:-$HERE/../../target/release/Himito}

@@ -956,7 +956,7 @@ pub fn start (graph_file: &PathBuf, bam_file: &PathBuf, output_file: &PathBuf, m
     let methyl_dict =  find_methylation_signal_on_major_haplotype(&graph);
     let _ = write_bed(methyl_dict.clone(), output_file, min_prob);
 
-    // extranct read level methylation patterns println!("{}", methyl_single_read.len());
+    // read-level methylation patterns
     let matrix_output = output_file.with_extension("methylation_per_read.csv");
     if major_haploype {
         let _ = write_methylation_to_csv(methyl_dict, min_prob, matrix_output);

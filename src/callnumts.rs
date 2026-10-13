@@ -4,8 +4,6 @@ use std::{collections::{HashMap, HashSet}, path::PathBuf, io::Write, fs::File};
 use rust_htslib::bam::{self, Read, record::{Aux, Cigar}};
 use rust_htslib::faidx;
 
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone)]
 pub struct CallNumtsConfig {
     pub tolerance: i64,        // clustering epsilon (bp)
@@ -32,8 +30,6 @@ impl Default for CallNumtsConfig {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
 
 /// One alignment of a read, with query spans normalized to the PRIMARY record's stored-SEQ frame.
 #[derive(Debug, Clone)]
@@ -117,8 +113,7 @@ fn cigar_metrics(ops: &[(u8, i64)]) -> (i64, i64, i64, i64) {
     (ref_len, lead, trail, qlen)
 }
 
-/// Build an AlignSeg from CIGAR pairs and orientation info.
-/// `ref_start` is 0-based.
+/// Build an AlignSeg from CIGAR pairs; `ref_start` is 0-based, strands are absolute.
 fn build_seg(
     contig: String,
     is_mt: bool,
@@ -149,7 +144,8 @@ fn build_seg(
     }
 }
 
-/// Reference base index (0-based) of the junction-facing anchor of a segment.
+/// Reference base index (0-based) of the junction-facing anchor of a segment; `is_left`: the segment is
+/// upstream of the junction in the record frame.
 fn anchor_ref(seg: &AlignSeg, is_left: bool) -> i64 {
     match (is_left, seg.same_as_primary) {
         (true, true) => seg.ref_end - 1,   // last aligned base, upstream in ref
@@ -171,8 +167,6 @@ fn revcomp(seq: &[u8]) -> Vec<u8> {
         })
         .collect()
 }
-
-// ---------------------------------------------------------------------------
 
 /// A single nuclear<->mt junction extracted from one read.
 #[derive(Debug, Clone)]
@@ -269,8 +263,6 @@ pub fn extract_junctions(qname: &str, segs: &[AlignSeg], seq: &[u8]) -> Vec<Junc
     out
 }
 
-// ---------------------------------------------------------------------------
-
 /// A clustered NUMT call.
 #[derive(Debug, Clone)]
 pub struct NumtCall {
@@ -309,7 +301,7 @@ fn uf_find(parent: &mut [usize], x: usize) -> usize {
     r
 }
 
-/// Single-linkage cluster junctions sharing.
+/// Single-linkage cluster junctions sharing chroms and orientation with both breakpoints within `eps`.
 pub fn cluster_junctions(junctions: &[Junction], eps: i64) -> Vec<NumtCall> {
     let n = junctions.len();
     let mut parent: Vec<usize> = (0..n).collect();
@@ -364,7 +356,7 @@ pub fn cluster_junctions(junctions: &[Junction], eps: i64) -> Vec<NumtCall> {
             .unwrap();
 
         let is_full_ins = members.iter().any(|m| m.is_full_ins);
-        // For an explicit-sequence INS the emitted ALT comes from `rep`.
+        // An explicit-sequence INS takes POS from `rep`, the read its ALT comes from; a BND uses the cluster median.
         let (nuclear_bp, mt_bp) = if is_full_ins {
             (rep.nuclear_bp, rep.mt_bp)
         } else {
@@ -372,7 +364,7 @@ pub fn cluster_junctions(junctions: &[Junction], eps: i64) -> Vec<NumtCall> {
         };
         let min_seg_mapq = members.iter().map(|m| m.min_seg_mapq).min().unwrap();
         let min_seg_len = members.iter().map(|m| m.min_seg_len).min().unwrap();
-        // Chimera rule is per-read: evaluate the most-fragmented supporting read against the allowance for ITS OWN length.
+        // Chimera rule is per read: the most-fragmented supporting read against its own length.
         let most_split = members.iter().max_by_key(|m| m.n_splits).unwrap();
         let max_n_splits = most_split.n_splits;
         let max_split_read_len = most_split.read_len;
@@ -407,14 +399,12 @@ pub fn cluster_junctions(junctions: &[Junction], eps: i64) -> Vec<NumtCall> {
     calls
 }
 
-// ---------------------------------------------------------------------------
-
 /// Maximum allowed alignment segments for a read of `read_len_bp` bases.
 fn max_allowed_splits(cfg: &CallNumtsConfig, read_len_bp: i64) -> i64 {
     cfg.max_splits + (cfg.max_splits_per_kb * (read_len_bp as f64 / 1000.0)).round() as i64
 }
 
-/// Populate `filters` for a call.
+/// Populate `filters` for a call; empty means PASS.
 pub fn apply_filters(call: &mut NumtCall, cfg: &CallNumtsConfig) {
     call.filters.clear();
     if call.min_seg_mapq < cfg.min_mapq {
@@ -467,8 +457,6 @@ fn bed_overlaps(bed: &HashMap<String, Vec<(i64, i64)>>, chrom: &str, pos: i64) -
         false
     }
 }
-
-// ---------------------------------------------------------------------------
 
 /// BND ALT string for a nuclear-anchored breakend pointing at the mt mate.
 fn bnd_alt(ref_base: &str, mt_chrom: &str, mt_pos_1based: i64, orientation: char) -> String {
@@ -586,8 +574,6 @@ fn write_vcf(
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
 
 /// True if the CIGAR contains any hard clip (`H`).
 fn has_hard_clip(ops: &[(u8, i64)]) -> bool {
@@ -744,8 +730,6 @@ pub fn start(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -768,7 +752,7 @@ mod tests {
 
     #[test]
     fn cigar_metrics_sums_combined_hard_and_soft_clips() {
-        // Valid SAM clip runs must be summed, not truncated to the first op: "10H20S30M40S5H" -> lead 30, trail 45.
+        // Clip runs are summed, not truncated to the first op.
         let (rl, lead, trail, qlen) = cigar_metrics(&parse_cigar_str("10H20S30M40S5H"));
         assert_eq!((rl, lead, trail, qlen), (30, 30, 45, 30));
     }
@@ -783,7 +767,7 @@ mod tests {
 
     #[test]
     fn sa_opposite_strand_uses_trailing_clip() {
-        // primary is forward; an SA on the reverse strand must flip to the trailing clip when placed in the record frame.
+        // Primary forward, SA reverse: the record-frame span starts at the SA's trailing clip.
         let s = seg("chr1", false, 2000, "70M30S", true, false, 60);
         assert_eq!((s.q_start, s.q_end), (30, 100));
     }
@@ -799,7 +783,7 @@ mod tests {
 
     #[test]
     fn forward_nuclear_then_mt_partial_junction() {
-        // Read (100bp): 0..60 aligns to chr1 (nuclear), 60..100 aligns to chrM (mt). primary = nuclear forward; SA = mt forward.
+        // Read (100bp): 0..60 on chr1 (nuclear primary), 60..100 on chrM (SA), both forward.
         let nuc = seg("chr1", false, 1000, "60M40S", false, false, 60);
         let mt = seg("chrM", true, 200, "60S40M", false, false, 60);
         let seq: Vec<u8> = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
@@ -840,7 +824,7 @@ mod tests {
     fn reverse_nuclear_revcomps_inserted_sequence() {
         // primary = mt forward; nuclear SA on opposite strand -> ins_seq revcomp'd.
         let mt = seg("chrM", true, 300, "40M60S", false, false, 60);
-        // nuclear SA opposite strand: cigar 40S60M reverse -> opposite uses trail(=0) as q_start -> q_start=0, q_end=60.
+        // Opposite strand uses the trailing clip: 60M40S reverse -> q_start 40, after the mt part.
         let nuc = seg("chr2", false, 8000, "60M40S", true, false, 60);
         let seq: Vec<u8> = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".iter().cloned()
             .chain(std::iter::repeat(b'T').take(60)).collect();
@@ -864,6 +848,7 @@ mod tests {
 
     #[test]
     fn build_read_segments_recovers_junction_from_mt_supplementary() {
+        // mt-only BAM: the nuclear primary was dropped; the soft-clipped chrM supplementary carries it in SA.
         let self_ops = parse_cigar_str("11848S459=1D466=");
         let sa = "chr3,171111165,+,11831M17I925S,60,1;";
         let segs = build_read_segments("chrM", false, 5000, &self_ops, 60, sa, "chrM");

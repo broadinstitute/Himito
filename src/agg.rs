@@ -99,8 +99,7 @@ impl GraphicalGenome {
     }
 
  
-    /// A Result containing the graphical genome of the single sample
-    /// # Panics
+    /// The graphical genome of a single sample.
     pub fn extract_single_sample_graph(
         &self,
         df_single_sample: &Array2<f64>, 
@@ -130,7 +129,6 @@ impl GraphicalGenome {
                 #[allow(clippy::cast_possible_truncation)]#[allow(clippy::cast_sign_loss)]
                 let usize_index = edgeindex as usize;
                 let edgename = d.get(&usize_index);
-                // println!("usize_index: {}, d: {:?}, edgename: {:?}", usize_index, &d, edgename).
                 new_edges.entry(edgename.unwrap().to_string()).or_insert_with(|| serde_json::json!({}));
                 if let Some(edge_value) = self.edges.get(&(*edgename.as_ref().unwrap()).to_string()) {
                     if let Some(seq_value) = edge_value.get("seq") {

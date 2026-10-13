@@ -65,7 +65,7 @@ Options:
           [default: 1000]
 
       --no-left-align
-          do not left-align indels (reproduces pre-2026-09 variant names)
+          keep the graph's indel spellings instead of left-aligning them
 
   -h, --help
           Print help (see a summary with '-h')

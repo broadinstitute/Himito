@@ -11,8 +11,6 @@ msaplot
 scripts/*
 !scripts/ont_recall/
 !scripts/ont_recall/**
-!scripts/dev/
-!scripts/dev/**
 plantgenome
 resource
 rtg_ref

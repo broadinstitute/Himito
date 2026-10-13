@@ -1,4 +1,5 @@
-//! A sub-2% lineage marker rides on the same molecules as the other markers; a sequencing error does not.
+//! Read-linkage rescue of low-frequency SNVs: a sub-2% lineage marker rides on the same molecules as the
+//! other markers; a sequencing error does not.
 
 use std::path::Path;
 use std::time::Instant;
@@ -7,46 +8,27 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use rust_htslib::bam::{self, ext::BamRecordExtensions, record::{Aux, Cigar}, Read as HtsRead};
 use rustc_hash::FxHashMap;
-use statrs::function::gamma::ln_gamma;
+use crate::denoise::base_to_idx;
+use crate::scite::lchoose;
 
-/// Thresholds of the linkage rule; `Default` is the `crate::LINK_*` constants.
-#[derive(Debug, Clone, Copy)]
-pub struct LinkOpts {
-    pub min_hf: f64,
-    pub max_hf: f64,
-    pub min_ac: u32,
-    pub min_dist: u32,
-    pub err_quantile: f64,
-    pub min_shared: u32,
-    pub min_shared_strand: u32,
-    pub min_cocover: u32,
-    pub min_cocover_strand: u32,
-    pub min_enrich: f64,
-    pub log10p: f64,
-    pub strand_log10p: f64,
-}
+// Candidate alleles: HF in [MIN_HF, MAX_HF) and at least MIN_AC carriers among the good reads.
+const MIN_HF: f64 = 0.004;
+const MAX_HF: f64 = 0.20;
+const MIN_AC: u32 = 10;
+/// Pairs at most this many bp apart are not tested.
+const MIN_DIST: u32 = 20;
+/// Reads whose error rate is above this quantile are dropped.
+const ERR_QUANTILE: f64 = 0.95;
+// Pair rule thresholds, on both strands together and on each strand.
+const MIN_SHARED: u32 = 5;
+const MIN_SHARED_STRAND: u32 = 3;
+const MIN_COCOVER: u32 = 50;
+const MIN_COCOVER_STRAND: u32 = 30;
+const MIN_ENRICH: f64 = 10.0;
+const MAX_LOG10P: f64 = -10.0;
+const MAX_STRAND_LOG10P: f64 = -5.0;
 
-impl Default for LinkOpts {
-    fn default() -> Self {
-        LinkOpts {
-            min_hf: crate::LINK_MIN_HF,
-            max_hf: crate::LINK_MAX_HF,
-            min_ac: crate::LINK_MIN_AC,
-            min_dist: crate::LINK_MIN_DIST,
-            err_quantile: crate::LINK_ERR_QUANTILE,
-            min_shared: crate::LINK_MIN_SHARED,
-            min_shared_strand: crate::LINK_MIN_SHARED_STRAND,
-            min_cocover: crate::LINK_MIN_COCOVER,
-            min_cocover_strand: crate::LINK_MIN_COCOVER_STRAND,
-            min_enrich: crate::LINK_MIN_ENRICH,
-            log10p: crate::LINK_LOG10P,
-            strand_log10p: crate::LINK_STRAND_LOG10P,
-        }
-    }
-}
-
-/// An accepted allele.
-/// `pos` is 0-based, like `call::Variant::pos` for SNPs.
+/// An accepted allele with its most significant partner; `pos` is 0-based like `call::Variant::pos` for SNPs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkCall {
     pub pos: usize,
@@ -62,7 +44,7 @@ pub struct LinkCall {
     pub log10p: f64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Default)]
 pub struct LinkSummary {
     pub reads: usize,
     pub bad_reads: usize,
@@ -70,11 +52,6 @@ pub struct LinkSummary {
     pub pairs_tested: usize,
     pub pairs_passing: usize,
     pub accepted: usize,
-}
-
-fn ln_choose(n: u32, k: u32) -> f64 {
-    let (n, k) = (n as f64, k as f64);
-    ln_gamma(n + 1.0) - ln_gamma(k + 1.0) - ln_gamma(n - k + 1.0)
 }
 
 /// log10 P(X >= k) for X ~ Hypergeometric(population `n_total`, `k_succ` successes, `n_draw` draws).
@@ -89,9 +66,11 @@ pub fn log10_hyper_sf(k: u32, n_total: u32, k_succ: u32, n_draw: u32) -> f64 {
     if lo > hi {
         return f64::NEG_INFINITY;
     }
-    let ln_den = ln_choose(n_total, n_draw);
+    let ln_den = lchoose(n_total as f64, n_draw as f64);
     let terms: Vec<f64> = (lo..=hi)
-        .map(|x| ln_choose(k_succ, x) + ln_choose(n_total - k_succ, n_draw - x) - ln_den)
+        .map(|x| {
+            lchoose(k_succ as f64, x as f64) + lchoose((n_total - k_succ) as f64, (n_draw - x) as f64) - ln_den
+        })
         .collect();
     let m = terms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let ln_sf = m + terms.iter().map(|t| (t - m).exp()).sum::<f64>().ln();
@@ -127,8 +106,9 @@ impl Fenwick {
     }
 }
 
-/// For each query `(lo, hi)` with `lo <= hi`.
-pub fn cocover_counts(spans: &[(u32, u32, bool)], queries: &[(u32, u32)], len: u32) -> Vec<(u32, u32)> {
+/// For each query `(lo, hi)` with `lo <= hi`: the (forward, reverse) number of half-open spans with
+/// `start <= lo` and `end > hi`.
+fn cocover_counts(spans: &[(u32, u32, bool)], queries: &[(u32, u32)], len: u32) -> Vec<[u32; 2]> {
     let mut by_start: Vec<usize> = (0..spans.len()).collect();
     by_start.sort_unstable_by_key(|&i| spans[i].0);
     let mut by_lo: Vec<usize> = (0..queries.len()).collect();
@@ -136,7 +116,7 @@ pub fn cocover_counts(spans: &[(u32, u32, bool)], queries: &[(u32, u32)], len: u
 
     let mut trees = [Fenwick::new(len as usize + 1), Fenwick::new(len as usize + 1)];
     let mut inserted = [0u32; 2];
-    let mut out = vec![(0, 0); queries.len()];
+    let mut out = vec![[0, 0]; queries.len()];
     let mut si = 0;
     for qi in by_lo {
         let (lo, hi) = queries[qi];
@@ -146,9 +126,7 @@ pub fn cocover_counts(spans: &[(u32, u32, bool)], queries: &[(u32, u32)], len: u
             inserted[rev as usize] += 1;
             si += 1;
         }
-        let f = inserted[0] - trees[0].prefix(hi as usize);
-        let r = inserted[1] - trees[1].prefix(hi as usize);
-        out[qi] = (f, r);
+        out[qi] = [0, 1].map(|s| inserted[s] - trees[s].prefix(hi as usize));
     }
     out
 }
@@ -174,16 +152,6 @@ struct Candidate {
 impl Candidate {
     fn name(&self) -> String {
         format!("m.{}{}>{}", self.pos + 1, self.ref_base as char, self.alt_base as char)
-    }
-}
-
-fn base_idx(b: u8) -> Option<usize> {
-    match b.to_ascii_uppercase() {
-        b'A' => Some(0),
-        b'C' => Some(1),
-        b'G' => Some(2),
-        b'T' => Some(3),
-        _ => None,
     }
 }
 
@@ -214,18 +182,19 @@ fn span_index(spans: &[(u32, u32)], p: u32) -> Option<usize> {
     spans.iter().position(|&(s, e)| s <= p && p < e)
 }
 
-/// A read co-covers two positions when its merged spans cover both.
-fn covers_both(spans: &[(u32, u32)], lo: u32, hi: u32) -> bool {
-    span_index(spans, lo).is_some() && span_index(spans, hi).is_some()
-}
-
-/// One side (overall or one strand) of the R3-4 pair rule.
-fn pair_rule(k: u32, n_total: u32, k_succ: u32, n_draw: u32, min_cover: u32, min_shared: u32, min_enrich: f64, max_log10p: f64) -> Option<(f64, f64)> {
+/// Pair rule on both strands together or on one strand (`per_strand`): of `n_total` reads co-covering
+/// alleles A and B, `k_succ` carry A, `n_draw` carry B and `k` carry both. `Some((enrichment, log10 p))` if it passes.
+fn pair_rule(k: u32, n_total: u32, k_succ: u32, n_draw: u32, per_strand: bool) -> Option<(f64, f64)> {
+    let (min_cover, min_shared, max_log10p) = if per_strand {
+        (MIN_COCOVER_STRAND, MIN_SHARED_STRAND, MAX_STRAND_LOG10P)
+    } else {
+        (MIN_COCOVER, MIN_SHARED, MAX_LOG10P)
+    };
     if n_total < min_cover || k < min_shared {
         return None;
     }
     let enrich = k as f64 * n_total as f64 / (k_succ as f64 * n_draw as f64);
-    if enrich < min_enrich {
+    if enrich < MIN_ENRICH {
         return None;
     }
     let lp = log10_hyper_sf(k, n_total, k_succ, n_draw);
@@ -233,15 +202,15 @@ fn pair_rule(k: u32, n_total: u32, k_succ: u32, n_draw: u32, min_cover: u32, min
 }
 
 /// Read-linkage rescue on `ref_name` of a coordinate-sorted BAM (the raw, pre-denoise reads).
-/// Returns every accepted allele with its best partner, sorted by position; whether it is already
-/// called is the caller's business (R3-5, R3-7).
-pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -> Result<(Vec<LinkCall>, LinkSummary)> {
+/// Returns every accepted allele, called already or not, sorted by position.
+pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str) -> Result<(Vec<LinkCall>, LinkSummary)> {
     let t0 = Instant::now();
     let mut summary = LinkSummary::default();
+    let open = || bam::Reader::from_path(bam_path).with_context(|| format!("cannot open linkage BAM {bam_path:?}"));
 
-    // 1.
-    let mut reader = bam::Reader::from_path(bam_path)
-        .with_context(|| format!("cannot open linkage BAM {bam_path:?}"))?;
+    // Pass 1, per read: strand of the primary, error rate (max NM / aligned query length over its
+    // records) and merged reference spans.
+    let mut reader = open()?;
     let tid = match reader.header().tid(ref_name.as_bytes()) {
         Some(t) => t as i32,
         None => {
@@ -304,13 +273,12 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
     }
     let mut errs: Vec<f64> = reads.iter().map(|r| r.err).collect();
     errs.sort_unstable_by(|a, b| a.total_cmp(b));
-    let err_cut = errs[(opts.err_quantile * (errs.len() - 1) as f64) as usize];
+    let err_cut = errs[(ERR_QUANTILE * (errs.len() - 1) as f64) as usize];
     let bad: Vec<bool> = reads.iter().map(|r| r.err > err_cut).collect();
     summary.bad_reads = bad.iter().filter(|&&b| b).count();
 
-    // 2.
-    let mut reader = bam::Reader::from_path(bam_path)
-        .with_context(|| format!("cannot open linkage BAM {bam_path:?}"))?;
+    // Pass 2: candidate alleles from a pileup of the good reads.
+    let mut reader = open()?;
     let mut plp = reader.pileup();
     plp.set_max_depth(i32::MAX as u32);
     let mut last_col = vec![u32::MAX; reads.len()];
@@ -322,7 +290,7 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
         }
         let pos = col.pos();
         let Some(ref_base) = refseq.get(pos as usize).map(|b| b.to_ascii_uppercase()) else { continue };
-        let Some(ref_idx) = base_idx(ref_base) else { continue };
+        let Some(ref_idx) = base_to_idx(ref_base) else { continue };
         let mut counts = [0u32; 4];
         let mut depth = 0u32;
         let mut alt_obs: Vec<(u32, usize)> = Vec::new();
@@ -342,7 +310,7 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
             }
             last_col[id as usize] = pos;
             depth += 1;
-            if let Some(bi) = base_idx(rec.seq()[qpos]) {
+            if let Some(bi) = base_to_idx(rec.seq()[qpos]) {
                 counts[bi] += 1;
                 if bi != ref_idx {
                     alt_obs.push((id, bi));
@@ -355,7 +323,7 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
         for bi in 0..4 {
             let ac = counts[bi];
             let hf = ac as f64 / depth as f64;
-            if bi == ref_idx || ac < opts.min_ac || hf < opts.min_hf || hf >= opts.max_hf {
+            if bi == ref_idx || ac < MIN_AC || hf < MIN_HF || hf >= MAX_HF {
                 continue;
             }
             let mut ids_here: Vec<u32> = alt_obs.iter().filter(|o| o.1 == bi).map(|o| o.0).collect();
@@ -375,7 +343,7 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
     }
     summary.candidates = cands.len();
 
-    // 3.
+    // Candidate pairs more than MIN_DIST apart sharing at least MIN_SHARED carriers.
     let n_c = cands.len();
     let pos_of: Vec<u32> = cands.iter().map(|c| c.pos).collect();
     let mut index: Vec<Vec<u32>> = vec![Vec::new(); reads.len()];
@@ -384,12 +352,12 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
             index[r as usize].push(ci as u32);
         }
     }
-    let mut pairs: Vec<(u32, u32, u32)> = (0..n_c)
+    let mut pairs: Vec<(u32, u32)> = (0..n_c)
         .into_par_iter()
         .map_init(
             || (vec![0u32; n_c], Vec::<u32>::new()),
             |(cnt, touched), a| {
-                let first_b = pos_of.partition_point(|&p| p <= pos_of[a] + opts.min_dist) as u32;
+                let first_b = pos_of.partition_point(|&p| p <= pos_of[a] + MIN_DIST) as u32;
                 for &r in &cands[a].reads {
                     let lst = &index[r as usize];
                     let from = lst.partition_point(|&b| b < first_b);
@@ -402,8 +370,8 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
                 }
                 let mut out = Vec::new();
                 for &b in touched.iter() {
-                    if cnt[b as usize] >= opts.min_shared {
-                        out.push((a as u32, b, cnt[b as usize]));
+                    if cnt[b as usize] >= MIN_SHARED {
+                        out.push((a as u32, b));
                     }
                     cnt[b as usize] = 0;
                 }
@@ -416,37 +384,38 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
     pairs.sort_unstable();
     summary.pairs_tested = pairs.len();
 
-    // 4.
+    // Good reads co-covering each pair, by strand: one span covering both positions (Fenwick sweep),
+    // or two different spans of a split read.
     let good: Vec<&ReadInfo> = reads.iter().zip(&bad).filter(|(_, &b)| !b).map(|(r, _)| r).collect();
     let spans: Vec<(u32, u32, bool)> = good
         .iter()
         .flat_map(|r| r.spans.iter().map(move |&(s, e)| (s, e, r.reverse)))
         .collect();
     let multi: Vec<&ReadInfo> = good.iter().copied().filter(|r| r.spans.len() > 1).collect();
-    let queries: Vec<(u32, u32)> = pairs.iter().map(|&(a, b, _)| (pos_of[a as usize], pos_of[b as usize])).collect();
+    let queries: Vec<(u32, u32)> = pairs.iter().map(|&(a, b)| (pos_of[a as usize], pos_of[b as usize])).collect();
     let mut cocover = cocover_counts(&spans, &queries, refseq.len() as u32);
     cocover.par_iter_mut().zip(queries.par_iter()).for_each(|(c, &(lo, hi))| {
         for r in &multi {
             if let (Some(i), Some(j)) = (span_index(&r.spans, lo), span_index(&r.spans, hi)) {
                 if i != j {
-                    if r.reverse { c.1 += 1 } else { c.0 += 1 }
+                    c[r.reverse as usize] += 1;
                 }
             }
         }
     });
 
-    // 5.
+    // Pair rule overall and on each strand, counting only carriers that co-cover both positions.
     let passing: Vec<(u32, u32, u32, f64, f64)> = pairs
         .par_iter()
         .zip(cocover.par_iter())
-        .filter_map(|(&(ia, ib, _), &(n_fwd, n_rev))| {
+        .filter_map(|(&(ia, ib), &n)| {
             let (a, b) = (&cands[ia as usize], &cands[ib as usize]);
             let (lo, hi) = (a.pos, b.pos);
             let strand_counts = |ids: &[u32]| {
                 let mut c = [0u32; 2];
                 for &r in ids {
                     let info = &reads[r as usize];
-                    if covers_both(&info.spans, lo, hi) {
+                    if span_index(&info.spans, lo).is_some() && span_index(&info.spans, hi).is_some() {
                         c[info.reverse as usize] += 1;
                     }
                 }
@@ -454,51 +423,19 @@ pub fn rescue(bam_path: &Path, refseq: &[u8], ref_name: &str, opts: &LinkOpts) -
             };
             let big_k = strand_counts(&a.reads);
             let small_n = strand_counts(&b.reads);
-            let shared: Vec<u32> = {
-                let (mut i, mut j, mut v) = (0, 0, Vec::new());
-                while i < a.reads.len() && j < b.reads.len() {
-                    match a.reads[i].cmp(&b.reads[j]) {
-                        std::cmp::Ordering::Less => i += 1,
-                        std::cmp::Ordering::Greater => j += 1,
-                        std::cmp::Ordering::Equal => {
-                            v.push(a.reads[i]);
-                            i += 1;
-                            j += 1;
-                        }
-                    }
-                }
-                v
-            };
+            let shared: Vec<u32> = a.reads.iter().copied().filter(|r| b.reads.binary_search(r).is_ok()).collect();
             let k = strand_counts(&shared);
-            let n_cov = [n_fwd, n_rev];
-            let (enrich, lp) = pair_rule(
-                k[0] + k[1],
-                n_fwd + n_rev,
-                big_k[0] + big_k[1],
-                small_n[0] + small_n[1],
-                opts.min_cocover,
-                opts.min_shared,
-                opts.min_enrich,
-                opts.log10p,
-            )?;
+            let both = |v: [u32; 2]| v[0] + v[1];
+            let (enrich, lp) = pair_rule(both(k), both(n), both(big_k), both(small_n), false)?;
             for s in 0..2 {
-                pair_rule(
-                    k[s],
-                    n_cov[s],
-                    big_k[s],
-                    small_n[s],
-                    opts.min_cocover_strand,
-                    opts.min_shared_strand,
-                    opts.min_enrich,
-                    opts.strand_log10p,
-                )?;
+                pair_rule(k[s], n[s], big_k[s], small_n[s], true)?;
             }
-            Some((ia, ib, k[0] + k[1], enrich, lp))
+            Some((ia, ib, both(k), enrich, lp))
         })
         .collect();
     summary.pairs_passing = passing.len();
 
-    // 6.
+    // Each allele keeps its most significant partner.
     let mut best: Vec<Option<(u32, u32, f64, f64)>> = vec![None; n_c];
     for &(ia, ib, k, enrich, lp) in &passing {
         for (me, other) in [(ia, ib), (ib, ia)] {
@@ -550,7 +487,7 @@ mod tests {
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use rust_htslib::bam::header::{Header, HeaderRecord};
-    use rust_htslib::bam::record::{Aux, Cigar, CigarString, Record};
+    use rust_htslib::bam::record::{CigarString, Record};
     use rust_htslib::bam::{Format, Writer};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -572,86 +509,66 @@ mod tests {
         }
     }
 
-    struct FxRead {
-        reverse: bool,
-        alts: Vec<usize>,
-        nm: i64,
-    }
-
     fn tmp_dir(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("himito_linkage_{}_{}", tag, std::process::id()));
         std::fs::create_dir_all(&d).unwrap();
         d
     }
 
-    /// Header `chr1`, `chrM`: chrM reads are tid 1, so a `tid() == 0` assumption sees nothing.
-    fn write_fixture(path: &Path, refseq: &[u8], reads: &[FxRead]) {
+    fn rec(name: &str, tid: i32, pos: usize, seq: &[u8], flags: u16, nm: i32) -> Record {
+        let mut rec = Record::new();
+        rec.set(name.as_bytes(), Some(&CigarString(vec![Cigar::Match(seq.len() as u32)])), seq, &vec![30u8; seq.len()]);
+        rec.set_tid(tid);
+        rec.set_pos(pos as i64);
+        rec.set_mapq(60);
+        rec.set_flags(flags);
+        rec.push_aux(b"NM", Aux::I32(nm)).unwrap();
+        rec
+    }
+
+    /// Writes `chrm` after a few chr1 reads under header `chr1`, `chrM`: chrM is tid 1, so a
+    /// `tid() == 0` assumption sees nothing.
+    fn write_bam(tag: &str, chrm: &[Record]) -> PathBuf {
         let mut header = Header::new();
-        for (name, len) in [("chr1", 100usize), ("chrM", refseq.len())] {
+        for (name, len) in [("chr1", 100usize), ("chrM", REF_LEN)] {
             let mut sq = HeaderRecord::new(b"SQ");
             sq.push_tag(b"SN", name);
             sq.push_tag(b"LN", &len.to_string());
             header.push_record(&sq);
         }
-        let mut w = Writer::from_path(path, &header, Format::Bam).unwrap();
+        let path = tmp_dir(tag).join("in.bam");
+        let mut w = Writer::from_path(&path, &header, Format::Bam).unwrap();
         for i in 0..5 {
-            let mut rec = Record::new();
-            let seq = vec![b'T'; 50];
-            rec.set(format!("c1_{i}").as_bytes(), Some(&CigarString(vec![Cigar::Match(50)])), &seq, &[30u8; 50]);
-            rec.set_tid(0);
-            rec.set_pos(0);
-            rec.set_mapq(60);
-            rec.push_aux(b"NM", Aux::I32(0)).unwrap();
-            w.write(&rec).unwrap();
+            w.write(&rec(&format!("c1_{i}"), 0, 0, &[b'T'; 50], 0, 0)).unwrap();
         }
-        for (i, r) in reads.iter().enumerate() {
-            let mut seq = refseq.to_vec();
-            for &p in &r.alts {
-                seq[p] = alt_of(refseq[p]);
-            }
-            let mut rec = Record::new();
-            let quals = vec![30u8; seq.len()];
-            rec.set(
-                format!("r{i}").as_bytes(),
-                Some(&CigarString(vec![Cigar::Match(seq.len() as u32)])),
-                &seq,
-                &quals,
-            );
-            rec.set_tid(1);
-            rec.set_pos(0);
-            rec.set_mapq(60);
-            rec.set_flags(if r.reverse { 16 } else { 0 });
-            rec.push_aux(b"NM", Aux::I32(r.nm as i32)).unwrap();
-            w.write(&rec).unwrap();
+        for r in chrm {
+            w.write(r).unwrap();
         }
+        path
     }
 
-    /// `N_READS` reads alternating forward/reverse; read `i` carries allele A (at `pa`) when `a(i)`.
+    /// `N_READS` full-length reads alternating forward/reverse; read `i` carries allele A (at `pa`) when `a(i)`.
     fn run_scenario(
         tag: &str,
         pa: usize,
         pb: usize,
         a: impl Fn(usize) -> bool,
         b: impl Fn(usize) -> bool,
-        nm: impl Fn(usize) -> i64,
+        nm: impl Fn(usize) -> i32,
     ) -> (Vec<LinkCall>, LinkSummary) {
         let refseq = fixture_ref();
-        let reads: Vec<FxRead> = (0..N_READS)
+        let reads: Vec<Record> = (0..N_READS)
             .map(|i| {
-                let mut alts = vec![];
-                if a(i) {
-                    alts.push(pa);
+                let mut seq = refseq.clone();
+                for (p, on) in [(pa, a(i)), (pb, b(i))] {
+                    if on {
+                        seq[p] = alt_of(refseq[p]);
+                    }
                 }
-                if b(i) {
-                    alts.push(pb);
-                }
-                FxRead { reverse: i % 2 == 1, alts, nm: nm(i) }
+                rec(&format!("r{i}"), 1, 0, &seq, if i % 2 == 1 { 16 } else { 0 }, nm(i))
             })
             .collect();
-        let dir = tmp_dir(tag);
-        let bam = dir.join("in.bam");
-        write_fixture(&bam, &refseq, &reads);
-        rescue(&bam, &refseq, "chrM", &LinkOpts::default()).unwrap()
+        rescue(&write_bam(tag, &reads), &refseq, "chrM").unwrap()
     }
 
     #[test]
@@ -695,7 +612,7 @@ mod tests {
                     if rev { r += 1 } else { f += 1 }
                 }
             }
-            assert_eq!(got[q], (f, r), "query {lo}-{hi}");
+            assert_eq!(got[q], [f, r], "query {lo}-{hi}");
         }
     }
 
@@ -755,35 +672,17 @@ mod tests {
     fn reads_split_into_two_records_co_cover_both_alleles() {
         // Like a read split at the circular origin.
         let refseq = fixture_ref();
-        let mut header = Header::new();
-        for (name, len) in [("chr1", 100usize), ("chrM", REF_LEN)] {
-            let mut sq = HeaderRecord::new(b"SQ");
-            sq.push_tag(b"SN", name);
-            sq.push_tag(b"LN", &len.to_string());
-            header.push_record(&sq);
-        }
-        let dir = tmp_dir("split");
-        let bam = dir.join("in.bam");
-        let mut w = Writer::from_path(&bam, &header, Format::Bam).unwrap();
+        let mut reads = Vec::new();
         for (start, end, alt_at, flag) in [(0usize, 300usize, 100usize, 0u16), (600, 1000, 900, 2048)] {
             for i in 0..N_READS {
                 let mut seq = refseq[start..end].to_vec();
                 if i < 40 {
                     seq[alt_at - start] = alt_of(refseq[alt_at]);
                 }
-                let mut rec = Record::new();
-                let quals = vec![30u8; seq.len()];
-                rec.set(format!("r{i}").as_bytes(), Some(&CigarString(vec![Cigar::Match(seq.len() as u32)])), &seq, &quals);
-                rec.set_tid(1);
-                rec.set_pos(start as i64);
-                rec.set_mapq(60);
-                rec.set_flags(flag | if i % 2 == 1 { 16 } else { 0 });
-                rec.push_aux(b"NM", Aux::I32(3)).unwrap();
-                w.write(&rec).unwrap();
+                reads.push(rec(&format!("r{i}"), 1, start, &seq, flag | if i % 2 == 1 { 16 } else { 0 }, 3));
             }
         }
-        drop(w);
-        let (calls, summary) = rescue(&bam, &refseq, "chrM", &LinkOpts::default()).unwrap();
+        let (calls, summary) = rescue(&write_bam("split", &reads), &refseq, "chrM").unwrap();
         assert_eq!(summary.reads, N_READS);
         assert_eq!(summary.pairs_passing, 1, "{summary:?}");
         assert_eq!(calls.len(), 2, "{calls:?}");
@@ -792,8 +691,8 @@ mod tests {
 
     #[test]
     fn alleles_within_min_dist_are_never_tested() {
-        // Exactly LINK_MIN_DIST (20 bp) apart and perfectly linked.
-        let (calls, summary) = run_scenario("dist", 200, 220, |i| i < 40, |i| i < 40, |_| 10);
+        // Exactly MIN_DIST apart and perfectly linked.
+        let (calls, summary) = run_scenario("dist", 200, 200 + MIN_DIST as usize, |i| i < 40, |i| i < 40, |_| 10);
         assert_eq!(summary.candidates, 2);
         assert_eq!(summary.pairs_tested, 0);
         assert!(calls.is_empty(), "{calls:?}");

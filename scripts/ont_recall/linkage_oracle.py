@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Read-linkage rescue oracle for low-frequency SNVs (ONT-recall revision 3).
+"""Read-linkage rescue oracle for low-frequency SNVs.
 
 For SNV alleles at the given positions, collect the reads carrying each allele
 from a raw (pre-denoise) BAM pileup. Then test every allele pair for
-co-occurrence on the same reads, and report which alleles the R3 rule
-accepts. This is the reference behaviour for `src/linkage.rs` (R3-T2).
+co-occurrence on the same reads, and report which alleles the rule
+accepts. This is the reference behaviour for `src/linkage.rs`.
 
-Rule (defaults = plan revision 3 decisions):
+Rule (defaults):
   candidates: SNV alleles with min_hf <= HF < max_hf and >= min_ac reads; NO strand gate
   reads:      the top 5% by error rate (NM / aligned length) are dropped from all counts
   pair test:  partners > min_dist bp apart, co-covered by >= 50 reads.

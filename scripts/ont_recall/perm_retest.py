@@ -8,8 +8,8 @@ src/call.rs (sum of Jaccard against every other row; shuffle a row among its
 covered reads; empirical p = (1 + #null >= obs) / (R + 1); BH over tested).
 
 Modes
-  --mode fixed     R = --rounds for every tested variant (today's behaviour)
-  --mode adaptive  the Plan 2026-10-11 T1 algorithm (the ORACLE for T1):
+  --mode fixed     R = --rounds for every tested variant
+  --mode adaptive  the adaptive test of src/call.rs (its reference behaviour):
                    stage 1 draws --rounds per variant, stopping a variant early
                    once it has --stop-after exceedances; stage 2 extends only the
                    variants still at zero exceedances to
@@ -17,7 +17,7 @@ Modes
                    --max-rounds, repeating until R_target stops growing.
   --mode normal    z-score of the observation against its own null (mean, sd),
                    one-sided normal tail. Diagnostic only.
-  --mode max-partner  ONT-recall T8 prototype: for each tested variant, over
+  --mode max-partner  prototype: for each tested variant, over
                    partners with >= --min-shared co-alt reads, take the
                    hypergeometric upper-tail p on co-covered reads, multiply by
                    the partner count (Bonferroni), then BH as usual.

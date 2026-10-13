@@ -26,16 +26,8 @@ version 1.0
 # exact minimum for topology=chain and falls back to sim_min_hf as a lower bound
 # otherwise, then fails the workflow before a single expensive cell runs.
 #
-# Defaults changed from the first version of this WDL, all of which produced an
-# EMPTY VCF and a failed `Himito lineage` on every cell:
-#   profile              ont-r10 -> ont-denoised  (ont-r10 skips denoise entirely)
-#   frequency_threshold  unset (0.2) -> 0.05      (0.2 is above every truth variant)
-#   sim_min_hf           0.01 -> 0.05             (0.01 sits under the gates)
-#   sim_max_hf           0.95 -> 0.99             (matches run_eval.sh)
-#
-# NOTE: topology/denoise_vaf and the HP modes (plan 2026-09-27 T10) require
-# an image built from the current lineage_sim/ scripts, including
-# hp_tracts.py. Rebuild the docker image before using them.
+# NOTE: topology/denoise_vaf and the HP modes require an image built from the
+# current lineage_sim/ scripts, including hp_tracts.py.
 
 workflow HimitoLineageSim {
     input {
@@ -53,9 +45,7 @@ workflow HimitoLineageSim {
         # every simulated truth variant and empties the VCF. Must be < sim_min_hf.
         Float frequency_threshold = 0.05
 
-        # Himito denoise --vaf. Unset follows --vaf (= min_hf). Previously
-        # hardcoded to 0.03 inside run_himito.sh, which silently deleted truth
-        # variants in any config whose clones were rarer than that. Must be
+        # Himito denoise --vaf. Unset follows --vaf (= min_hf). Must be
         # < sim_min_hf when set.
         Float? denoise_vaf
 
@@ -82,7 +72,7 @@ workflow HimitoLineageSim {
         # ordering call hard; lower is harder, and it costs no detection.
         Float internal_keep = 0.20
 
-        # Plan 2026-09-27 T10. Homopolymer length heteroplasmy; all off by default so an
+        # Homopolymer length heteroplasmy; all off by default so an
         # unchanged inputs JSON reproduces the SNV-only benchmark.
         String background = "none"          # none | hvs1-polyC | comma list e.g. "T16189C,A16183C"
         Int hp_lineage_indels = 0           # K of the n_mutations edges are HP length changes
@@ -99,7 +89,7 @@ workflow HimitoLineageSim {
     String fp_arg = if defined(fp) then "--fp " + select_first([fp]) else ""
     String fn_arg = if defined(fn) then "--fn " + select_first([fn]) else ""
     String denoise_vaf_arg = if defined(denoise_vaf) then "--denoise-vaf " + select_first([denoise_vaf]) else ""
-    # Plan 2026-09-27 T10. Empty when the mode is off, same pattern as fp_arg.
+    # Empty when the mode is off, same pattern as fp_arg.
     # Quote specs that may contain ';' so the shell does not split them.
     String background_arg = if background == "none" then "" else "--background \"" + background + "\""
     String hp_lineage_arg = if hp_lineage_indels > 0 then "--hp-lineage-indels " + hp_lineage_indels else ""
@@ -230,8 +220,8 @@ task ValidateConfig {
         Boolean collapse_hp
         Boolean hp_fp_set
         Boolean hp_fn_set
-        # Plan 2026-09-27 T11. The HP-rate sweep sets this. The sim workflow
-        # leaves it false, so an SNV-only inputs JSON still validates.
+        # The HP-rate sweep sets this. The sim workflow leaves it false, so an
+        # SNV-only inputs JSON still validates.
         Boolean require_hp_mode = false
         String docker
     }
@@ -250,7 +240,7 @@ try:
 except ImportError as exc:
     print(
         "ERROR: cannot import hp_tracts/simulate_tree from /opt/lineage_sim "
-        f"({exc}). Rebuild the himito-lineage-sim image (plan 2026-09-27 T10).",
+        f"({exc}). Rebuild the himito-lineage-sim image.",
         file=sys.stderr,
     )
     sys.exit(1)
@@ -263,16 +253,15 @@ sim_min   = float("~{sim_min_hf}")
 topology  = "~{topology}"
 keep      = float("~{internal_keep}")
 nmuts     = [int(x) for x in "~{sep=' ' n_mutations}".split()]
-# Plan 2026-09-27 T10. parse_hp_unstable is simulate_tree.parse_hp_unstable;
-# it checks tract ids against hp_tracts.CATALOGUE.
+# simulate_tree.parse_hp_unstable checks tract ids against hp_tracts.CATALOGUE.
 background = "~{background}"
 hp_unstable = "~{hp_unstable}"
 hp_k = int("~{hp_lineage_indels}")
 collapse_hp = "~{collapse_hp}".lower() == "true"
 hp_fp_set = "~{hp_fp_set}".lower() == "true"
 hp_fn_set = "~{hp_fn_set}".lower() == "true"
-# Plan 2026-09-27 T11. Background alone, or collapse_hp alone, does not give
-# the HP rates a variant to act on. The sweep is then guaranteed flat.
+# Background alone, or collapse_hp alone, does not give the HP rates a variant
+# to act on. The sweep is then guaranteed flat.
 require_hp_mode = "~{require_hp_mode}".lower() == "true"
 REF_FRACTION = 0.15   # simulate_tree.py default; not exposed by run_eval.sh
 
@@ -328,7 +317,7 @@ if topology == "chain":
 else:
     check_gates(sim_min, False, "")
 
-# --- homopolymer modes (plan 2026-09-27 T10) ---------------------------------
+# --- homopolymer modes ---------------------------------------------------------
 try:
     bg_tokens = simulate_tree.parse_background(background)
 except ValueError as exc:
@@ -533,14 +522,12 @@ task RunEvalCell {
             ~{hp_fn_arg}
 
         # Prepend the identifying columns run_simulation.sh adds to the combined
-        # table. Read the header from the file rather than assuming a column
-        # order: score_lineage.py's FIELDS has changed (n_truth_pairs added) and
-        # will change again.
+        # table. Read the header from the file rather than assuming
+        # score_lineage.py's column order.
         metrics="~{cell}/metrics.tsv"
         header=$(head -n 1 "$metrics")
         row=$(tail -n 1 "$metrics")
-        # Plan 2026-09-27 T10. Identifying columns after internal_keep. NA for
-        # unset hp_unstable / hp_fp_rate / hp_fn_rate.
+        # NA for unset hp_unstable / hp_fp_rate / hp_fn_rate.
         printf 'seed\tn_mutations\ttotal_depth\ttopology\tinternal_keep\tbackground\thp_lineage_indels\thp_unstable\tcollapse_hp\thp_fp_rate\thp_fn_rate\t%s\n' "$header" > cell_metrics.tsv
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "~{seed}" "~{n_mutations}" "~{total_depth}" "~{topology}" "~{internal_keep}" \
@@ -607,7 +594,7 @@ task CombineMetrics {
                 cat "$f" >> metrics.tsv
                 first=0
             else
-                # Plan 2026-09-27 T10. Position-wise concat misaligns mixed schemas.
+                # Position-wise concat misaligns mixed schemas.
                 if [[ "$header" != "$expected" ]]; then
                     echo "ERROR: header mismatch: $f" >&2
                     exit 1

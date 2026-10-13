@@ -617,7 +617,7 @@ fn gap_open_aligner(reference: &str, sequence: &str) -> String {
     let cigar = alignment_to_cigar(&alignment.operations);
     // println!("{:?}", cigar);
 
-    // Safety net.
+    // Safety net for a mismatch still folded into a homopolymer indel.
     normalize_homopolymer_indels(&cigar, reference, sequence)
 }
 
@@ -854,7 +854,7 @@ pub fn generate_cigar(
 }
 
 
-/// Read support for the edge that circularizes the reference path.
+/// Reads supporting the spliced edge that circularizes the reference path: those on both its tail and head.
 fn circularized_edge_reads(tail: &HashSet<String>, head: &[String]) -> HashSet<String> {
     let head_set: HashSet<&String> = head.iter().collect();
     tail.iter()
@@ -863,30 +863,19 @@ fn circularized_edge_reads(tail: &HashSet<String>, head: &[String]) -> HashSet<S
         .collect()
 }
 
-/// Skip secondary/supplementary (and empty SEQ).
-/// The primary's soft-clipped SEQ is the full read under default minimap2; a later hard- or
-/// soft-clipped supplementary must not overwrite it.
-pub fn read_sequences_from_bam(path: &std::path::Path) -> HashMap<String, String> {
+/// Read name -> SEQ of its primary record. Secondary, supplementary and empty-SEQ records are skipped:
+/// under default minimap2 the soft-clipped primary carries the full read, a clipped supplementary does not.
+fn read_sequences_from_bam(path: &std::path::Path) -> HashMap<String, String> {
     let mut read_dictionary: HashMap<String, String> = HashMap::new();
     let mut hardclipped_primaries = 0u64;
     let mut bam = bam::Reader::from_path(path).expect("Failed to open BAM/SAM");
     for record in bam.records() {
         let r = record.expect("Failed to read BAM record");
-        if r.is_secondary() || r.is_supplementary() {
+        if r.is_secondary() || r.is_supplementary() || r.seq_len() == 0 {
             continue;
         }
-        if r.seq_len() == 0 {
-            continue;
-        }
-        // Out of scope: a hard-clipped primary's SEQ is not the full read.
-        if !r.is_unmapped() {
-            let cigar = r.cigar();
-            if cigar
-                .iter()
-                .any(|op| matches!(op, rust_htslib::bam::record::Cigar::HardClip(_)))
-            {
-                hardclipped_primaries += 1;
-            }
+        if !r.is_unmapped() && r.cigar().iter().any(|op| matches!(op, bam::record::Cigar::HardClip(_))) {
+            hardclipped_primaries += 1;
         }
         let contig = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
         let contig_name = String::from_utf8_lossy(r.qname()).to_string();
@@ -1016,18 +1005,16 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
         tail_read_count,
         head_read_count
     );
+    // Sorted so the GFA is reproducible: HashSet iteration order is not stable across runs.
+    let mut l_ref_reads: Vec<String> = l_ref_reads.into_iter().collect();
+    l_ref_reads.sort();
     edge_info.remove(&l_ref_edge);
     edge_info.remove(&f_ref_edge);
     edge_info.insert(l_ref_edge.clone(), EdgeInfo {
         seq: l_ref_seq,
         src: f_src_anchor.clone(),
         dst: f_dst_anchor.clone(),
-        // Sorted so the emitted GFA is byte-reproducible: HashSet iteration order is not stable across runs.
-        reads: {
-            let mut r: Vec<String> = l_ref_reads.iter().cloned().collect();
-            r.sort();
-            r
-        },
+        reads: l_ref_reads,
         samples: HashSet::new(),
     });
     // Write final graph to disk.
@@ -1039,7 +1026,7 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
     let tmp_gfa_path = PathBuf::from("tmp.gfa");
     let mut graph = agg::GraphicalGenome::load_graph(&tmp_gfa_path).unwrap();
 
-    // generate cigar.
+    // generate cigar
     generate_cigar(&mut graph, &ref_header, k, maxlength, min_edge_reads);
     let graph_output = output.with_extension("gfa");
     let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph);
@@ -1048,64 +1035,29 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
-    use std::path::Path;
 
-    fn write_sam(path: &Path, body_lines: &[&str]) {
-        let mut f = File::create(path).unwrap();
-        writeln!(f, "@HD\tVN:1.6\tSO:coordinate").unwrap();
-        writeln!(f, "@SQ\tSN:chrM\tLN:100").unwrap();
-        for line in body_lines {
-            writeln!(f, "{}", line).unwrap();
-        }
-    }
-
+    /// A clipped supplementary must not replace the primary's SEQ; secondaries are skipped.
     #[test]
     fn read_sequences_from_bam_keeps_primary_full_seq() {
-        let dir = std::env::temp_dir().join("himito_build_t0_bam_seq");
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = std::env::temp_dir().join("himito_build_bam_seq");
         std::fs::create_dir_all(&dir).unwrap();
         let sam = dir.join("reads.sam");
+        let lines = [
+            "@HD\tVN:1.6\tSO:coordinate",
+            "@SQ\tSN:chrM\tLN:100",
+            "r_hard\t0\tchrM\t1\t60\t6S4M\t*\t0\t0\tACGTACGTAA\t*",
+            "r_hard\t2048\tchrM\t50\t60\t8H4M\t*\t0\t0\tACGT\t*",
+            "r_soft\t0\tchrM\t2\t60\t6S4M\t*\t0\t0\tGGGGCCCCAA\t*",
+            "r_soft\t2048\tchrM\t60\t60\t6S4M\t*\t0\t0\tGGGGCCCCAT\t*",
+            "r_lone\t0\tchrM\t3\t60\t8M\t*\t0\t0\tTTTTAAAA\t*",
+            "r_sec\t256\tchrM\t4\t0\t4M\t*\t0\t0\t*\t*",
+        ];
+        std::fs::write(&sam, lines.join("\n") + "\n").unwrap();
 
-        // Full primary SEQ for r_hard, then hard-clipped supp at a higher coordinate. r_soft.
-        let primary_hard = "ACGTACGTAA"; // 10 bp full
-        let supp_hard = "ACGT"; // 4 bp hard-clipped fragment
-        let primary_soft = "GGGGCCCCAA"; // "denoised"
-        let supp_soft = "GGGGCCCCAT"; // "raw" — differs at last base
-        let lone = "TTTTAAAA";
-
-        write_sam(
-            &sam,
-            &[
-                // qname flag rname pos mapq cigar rnext pnext tlen seq qual
-                &format!(
-                    "r_hard\t0\tchrM\t1\t60\t6S4M\t*\t0\t0\t{}\t*",
-                    primary_hard
-                ),
-                &format!(
-                    "r_hard\t2048\tchrM\t50\t60\t8H4M\t*\t0\t0\t{}\t*",
-                    supp_hard
-                ),
-                &format!(
-                    "r_soft\t0\tchrM\t2\t60\t6S4M\t*\t0\t0\t{}\t*",
-                    primary_soft
-                ),
-                &format!(
-                    "r_soft\t2048\tchrM\t60\t60\t6S4M\t*\t0\t0\t{}\t*",
-                    supp_soft
-                ),
-                &format!("r_lone\t0\tchrM\t3\t60\t8M\t*\t0\t0\t{}\t*", lone),
-                "r_sec\t256\tchrM\t4\t0\t4M\t*\t0\t0\t*\t*",
-            ],
-        );
-
-        let got = read_sequences_from_bam(&sam);
-        assert_eq!(got.get("r_hard").map(String::as_str), Some(primary_hard));
-        assert_eq!(got.get("r_soft").map(String::as_str), Some(primary_soft));
-        assert_eq!(got.get("r_lone").map(String::as_str), Some(lone));
-        assert!(!got.contains_key("r_sec"));
-        assert_eq!(got.len(), 3);
-
+        let mut got: Vec<(String, String)> = read_sequences_from_bam(&sam).into_iter().collect();
+        got.sort();
+        let want = [("r_hard", "ACGTACGTAA"), ("r_lone", "TTTTAAAA"), ("r_soft", "GGGGCCCCAA")];
+        assert_eq!(got, want.map(|(n, s)| (n.to_string(), s.to_string())));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1159,42 +1111,23 @@ mod tests {
         total
     }
 
-    fn rs(names: &[&str]) -> HashSet<String> {
-        names.iter().map(|s| s.to_string()).collect()
-    }
-    fn sorted(s: &HashSet<String>) -> Vec<String> {
-        let mut v: Vec<String> = s.iter().cloned().collect();
-        v.sort();
-        v
-    }
-
-    /// The spliced edge is supported only by reads that wrap the origin.
+    /// Only reads on both halves, i.e. wrapping the origin, support the spliced edge.
     #[test]
-    fn circularized_edge_reads_keeps_only_reads_on_both_halves() {
-        let tail = rs(&["r_wrap1", "r_tail_only", "r_wrap2"]);
-        let head = ["r_wrap1".to_string(), "r_head_only".to_string(), "r_wrap2".to_string()];
-
-        let got = circularized_edge_reads(&tail, &head);
-
-        assert_eq!(sorted(&got), vec!["r_wrap1", "r_wrap2"]);
-        // The pre-fix no-op behaviour was to return the tail unchanged.
-        assert_ne!(sorted(&got), sorted(&tail));
-    }
-
-    #[test]
-    fn circularized_edge_reads_handles_disjoint_and_empty_halves() {
-        // No read wraps the origin: the spliced edge has no support.
-        assert!(circularized_edge_reads(&rs(&["a", "b"]), &["c".to_string()]).is_empty());
-        // Either half missing collapses to empty, never to the other half.
-        assert!(circularized_edge_reads(&rs(&[]), &["a".to_string()]).is_empty());
-        assert!(circularized_edge_reads(&rs(&["a"]), &[]).is_empty());
-    }
-
-    #[test]
-    fn circularized_edge_reads_collapses_duplicate_head_entries() {
-        // EdgeInfo.reads is a Vec, so the head half can repeat a read name.
-        let got = circularized_edge_reads(&rs(&["a", "b"]), &["a".to_string(), "a".to_string()]);
-        assert_eq!(sorted(&got), vec!["a"]);
+    fn circularized_edge_reads_intersects_halves() {
+        let set = |names: &[&str]| -> HashSet<String> { names.iter().map(|s| s.to_string()).collect() };
+        let cases: [(&[&str], &[&str], &[&str]); 5] = [
+            (&["w1", "tail_only", "w2"], &["w1", "head_only", "w2"], &["w1", "w2"]),
+            (&["a", "b"], &["c"], &[]),
+            // An empty half gives no support, never the other half.
+            (&[], &["a"], &[]),
+            (&["a"], &[], &[]),
+            // EdgeInfo.reads is a Vec, so the head half can repeat a read name.
+            (&["a", "b"], &["a", "a"], &["a"]),
+        ];
+        for (tail, head, want) in cases {
+            let head: Vec<String> = head.iter().map(|s| s.to_string()).collect();
+            assert_eq!(circularized_edge_reads(&set(tail), &head), set(want), "{tail:?} {head:?}");
+        }
     }
 
     /// Scoring must favor the clean two-gap edit over one gap plus a mismatch in a homopolymer run.
@@ -1216,31 +1149,26 @@ mod tests {
         }
     }
 
-    /// The gap-friendly scoring must not start swallowing real substitutions.
+    /// The gap-friendly scoring keeps plain edits: an isolated SNP, identity, an empty alt and a deletion.
     #[test]
-    fn aligner_preserves_isolated_snp_and_deletion() {
-        let snp = gap_open_aligner("ACGTACGTACGTACGT", "ACGTACGAACGTACGT");
-        assert_eq!(snp, "7=1X8=");
-
-        let del = gap_open_aligner("ACGTACGTTTTACGTACGT", "ACGTACGTACGTACGT");
-        assert_eq!(ref_consumed(&del), 19);
-        assert_eq!(reconstruct_alt(&del, "ACGTACGTTTTACGTACGT", "ACGTACGTACGTACGT"), "ACGTACGTACGTACGT");
+    fn aligner_keeps_plain_edits() {
+        for (r, a, want) in [
+            ("ACGTACGTACGTACGT", "ACGTACGAACGTACGT", "7=1X8="),
+            ("ACGTACGTAC", "ACGTACGTAC", "10="),
+            ("ACGTACGTAC", "", "10D"),
+        ] {
+            assert_eq!(gap_open_aligner(r, a), want);
+        }
+        let (r, a) = ("ACGTACGTTTTACGTACGT", "ACGTACGTACGTACGT");
+        let del = gap_open_aligner(r, a);
         assert!(del.contains('D') && !del.contains('X'), "got {}", del);
-    }
-
-    /// Identical sequences, and the degenerate empty-alt edge.
-    #[test]
-    fn aligner_handles_trivial_inputs() {
-        let same = gap_open_aligner("ACGTACGTAC", "ACGTACGTAC");
-        assert_eq!(same, "10=");
-
-        let empty = gap_open_aligner("ACGTACGTAC", "");
-        assert_eq!(empty, "10D");
+        assert_eq!(ref_consumed(&del), r.len());
+        assert_eq!(reconstruct_alt(&del, r, a), a);
     }
 
     #[test]
     fn homopolymer_insertion_absorbs_adjacent_mismatch() {
-        // The sample's edge inserts 4 extra C's in that stretch.
+        // chrM poly-C tract: the edge inserts 4 C's; the raw CIGAR folds the 4th and a lone T into a spurious T>C.
         let ref_seq = "AAAAATTTCCACCAAACCCCCCCTCCCCCGCTTCTGGCCACAGC";
         let alt_seq = "AAAAATTTCCACCAAACCCCCCCCCCTCCCCCCGCTTCTGGCCACAGC";
         let raw_cigar = "23=4I1X20=";
@@ -1259,7 +1187,7 @@ mod tests {
 
     #[test]
     fn genuine_snp_next_to_unrelated_indel_is_left_alone() {
-        // A real substitution sitting right next to an insertion whose inserted base never equals the mismatched ref base
+        // A real substitution next to an insertion whose bases never equal the mismatched ref base.
         let ref_seq = "ACGTACGTG";
         let alt_seq = "ACGTACGTTTA"; // insert "TT" then mismatch G->A
         let raw_cigar = "8=2I1X";

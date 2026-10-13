@@ -29,20 +29,9 @@ pub fn containing_tract_in(tracts: &[Tract], span: &VariantSpan) -> Option<usize
     })
 }
 
-/// Index of the [`KNOWN_TRACTS`] entry that fully contains `span`, if any.
-#[allow(dead_code)] // the KNOWN_TRACTS shorthand; T5 goes through `*_in`.
-pub fn containing_tract(span: &VariantSpan) -> Option<usize> {
-    containing_tract_in(KNOWN_TRACTS, span)
-}
-
-/// Whether `span` overlaps any tract in `tracts`.
-pub fn overlaps_tract_in(tracts: &[Tract], span: &VariantSpan) -> bool {
-    tracts.iter().any(|t| tract_span(t).overlaps(span))
-}
-
 /// Whether `span` overlaps any [`KNOWN_TRACTS`] entry.
 pub fn overlaps_tract(span: &VariantSpan) -> bool {
-    overlaps_tract_in(KNOWN_TRACTS, span)
+    KNOWN_TRACTS.iter().any(|t| tract_span(t).overlaps(span))
 }
 
 /// The matrix row name for tract allele `alt`: `m.<start><ref_seq>><alt>`.
@@ -88,21 +77,22 @@ mod tests {
 
     #[test]
     fn containing_tract_accepts_variants_inside_and_rejects_those_outside() {
+        let containing = |v: &str| containing_tract_in(KNOWN_TRACTS, &span(v));
         // Anchor insertion at the first base, SNV in the middle, SNV at the last base: all inside HVS1-C (index 1).
-        assert_eq!(containing_tract(&span("m.16183A>AC")), Some(1));
-        assert_eq!(containing_tract(&span("m.16189T>C")), Some(1));
-        assert_eq!(containing_tract(&span("m.16193C>T")), Some(1));
+        assert_eq!(containing("m.16183A>AC"), Some(1));
+        assert_eq!(containing("m.16189T>C"), Some(1));
+        assert_eq!(containing("m.16193C>T"), Some(1));
         // A deletion wholly inside the tract.
-        assert_eq!(containing_tract(&span("m.16192CC>C")), Some(1));
+        assert_eq!(containing("m.16192CC>C"), Some(1));
         // The other two tracts.
-        assert_eq!(containing_tract(&span("m.302A>AC")), Some(0));
-        assert_eq!(containing_tract(&span("m.513G>GCA")), Some(2));
+        assert_eq!(containing("m.302A>AC"), Some(0));
+        assert_eq!(containing("m.513G>GCA"), Some(2));
         // One base before the anchor, one base past the end, and far away.
-        assert_eq!(containing_tract(&span("m.16182A>C")), None);
-        assert_eq!(containing_tract(&span("m.16194A>G")), None);
-        assert_eq!(containing_tract(&span("m.3243A>G")), None);
+        assert_eq!(containing("m.16182A>C"), None);
+        assert_eq!(containing("m.16194A>G"), None);
+        assert_eq!(containing("m.3243A>G"), None);
         // Straddling the 3' boundary: REF covers 16193 and 16194.
-        assert_eq!(containing_tract(&span("m.16193CA>C")), None);
+        assert_eq!(containing("m.16193CA>C"), None);
     }
 
     #[test]

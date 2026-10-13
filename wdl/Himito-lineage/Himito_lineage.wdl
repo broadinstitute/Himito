@@ -171,7 +171,7 @@ task Himito_quickstart {
         String sample_id
         String data_type
         String chromo = "chrM"
-        String extra_args = "--left-align"
+        String extra_args = ""
 
         RuntimeAttr? runtime_attr_override
     }

@@ -20,68 +20,17 @@ mod denoise;
 mod denoise_indel;
 mod linkage;
 
-// Thresholds: see dev_docs/superpowers/plans/2026-10-11-ont-recall-high-coverage.md
 pub const DENOISE_KEEP_VAF: f64 = 0.03;
-pub const PENDING_FLOOR: f64 = 0.005;
-pub const PERM_STOP_AFTER: u32 = 10;
-pub const PERM_HEADROOM: f64 = 5.0;
-pub const PERM_MAX_ROUNDS: usize = 100_000;
-pub const PERM_SEED: u64 = 42;
-pub const STRAND_BIAS_MIN_EFFECT: f64 = 0.20;
-pub const STRAND_LOCAL_MIN_READS: usize = 20;
-pub const GENOTYPE_MAX_ED_ONT: u32 = 4;
-pub const GENOTYPE_FLANK: usize = 10;
-pub const COOC_EXEMPT_HF: f64 = 0.10;
-pub const COOC_EXEMPT_MIN_AC: usize = 20;
-pub const LINK_MIN_HF: f64 = 0.004;
-pub const LINK_MAX_HF: f64 = 0.20;
-pub const LINK_MIN_AC: u32 = 10;
-pub const LINK_MIN_DIST: u32 = 20;
-pub const LINK_ERR_QUANTILE: f64 = 0.95;
-pub const LINK_MIN_SHARED: u32 = 5;
-pub const LINK_MIN_SHARED_STRAND: u32 = 3;
-pub const LINK_MIN_COCOVER: u32 = 50;
-pub const LINK_MIN_COCOVER_STRAND: u32 = 30;
-pub const LINK_MIN_ENRICH: f64 = 10.0;
-pub const LINK_LOG10P: f64 = -10.0;
-pub const LINK_STRAND_LOG10P: f64 = -5.0;
-pub const DENOISE_MIN_STRAND: u32 = 2;
-pub const DENOISE_STRAND_BIAS_P: f64 = 0.01;
 pub const DENOISE_HOMOPLASMIC_VAF: f64 = 0.95;
 
 /// The data types Himito accepts wherever a `-d/--data-type` is taken.
 pub const DATA_TYPES: [&str; 4] = ["pacbio", "ont-r9", "ont-r10", "ont-denoised"];
-
-/// Minimal reads a variant must be present in / absent from for `lineage` to treat it as informative.
-pub const LINEAGE_MIN_PRESENCE: usize = 2;
-pub const LINEAGE_MIN_ABSENCE: usize = 1;
-
-/// Minimal reads backing a haplotype for `lineage` to report it.
-pub const LINEAGE_MIN_READS: usize = 3;
-
-/// RNG seed for the SCITE MCMC search, fixed so runs are reproducible.
-pub const LINEAGE_MCMC_SEED: u64 = 42;
-
-/// Lineage root block (always on): minimum HF for a variant to be CONSIDERED homoplasmic.
-pub const LINEAGE_ROOT_BLOCK_MIN_HF: f64 = 0.80;
-
-/// Lineage root block: Benjamini-Hochberg q above which a variant's absences count as unstructured.
-pub const LINEAGE_ROOT_BLOCK_MAX_Q: f64 = 0.05;
-
-/// Lineage root block: below this many absent calls a high-HF variant is admitted without testing.
-pub const LINEAGE_ROOT_BLOCK_MIN_ABSENT: usize = 10;
-
-/// Lineage root block: minimum enrichment odds ratio for a partner's absences to be structured.
-pub const LINEAGE_ROOT_BLOCK_MIN_OR: f64 = 2.0;
 
 /// Quick-start: longest read span (bp) the graph build aligns.
 pub const QUICK_START_LENGTH_MAX: usize = 3000;
 
 /// Quick-start: RNG seed of the mt-read downsampling, fixed for reproducible subsets.
 pub const QUICK_START_DOWNSAMPLE_SEED: u64 = 42;
-
-/// Strand-skewed SNPs below this HF are dropped instead of flagged.
-pub const STRAND_BIAS_DROP_MAX_HF: f64 = 0.10;
 
 #[derive(Debug, Parser)]
 #[clap(name = "Himito")]
@@ -99,13 +48,13 @@ struct Cli {
 #[derive(Args, Debug)]
 pub struct GlobalOpts {
     /// worker threads for parallel stages
-    #[arg(long, global = true)]
+    #[arg(long, global = true, value_parser = parse_positive)]
     pub threads: Option<usize>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Quick start pipeline for mitochondrial assembly.
+    /// Quick start pipeline for mitochondrial assembly, variant calling and methylation aggregation
     #[clap(arg_required_else_help = true)]
     QuickStart {
         /// input BAM of reads, coordinate-sorted
@@ -180,13 +129,8 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 1000, hide_short_help = true)]
         permutation_rounds: usize,
 
-        // `--left-align` is a no-op kept so old command lines still parse.
-        /// no-op; indels are left-aligned by default
-        #[clap(long = "left-align", action, hide = true)]
-        left_align_compat: bool,
-
-        /// do not left-align indels (reproduces pre-2026-09 variant names)
-        #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat", hide_short_help = true)]
+        /// keep the graph's indel spellings instead of left-aligning them
+        #[clap(long = "no-left-align", action, hide_short_help = true)]
         no_left_align: bool,
 
         /// turn off read-linkage rescue of low-frequency SNVs (ONT only)
@@ -292,7 +236,7 @@ enum Commands {
         indels: bool,
 
         /// an allele at or above this fraction of reads at a site is never corrected away.
-        #[clap(long, value_parser, default_value_t = 0.2)]
+        #[clap(long, value_parser = parse_protect_vaf, default_value_t = 0.2)]
         indel_protect_vaf: f64,
 
         /// EXPERIMENTAL: treat a homopolymer as a single LENGTH.
@@ -390,13 +334,8 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 1000, hide_short_help = true)]
         permutation_rounds: usize,
 
-        // `--left-align` is a no-op kept so old command lines still parse.
-        /// no-op; indels are left-aligned by default
-        #[clap(long = "left-align", action, hide = true)]
-        left_align_compat: bool,
-
-        /// do not left-align indels (reproduces pre-2026-09 variant names)
-        #[clap(long = "no-left-align", action, conflicts_with = "left_align_compat", hide_short_help = true)]
+        /// keep the graph's indel spellings instead of left-aligning them
+        #[clap(long = "no-left-align", action, hide_short_help = true)]
         no_left_align: bool,
     },
 
@@ -513,7 +452,7 @@ enum Commands {
         emit_bnd: bool,
     },
 
-    /// Infer mitochondrial lineage tree from Himito read_var matrix CSV.
+    /// Infer mitochondrial lineage tree from Himito read_var matrix CSV and heteroplasmic variants
     #[clap(arg_required_else_help = true)]
     Lineage {
         /// Himito matrix CSV (<prefix>.matrix.csv)
@@ -571,7 +510,7 @@ enum Commands {
         mcmc_iterations: usize,
 
         /// independent MCMC chains; the best tree is kept
-        #[clap(long, value_parser, default_value_t = 3, hide_short_help = true)]
+        #[clap(long, value_parser = parse_positive, default_value_t = 3, hide_short_help = true)]
         mcmc_chains: usize,
 
         /// also write raw_haplotype_map.tsv and raw_variant_cooccurrence.tsv
@@ -580,27 +519,24 @@ enum Commands {
     }
 }
 
-/// Validate the user-settable `--indel-*` options at the CLI boundary.
-fn validate_indel_opts(o: &denoise_indel::IndelOpts) -> AnyhowResult<()> {
-    anyhow::ensure!(
-        o.protect_vaf > 0.0 && o.protect_vaf <= 1.0,
-        "--indel-protect-vaf must be in (0, 1] (got {})", o.protect_vaf
-    );
-    Ok(())
+/// `--indel-protect-vaf` must be in (0, 1]; 0 would protect every allele.
+/// Counts that must be at least 1.
+fn parse_positive(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if n >= 1 => Ok(n),
+        _ => Err(format!("must be a positive integer, got {s}")),
+    }
 }
 
-fn validate_lineage_opts(mcmc_chains: usize) -> AnyhowResult<()> {
-    if mcmc_chains == 0 {
-        anyhow::bail!("--mcmc-chains must be at least 1 (got {mcmc_chains})");
-    }
-    Ok(())
+fn parse_protect_vaf(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|e| format!("{e}"))?;
+    if v > 0.0 && v <= 1.0 { Ok(v) } else { Err(format!("must be in (0, 1], got {v}")) }
 }
 
 pub fn init_rayon_threads(threads: Option<usize>) -> AnyhowResult<()> {
     let Some(n) = threads else {
         return Ok(());
     };
-    anyhow::ensure!(n >= 1, "--threads must be at least 1 (got {n})");
     rayon::ThreadPoolBuilder::new()
         .num_threads(n)
         .build_global()
@@ -612,7 +548,10 @@ pub fn init_rayon_threads(threads: Option<usize>) -> AnyhowResult<()> {
 fn main() {
     env_logger::init();
     let args = Cli::parse();
-    init_rayon_threads(args.global.threads);
+    if let Err(e) = init_rayon_threads(args.global.threads) {
+        eprintln!("Error: {e:#}");
+        std::process::exit(1);
+    }
     match args.command {
         Commands::QuickStart {
             input_bam,
@@ -634,12 +573,11 @@ fn main() {
             permutation_frequency_threshold,
             permutation_rounds,
             no_left_align,
-            left_align_compat: _,
             no_linkage_rescue,
             denoise_keep_vaf,
         } => {
             let left_align = !no_left_align;
-            let (p_value_threshold, frequency_threshold, permutation_frequency_threshold_) =
+            let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold, permutation_frequency_threshold);
             let indel_false_threshold = call::resolve_indel_false_threshold(&data_type, indel_false_threshold);
             let mt_output = output_prefix.with_extension("mt.bam");
@@ -655,31 +593,17 @@ fn main() {
                 QUICK_START_DOWNSAMPLE_SEED,
             );
             
-            // For ONT, denoise the mt BAM so reads consolidate; PacBio is untouched.
-            let (build_bam, data_type_) = if data_type == "ont-denoised" {
+            // ont-denoised builds the graph from a denoised copy of the mt BAM (indel correction on).
+            let mut build_bam = mt_output.clone();
+            if data_type == "ont-denoised" {
                 let denoised = output_prefix.with_extension("mt.denoised.bam");
-                // Denoise settings for the combined pipeline.
-                if let Err(e) = denoise::start(
-                    &mt_output, &denoised, &reference_path, &data_type,
-                    // Denoise's keep threshold, NOT `vaf_threshold`.
-                    denoise_keep_vaf, 0.7,
-                    // Indel correction is on in QuickStart.
-                    &denoise_indel::IndelOpts {
-                        enabled: true,
-                        hp_length_model: false,
-                        ..Default::default()
-                    },
-                    None,
-                ) {
-                    eprintln!("Warning: denoise failed ({e:#}); falling back to raw mt BAM.");
-                    (mt_output.clone(), data_type.as_str())
-                } else {
-                    (denoised, "ont-denoised")
+                let iopts = denoise_indel::IndelOpts { enabled: true, ..Default::default() };
+                // `denoise_keep_vaf` is the denoiser's own keep threshold, not `vaf_threshold`.
+                match denoise::start(&mt_output, &denoised, &reference_path, &data_type, denoise_keep_vaf, 0.7, &iopts, None) {
+                    Ok(()) => build_bam = denoised,
+                    Err(e) => eprintln!("Warning: denoise failed ({e:#}); falling back to raw mt BAM."),
                 }
-            } else {
-                (mt_output.clone(), data_type.as_str())
-            };
-            info!("Data Type for variant calling: {data_type_}");
+            }
 
             let graph_output = output_prefix.with_extension("gfa");
             let _ = build::start(&graph_output, kmer_size, &build_bam, &reference_path, QUICK_START_LENGTH_MAX, 2);
@@ -688,7 +612,6 @@ fn main() {
             asm::start(&graph_output, &assemble_output, &sample_id);
 
             let vcf_output = output_prefix.with_extension("vcf");
-            println!("{}", data_type_);
             call::start(
                 &graph_output,
                 &reference_path,
@@ -697,26 +620,20 @@ fn main() {
                 &vcf_output,
                 &sample_id,
                 vaf_threshold,
-                &data_type_,
+                &data_type,
                 p_value_threshold,
                 frequency_threshold,
                 // Raw mt BAM, not build_bam (denoise turns uncertain ALTs into REF).
                 Some(&mt_output),
                 strand_bias_threshold,
                 indel_false_threshold,
-                permutation_frequency_threshold_,
+                permutation_frequency_threshold,
                 permutation_rounds,
-                // Adaptive permutation test; Fixed is only reachable from unit tests.
-                call::PermutationMode::Adaptive,
-                // None: the data-type preset (drop for ont-denoised, flag otherwise).
-                None,
-                STRAND_BIAS_DROP_MAX_HF,
                 left_align,
                 no_linkage_rescue,
             );
-            let annotated_graph_output = output_prefix.with_extension("gfa");
             let methyl_output = output_prefix.with_extension("bed");
-            methyl::start(&annotated_graph_output, &mt_output, &methyl_output, threshold_methylation_prob, false);
+            methyl::start(&graph_output, &mt_output, &methyl_output, threshold_methylation_prob, false);
         }
         Commands::Filter {
             input_bam,
@@ -766,15 +683,7 @@ fn main() {
                 enabled: indels,
                 protect_vaf: indel_protect_vaf,
                 hp_length_model: indel_hp_length_model,
-                ..Default::default()
             };
-            // Only validate when --indels is actually in effect.
-            if iopts.enabled {
-                if let Err(e) = validate_indel_opts(&iopts) {
-                    eprintln!("Error: {e:#}");
-                    std::process::exit(1);
-                }
-            }
             if let Err(e) = denoise::start(
                 &input, &output, &reference, &data_type, vaf,
                 DENOISE_HOMOPLASMIC_VAF, &iopts, stats.as_ref(),
@@ -812,7 +721,6 @@ fn main() {
             permutation_frequency_threshold,
             permutation_rounds,
             no_left_align,
-            left_align_compat: _,
         } => {
             let left_align = !no_left_align;
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
@@ -834,11 +742,6 @@ fn main() {
                 indel_false_threshold,
                 permutation_frequency_threshold,
                 permutation_rounds,
-                // Adaptive permutation test; Fixed is only reachable from unit tests.
-                call::PermutationMode::Adaptive,
-                // None: the data-type preset (drop for ont-denoised, flag otherwise).
-                None,
-                STRAND_BIAS_DROP_MAX_HF,
                 left_align,
                 false,
             );
@@ -939,34 +842,17 @@ fn main() {
             } else {
                 &[]
             };
-            // Root block is always on.
-            let root_block = Some(rootblock::RootBlockConfig {
-                min_hf: LINEAGE_ROOT_BLOCK_MIN_HF,
-                max_q: LINEAGE_ROOT_BLOCK_MAX_Q,
-                min_absent: LINEAGE_ROOT_BLOCK_MIN_ABSENT,
-                min_or: LINEAGE_ROOT_BLOCK_MIN_OR,
-            });
-            // `run_mcmc_multichain` panics on an empty chain list.
-            if let Err(e) = validate_lineage_opts(mcmc_chains) {
-                eprintln!("Error: {e:#}");
-                std::process::exit(1);
-            }
             if let Err(e) = lineage::start(
                 matrix_file,
                 vcf_file,
                 min_hf,
                 max_hf,
-                LINEAGE_MIN_PRESENCE,
-                LINEAGE_MIN_ABSENCE,
-                LINEAGE_MIN_READS,
                 fp_rate,
                 fn_rate,
                 hp_rates,
                 tracts,
                 mcmc_iterations,
                 mcmc_chains,
-                LINEAGE_MCMC_SEED,
-                root_block,
                 debug,
                 &output_prefix,
             ) {
@@ -980,502 +866,31 @@ fn main() {
 }
 
 #[cfg(test)]
-mod indel_opts_validation_tests {
-    use super::*;
-    use denoise_indel::IndelOpts;
-
-    fn opts() -> IndelOpts {
-        IndelOpts { enabled: true, ..Default::default() }
-    }
-
-    #[test]
-    fn shipped_defaults_pass_validation() {
-        assert!(validate_indel_opts(&opts()).is_ok());
-    }
-
-    #[test]
-    fn protect_vaf_zero_is_rejected() {
-        // --indel-protect-vaf 0 protects every non-strand-rejected read, so it is the exact inverse of "protect less.
-        let mut o = opts();
-        o.protect_vaf = 0.0;
-        assert!(validate_indel_opts(&o).is_err());
-    }
-
-    #[test]
-    fn protect_vaf_one_is_accepted() {
-        let mut o = opts();
-        o.protect_vaf = 1.0;
-        assert!(validate_indel_opts(&o).is_ok());
-    }
-
-    #[test]
-    fn protect_vaf_above_one_is_rejected() {
-        let mut o = opts();
-        o.protect_vaf = 1.5;
-        assert!(validate_indel_opts(&o).is_err());
-    }
-
-    // The former per-field range tests were deleted along with the flags that set those fields.
-
-    #[test]
-    fn hp_length_model_is_off_unless_the_flag_is_passed() {
-        use clap::Parser;
-        let base = [
-            "Himito", "denoise", "-i", "in.bam", "-o", "out.bam", "-r", "ref.fa", "--indels",
-        ];
-        let hp_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
-            Commands::Denoise { indel_hp_length_model, .. } => indel_hp_length_model,
-            other => panic!("expected the Denoise subcommand, got {other:?}"),
-        };
-        assert!(!hp_of(&base), "--indels alone must not enable the HP length model");
-        let mut on = base.to_vec();
-        on.push("--indel-hp-length-model");
-        assert!(hp_of(&on), "the flag must enable it");
-    }
-}
-
-#[cfg(test)]
-mod lineage_opts_validation_tests {
-    use super::*;
-
-    #[test]
-    fn mcmc_chains_zero_is_rejected() {
-        let err = validate_lineage_opts(0).unwrap_err();
-        assert_eq!(
-            format!("{err:#}"),
-            "--mcmc-chains must be at least 1 (got 0)"
-        );
-    }
-
-    #[test]
-    fn mcmc_chains_one_is_accepted() {
-        assert!(validate_lineage_opts(1).is_ok());
-    }
-
-    #[test]
-    fn collapse_hp_is_off_unless_the_flag_is_passed() {
-        use clap::Parser;
-        let base = ["Himito", "lineage", "-m", "matrix.csv", "-o", "out"];
-        let collapse_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
-            Commands::Lineage { collapse_hp, .. } => collapse_hp,
-            other => panic!("expected the Lineage subcommand, got {other:?}"),
-        };
-        assert!(!collapse_of(&base), "collapse must be off by default");
-        let mut on = base.to_vec();
-        on.push("--collapse-hp");
-        assert!(collapse_of(&on), "--collapse-hp must enable it");
-    }
-}
-
-#[cfg(test)]
-mod linkage_cli_tests {
-    use super::*;
-
-    #[test]
-    fn linkage_flags_parse() {
-        let cli = Cli::try_parse_from([
-            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out", "--no-linkage-rescue",
-        ])
-        .unwrap();
-        assert!(matches!(cli.command, Commands::QuickStart { no_linkage_rescue: true, .. }));
-    }
-}
-
-#[cfg(test)]
-mod bam_cli_tests {
-    use super::*;
-
-    const CALL: [&str; 9] = ["Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o"];
-
-    fn call_args(extra: &[&str]) -> Vec<String> {
-        let mut v: Vec<String> = CALL.iter().map(|s| s.to_string()).collect();
-        v.push("out.vcf".into());
-        v.extend(extra.iter().map(|s| s.to_string()));
-        v
-    }
-
-    fn bam_of(extra: &[&str]) -> Option<PathBuf> {
-        match Cli::try_parse_from(call_args(extra)).unwrap().command {
-            Commands::Call { bam, .. } => bam,
-            other => panic!("unexpected subcommand: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn call_short_flag_sets_bam() {
-        assert_eq!(bam_of(&["-b", "raw.bam"]), Some(PathBuf::from("raw.bam")));
-        assert_eq!(bam_of(&["--bam", "raw.bam"]), Some(PathBuf::from("raw.bam")));
-    }
-
-    #[test]
-    fn call_input_bam_is_an_alias_of_bam() {
-        assert_eq!(bam_of(&["--input-bam", "raw.bam"]), Some(PathBuf::from("raw.bam")));
-    }
-
-    #[test]
-    fn call_bam_is_optional() {
-        assert_eq!(bam_of(&[]), None);
-    }
-
-    #[test]
-    fn call_rejects_the_removed_bam_flags() {
-        for flag in ["--genotype-bam", "--linkage-bam"] {
-            let err = Cli::try_parse_from(call_args(&[flag, "x.bam"])).unwrap_err();
-            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{flag}");
-        }
-    }
-
-    #[test]
-    fn quickstart_rejects_genotype_from_bam() {
-        let err = Cli::try_parse_from([
-            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out", "--genotype-from-bam",
-        ])
-        .unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
-    }
-}
-
-#[cfg(test)]
-mod denoise_keep_vaf_cli_tests {
-    use super::*;
-
-    fn keep_vaf_of(extra: &[&str]) -> f64 {
-        let mut args = vec!["Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out"];
-        args.extend_from_slice(extra);
-        match Cli::try_parse_from(args).unwrap().command {
-            Commands::QuickStart { denoise_keep_vaf, vaf_threshold, .. } => {
-                assert_eq!(vaf_threshold, 0.01, "-v must stay independent of --denoise-keep-vaf");
-                denoise_keep_vaf
-            }
-            other => panic!("expected the QuickStart subcommand, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn quickstart_denoise_keep_vaf_defaults_to_the_constant() {
-        assert_eq!(keep_vaf_of(&[]), DENOISE_KEEP_VAF);
-        assert_eq!(DENOISE_KEEP_VAF, 0.03);
-    }
-
-    #[test]
-    fn quickstart_denoise_keep_vaf_explicit_value_wins() {
-        assert_eq!(keep_vaf_of(&["--denoise-keep-vaf", "0.01"]), 0.01);
-    }
-}
-
-// Effective left-alignment is the default; `--left-align` remains accepted and `--no-left-align` turns it off.
-#[cfg(test)]
-mod left_align_cli_tests {
-    use super::*;
-
-    fn parse(args: &[&str]) -> clap::error::Result<Cli> {
-        Cli::try_parse_from(args)
-    }
-
-    fn effective_left_align(cli: Cli) -> bool {
-        match cli.command {
-            Commands::Call { no_left_align, .. } | Commands::QuickStart { no_left_align, .. } => {
-                !no_left_align
-            }
-            other => panic!("unexpected subcommand: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn call_left_aligns_by_default() {
-        let cli = parse(&["Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf"]).unwrap();
-        assert!(effective_left_align(cli));
-    }
-
-    #[test]
-    fn call_left_align_flag_still_left_aligns() {
-        let cli = parse(&[
-            "Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf", "--left-align",
-        ])
-        .unwrap();
-        assert!(effective_left_align(cli));
-    }
-
-    #[test]
-    fn call_no_left_align_disables_it() {
-        let cli = parse(&[
-            "Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf", "--no-left-align",
-        ])
-        .unwrap();
-        assert!(!effective_left_align(cli));
-    }
-
-    #[test]
-    fn call_rejects_both_left_align_flags() {
-        let err = parse(&[
-            "Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf",
-            "--left-align", "--no-left-align",
-        ])
-        .unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn quickstart_left_aligns_by_default() {
-        let cli = parse(&[
-            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out",
-        ])
-        .unwrap();
-        assert!(effective_left_align(cli));
-    }
-
-    #[test]
-    fn quickstart_left_align_flag_still_left_aligns() {
-        let cli = parse(&[
-            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out", "--left-align",
-        ])
-        .unwrap();
-        assert!(effective_left_align(cli));
-    }
-
-    #[test]
-    fn quickstart_no_left_align_disables_it() {
-        let cli = parse(&[
-            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out", "--no-left-align",
-        ])
-        .unwrap();
-        assert!(!effective_left_align(cli));
-    }
-
-    #[test]
-    fn quickstart_rejects_both_left_align_flags() {
-        let err = parse(&[
-            "Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out",
-            "--left-align", "--no-left-align",
-        ])
-        .unwrap_err();
-        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-}
-
-#[cfg(test)]
-mod option_split_tests {
+mod tests {
     use super::*;
     use clap::CommandFactory;
 
-    struct Split {
-        sub: &'static str,
-        visible: &'static [&'static str],
-        // (long flag, value to parse it with; "" for a switch)
-        advanced: &'static [(&'static str, &'static str)],
-        gone: &'static [&'static str],
-    }
-
-    const QUICK_START: Split = Split {
-        sub: "quick-start",
-        visible: &[
-            "--input-bam", "--chromo", "--reference-path", "--sample-id", "--data-type",
-            "--output-prefix", "--maximal-mt-depth", "--threads",
-        ],
-        advanced: &[
-            ("--kmer-size", "21"), ("--minimal-ac", "2"), ("--vaf-threshold", "0.01"),
-            ("--threshold-methylation-prob", "0.5"), ("--filter-max-methylation", "0.2"),
-            ("--p-value-threshold", "0.01"), ("--heteroplasmic-frequency-threshold", "0.5"),
-            ("--strand-bias-threshold", "0.05"), ("--indel-false-threshold", "0.1"),
-            ("--permutation-frequency-threshold", "0.5"), ("--permutation-rounds", "1000"),
-            ("--no-left-align", ""), ("--no-linkage-rescue", ""), ("--denoise-keep-vaf", "0.03"),
-        ],
-        gone: &[
-            "--length-max", "--downsample-seed", "--strand-bias-drop-max-hf",
-            "--strand-bias-action", "--permutation-mode", "--cooccurrence-stat",
-            "--genotype-from-bam", "--left-align",
-        ],
-    };
-
-    const CALL: Split = Split {
-        sub: "call",
-        visible: &[
-            "--graphfile", "--reference-fasta", "--sample-id", "--data-type", "--output-file",
-            "--bam", "--threads",
-        ],
-        advanced: &[
-            ("--k", "21"), ("--minimal-ac", "2"), ("--vaf-threshold", "0.01"),
-            ("--p-value-threshold", "0.01"), ("--frequency-threshold", "0.5"),
-            ("--strand-bias-threshold", "0.01"), ("--indel-false-threshold", "0.1"),
-            ("--permutation-frequency-threshold", "0.5"), ("--permutation-rounds", "1000"),
-            ("--no-left-align", ""),
-        ],
-        gone: &[
-            "--strand-bias-action", "--strand-bias-drop-max-hf", "--permutation-mode",
-            "--genotype-max-ed", "--genotype-flank", "--cooccurrence-stat",
-            "--genotype-bam", "--linkage-bam", "--left-align", "--input-bam",
-        ],
-    };
-
-    const LINEAGE: Split = Split {
-        sub: "lineage",
-        visible: &[
-            "--matrix-file", "--vcf-file", "--data-type", "--output-prefix", "--min-hf",
-            "--max-hf", "--threads",
-        ],
-        advanced: &[
-            ("--fp-rate", "0.005"), ("--fn-rate", "0.02"), ("--hp-fp-rate", "0.01"),
-            ("--hp-fn-rate", "0.04"), ("--collapse-hp", ""), ("--mcmc-iterations", "100"),
-            ("--mcmc-chains", "2"), ("--debug", ""),
-        ],
-        gone: &[
-            "--no-root-block", "--root-block-min-hf", "--root-block-max-q",
-            "--root-block-min-absent", "--root-block-min-or",
-        ],
-    };
-
-    /// (short help, long help) of a subcommand, as `-h` and `--help` print them.
-    fn helps(sub: &str) -> (String, String) {
-        let mut root = Cli::command();
-        root.build();
-        let cmd = root.find_subcommand_mut(sub).expect("subcommand exists");
-        (cmd.render_help().to_string(), cmd.render_long_help().to_string())
-    }
-
-    /// Long flags that head an option entry (not ones merely mentioned in prose).
-    fn listed(help: &str) -> Vec<String> {
-        help.lines()
-            .map(str::trim_start)
-            .filter(|l| l.starts_with('-'))
-            .flat_map(|l| {
-                l.split_whitespace()
-                    .take_while(|t| t.starts_with('-'))
-                    .filter(|t| t.starts_with("--"))
-                    .map(|t| t.trim_end_matches(',').to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect()
-    }
-
-    fn cmdline(split: &Split, extra: &[&str]) -> Vec<String> {
-        let base: &[&str] = match split.sub {
-            "quick-start" => &["Himito", "quick-start", "-i", "in.bam", "-r", "ref.fa", "-s", "S", "-o", "out"],
-            "call" => &["Himito", "call", "-g", "g.gfa", "-r", "ref.fa", "-s", "S", "-o", "out.vcf"],
-            "lineage" => &["Himito", "lineage", "-m", "m.csv", "-o", "out"],
-            other => panic!("no base command line for {other}"),
-        };
-        base.iter().chain(extra).map(|s| s.to_string()).collect()
-    }
-
-    fn check(split: &Split) {
-        let (short, long) = helps(split.sub);
-        let (short, long) = (listed(&short), listed(&long));
-        let has = |v: &[String], f: &str| v.iter().any(|x| x == f);
-        for f in split.visible {
-            assert!(has(&short, f), "{} -h must list {f}", split.sub);
-            assert!(has(&long, f), "{} --help must list {f}", split.sub);
+    #[test]
+    fn value_parsers_enforce_ranges() {
+        for (v, ok) in [("0", false), ("1e-9", true), ("1", true), ("1.5", false), ("NaN", false)] {
+            assert_eq!(parse_protect_vaf(v).is_ok(), ok, "{v}");
         }
-        for (f, _) in split.advanced {
-            assert!(!has(&short, f), "{} -h must NOT list advanced {f}", split.sub);
-            assert!(has(&long, f), "{} --help must list advanced {f}", split.sub);
-        }
-        for f in split.gone {
-            assert!(!has(&short, f), "{} -h must not list {f}", split.sub);
-            assert!(!has(&long, f), "{} --help must not list {f}", split.sub);
+        for (v, ok) in [("0", false), ("1", true), ("-1", false), ("x", false)] {
+            assert_eq!(parse_positive(v).is_ok(), ok, "{v}");
         }
     }
 
-    fn check_parse(split: &Split) {
-        for (f, v) in split.advanced {
-            let extra: Vec<&str> = if v.is_empty() { vec![f] } else { vec![f, v] };
-            if let Err(e) = Cli::try_parse_from(cmdline(split, &extra)) {
-                panic!("{} {f}: advanced flag must still parse: {e}", split.sub);
-            }
-        }
-        for f in split.gone {
-            if *f == "--input-bam" || *f == "--left-align" {
-                continue;
-            }
-            let err = Cli::try_parse_from(cmdline(split, &[f, "1"])).expect_err(f);
-            assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument, "{} {f}", split.sub);
-        }
-    }
-
+    /// docs/cli/ holds the `-h` and `--help` text of the commands that hide advanced options from `-h`.
     #[test]
-    fn quick_start_help_split() {
-        check(&QUICK_START);
-    }
-
-    #[test]
-    fn call_help_split() {
-        check(&CALL);
-    }
-
-    #[test]
-    fn lineage_help_split() {
-        check(&LINEAGE);
-    }
-
-    #[test]
-    fn quick_start_advanced_parse_and_removed_rejected() {
-        check_parse(&QUICK_START);
-    }
-
-    #[test]
-    fn call_advanced_parse_and_removed_rejected() {
-        check_parse(&CALL);
-    }
-
-    #[test]
-    fn lineage_advanced_parse_and_removed_rejected() {
-        check_parse(&LINEAGE);
-    }
-
-    #[test]
-    fn left_align_is_a_hidden_noop_on_quick_start_and_call() {
-        for split in [&QUICK_START, &CALL] {
-            Cli::try_parse_from(cmdline(split, &["--left-align"])).unwrap();
-            let (short, long) = helps(split.sub);
-            assert!(!listed(&short).iter().any(|f| f == "--left-align"));
-            assert!(!listed(&long).iter().any(|f| f == "--left-align"));
-        }
-    }
-
-    #[test]
-    fn call_input_bam_alias_still_parses_but_is_not_listed() {
-        Cli::try_parse_from(cmdline(&CALL, &["--input-bam", "raw.bam"])).unwrap();
-        let (short, long) = helps("call");
-        assert!(!listed(&short).iter().any(|f| f == "--input-bam"));
-        assert!(!listed(&long).iter().any(|f| f == "--input-bam"));
-    }
-
-    #[test]
-    fn data_type_is_validated_on_quick_start_and_call() {
-        for split in [&QUICK_START, &CALL] {
-            let err = Cli::try_parse_from(cmdline(split, &["-d", "ont-10"])).unwrap_err();
-            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{}", split.sub);
-            for dt in DATA_TYPES {
-                Cli::try_parse_from(cmdline(split, &["-d", dt])).unwrap();
-            }
-        }
-    }
-
-    #[test]
-    fn help_strings_are_one_short_line_without_defaults() {
+    fn docs_cli_match_help() {
         let mut root = Cli::command();
         root.build();
         for sub in ["quick-start", "call", "lineage"] {
-            for arg in root.find_subcommand(sub).unwrap().get_arguments() {
-                let id = arg.get_id();
-                // clap's own -h/--help carries a long form by design.
-                if arg.is_hide_set() || id == "help" || id == "version" {
-                    continue;
-                }
-                assert!(arg.get_long_help().is_none(), "{sub} --{id}: long help set");
-                let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
-                assert!(!help.is_empty(), "{sub} --{id}: no help");
-                assert!(!help.contains('\n'), "{sub} --{id}: help spans lines");
-                assert!(help.chars().count() <= 80, "{sub} --{id}: {} chars", help.chars().count());
-                assert!(!help.to_lowercase().contains("default"), "{sub} --{id}: names a default");
+            let cmd = root.find_subcommand_mut(sub).unwrap();
+            for (kind, help) in [("short", cmd.render_help()), ("long", cmd.render_long_help())] {
+                let path = format!("{}/docs/cli/{sub}.{kind}.txt", env!("CARGO_MANIFEST_DIR"));
+                assert_eq!(help.to_string(), std::fs::read_to_string(&path).unwrap(), "{path} is out of date");
             }
         }
-    }
-
-    #[test]
-    fn lineage_root_block_is_always_on() {
-        assert_eq!(LINEAGE_ROOT_BLOCK_MIN_HF, 0.80);
-        assert_eq!(LINEAGE_ROOT_BLOCK_MAX_Q, 0.05);
-        assert_eq!(LINEAGE_ROOT_BLOCK_MIN_ABSENT, 10);
-        assert_eq!(LINEAGE_ROOT_BLOCK_MIN_OR, 2.0);
     }
 }

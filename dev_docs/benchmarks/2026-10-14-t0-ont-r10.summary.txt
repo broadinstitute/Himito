@@ -1,3 +1,0 @@
-Threshold  True-pos-baseline  True-pos-call  False-pos  False-neg  Precision  Sensitivity  F-measure
-----------------------------------------------------------------------------------------------------
-     None                115            114          5          6     0.9580       0.9504     0.9542

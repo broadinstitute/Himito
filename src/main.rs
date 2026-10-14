@@ -140,6 +140,10 @@ enum Commands {
         /// keep threshold of the denoise site model (ont-denoised only)
         #[clap(long, value_parser, default_value_t = DENOISE_KEEP_VAF, hide_short_help = true)]
         denoise_keep_vaf: f64,
+
+        /// PacBio opt-in: admit out-of-tract small indels with HF ≥ this (still < indel_false_threshold)
+        #[clap(long, value_parser, hide = true)]
+        indel_linked_min_hf: Option<f64>,
     },
 
     /// Filter reads derived from Numts
@@ -337,6 +341,10 @@ enum Commands {
         /// keep the graph's indel spellings instead of left-aligning them
         #[clap(long = "no-left-align", action, hide_short_help = true)]
         no_left_align: bool,
+
+        /// PacBio opt-in: admit out-of-tract small indels with HF ≥ this (still < indel_false_threshold)
+        #[clap(long, value_parser, hide = true)]
+        indel_linked_min_hf: Option<f64>,
     },
 
     /// Extract Major Haplotype as Fasta file from Graph
@@ -575,6 +583,7 @@ fn main() {
             no_left_align,
             no_linkage_rescue,
             denoise_keep_vaf,
+            indel_linked_min_hf,
         } => {
             let left_align = !no_left_align;
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
@@ -632,6 +641,7 @@ fn main() {
                 permutation_rounds,
                 left_align,
                 no_linkage_rescue,
+                indel_linked_min_hf,
             );
             let methyl_output = output_prefix.with_extension("bed");
             methyl::start(&graph_output, &mt_output, &methyl_output, threshold_methylation_prob, false);
@@ -722,6 +732,7 @@ fn main() {
             permutation_frequency_threshold,
             permutation_rounds,
             no_left_align,
+            indel_linked_min_hf,
         } => {
             let left_align = !no_left_align;
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
@@ -746,6 +757,7 @@ fn main() {
                 permutation_rounds,
                 left_align,
                 false,
+                indel_linked_min_hf,
             );
         }
 

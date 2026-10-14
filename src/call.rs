@@ -472,7 +472,12 @@ fn collapse_identical_records(variants: Vec<Variant>, ref_length: usize) -> Vec<
         .collect()
 }
 
-fn format_vcf_record(variant: &Variant, coverage: HashMap<usize, usize>, indel_false_threshold: f64) -> String {
+fn format_vcf_record(
+    variant: &Variant,
+    coverage: HashMap<usize, usize>,
+    indel_false_threshold: f64,
+    skip_indel_artifact: bool,
+) -> String {
     // Add AC (allele count) to INFO field
     let read_depth = coverage.get(&variant.pos).unwrap_or(&0);
     let allele_frequency = if *read_depth == 0 {
@@ -495,7 +500,7 @@ fn format_vcf_record(variant: &Variant, coverage: HashMap<usize, usize>, indel_f
             filters.push(existing.to_string());
         }
     }
-    if is_small_indel && allele_frequency < indel_false_threshold as f32 {
+    if is_small_indel && allele_frequency < indel_false_threshold as f32 && !skip_indel_artifact {
         filters.push("Potential_Artifact".to_string());
     }
     let filter = if filters.is_empty() {
@@ -634,6 +639,7 @@ pub(crate) fn write_vcf(
     indel_false_threshold: f64,
     left_align: bool,
     links: Option<&[LinkCall]>,
+    indel_artifact_exempt: &HashSet<String>,
 ) -> std::io::Result<()> {
     let mut file = File::create(Path::new(output_file))?;
 
@@ -704,7 +710,13 @@ pub(crate) fn write_vcf(
             writeln!(file, "{}", format_link_record(sorted_links[li]))?;
             li += 1;
         }
-        writeln!(file, "{}", format_vcf_record(&variant, coverage.clone(), indel_false_threshold))?;
+        let name = generate_variant_name(&variant);
+        let skip = indel_artifact_exempt.contains(&name);
+        writeln!(
+            file,
+            "{}",
+            format_vcf_record(&variant, coverage.clone(), indel_false_threshold, skip)
+        )?;
     }
     for l in &sorted_links[li..] {
         writeln!(file, "{}", format_link_record(l))?;
@@ -1762,6 +1774,16 @@ fn adaptive_permutation(
 }
 
 /// Co-occurrence permutation test: drops admitted variants whose BH q exceeds `p_value_threshold`.
+fn indel_in_hp_tract(v: &Variant) -> bool {
+    let name = generate_variant_name(v);
+    let spans = crate::scite::variant_spans(std::slice::from_ref(&name));
+    if crate::tracts::overlaps_tract(&spans[0]) {
+        return true;
+    }
+    // Plan T5 window (anchor positions): D310 301–316, CA 512–526, HVS-I 16181–16194.
+    matches!(spans[0].start, 301..=316 | 512..=526 | 16181..=16194)
+}
+
 fn permutation_test(
     matrix: &Array2<f64>,
     p_value_threshold: f64,
@@ -1772,6 +1794,7 @@ fn permutation_test(
     permutation_frequency_threshold: f64,
     data_type: &str,
     indel_false_threshold: f64,
+    indel_linked_min_hf: Option<f64>,
 ) -> (Vec<Variant>, Array2<f64>) {
     // Admission: which variants are candidates for the permutation test at all.
     let admitted = |current_variant: &Variant| -> bool {
@@ -1807,9 +1830,14 @@ fn permutation_test(
         if is_snp && data_type == "pacbio" {
             return current_variant.allele_count < pb_noise_threshold(depth);
         }
-        // PacBio: small indels below indel_false_threshold can never PASS, so skip the test.
+        // PacBio: small indels below indel_false_threshold can never PASS, so skip the test —
+        // unless opt-in promotion: out-of-tract indels with HF ≥ indel_linked_min_hf are tested.
         if !is_snp && data_type == "pacbio" && indel_len < 5 && frequency < indel_false_threshold {
-            return false;
+            let promote = indel_linked_min_hf
+                .is_some_and(|f| frequency >= f && !indel_in_hp_tract(current_variant));
+            if !promote {
+                return false;
+            }
         }
         true
     };
@@ -1902,6 +1930,8 @@ pub fn start(
     permutation_rounds: usize,
     left_align: bool,
     no_linkage_rescue: bool,
+    // Opt-in (T5): admit out-of-tract PacBio small indels with HF ≥ this and < indel_false_threshold.
+    indel_linked_min_hf: Option<f64>,
 ) {
     // reference fasta information
     let ref_reader = Reader::from_file(fasta_reference).unwrap();
@@ -1978,6 +2008,7 @@ pub fn start(
         permutation_frequency_threshold,
         data_type,
         indel_false_threshold,
+        indel_linked_min_hf,
     );
 
     let link_calls: Option<Vec<LinkCall>> = linkage_bam.and_then(|bam| {
@@ -2002,6 +2033,25 @@ pub fn start(
     }
     let rescued_var: Vec<Variant> = new_links.iter().map(link_variant).collect();
 
+    // Promoted low-HF PacBio indels that survived the test are PASS (not Potential_Artifact).
+    let indel_artifact_exempt: HashSet<String> = permu_filtered_var
+        .iter()
+        .filter(|v| {
+            let depth = coverage.get(&v.pos).copied().unwrap_or(0);
+            let hf = if depth == 0 { 0.0 } else { v.allele_count as f64 / depth as f64 };
+            let indel_len = (v.ref_allele.len() as i32 - v.alt_allele.len() as i32).abs();
+            indel_linked_min_hf.is_some_and(|f| {
+                data_type == "pacbio"
+                    && !is_snp_variant(v)
+                    && indel_len < 5
+                    && hf >= f
+                    && hf < indel_false_threshold
+                    && !indel_in_hp_tract(v)
+            })
+        })
+        .map(generate_variant_name)
+        .collect();
+
     // write filtered vcf
     let _ = write_vcf(
         &permu_filtered_var,
@@ -2013,6 +2063,7 @@ pub fn start(
         indel_false_threshold,
         left_align,
         link_calls.as_ref().map(|_| new_links.as_slice()),
+        &indel_artifact_exempt,
     );
     // The VCF and every filter above run on the graph; only the lineage matrix is BAM-genotyped.
     let genotype_src = bam.map(|bam| GenotypeSource {
@@ -2213,7 +2264,7 @@ mod tests {
         let artifact = generate_variant_name(&variants[2]);
         // Denoising leaves systematic error behind, so ont-denoised tests SNPs; PacBio SNPs are exempt.
         for (data_type, artifact_kept) in [("ont-denoised", false), ("pacbio", true)] {
-            let (kept, _) = permutation_test(&matrix, 0.5, 0.9, 200, &variants, &coverage, 0.9, data_type, resolve_indel_false_threshold(data_type, None));
+            let (kept, _) = permutation_test(&matrix, 0.5, 0.9, 200, &variants, &coverage, 0.9, data_type, resolve_indel_false_threshold(data_type, None), None);
             let names: Vec<String> = kept.iter().map(generate_variant_name).collect();
             assert_eq!(names.contains(&artifact), artifact_kept, "{data_type}");
             assert_eq!(names.len(), 2 + artifact_kept as usize, "{data_type}: the lineage pair survives");
@@ -2228,7 +2279,7 @@ mod tests {
         let mut matrix = Array2::<f64>::zeros((2, 10));
         matrix.slice_mut(s![.., ..9]).fill(1.0);
         let coverage: HashMap<usize, usize> = [(100, 100), (200, 100)].into_iter().collect();
-        let (kept, _) = permutation_test(&matrix, 0.5, 0.5, 16, &variants, &coverage, 0.7, "ont-denoised", 0.015);
+        let (kept, _) = permutation_test(&matrix, 0.5, 0.5, 16, &variants, &coverage, 0.7, "ont-denoised", 0.015, None);
         assert_eq!(kept.len(), 2, "an untested variant must be kept, not dropped");
     }
 
@@ -2255,7 +2306,7 @@ mod tests {
             }
         }
         let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, n_reads)).collect();
-        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10", 0.015);
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10", 0.015, None);
         // A untested, B/C tested: all lineage markers survive.
         assert_eq!(kept.iter().filter(|v| v.pos >= 1000).count(), n_markers, "lineage markers must survive");
         kept.iter().map(generate_variant_name).collect()
@@ -2346,7 +2397,7 @@ mod tests {
         let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, n_reads)).collect();
 
         // 1000 rounds alone put the lineage rows at p = 1/1001, BH q = 0.013 > 0.01: stage 2 must lift that floor.
-        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10", 0.015);
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10", 0.015, None);
         let lineage = kept.iter().filter(|v| v.pos < 110).count();
         assert_eq!(lineage, 10, "every lineage row must be kept");
         assert!(kept.len() - lineage <= 1, "at most one noise row may survive, got {}", kept.len() - lineage);
@@ -2411,7 +2462,7 @@ mod tests {
             matrix[[3, j]] = 1.0;
         }
         let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, 6500)).collect();
-        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "pacbio", 0.1);
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "pacbio", 0.1, None);
         let pos: Vec<usize> = kept.iter().map(|v| v.pos).collect();
         assert!(pos.contains(&1000) && pos.contains(&3000), "linked gray-zone SNPs kept: {pos:?}");
         assert!(pos.contains(&5000), "AC≥T SNP is exempt and kept: {pos:?}");
@@ -2428,7 +2479,7 @@ mod tests {
             matrix90[[1, j]] = 1.0;
         }
         let coverage90: HashMap<usize, usize> = [(100, 90), (200, 90)].into_iter().collect();
-        let (kept90, _) = permutation_test(&matrix90, 0.01, 0.2, 200, &variants90, &coverage90, 0.7, "pacbio", 0.1);
+        let (kept90, _) = permutation_test(&matrix90, 0.01, 0.2, 200, &variants90, &coverage90, 0.7, "pacbio", 0.1, None);
         assert_eq!(kept90.len(), 2, "at DP 90 every AC≥3 SNP is exempt: {:?}", kept90.iter().map(|v| v.pos).collect::<Vec<_>>());
     }
 
@@ -2456,6 +2507,53 @@ mod tests {
     }
 
     #[test]
+    fn pacbio_linked_low_hf_indel_promoted_outside_tract_only() {
+        // 247 GA>G at 3% outside a tract, linked to an AC≥T backbone → promoted and kept.
+        // 16182 A>ACC at 2% inside HVS-I window → not promoted (stays untested / kept as artifact).
+        let backbone = snp(5000, "G", 30);
+        let outside = var(247, "GA", "G", 30); // HF 0.03 at DP 1000
+        let inside = var(16182, "A", "ACC", 20); // HF 0.02
+        assert!(!indel_in_hp_tract(&outside), "247 is outside tracts");
+        assert!(indel_in_hp_tract(&inside), "16182 is inside HVS-I window");
+        let variants = vec![outside.clone(), inside.clone(), backbone];
+        let mut matrix = Array2::<f64>::zeros((3, 200));
+        for j in 0..30 {
+            matrix[[0, j]] = 1.0;
+            matrix[[2, j]] = 1.0; // linked
+        }
+        for j in 100..120 {
+            matrix[[1, j]] = 1.0;
+        }
+        for j in 30..60 {
+            matrix[[2, j]] = 1.0;
+        }
+        let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, 1000)).collect();
+        let (kept, _) = permutation_test(
+            &matrix, 0.01, 0.2, 500, &variants, &coverage, 0.7, "pacbio", 0.1, Some(0.01),
+        );
+        let pos: Vec<usize> = kept.iter().map(|v| v.pos).collect();
+        assert!(pos.contains(&247), "promoted linked out-of-tract indel kept: {pos:?}");
+        assert!(pos.contains(&16182), "in-tract low-HF indel not tested → kept: {pos:?}");
+        assert!(pos.contains(&5000), "backbone kept: {pos:?}");
+        // Without the flag, 247 is not admitted and would still be kept — discriminate via a scattered twin.
+        let scattered = var(900, "GA", "G", 30);
+        let variants2 = vec![scattered, snp(5000, "G", 30)];
+        let mut matrix2 = Array2::<f64>::zeros((2, 200));
+        for j in 100..130 {
+            matrix2[[0, j]] = 1.0;
+        }
+        for j in 0..30 {
+            matrix2[[1, j]] = 1.0;
+        }
+        let coverage2: HashMap<usize, usize> = variants2.iter().map(|v| (v.pos, 1000)).collect();
+        let (kept2, _) = permutation_test(
+            &matrix2, 0.01, 0.2, 500, &variants2, &coverage2, 0.7, "pacbio", 0.1, Some(0.01),
+        );
+        let pos2: Vec<usize> = kept2.iter().map(|v| v.pos).collect();
+        assert!(!pos2.contains(&900), "promoted but unlinked indel is dropped: {pos2:?}");
+    }
+
+    #[test]
     fn pacbio_small_indel_below_false_threshold_is_not_admitted() {
         // 5% indel (HF < 0.1) is not admitted → kept even with no partners.
         // 12% indel is admitted and, with no partners, dropped.
@@ -2471,7 +2569,7 @@ mod tests {
             matrix[[1, j]] = 1.0;
         }
         let coverage: HashMap<usize, usize> = [(1000, 1000), (3000, 1000)].into_iter().collect();
-        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 500, &variants, &coverage, 0.7, "pacbio", 0.1);
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 500, &variants, &coverage, 0.7, "pacbio", 0.1, None);
         let pos: Vec<usize> = kept.iter().map(|v| v.pos).collect();
         assert!(pos.contains(&1000), "5% indel not admitted → kept: {pos:?}");
         assert!(!pos.contains(&3000), "12% indel admitted and fails alone: {pos:?}");
@@ -2526,7 +2624,7 @@ mod tests {
         ];
         for (dt, want_kept, want_outcomes) in frozen {
             let (p, f, perm_freq) = (0.01, 0.2, 0.7);
-            let (kept, _) = permutation_test(&matrix, p, f, 1000, &variants, &coverage, perm_freq, dt, resolve_indel_false_threshold(dt, None));
+            let (kept, _) = permutation_test(&matrix, p, f, 1000, &variants, &coverage, perm_freq, dt, resolve_indel_false_threshold(dt, None), None);
             let got_kept: Vec<usize> = kept.iter().map(|v| v.pos).collect();
             let positions: Vec<usize> = variants.iter().map(|v| v.pos).collect();
             let partners: Vec<usize> = (0..variants.len()).collect(); // ONT: PartnerRule::All
@@ -2537,7 +2635,7 @@ mod tests {
         }
         // T2/T3 discrimination: PacBio gray-zone + partner rules change the kept set vs ont-r10.
         // AC 30 (17000) is exempt (AC ≥ T); adjacent pair 11000/11001 has no partner ≥20 bp away → dropped.
-        let (pb_kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "pacbio", 0.1);
+        let (pb_kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "pacbio", 0.1, None);
         let pb_pos: Vec<usize> = pb_kept.iter().map(|v| v.pos).collect();
         assert_ne!(pb_pos, vec![1000, 3000, 5000, 7000, 9000, 11000, 11001, 15000], "pacbio kept must differ from ont-r10");
         assert!(pb_pos.contains(&17000), "AC≥T SNP stays on PacBio: {pb_pos:?}");
@@ -2559,7 +2657,7 @@ mod tests {
         // Depth high enough that T > 5, so only the AC-30 row is a partner.
         let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, 6500)).collect();
         assert_eq!(resolve_perm_opts("pacbio").partner_min_dist, 20);
-        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 500, &variants, &coverage, 0.7, "pacbio", 0.1);
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 500, &variants, &coverage, 0.7, "pacbio", 0.1, None);
         let pos: Vec<usize> = kept.iter().map(|v| v.pos).collect();
         assert!(!pos.contains(&100) && !pos.contains(&101), "adjacent pair must be rejected: {pos:?}");
         assert!(pos.contains(&5000), "backbone partner itself is exempt: {pos:?}");
@@ -2582,7 +2680,7 @@ mod tests {
         }
         let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, 6500)).collect();
         // T(6500)=25: all three are gray-zone (admitted) but none qualify as partners.
-        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 500, &variants, &coverage, 0.7, "pacbio", 0.1);
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 500, &variants, &coverage, 0.7, "pacbio", 0.1, None);
         assert!(kept.is_empty(), "noise with only sub-threshold partners must all be dropped: {:?}", kept.iter().map(|v| v.pos).collect::<Vec<_>>());
     }
 
@@ -2773,7 +2871,7 @@ mod tests {
         for left_align in [true, false] {
             let path = std::env::temp_dir().join(format!("himito_left_align_{left_align}_{}.vcf", std::process::id()));
             let coverage: HashMap<usize, usize> = [(5, 30)].into_iter().collect();
-            write_vcf(&[del_at(HOMOPOLYMER_REF, 5, 1, 3)], &coverage, &path, "s1", "chrM", 10, 0.1, left_align, None).unwrap();
+            write_vcf(&[del_at(HOMOPOLYMER_REF, 5, 1, 3)], &coverage, &path, "s1", "chrM", 10, 0.1, left_align, None, &HashSet::new()).unwrap();
             let vcf = std::fs::read_to_string(&path).unwrap();
             assert_eq!(vcf.contains("##HimitoNormalization=left-aligned"), left_align);
         }
@@ -2782,9 +2880,9 @@ mod tests {
     #[test]
     fn small_indel_at_ont_threshold_passes_above_and_is_artifact_below() {
         let cov: HashMap<usize, usize> = [(100, 1000)].into_iter().collect();
-        let rec = format_vcf_record(&var(100, "GA", "G", 18), cov.clone(), 0.015);
+        let rec = format_vcf_record(&var(100, "GA", "G", 18), cov.clone(), 0.015, false);
         assert!(rec.contains("\tPASS\t"), "HF 0.018 should pass at 0.015: {rec}");
-        let rec = format_vcf_record(&var(100, "GA", "G", 11), cov, 0.015);
+        let rec = format_vcf_record(&var(100, "GA", "G", 11), cov, 0.015, false);
         assert!(rec.contains("Potential_Artifact"), "HF 0.011 should be flagged: {rec}");
     }
 

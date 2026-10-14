@@ -742,7 +742,7 @@ mod tests {
 
         let path = tmp_dir("vcf").join("out.vcf");
         let coverage: HashMap<usize, usize> = [(199, 100), (699, 100), (799, 100)].into_iter().collect();
-        write_vcf(&merged, &coverage, &path, "s1", "chrM", REF_LEN, 0.015, true, Some(&new_calls)).unwrap();
+        write_vcf(&merged, &coverage, &path, "s1", "chrM", REF_LEN, 0.015, true, Some(&new_calls), &std::collections::HashSet::new()).unwrap();
         let vcf = std::fs::read_to_string(&path).unwrap();
         assert!(vcf.contains("##INFO=<ID=LINK,"), "{vcf}");
         let body: Vec<&str> = vcf.lines().filter(|l| !l.starts_with('#')).collect();
@@ -752,7 +752,7 @@ mod tests {
         assert!(body[2].contains("\tPASS\t"), "{}", body[2]);
 
         // Without a linkage run the header has no LINK line.
-        write_vcf(&merged, &coverage, &path, "s1", "chrM", REF_LEN, 0.015, true, None).unwrap();
+        write_vcf(&merged, &coverage, &path, "s1", "chrM", REF_LEN, 0.015, true, None, &std::collections::HashSet::new()).unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("ID=LINK"));
     }
 }

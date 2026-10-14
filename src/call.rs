@@ -10,7 +10,7 @@ use std::{collections::HashSet, path::PathBuf};
 use std::error::Error;
 use csv::Writer;
 use ndarray::{Array2, Axis, s};
-use statrs::distribution::{Binomial, DiscreteCDF};
+use statrs::distribution::{Binomial, DiscreteCDF, Poisson};
 use adjustp::{adjust, Procedure};
 use bio::io::fasta::{Reader, Record};
 use crate::denoise_indel::{normalize_left, Allele};
@@ -1410,6 +1410,34 @@ const PERM_MAX_STAGE2_PASSES: usize = 5;
 const COOC_EXEMPT_HF: f64 = 0.10;
 const COOC_EXEMPT_MIN_AC: usize = 20;
 
+/// PacBio hot-allele error rate and noise-tail for the depth-aware AC floor T(DP).
+const PB_HOT_ERR: f64 = 0.002;
+const PB_NOISE_TAIL: f64 = 0.002;
+
+/// Smallest k with P(Poisson(PB_HOT_ERR · DP) ≥ k) < PB_NOISE_TAIL, floored at 3.
+/// Only for PacBio paths (see gray-zone admission in T2).
+pub fn pb_noise_threshold(dp: usize) -> usize {
+    let lambda = PB_HOT_ERR * dp as f64;
+    // λ = 0 → Poisson is a point mass at 0; T collapses to the floor.
+    if lambda == 0.0 {
+        return 3;
+    }
+    let pois = Poisson::new(lambda).expect("PB_HOT_ERR * dp is a valid Poisson rate");
+    let mut k = 1usize;
+    loop {
+        // P(X >= k) = 1 - F(k-1)
+        let tail = 1.0 - pois.cdf((k - 1) as u64);
+        if tail < PB_NOISE_TAIL {
+            return k.max(3);
+        }
+        k += 1;
+        // Defensive: λ·DP is tiny in practice; never spin forever.
+        if k > dp.max(3) + 1000 {
+            return k.max(3);
+        }
+    }
+}
+
 /// A genotype row as bitsets over reads.
 struct BitRow {
     alt: Vec<u64>,
@@ -2185,6 +2213,18 @@ mod tests {
         assert!(clear.iter().all(|o| o.draws < 1000), "clear nulls must stop before 1000 draws");
         // Per-variant seeds make the outcome independent of thread scheduling.
         assert_eq!(adaptive_permutation(&matrix, &tested, &names, 1000, 0.01), outcomes);
+    }
+
+    // ---- PacBio precision plan T1: depth-aware noise threshold ----
+
+    #[test]
+    fn pb_noise_threshold_matches_poisson_table() {
+        assert_eq!(pb_noise_threshold(0), 3);
+        assert_eq!(pb_noise_threshold(6), 3);
+        assert_eq!(pb_noise_threshold(88), 3);
+        assert_eq!(pb_noise_threshold(268), 5);
+        assert_eq!(pb_noise_threshold(970), 8);
+        assert_eq!(pb_noise_threshold(6494), 25);
     }
 
     // ---- frozen ONT baseline (PacBio precision plan, T0) ----

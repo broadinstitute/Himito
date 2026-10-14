@@ -38,9 +38,7 @@ Options:
           [default: 2]
 
   -v, --vaf-threshold <VAF_THRESHOLD>
-          minimum heteroplasmic frequency for a variant
-          
-          [default: 0.01]
+          minimum heteroplasmic frequency for a variant (preset by data type)
 
   -p, --p-value-threshold <P_VALUE_THRESHOLD>
           permutation-test p-value cutoff; 1 disables it (preset by data type)

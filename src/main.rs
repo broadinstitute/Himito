@@ -101,9 +101,9 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 2, hide_short_help = true)]
         minimal_ac: usize,
 
-        /// minimum heteroplasmic frequency for a variant
-        #[clap(short, long, value_parser, default_value_t = 0.01, hide_short_help = true)]
-        vaf_threshold: f32,
+        /// minimum heteroplasmic frequency for a variant (preset by data type)
+        #[clap(short, long, value_parser, hide_short_help = true)]
+        vaf_threshold: Option<f32>,
 
         /// permutation-test p-value cutoff; 1 disables it (preset by data type)
         #[clap(long, value_parser, hide_short_help = true)]
@@ -306,9 +306,9 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 2, hide_short_help = true)]
         minimal_ac: usize,
 
-        /// minimum heteroplasmic frequency for a variant
-        #[clap(short, long, value_parser, default_value_t = 0.01, hide_short_help = true)]
-        vaf_threshold: f32,
+        /// minimum heteroplasmic frequency for a variant (preset by data type)
+        #[clap(short, long, value_parser, hide_short_help = true)]
+        vaf_threshold: Option<f32>,
 
         /// permutation-test p-value cutoff; 1 disables it (preset by data type)
         #[clap(short, long, value_parser, hide_short_help = true)]
@@ -580,6 +580,7 @@ fn main() {
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold, permutation_frequency_threshold);
             let indel_false_threshold = call::resolve_indel_false_threshold(&data_type, indel_false_threshold);
+            let vaf_threshold = call::resolve_vaf(&data_type, vaf_threshold);
             let mt_output = output_prefix.with_extension("mt.bam");
             let numts_output = output_prefix.with_extension("numts.bam");
             let _ = filter::start(
@@ -726,6 +727,7 @@ fn main() {
             let (p_value_threshold, frequency_threshold, permutation_frequency_threshold) =
                 call::resolve_thresholds(&data_type, p_value_threshold, frequency_threshold, permutation_frequency_threshold);
             let indel_false_threshold = call::resolve_indel_false_threshold(&data_type, indel_false_threshold);
+            let vaf_threshold = call::resolve_vaf(&data_type, vaf_threshold);
             call::start(
                 &graphfile,
                 &reference_fasta,

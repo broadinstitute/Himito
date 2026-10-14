@@ -2187,6 +2187,79 @@ mod tests {
         assert_eq!(adaptive_permutation(&matrix, &tested, &names, 1000, 0.01), outcomes);
     }
 
+    // ---- frozen ONT baseline (PacBio precision plan, T0) ----
+    // Later tasks APPEND rows/assertions; the ONT rows and literals below never change.
+
+    #[test]
+    fn ont_presets_are_frozen() {
+        for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
+            let want = if dt == "ont-r9" { (0.0001, 0.5, 0.7) } else { (0.01, 0.2, 0.7) };
+            assert_eq!(resolve_thresholds(dt, None, None, None), want, "{dt}");
+            assert_eq!(resolve_indel_false_threshold(dt, None), 0.015, "{dt}");
+            assert!(is_ont(dt), "{dt}");
+        }
+        // T3 appends: resolve_perm_opts(dt) == PermOpts::all_rows()   (today's statistic)
+        // T4 appends: resolve_vaf(dt, None) == 0.01
+    }
+
+    /// 200 reads, depth 6500 everywhere: straddles every PacBio rule (T = 25 there, all variants gray-zone).
+    fn frozen_ont_fixture() -> (Vec<Variant>, Array2<f64>, HashMap<usize, usize>) {
+        let mut variants = Vec::new();
+        let mut rows: Vec<Vec<usize>> = Vec::new();
+        let mut add = |v: Variant, reads: Vec<usize>| {
+            variants.push(v);
+            rows.push(reads);
+        };
+        for pos in [1000, 3000, 5000] {
+            add(snp(pos, "A", 20), (0..20).collect()); // lineage A
+        }
+        for pos in [7000, 9000] {
+            add(snp(pos, "C", 6), (20..26).collect()); // lineage B
+        }
+        add(snp(11000, "G", 3), (30..33).collect()); // adjacent error pair
+        add(snp(11001, "G", 3), (30..33).collect());
+        add(snp(13000, "A", 3), vec![40, 90, 150]); // scattered
+        add(var(15000, "TT", "T", 10), (0..10).collect()); // 1-bp deletion, HF 0.05 by matrix
+        add(snp(17000, "C", 30), (100..130).collect()); // AC 30
+        let mut matrix = Array2::<f64>::zeros((variants.len(), 200));
+        for (i, reads) in rows.iter().enumerate() {
+            for &j in reads {
+                matrix[[i, j]] = 1.0;
+            }
+        }
+        let coverage = variants.iter().map(|v| (v.pos, 6500)).collect();
+        (variants, matrix, coverage)
+    }
+
+    #[test]
+    fn ont_permutation_is_frozen() {
+        let (variants, matrix, coverage) = frozen_ont_fixture();
+        let names: Vec<String> = variants.iter().map(generate_variant_name).collect();
+        let tested: Vec<usize> = (0..variants.len()).collect();
+        // (kept variant positions, (exceed, draws) per variant, in fixture order); literals captured at the starting commit.
+        // Fixture order: 1000, 3000, 5000 | 7000, 9000 | 11000, 11001 | 13000 (scattered) | 15000 del | 17000 (AC 30).
+        // The scattered SNP and the AC-30 SNP are indistinguishable from the null (100 exceedances in the first
+        // 100 draws, p ~ 1) and are rejected; every other row sits at the p floor and is kept.
+        let kept_all: Vec<usize> = vec![1000, 3000, 5000, 7000, 9000, 11000, 11001, 15000];
+        let outcomes_all: Vec<(u32, u32)> = vec![
+            (0, 1000), (0, 1000), (0, 1000), (0, 1000), (0, 1000), (0, 1000), (0, 1000), (100, 100), (0, 1000), (100, 100),
+        ];
+        let frozen: [(&str, Vec<usize>, Vec<(u32, u32)>); 3] = [
+            ("ont-r9", kept_all.clone(), outcomes_all.clone()),
+            ("ont-r10", kept_all.clone(), outcomes_all.clone()),
+            ("ont-denoised", kept_all, outcomes_all),
+        ];
+        for (dt, want_kept, want_outcomes) in frozen {
+            let (p, f, perm_freq) = (0.01, 0.2, 0.7);
+            let (kept, _) = permutation_test(&matrix, p, f, 1000, &variants, &coverage, perm_freq, dt);
+            let got_kept: Vec<usize> = kept.iter().map(|v| v.pos).collect();
+            let outcomes = adaptive_permutation(&matrix, &tested, &names, 1000, p);
+            let got: Vec<(u32, u32)> = outcomes.iter().map(|o| (o.exceed, o.draws)).collect();
+            assert_eq!(got_kept, want_kept, "{dt}: kept");
+            assert_eq!(got, want_outcomes, "{dt}: (exceed, draws)");
+        }
+    }
+
     // ---- strand bias ----
 
     /// One variant's strand evidence: alt reads per strand, plus further covering reads per strand.

@@ -1678,8 +1678,11 @@ fn permutation_test(
             return false;
         }
 
-        // PacBio: exclude SNPs from the permutation test (SNP accuracy is high enough).
-        !(is_snp && data_type == "pacbio")
+        // PacBio: test SNPs only in the gray zone 3 ≤ AC < T(DP); AC ≥ T(DP) are exempt.
+        if is_snp && data_type == "pacbio" {
+            return current_variant.allele_count < pb_noise_threshold(depth);
+        }
+        true
     };
 
     let names: Vec<String> = filtered_var.iter().map(generate_variant_name).collect();
@@ -2227,6 +2230,55 @@ mod tests {
         assert_eq!(pb_noise_threshold(6494), 25);
     }
 
+    // ---- PacBio precision plan T2: gray-zone admission ----
+
+    #[test]
+    fn pacbio_snps_are_tested_only_in_gray_zone() {
+        // At DP 6500, T=25: AC 20 is gray-zone (admitted), AC 30 is exempt.
+        assert!(20 < pb_noise_threshold(6500));
+        assert!(!(30 < pb_noise_threshold(6500)));
+        // A linked AC-20 SNP is tested and kept; a lone AC-30 SNP is not tested and kept;
+        // a scattered AC-20 SNP is tested and dropped.
+        let variants = vec![
+            snp(1000, "A", 20),
+            snp(3000, "A", 20),
+            snp(5000, "C", 30),
+            snp(7000, "G", 20),
+        ];
+        let mut matrix = Array2::<f64>::zeros((4, 200));
+        for j in 0..20 {
+            matrix[[0, j]] = 1.0;
+            matrix[[1, j]] = 1.0;
+        }
+        for j in 100..130 {
+            matrix[[2, j]] = 1.0;
+        }
+        // Scattered AC-20: disjoint from the linked pair and from the AC-30 block.
+        for j in 50..70 {
+            matrix[[3, j]] = 1.0;
+        }
+        let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, 6500)).collect();
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "pacbio");
+        let pos: Vec<usize> = kept.iter().map(|v| v.pos).collect();
+        assert!(pos.contains(&1000) && pos.contains(&3000), "linked gray-zone SNPs kept: {pos:?}");
+        assert!(pos.contains(&5000), "AC≥T SNP is exempt and kept: {pos:?}");
+        assert!(!pos.contains(&7000), "scattered gray-zone SNP is tested and dropped: {pos:?}");
+
+        // At DP 90, T=3: no SNP with AC≥3 is admitted (all exempt).
+        assert_eq!(pb_noise_threshold(90), 3);
+        let variants90 = vec![snp(100, "A", 3), snp(200, "C", 5)];
+        let mut matrix90 = Array2::<f64>::zeros((2, 30));
+        for j in [10, 17, 24] {
+            matrix90[[0, j]] = 1.0;
+        }
+        for j in 0..5 {
+            matrix90[[1, j]] = 1.0;
+        }
+        let coverage90: HashMap<usize, usize> = [(100, 90), (200, 90)].into_iter().collect();
+        let (kept90, _) = permutation_test(&matrix90, 0.01, 0.2, 200, &variants90, &coverage90, 0.7, "pacbio");
+        assert_eq!(kept90.len(), 2, "at DP 90 every AC≥3 SNP is exempt: {:?}", kept90.iter().map(|v| v.pos).collect::<Vec<_>>());
+    }
+
     // ---- frozen ONT baseline (PacBio precision plan, T0) ----
     // Later tasks APPEND rows/assertions; the ONT rows and literals below never change.
 
@@ -2298,6 +2350,13 @@ mod tests {
             assert_eq!(got_kept, want_kept, "{dt}: kept");
             assert_eq!(got, want_outcomes, "{dt}: (exceed, draws)");
         }
+        // T2 discrimination: PacBio gray-zone admission changes the kept set vs ont-r10.
+        // AC 30 (17000) is exempt on PacBio (AC ≥ T(6500)=25) so it is kept; ONT tests and drops it.
+        // (T3 will further drop the adjacent pair 11000/11001 via the partner min-distance rule.)
+        let (pb_kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "pacbio");
+        let pb_pos: Vec<usize> = pb_kept.iter().map(|v| v.pos).collect();
+        assert_ne!(pb_pos, vec![1000, 3000, 5000, 7000, 9000, 11000, 11001, 15000], "pacbio kept must differ from ont-r10");
+        assert!(pb_pos.contains(&17000), "AC≥T SNP stays on PacBio: {pb_pos:?}");
     }
 
     // ---- strand bias ----

@@ -10,18 +10,21 @@ pub fn downsample_list(
     max_reads: usize,
     seed: u64,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    if mt_readnames.len() <= max_reads {
-        return Ok(mt_readnames.iter().cloned().collect());
+    // Sort before sampling: HashSet iteration order is per-process, so a seeded
+    // choose_multiple over the raw set is not reproducible across runs.
+    let mut names: Vec<String> = mt_readnames.iter().cloned().collect();
+    names.sort();
+    if names.len() <= max_reads {
+        return Ok(names);
     }
     let mut rng = StdRng::seed_from_u64(seed);
-    let downsampled_mt_readnames: Vec<String> = mt_readnames
+    let downsampled_mt_readnames: Vec<String> = names
         .iter()
         .choose_multiple(&mut rng, max_reads)
         .into_iter()
         .cloned()
         .collect();
     Ok(downsampled_mt_readnames)
-
 }
 
 
@@ -200,4 +203,35 @@ pub fn start(
     }
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downsample_list_is_deterministic_across_hashset_insertion_orders() {
+        let names: Vec<String> = (0..200).map(|i| format!("read_{i:03}")).collect();
+        let mut a = HashSet::new();
+        for n in &names {
+            a.insert(n.clone());
+        }
+        let mut b = HashSet::new();
+        for n in names.iter().rev() {
+            b.insert(n.clone());
+        }
+        let da = downsample_list(&a, 50, 42).unwrap();
+        let db = downsample_list(&b, 50, 42).unwrap();
+        assert_eq!(da, db, "same seed must pick the same reads regardless of HashSet iteration order");
+    }
+
+    #[test]
+    fn downsample_list_returns_all_sorted_when_under_cap() {
+        let names: HashSet<String> = ["c", "a", "b"].into_iter().map(str::to_string).collect();
+        let out = downsample_list(&names, 10, 1).unwrap();
+        assert_eq!(
+            out,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
 }

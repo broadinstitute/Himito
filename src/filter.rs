@@ -10,8 +10,7 @@ pub fn downsample_list(
     max_reads: usize,
     seed: u64,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    // Sort before sampling: HashSet iteration order is per-process, so a seeded
-    // choose_multiple over the raw set is not reproducible across runs.
+    // HashSet iteration order varies per process; sort so the seeded sample is reproducible.
     let mut names: Vec<String> = mt_readnames.iter().cloned().collect();
     names.sort();
     if names.len() <= max_reads {
@@ -210,28 +209,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn downsample_list_is_deterministic_across_hashset_insertion_orders() {
+    fn downsample_list_is_deterministic_and_sorted() {
         let names: Vec<String> = (0..200).map(|i| format!("read_{i:03}")).collect();
-        let mut a = HashSet::new();
-        for n in &names {
-            a.insert(n.clone());
-        }
-        let mut b = HashSet::new();
-        for n in names.iter().rev() {
-            b.insert(n.clone());
-        }
-        let da = downsample_list(&a, 50, 42).unwrap();
-        let db = downsample_list(&b, 50, 42).unwrap();
-        assert_eq!(da, db, "same seed must pick the same reads regardless of HashSet iteration order");
-    }
-
-    #[test]
-    fn downsample_list_returns_all_sorted_when_under_cap() {
-        let names: HashSet<String> = ["c", "a", "b"].into_iter().map(str::to_string).collect();
-        let out = downsample_list(&names, 10, 1).unwrap();
-        assert_eq!(
-            out,
-            vec!["a".to_string(), "b".to_string(), "c".to_string()]
-        );
+        let forward: HashSet<String> = names.iter().cloned().collect();
+        let reverse: HashSet<String> = names.iter().rev().cloned().collect();
+        // The same seed picks the same reads whatever the HashSet iteration order.
+        assert_eq!(downsample_list(&forward, 50, 42).unwrap(), downsample_list(&reverse, 50, 42).unwrap());
+        // Under the cap every read is returned, sorted.
+        assert_eq!(downsample_list(&forward, 500, 1).unwrap(), names);
     }
 }

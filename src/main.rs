@@ -73,7 +73,7 @@ enum Commands {
         #[clap(short, long, value_parser, required = true)]
         sample_id: String,
 
-        /// sequencing data type; sets the filter and denoise presets
+        /// sequencing data type; sets the filter and denoise presets (pacbio, ont-r9, ont-r10, ont-denoised)
         #[clap(short, long, default_value = "pacbio", value_parser = clap::builder::PossibleValuesParser::new(DATA_TYPES))]
         data_type: String,
 

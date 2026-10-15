@@ -1863,7 +1863,7 @@ pub fn start(
 
     // Strand-bias filtering runs before the permutation test so artifacts do not feed its null.
     let action = if data_type == "ont-denoised" { StrandBiasAction::Drop } else { StrandBiasAction::Flag };
-    // Linkage rescue (and with it the indel strand recount) runs on ONT only; PacBio is not evaluated.
+    // Linkage rescue runs on ONT only; PacBio is not evaluated.
     let linkage_bam = bam.filter(|_| is_ont(data_type) && !no_linkage_rescue);
     let (sb_filtered_var, sb_matrix) = match bam {
         Some(bam) => {
@@ -1882,18 +1882,15 @@ pub fn start(
                 permutation_frequency_threshold,
                 action,
             );
-            let sb_var = match linkage_bam {
-                Some(raw) => recount_flagged_indels_from_bam(
-                    &sb_var,
-                    raw,
-                    &strand_map,
-                    fwd_frac,
-                    ref_seq.as_bytes(),
-                    &ref_header,
-                    strand_bias_threshold,
-                ),
-                None => sb_var,
-            };
+            let sb_var = recount_flagged_indels_from_bam(
+                &sb_var,
+                bam,
+                &strand_map,
+                fwd_frac,
+                ref_seq.as_bytes(),
+                &ref_header,
+                strand_bias_threshold,
+            );
             (sb_var, sb_matrix)
         }
         None => (var_record.clone(), matrix.clone()),

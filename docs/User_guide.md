@@ -205,12 +205,12 @@ Required Parameters:
 - -r, --reference <FILE>: Mitochondrial reference genome (FASTA)
 
 Commonly used optional parameters (run `Himito denoise --help` for the full list):
-- -d, --data-type <STRING>: only `ont-*` is denoised, others pass through unchanged [default: ont-r10]
+- -d, --data-type <STRING>: pacbio, ont-r9, ont-r10 or ont-denoised; only `ont-*` is denoised, pacbio passes through unchanged [default: ont-r10]
 - --vaf <FLOAT>: minimal VAF for a substitution allele to be kept [default: 0.03]
 - --stats <FILE>: optional path to write denoise statistics as JSON
 
 The strand-candidacy gates are fixed: an allele needs at least 2 observations on each
-strand, and one below 0.95 within-column frequency must not be strand-skewed (binomial
+strand, and one below 0.7 within-column frequency must not be strand-skewed (binomial
 p < 0.01 against the column's own strand mix *and* a forward-fraction shift of at least 0.20).
 
 Example:

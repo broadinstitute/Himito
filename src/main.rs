@@ -21,7 +21,6 @@ mod denoise_indel;
 mod linkage;
 
 pub const DENOISE_KEEP_VAF: f64 = 0.03;
-pub const DENOISE_HOMOPLASMIC_VAF: f64 = 0.95;
 
 /// The data types Himito accepts wherever a `-d/--data-type` is taken.
 pub const DATA_TYPES: [&str; 4] = ["pacbio", "ont-r9", "ont-r10", "ont-denoised"];
@@ -227,8 +226,8 @@ enum Commands {
         #[clap(short, long, value_parser, required = true)]
         reference: PathBuf,
 
-        /// data type; only ont-* is denoised, others pass through unchanged
-        #[clap(short, long, value_parser, default_value = "ont-r10")]
+        /// data type; only ont-* is denoised, pacbio passes through unchanged
+        #[clap(short, long, default_value = "ont-r10", value_parser = clap::builder::PossibleValuesParser::new(DATA_TYPES))]
         data_type: String,
 
         /// minimal VAF for an allele to be kept (below this it is corrected away)
@@ -609,7 +608,7 @@ fn main() {
                 let denoised = output_prefix.with_extension("mt.denoised.bam");
                 let iopts = denoise_indel::IndelOpts { enabled: true, ..Default::default() };
                 // `denoise_keep_vaf` is the denoiser's own keep threshold, not `vaf_threshold`.
-                match denoise::start(&mt_output, &denoised, &reference_path, &data_type, denoise_keep_vaf, 0.7, &iopts, None) {
+                match denoise::start(&mt_output, &denoised, &reference_path, &data_type, denoise_keep_vaf, &iopts, None) {
                     Ok(()) => build_bam = denoised,
                     Err(e) => eprintln!("Warning: denoise failed ({e:#}); falling back to raw mt BAM."),
                 }
@@ -695,10 +694,7 @@ fn main() {
                 protect_vaf: indel_protect_vaf,
                 hp_length_model: indel_hp_length_model,
             };
-            if let Err(e) = denoise::start(
-                &input, &output, &reference, &data_type, vaf,
-                DENOISE_HOMOPLASMIC_VAF, &iopts, stats.as_ref(),
-            ) {
+            if let Err(e) = denoise::start(&input, &output, &reference, &data_type, vaf, &iopts, stats.as_ref()) {
                 eprintln!("Error running denoise: {e:#}");
                 std::process::exit(1);
             }

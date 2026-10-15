@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use rust_htslib::bam::record::{Cigar, CigarString};
 
-use crate::denoise::{MIN_STRAND, STRAND_BIAS_P};
+use crate::denoise::{HOMOPLASMIC_VAF, MIN_STRAND, STRAND_BIAS_P};
 
 /// An indel allele at a left-normalized site.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -273,7 +273,6 @@ pub fn fit_indel_site(
     site: &IndelSite,
     refseq: &[u8],
     norm_pos: u32,
-    homoplasmic_vaf: f64,
     n_sites: usize,
     o: &IndelOpts,
 ) -> IndelSiteModel {
@@ -334,7 +333,7 @@ pub fn fit_indel_site(
             continue;
         }
         // Near-homoplasmic exemption: a single-strand artifact cannot reach that VAF.
-        if vaf < homoplasmic_vaf
+        if vaf < HOMOPLASMIC_VAF
             && crate::call::is_strand_skewed(fwd as usize, rev as usize, expected_fwd_frac, STRAND_BIAS_P)
         {
             strand_biased += 1;
@@ -1003,7 +1002,6 @@ mod tests {
     const C5_REF: &[u8] = b"TACCCCCTCTA";
     // The A-run is 8..=15: HP anchor 7, exclusive end 16.
     const REF29: &[u8] = b"ACGTACGTAAAAAAAACGTACGTACGTAC";
-    const HOM_VAF: f64 = 0.7;
 
     #[test]
     fn normalize_left_moves_to_the_leftmost_equivalent_anchor() {
@@ -1091,7 +1089,7 @@ mod tests {
 
     fn fit(r: &[u8], pos: u32, s: &IndelSite, n_sites: usize, hp: bool) -> IndelSiteModel {
         let o = IndelOpts { hp_length_model: hp, ..Default::default() };
-        fit_indel_site(s, r, pos, HOM_VAF, n_sites, &o)
+        fit_indel_site(s, r, pos, n_sites, &o)
     }
 
     #[test]

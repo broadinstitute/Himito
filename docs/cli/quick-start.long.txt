@@ -21,7 +21,7 @@ Options:
           sample name written to the outputs
 
   -d, --data-type <DATA_TYPE>
-          sequencing data type; sets the filter and denoise presets
+          sequencing data type; sets the filter and denoise presets (pacbio, ont-r9, ont-r10, ont-denoised)
           
           [default: pacbio]
           [possible values: pacbio, ont-r9, ont-r10, ont-denoised]

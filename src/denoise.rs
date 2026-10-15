@@ -18,6 +18,9 @@ const E_MAX: f64 = 0.75;
 pub(crate) const MIN_STRAND: u32 = 2;
 /// Strand-bias test p-value threshold.
 pub(crate) const STRAND_BIAS_P: f64 = 0.01;
+/// Alleles at or above this within-column frequency skip the strand-bias test (a single-strand artifact cannot
+/// get there) and are not minor alleles for linkage rescue. Matches `call`'s near-homoplasmic exemption (0.7).
+pub(crate) const HOMOPLASMIC_VAF: f64 = 0.7;
 /// Non-kept alleles at or above this frequency are pending: corrected unless rescued by linkage.
 const PENDING_FLOOR: f64 = 0.005;
 
@@ -91,7 +94,7 @@ impl SiteModel {
 }
 
 /// EM fit of one column's allele frequencies under a per-quality error model, then the keep/pending rule.
-fn fit_site(c: &ColumnCounts, vaf: f64, homoplasmic_vaf: f64) -> SiteModel {
+fn fit_site(c: &ColumnCounts, vaf: f64) -> SiteModel {
     // The null for the strand-bias test is this column's OWN forward fraction, not a library-wide constant.
     let (col_fwd, col_rev) = c.strand_totals();
     let col_total = col_fwd + col_rev;
@@ -115,7 +118,7 @@ fn fit_site(c: &ColumnCounts, vaf: f64, homoplasmic_vaf: f64) -> SiteModel {
         }
         // Mirrors call::filter_strand_bias's near-homoplasmic exemption.
         let prop = (fwd + rev) as f64 / col_total as f64;
-        if prop < homoplasmic_vaf
+        if prop < HOMOPLASMIC_VAF
             && crate::call::is_strand_skewed(fwd as usize, rev as usize, expected_fwd_frac, STRAND_BIAS_P)
         {
             strand_biased_alts += 1;
@@ -311,7 +314,6 @@ fn compute_corrections(
     bam_path: &Path,
     refs: &HashMap<Vec<u8>, Vec<u8>>,
     vaf: f64,
-    homoplasmic_vaf: f64,
     iopts: &indel::IndelOpts,
 ) -> Result<(Corrections, IndelModels, DenoiseStats)> {
     let mut reader = Reader::from_path(bam_path)
@@ -503,12 +505,12 @@ fn compute_corrections(
             continue;
         }
 
-        let model = fit_site(&counts, vaf, homoplasmic_vaf);
+        let model = fit_site(&counts, vaf);
         stats.alt_sites_preserved += model.kept_alt_count(ref_idx) as u64;
         stats.alt_alleles_strand_biased += model.strand_biased_alts as u64;
 
         for a in 0..4 {
-            if model.kept[a] && Some(a) != ref_idx && model.freq[a] < homoplasmic_vaf {
+            if model.kept[a] && Some(a) != ref_idx && model.freq[a] < HOMOPLASMIC_VAF {
                 kept_minors.insert((tid, pos, a));
             }
         }
@@ -581,7 +583,7 @@ fn compute_corrections(
             site.col_rev = rev;
 
             stats.indel_sites_examined += 1;
-            let model = indel::fit_indel_site(&site, refseq, norm_pos, homoplasmic_vaf, n_sites, iopts);
+            let model = indel::fit_indel_site(&site, refseq, norm_pos, n_sites, iopts);
             stats.indel_alt_alleles_strand_biased += model.strand_biased as u64;
             // `kept` includes REF; count only surviving non-reference alleles.
             stats.indel_alt_alleles_kept +=
@@ -980,7 +982,6 @@ pub fn start(
     reference: &PathBuf,
     data_type: &str,
     vaf: f64,
-    homoplasmic_vaf: f64,
     indels: &indel::IndelOpts,
     stats_out: Option<&PathBuf>,
 ) -> Result<()> {
@@ -1002,7 +1003,7 @@ pub fn start(
     }
 
     let (corrections, models, mut stats) =
-        compute_corrections(input, &refs, vaf, homoplasmic_vaf, indels)?;
+        compute_corrections(input, &refs, vaf, indels)?;
     apply_corrections(input, output, &corrections, &refs, &models, indels, &mut stats)?;
 
     let rate = if stats.bases_examined > 0 {
@@ -1048,7 +1049,6 @@ mod tests {
     use rust_htslib::bam::{Format, Header, Record, Writer};
 
     // QuickStart's homoplasmic exemption.
-    const HOM_VAF: f64 = 0.7;
 
     /// A column with reference A (0); each `(allele, qual, fwd, rev)` adds `fwd` + `rev` observations.
     fn column(groups: &[(usize, u8, u32, u32)]) -> ColumnCounts {
@@ -1071,7 +1071,7 @@ mod tests {
     #[test]
     fn zero_quality_observations_are_never_inverted() {
         // ref A 60%, alt G 40%, all at Q0 -- the shape pbsim's errhmm models emit.
-        let m = fit_site(&column(&[(0, 0, 30, 30), (2, 0, 20, 20)]), 0.01, HOM_VAF);
+        let m = fit_site(&column(&[(0, 0, 30, 30), (2, 0, 20, 20)]), 0.01);
         assert!(m.kept[0] && m.kept[2]);
         // At the clamp the likelihood is flat (1 - e == e/3), so kept alleles stand and rejected ones,
         // with no evidence and no prior, fall back to the most frequent kept allele.
@@ -1088,7 +1088,7 @@ mod tests {
             .iter()
             .flat_map(|&q| [(0, q, 23, 23), (2, q, 2, 2)])
             .collect();
-        let m = fit_site(&column(&groups), 0.01, HOM_VAF);
+        let m = fit_site(&column(&groups), 0.01);
         assert!(m.kept[0] && m.kept[2]);
         for q in [0, 4, 6, 7, 30] {
             assert_eq!(map_allele(2, q, &m), 2, "kept alt reverted at Q{q}");
@@ -1102,7 +1102,7 @@ mod tests {
     #[test]
     fn pure_ref_column_with_sparse_errors_keeps_only_ref() {
         // 30 clean A plus a stray G (fwd only) and C (rev only) at low quality.
-        let m = fit_site(&column(&[(0, 30, 15, 15), (2, 8, 1, 0), (1, 8, 0, 1)]), 0.01, HOM_VAF);
+        let m = fit_site(&column(&[(0, 30, 15, 15), (2, 8, 1, 0), (1, 8, 0, 1)]), 0.01);
         assert_eq!(m.kept, [true, false, false, false]);
         assert_eq!(map_allele(2, 8, &m), 0);
         assert_eq!(map_allele(1, 8, &m), 0);
@@ -1110,7 +1110,7 @@ mod tests {
 
     #[test]
     fn strand_balanced_heteroplasmy_is_preserved() {
-        let m = fit_site(&column(&[(0, 30, 30, 30), (2, 30, 20, 20)]), 0.01, HOM_VAF);
+        let m = fit_site(&column(&[(0, 30, 30, 30), (2, 30, 20, 20)]), 0.01);
         assert_eq!(m.kept, [true, false, true, false]);
         assert_eq!(map_allele(0, 30, &m), 0);
         assert_eq!(map_allele(2, 30, &m), 2);
@@ -1121,7 +1121,7 @@ mod tests {
     #[test]
     fn single_strand_candidate_fails_the_per_strand_gate() {
         // A 10% alt seen only on the forward strand.
-        let m = fit_site(&column(&[(0, 30, 45, 45), (2, 30, 10, 0)]), 0.01, HOM_VAF);
+        let m = fit_site(&column(&[(0, 30, 45, 45), (2, 30, 10, 0)]), 0.01);
         assert!(!m.kept[2] && !m.pending[2]);
         assert_eq!(m.strand_biased_alts, 0, "rejected by the count gate, not the strand-bias test");
         assert_eq!(map_allele(2, 30, &m), 0);
@@ -1129,21 +1129,19 @@ mod tests {
 
     #[test]
     fn strand_bias_test_rejects_only_large_strand_effects() {
-        // (ref fwd, ref rev, alt fwd, alt rev, homoplasmic vaf, alt kept)
-        for (rf, rr, af, ar, hom, kept) in [
+        // (ref fwd, ref rev, alt fwd, alt rev, alt kept)
+        for (rf, rr, af, ar, kept) in [
             // Passes the per-strand gate, fails the bias test.
-            (40, 40, 18, 2, HOM_VAF, false),
-            // 75% of the column: near-homoplasmic, so exempt...
-            (0, 25, 73, 2, HOM_VAF, true),
-            // ...unless the exemption bar is above its frequency.
-            (0, 25, 73, 2, 0.95, false),
+            (40, 40, 18, 2, false),
+            // 75% of the column: near-homoplasmic, so exempt.
+            (0, 25, 73, 2, true),
             // Deep and significant, but a strand effect of only 0.11 vs the column's 0.514.
-            (2365, 2351, 328, 196, HOM_VAF, true),
+            (2365, 2351, 328, 196, true),
             // Deep single-strand artifact: effect 0.968 - 0.468 = 0.50.
-            (1722, 2454, 449, 15, HOM_VAF, false),
+            (1722, 2454, 449, 15, false),
         ] {
-            let m = fit_site(&column(&[(0, 30, rf, rr), (2, 30, af, ar)]), 0.01, hom);
-            assert_eq!(m.kept[2], kept, "alt {af}/{ar} vs ref {rf}/{rr}, hom {hom}");
+            let m = fit_site(&column(&[(0, 30, rf, rr), (2, 30, af, ar)]), 0.01);
+            assert_eq!(m.kept[2], kept, "alt {af}/{ar} vs ref {rf}/{rr}");
             assert_eq!(m.strand_biased_alts, !kept as usize);
             assert_eq!(map_allele(2, 30, &m), if kept { 2 } else { 0 });
         }
@@ -1153,7 +1151,7 @@ mod tests {
 
     #[test]
     fn empty_column_falls_back_to_reference_only() {
-        let m = fit_site(&column(&[]), 0.01, HOM_VAF);
+        let m = fit_site(&column(&[]), 0.01);
         assert_eq!(m.kept, [true, false, false, false]);
         assert_eq!(m.freq, [1.0, 0.0, 0.0, 0.0]);
     }
@@ -1167,7 +1165,7 @@ mod tests {
             (998, 2, 2, (false, false, 0)),   // 0.2%: below the pending floor
             (486, 26, 2, (false, false, 1)),  // strand-biased alleles are never pending
         ] {
-            let m = fit_site(&column(&[(0, 30, r, r), (2, 30, af, ar)]), 0.03, HOM_VAF);
+            let m = fit_site(&column(&[(0, 30, r, r), (2, 30, af, ar)]), 0.03);
             assert_eq!((m.kept[2], m.pending[2], m.strand_biased_alts), want, "alt {af}/{ar}");
             assert!(!m.pending[0], "reference is never pending");
         }
@@ -1296,7 +1294,7 @@ mod tests {
         write_bam(&inb, refseq.len(), recs);
         let refs = refs_of(refseq);
         let (corr, models, mut stats) =
-            compute_corrections(&inb, &refs, vaf, HOM_VAF, &iopts).unwrap();
+            compute_corrections(&inb, &refs, vaf, &iopts).unwrap();
         apply_corrections(&inb, &outb, &corr, &refs, &models, &iopts, &mut stats).unwrap();
         Run { corr, models, stats, out: read_bam(&outb) }
     }
@@ -1332,7 +1330,7 @@ mod tests {
             (s.path("in.bam"), s.path("out.bam"), s.path("ref.fa"), s.path("stats.json"));
         write_bam(&inb, refseq.len(), recs);
         std::fs::write(&reff, [&b">chrM\n"[..], refseq, b"\n"].concat()).unwrap();
-        start(&inb, &outb, &reff, "ont-r10", 0.01, HOM_VAF, &iopts, Some(&statsf)).unwrap();
+        start(&inb, &outb, &reff, "ont-r10", 0.01, &iopts, Some(&statsf)).unwrap();
         let json = serde_json::from_str(&std::fs::read_to_string(&statsf).unwrap()).unwrap();
         (json, read_bam(&outb))
     }
@@ -1430,7 +1428,7 @@ mod tests {
         let (inb, outb, reff) = (s.path("in.bam"), s.path("out.bam"), s.path("ref.fa"));
         std::fs::write(&reff, ">chrM\nAAAAAA\n").unwrap();
         write_bam(&inb, 6, &[read("r0", 0, b"AAGAAA", "6M", false)]);
-        start(&inb, &outb, &reff, "pacbio", 0.01, HOM_VAF, &indel::IndelOpts::default(), None)
+        start(&inb, &outb, &reff, "pacbio", 0.01, &indel::IndelOpts::default(), None)
             .unwrap();
         assert_eq!(std::fs::read(&inb).unwrap(), std::fs::read(&outb).unwrap());
     }

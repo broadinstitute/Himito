@@ -12,7 +12,8 @@ workflow Himito_lineage_eval {
         Float min_hf
         Float max_hf
         String chromo
-        String? extra_args
+        String? extra_args_quickstart
+        String? extra_args_lineage
     }
 
     call CalculateCoverage as CalculateCoveragePacBio {
@@ -35,7 +36,7 @@ workflow Himito_lineage_eval {
             sample_id = sample_id,
             chromo = chromo,
             data_type = "pacbio",
-            extra_args = extra_args
+            extra_args = extra_args_quickstart
 
     }
 
@@ -46,7 +47,7 @@ workflow Himito_lineage_eval {
             prefix = prefix,
             min_hf = min_hf,
             max_hf = max_hf,
-            extra_args = extra_args
+            extra_args = extra_args_lineage
     }
 
     output {

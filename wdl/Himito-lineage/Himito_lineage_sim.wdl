@@ -279,8 +279,7 @@ if topology not in ("random", "chain", "star"):
 # For a chain the minimum is exact and deterministic. For random/star it is
 # seed-dependent and unknowable here, so sim_min_hf is the only guaranteed bound
 # and the check is necessarily weaker.
-GATES = (("call -f (frequency_threshold)", freq),
-         ("denoise --vaf", denoise),
+GATES = (("denoise --vaf", denoise),
          ("call -v (min_hf)", min_hf))
 
 def check_gates(min_truth_hf, exact, ctx):

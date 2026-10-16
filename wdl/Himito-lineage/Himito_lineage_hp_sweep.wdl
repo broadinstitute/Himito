@@ -278,8 +278,8 @@ task LineageScoreCell {
         PROFILE="~{profile}"
         case "$PROFILE" in
           hifi)          DTYPE=pacbio;       DEFAULT_FP=0.005;  DEFAULT_FN=0.05;;
-          ont-denoised)  DTYPE=ont-denoised; DEFAULT_FP=0.0001; DEFAULT_FN=0.01;;
-          ont-r10)       DTYPE=ont-r10;      DEFAULT_FP=0.001;  DEFAULT_FN=0.05;;
+          ont-denoised)  DTYPE=ont-denoised; DEFAULT_FP=0.005; DEFAULT_FN=0.02;;
+          ont-r10)       DTYPE=ont-r10;      DEFAULT_FP=0.005; DEFAULT_FN=0.02;;
           *) echo "profile must be hifi or ont-r10 or ont-denoised" >&2; exit 1;;
         esac
 

@@ -139,9 +139,7 @@ pub fn find_mapping_position(graph:&GraphicalGenome, r: &Record, forward_contig:
         position_dict.entry(anchor_rev).or_insert_with(Vec::new);
     }
 
-    // Find positions of anchor sequences in the read
-    // Start at 0 so a k-mer at the very start of the read is not missed, and use
-    // >= k so a read exactly one anchor long is still scanned.
+    // Find positions of anchor sequences in the read.
     if forward_contig.len() >= k && k > 0 {
         for i in 0..(forward_contig.len() - k + 1) {
             if let Some(kmer) = forward_contig.get(i..i+k) {
@@ -163,9 +161,6 @@ pub fn find_mapping_position(graph:&GraphicalGenome, r: &Record, forward_contig:
                 let pos_seq = position_dict.get(seq).map_or(Vec::new(), |v| v.clone());
                 let pos_rev = position_dict.get(&anchor_rev).map_or(Vec::new(), |v| v.clone());
                 let position_list = [pos_seq.clone(), pos_rev.clone()].concat();
-                // if r.is_reverse(){
-                //     println!("{}, {}", pos_seq.len(), pos_rev.len());
-                // }
                 if position_list.len() == 1 && pos_rev.is_empty() {
                     final_anchor.insert(anchor.clone(), pos_seq[0]);
                 }
@@ -382,8 +377,7 @@ pub fn get_reference_coordinates(cigar: &str, ref_start: usize) -> HashMap<usize
                 alt_pos += length;
             },
             'I' => {  // Insertion
-                // Map to one base pair before; guard against underflow when the
-                // alt sequence begins with an insertion at reference start 0.
+                // Map to one base pair before; guard against underflow.
                 let pos = (ref_start + ref_pos).saturating_sub(1);
                 for i in 0..length {
                     position_mapping.insert(alt_pos + i, pos);
@@ -394,8 +388,7 @@ pub fn get_reference_coordinates(cigar: &str, ref_start: usize) -> HashMap<usize
                 ref_pos += length;
             },
             _ => {
-                // Handle other CIGAR operations or error cases
-                // You might want to add logging or proper error handling here
+                // Handle other CIGAR operations or error cases.
             }
         }
     }
@@ -418,8 +411,7 @@ fn collect_methylation_updates(
                         .get("seq")
                         .and_then(|s| s.as_str())
                         .expect(&format!("No seq for anchor {}", item));
-                    // Skip (don't abort) if the mapped base isn't a C. A single
-                    // off-by-one or edge mismatch must not kill the whole run.
+                    // Skip (don't abort) if the mapped base isn't a C.
                     if seq.as_bytes().get(*offset) != Some(&b'C') {
                         continue;
                     }
@@ -458,8 +450,7 @@ fn collect_methylation_updates(
 }
 
 fn apply_methylation_updates(graph: &mut GraphicalGenome, updates: &[GraphMethylUpdate]) {
-    // Deduplicate once by (kind, item, read, offset) so we can drop the per-array
-    // linear `contains` scan that made application O(n^2) at high coverage.
+    // Deduplicate once by (kind, item, read, offset) instead of a linear `contains` scan per array.
     let mut seen: HashSet<(bool, &str, &str, usize)> = HashSet::new();
     for update in updates {
         let key = (
@@ -507,17 +498,13 @@ pub fn add_methylation_to_graph(
 fn process_bam_record(graph: &GraphicalGenome, r: &Record) -> (Option<ProcessedRead>, RecordTiming) {
     let mut timing = RecordTiming::default();
 
-    // Skip unmapped, supplementary, and secondary alignments. Secondary records
-    // share the primary read's qname (double-counting methylation) and may carry
-    // an empty SEQ field.
+    // Skip unmapped, supplementary, and secondary alignments.
     if r.is_unmapped() || r.is_supplementary() || r.is_secondary() {
         return (None, timing);
     }
 
     let read_name = String::from_utf8_lossy(&r.qname()).to_string();
     let is_reverse = r.is_reverse();
-    // Decode the read sequence once and share it across the three steps below
-    // (previously each allocated its own copy).
     let read_seq = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
 
     let t0 = Instant::now();
@@ -687,8 +674,6 @@ fn write_bed(
         file,
         "#CHROM\tRef_start\tRef_end\tAsm_start\tAsm_end\tMotif\tMod_rate\tUnmod_rate\tCov\tMod_count\tUnmod_count"
     )?;
-    // let min_prob = 0.5;
-    // let mut methylation_signal: HashMap<(usize, Option<usize>), (f64, f64)> = HashMap::new();
     let mut methyl_info = Vec::new();
     for ((pos, refpos, motif), d) in methyl.iter() {
         let mut methyl_count = 0;
@@ -736,9 +721,7 @@ fn write_methylation_to_csv<P: AsRef<Path>>(
     let file = File::create(path)?;
     let mut writer = Writer::from_writer(file);
 
-    // find all the readsets and positions. Deduplicate reference positions: insertions
-    // map several assembly positions to the same refpos, so a plain push would create
-    // duplicate (all-zero) matrix rows and collapse distinct CpGs onto one row.
+    // find all the readsets and positions.
     let mut refpos_set = HashSet::new();
     let mut read_set = HashSet::new();
     for ((_pos, refpos, _motif), d) in methyl.iter() {
@@ -764,8 +747,6 @@ fn write_methylation_to_csv<P: AsRef<Path>>(
         .map(|(i, read)| (read.clone(), i))
         .collect();
 
-    // construct matrix
-    // let mut matrix = Array2::<f64>::zeros((refpos_list.len(), read_vec.len()));
     let mut matrix = Array2::<f64>::from_elem((refpos_list.len(), read_vec.len()), f64::NAN);
     
     for ((_pos, refpos, _motif), d) in methyl.iter() {
@@ -975,8 +956,7 @@ pub fn start (graph_file: &PathBuf, bam_file: &PathBuf, output_file: &PathBuf, m
     let methyl_dict =  find_methylation_signal_on_major_haplotype(&graph);
     let _ = write_bed(methyl_dict.clone(), output_file, min_prob);
 
-    // extranct read level methylation patterns
-    // println!("{}", methyl_single_read.len());
+    // read-level methylation patterns
     let matrix_output = output_file.with_extension("methylation_per_read.csv");
     if major_haploype {
         let _ = write_methylation_to_csv(methyl_dict, min_prob, matrix_output);

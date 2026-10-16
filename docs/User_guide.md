@@ -55,8 +55,8 @@ Here's a basic workflow to get started with Himito:
 msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ./target/release/Himito correct -g <output.gfa> -b <bwt_file, e.g. sr_msbwt.npy> -o <corrected.gfa> -m <minimal_supporting_sr> -q <query_length, should be less than short read length>
 
-# call variants from graph
-./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf>
+# call variants from graph (-b: raw mt BAM for strand filter and the matrix)
+./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -s <sampleid> -d <data_type> -o <output.vcf> -b <mt_output.bam>
 
 # extract major haplotype from graph
 ./target/release/Himito asm -g <output.gfa>  -o <output.majorhaplotpe.fasta> -s <header string, e.g. "HG002 major haplotype">
@@ -131,17 +131,28 @@ Identifies homoplasmic and heteroplasmic variants from the mitochondrial graph.
 ```
 
 Required Parameters:
-- -g, --graph <FILE>: Input graph file (GFA format)
-- -r, --reference <FILE>: Mitochondrial reference genome (FASTA)
-- -k, --kmer-size <INT>: K-mer size (should match build step)
+- -g, --graphfile <FILE>: Input graph file (GFA format)
+- -r, --reference-fasta <FILE>: Mitochondrial reference genome (FASTA)
 - -s, --sample-id <STRING>: Sample identifier
-- -d, --data-type <String>: Long Read Sequencing technology (pacbio or ont)
-- -o, --output <FILE>: Output VCF file
+- -d, --data-type <STRING>: pacbio, ont-r9, ont-r10 or ont-denoised
+- -o, --output-file <FILE>: Output VCF file
+
+Optional:
+- -b, --bam <FILE>: raw (pre-denoise) BAM of the same reads. It drives the strand-bias filter,
+  ONT linkage rescue and `<output>.matrix.csv`. `--input-bam` is an alias. Without it the matrix
+  comes from the graph and the strand filter and linkage rescue are off.
+
+Advanced options are hidden from `-h` and listed by `--help`: `-k`, `-m`, `-v`, `-p`, `-f`,
+`--strand-bias-threshold`, `--indel-false-threshold`, `--permutation-frequency-threshold`,
+`--permutation-rounds`, `--no-left-align`. The full text of `-h` and `--help` for `call`,
+`quick-start` and `lineage` is in [`docs/cli/`](cli/).
+
+The strand-bias action, permutation mode and genotyping gates are set by the data-type preset.
 
 Example:
 
 ```
-./target/release/Himito call -g HG002_mt.gfa -r rCRS.fasta -k 21 -s HG002 -o HG002_variants.vcf
+./target/release/Himito call -g HG002_mt.gfa -r rCRS.fasta -s HG002 -d pacbio -o HG002_variants.vcf
 ```
 
 ### asm - Primary Assembly Extraction
@@ -178,6 +189,111 @@ Example:
 ```
 ./target/release/Himito methyl -g HG002_mt.annotated.gfa -p 0.7 -b HG002_mt.bam -o HG002_methylation.bed
 ```
+
+### denoise - ONT Read Denoising
+Corrects sequencing errors in an ONT BAM before graph construction. Substitution
+correction runs for any `ont-*` data type (pacbio and other data types pass through
+unchanged); small-indel correction is available in addition but is **opt-in**.
+
+```
+./target/release/Himito denoise [OPTIONS]
+```
+
+Required Parameters:
+- -i, --input <FILE>: Input BAM (coordinate-sorted)
+- -o, --output <FILE>: Output denoised BAM
+- -r, --reference <FILE>: Mitochondrial reference genome (FASTA)
+
+Commonly used optional parameters (run `Himito denoise --help` for the full list):
+- -d, --data-type <STRING>: pacbio, ont-r9, ont-r10 or ont-denoised; only `ont-*` is denoised, pacbio passes through unchanged [default: ont-r10]
+- --vaf <FLOAT>: minimal VAF for a substitution allele to be kept [default: 0.03]
+- --stats <FILE>: optional path to write denoise statistics as JSON
+
+The strand-candidacy gates are fixed: an allele needs at least 2 observations on each
+strand, and one below 0.7 within-column frequency must not be strand-skewed (binomial
+p < 0.01 against the column's own strand mix *and* a forward-fraction shift of at least 0.20).
+
+Example:
+```
+./target/release/Himito denoise -i HG002_mt.bam -o HG002_mt.denoised.bam -r rCRS.fasta -d ont-r10 --stats HG002_denoise_stats.json
+```
+
+#### Small-indel denoising (ONT, opt-in)
+
+`Himito denoise --indels` extends substitution correction to indels shorter than
+`MAX_INDEL_LEN` (5, exclusive — so lengths 1-4). Reads are reassigned at
+left-normalized indel sites in both directions: a read can lose a spurious indel,
+gain a consensus indel it dropped, or snap from one indel allele to another of the
+same kind.
+
+Correction aggressiveness is governed by a repeat-context-scaled error rate: an indel
+inside a long homopolymer must clear a much higher frequency bar than the same indel
+in unique sequence, because that is where ONT's indel errors concentrate. A read only
+leaves its own allele when that allele's frequency falls below `eps / (1 - eps)` of a
+competing one.
+
+**Enabled by Quick Start.** `Himito quick-start -d ont-denoised` denoises the mt BAM
+**with indel correction on**. Running `Himito denoise --indels` yourself is only needed
+for a standalone, stepwise run.
+
+**The model constants below are unvalidated starting points, not tuned claims** — they
+are pending a validation sweep against `lineage_sim` (graph/matrix cleanliness with no
+regression in tree score or indel precision/recall).
+
+Indel flags (from `Himito denoise --help`):
+- `--indels`: enable small-indel (<5bp) correction in addition to substitutions [off by default]
+- `--indel-protect-vaf <FLOAT>`: an allele carried by at least this fraction of reads at a site is never corrected away, whatever candidacy says [default: 0.2]
+
+The rest of the indel model is fixed in `src/denoise_indel.rs`: `MAX_INDEL_LEN` 5 (exclusive,
+so lengths 1-4), `VAF_ABS_MIN` 0.05, the per-read error rate `eps(L) = ERR0 * ERR_SCALE^(L-1)`
+capped at `ERR_CAP` (0.01, 1.5, 0.4), `EXCESS_ALPHA` 1e-3, `DELTA` 0.3 and `INDEL_FLANK` 5.
+
+**Candidacy floor and `--indel-protect-vaf`.** An indel allele is a candidate only if its VAF
+reaches `max(VAF_ABS_MIN, 1.5 * eps(L))` and its count is a significant excess over `eps(L)`
+(binomial, `EXCESS_ALPHA` Bonferroni-corrected over sites), where `L` is the reference
+repeat-context length. In deep repeats the floor climbs steeply (about 0.11 at L = 6, 0.26 at
+L = 8, 0.6 from L = 11), so in the mtDNA poly-C tracts (m.303-315, m.16184-16193) genuine
+heteroplasmic indels would otherwise be reverted to reference. `--indel-protect-vaf` guards
+against that: an allele carried by at least that fraction of reads is kept regardless of
+candidacy, **except** when it was rejected by the strand-bias gate (suspected single-strand
+artifacts are what the denoiser exists to remove).
+
+**Sensitivity floor in repeats.** The effective revert threshold is therefore
+`min(max(VAF_ABS_MIN, 1.5 * eps(L)), protect_vaf)`. At the stock 0.2 that is a flat 0.2 for
+every repeat context `L >= 8`: an indel below ~20% VAF in a homopolymer or tandem repeat of
+length 8 or more is reverted whatever the error-model constants are. In shorter contexts the
+error model decides, and it always sets the MAP crossover, i.e. *which* allele a sub-threshold
+read is moved to. Lowering `--indel-protect-vaf` is the only way to raise sensitivity below
+20% VAF in long repeats, at the cost of protecting more errors.
+
+**Known limitation — methylation tags are lost on any structurally-changed read.** A
+read loses its `MM`/`ML`/`MN` (methylation) tags and its `NM`/`MD`/`cs` tags whenever at
+least one indel edit was actually applied to it — a **structural** change, not a
+**length** change. Those are not the same trigger: an insertion at one site and a
+deletion at another site can offset each other, leaving the read's SEQ length
+unchanged while its CIGAR is rewritten and every downstream query offset still shifts.
+A length check would silently miss exactly that case. These tags are indexed by the
+read's own base positions and cannot survive either kind of change. This is safe in
+the standard pipeline because methylation aggregation (`Himito methyl`) reads the
+*original* mt BAM, not the denoised one — but an indel-denoised BAM must not itself be
+used as a methylation input.
+
+**Known limitation — do not re-run the denoiser on its own output.** Allele
+frequencies are computed once from the input BAM and decisions are applied once.
+Feeding already-denoised reads back into another `denoise --indels` pass would let
+each pass shift the frequencies the next pass sees, compounding correction rather than
+converging.
+
+**Diagnostics.** When `--stats` is given, the JSON includes counters worth checking
+after a run:
+- `indel_edits_emitted_but_not_applied`: should normally be zero; a non-zero value
+  means edits were emitted that the rewrite step could not apply.
+- `indel_events_out_of_span`, `indel_events_duplicate_site`: bookkeeping counters for
+  events that fell outside a read's aligned span or collided on the same site.
+- `assignments_skipped_*`: counters for reads skipped during reassignment (e.g.
+  insufficient flank).
+- `reassignments_by_hp_length`: shows how much correction fired inside long
+  homopolymers, broken down by homopolymer length.
 
 ## Workflows
 ### WDL Workflows

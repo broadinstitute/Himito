@@ -394,8 +394,6 @@ pub fn start (graph_file: &PathBuf, ref_length:i64, bin_size:i32, pad_size:i64, 
         minimal_read_number = count_support as f64;
     }
     println!("Total read number: {}, Minimal read number: {}", readset.len(), minimal_read_number);
-    // let mut sp_anchor = graph.anchor.keys().collect::<Vec<&String>>();
-    // sp_anchor.sort();
     let graph_intervals_dict = get_graph_intervals(&graph, ref_length);
     let interval_list: Vec<i64> = (1..ref_length).step_by(bin_size as usize).map(|x| x as i64).collect();
     let mut haplotype_dict: HashMap<i64, HashMap<String, Vec<String>>> = HashMap::new();
@@ -427,7 +425,5 @@ pub fn start (graph_file: &PathBuf, ref_length:i64, bin_size:i32, pad_size:i64, 
     let results = dfs(&haplotype_dict, minimal_read_number as usize);
     let haplotypes = reconstruct_haplotypes(&results, &graph);
     let _ =write_multipleseq_fasta(output_file, haplotypes, header).unwrap();
-    // write fasta
-    // write_fasta(output_file, haplotype, header).unwrap();
 
 }

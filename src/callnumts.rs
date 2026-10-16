@@ -1,28 +1,8 @@
 // Sequence-resolved NUMT caller.
-//
-// Parses read CIGARs (primary + SA) to locate nuclear<->mitochondrial junctions,
-// extracts the mt-derived sequence carried by each read, clusters junctions by
-// signature, applies false-positive filters, and writes a sequence-resolved VCF
-// (explicit-sequence INS when a single read spans both boundaries, BND fallback
-// otherwise). Everything lives in this one file, organized into sections:
-//   - align:    AlignSeg model + CIGAR arithmetic (pure)
-//   - junction: per-read junction extraction + sequence resolution (pure)
-//   - cluster:  junction-signature single-linkage clustering + AC (pure)
-//   - filters:  FP metrics -> FILTER tags (pure)
-//   - vcf:      VCF record construction + writer
-//   - config + start(): orchestrator + BAM reading
-//
-// Grounding (2026-07-16 field survey): thresholds follow the split-read SV / NUMT
-// caller consensus (Sniffles2/cuteSV MAPQ 20, ~100bp clustering; dinumt ref-NUMT
-// masking; Sniffles2 3+0.1/kb max-splits chimera rule). 
 
 use std::{collections::{HashMap, HashSet}, path::PathBuf, io::Write, fs::File};
 use rust_htslib::bam::{self, Read, record::{Aux, Cigar}};
 use rust_htslib::faidx;
-
-// ---------------------------------------------------------------------------
-// config
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct CallNumtsConfig {
@@ -51,14 +31,7 @@ impl Default for CallNumtsConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// align section
-// ---------------------------------------------------------------------------
-
-/// One alignment of a read (primary record OR one SA entry), with query spans
-/// normalized to the PRIMARY record's stored-SEQ frame ("record frame"), so that
-/// spans from the primary and from SA entries are directly comparable and can
-/// index the primary's `seq()`.
+/// One alignment of a read, with query spans normalized to the PRIMARY record's stored-SEQ frame.
 #[derive(Debug, Clone)]
 pub struct AlignSeg {
     pub contig: String,
@@ -106,9 +79,6 @@ fn cigar_to_pair(c: &Cigar) -> (u8, i64) {
 }
 
 /// From CIGAR pairs compute (ref_len, leading clip, trailing clip, aligned query len).
-/// Leading/trailing clip counts both soft (S) and hard (H) clips so that spans are
-/// on a consistent full-read coordinate axis across primary (soft-clipped) and
-/// supplementary (often hard-clipped) alignments.
 fn cigar_metrics(ops: &[(u8, i64)]) -> (i64, i64, i64, i64) {
     let mut ref_len = 0i64;
     let mut qlen = 0i64;
@@ -122,10 +92,7 @@ fn cigar_metrics(ops: &[(u8, i64)]) -> (i64, i64, i64, i64) {
             _ => {}
         }
     }
-    // Sum consecutive clip ops at each end (a valid SAM clip run may be H then S,
-    // e.g. "10H20S..."), so spans land on a consistent full-read coordinate axis
-    // across soft-clipped primaries and hard-clipped supplementaries. A valid
-    // alignment always has >=1 consuming op between the runs, so they never overlap.
+    // Sum consecutive clip ops at each end.
     let is_clip = |op: u8| op == b'S' || op == b'H';
     let mut lead = 0i64;
     for (op, len) in ops {
@@ -146,9 +113,7 @@ fn cigar_metrics(ops: &[(u8, i64)]) -> (i64, i64, i64, i64) {
     (ref_len, lead, trail, qlen)
 }
 
-/// Build an AlignSeg from CIGAR pairs and orientation info.
-/// `ref_start` is 0-based. `seg_is_reverse` / `primary_is_reverse` are absolute
-/// (vs reference forward). Query spans are placed in the primary's record frame.
+/// Build an AlignSeg from CIGAR pairs; `ref_start` is 0-based, strands are absolute.
 fn build_seg(
     contig: String,
     is_mt: bool,
@@ -179,9 +144,8 @@ fn build_seg(
     }
 }
 
-/// Reference base index (0-based) of the junction-facing anchor of a segment.
-/// `is_left` = this segment is the upstream (smaller record-frame q) side of the
-/// junction, so its junction-facing end is the q_end side.
+/// Reference base index (0-based) of the junction-facing anchor of a segment; `is_left`: the segment is
+/// upstream of the junction in the record frame.
 fn anchor_ref(seg: &AlignSeg, is_left: bool) -> i64 {
     match (is_left, seg.same_as_primary) {
         (true, true) => seg.ref_end - 1,   // last aligned base, upstream in ref
@@ -204,10 +168,6 @@ fn revcomp(seq: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// junction section
-// ---------------------------------------------------------------------------
-
 /// A single nuclear<->mt junction extracted from one read.
 #[derive(Debug, Clone)]
 pub struct Junction {
@@ -229,8 +189,7 @@ pub struct Junction {
     pub min_seg_len: i64,
 }
 
-/// Extract junctions from one read's segment set (already in record frame) and the
-/// primary's stored SEQ (record frame). Emits at most one junction per mt segment.
+/// Extract junctions from one read's segment set and the primary's stored SEQ.
 pub fn extract_junctions(qname: &str, segs: &[AlignSeg], seq: &[u8]) -> Vec<Junction> {
     let mut sorted: Vec<AlignSeg> = segs.to_vec();
     sorted.sort_by_key(|s| s.q_start);
@@ -273,8 +232,7 @@ pub fn extract_junctions(qname: &str, segs: &[AlignSeg], seq: &[u8]) -> Vec<Junc
         let lo = mt.q_start.max(0) as usize;
         let hi = (mt.q_end.max(0) as usize).min(seq.len());
         let mut ins_seq = if lo < hi { seq[lo..hi].to_vec() } else { Vec::new() };
-        // record frame == nuclear-forward iff the nuclear segment matches the
-        // primary orientation; otherwise reverse-complement to nuclear-forward.
+        // record frame == nuclear-forward iff the nuclear segment matches the primary orientation.
         if !nuclear.same_as_primary {
             ins_seq = revcomp(&ins_seq);
         }
@@ -304,10 +262,6 @@ pub fn extract_junctions(qname: &str, segs: &[AlignSeg], seq: &[u8]) -> Vec<Junc
     }
     out
 }
-
-// ---------------------------------------------------------------------------
-// cluster section
-// ---------------------------------------------------------------------------
 
 /// A clustered NUMT call.
 #[derive(Debug, Clone)]
@@ -347,8 +301,7 @@ fn uf_find(parent: &mut [usize], x: usize) -> usize {
     r
 }
 
-/// Single-linkage cluster junctions sharing (nuclear_chrom, nuclear_bp +/- eps,
-/// mt_chrom, mt_bp +/- eps, orientation). Returns one NumtCall per cluster.
+/// Single-linkage cluster junctions sharing chroms and orientation with both breakpoints within `eps`.
 pub fn cluster_junctions(junctions: &[Junction], eps: i64) -> Vec<NumtCall> {
     let n = junctions.len();
     let mut parent: Vec<usize> = (0..n).collect();
@@ -403,9 +356,7 @@ pub fn cluster_junctions(junctions: &[Junction], eps: i64) -> Vec<NumtCall> {
             .unwrap();
 
         let is_full_ins = members.iter().any(|m| m.is_full_ins);
-        // For an explicit-sequence INS the emitted ALT comes from `rep`; anchor POS
-        // to the SAME read so POS/REF/ins_seq/MTREGION are internally consistent.
-        // Otherwise (BND fallback) use the robust cluster median.
+        // An explicit-sequence INS takes POS from `rep`, the read its ALT comes from; a BND uses the cluster median.
         let (nuclear_bp, mt_bp) = if is_full_ins {
             (rep.nuclear_bp, rep.mt_bp)
         } else {
@@ -413,8 +364,7 @@ pub fn cluster_junctions(junctions: &[Junction], eps: i64) -> Vec<NumtCall> {
         };
         let min_seg_mapq = members.iter().map(|m| m.min_seg_mapq).min().unwrap();
         let min_seg_len = members.iter().map(|m| m.min_seg_len).min().unwrap();
-        // Chimera rule is per-read: evaluate the most-fragmented supporting read
-        // against the allowance for ITS OWN length.
+        // Chimera rule is per read: the most-fragmented supporting read against its own length.
         let most_split = members.iter().max_by_key(|m| m.n_splits).unwrap();
         let max_n_splits = most_split.n_splits;
         let max_split_read_len = most_split.read_len;
@@ -449,17 +399,12 @@ pub fn cluster_junctions(junctions: &[Junction], eps: i64) -> Vec<NumtCall> {
     calls
 }
 
-// ---------------------------------------------------------------------------
-// filters section
-// ---------------------------------------------------------------------------
-
-/// Maximum allowed alignment segments for a read of `read_len_bp` bases
-/// (Sniffles2 "3 + 0.1/kb" rule). Split count above this flags a chimera.
+/// Maximum allowed alignment segments for a read of `read_len_bp` bases.
 fn max_allowed_splits(cfg: &CallNumtsConfig, read_len_bp: i64) -> i64 {
     cfg.max_splits + (cfg.max_splits_per_kb * (read_len_bp as f64 / 1000.0)).round() as i64
 }
 
-/// Populate `filters` for a call. Empty => PASS.
+/// Populate `filters` for a call; empty means PASS.
 pub fn apply_filters(call: &mut NumtCall, cfg: &CallNumtsConfig) {
     call.filters.clear();
     if call.min_seg_mapq < cfg.min_mapq {
@@ -474,8 +419,7 @@ pub fn apply_filters(call: &mut NumtCall, cfg: &CallNumtsConfig) {
     if call.mt_bp_spread > cfg.tolerance {
         call.filters.push("DISCORDANT".to_string());
     }
-    // Chimera: compare the most-fragmented supporting read's segment count against
-    // the "3 + 0.1/kb" allowance for THAT read's actual length.
+    // Chimera: compare the most-fragmented supporting read's segment count to its length-based allowance.
     if (call.max_n_splits as i64) > max_allowed_splits(cfg, call.max_split_read_len) {
         call.filters.push("MULTISPLIT".to_string());
     }
@@ -513,10 +457,6 @@ fn bed_overlaps(bed: &HashMap<String, Vec<(i64, i64)>>, chrom: &str, pos: i64) -
         false
     }
 }
-
-// ---------------------------------------------------------------------------
-// vcf section
-// ---------------------------------------------------------------------------
 
 /// BND ALT string for a nuclear-anchored breakend pointing at the mt mate.
 fn bnd_alt(ref_base: &str, mt_chrom: &str, mt_pos_1based: i64, orientation: char) -> String {
@@ -635,22 +575,12 @@ fn write_vcf(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// orchestrator
-// ---------------------------------------------------------------------------
-
-/// True if the CIGAR contains any hard clip (`H`). A hard-clipped record's stored
-/// `seq()` is missing the clipped bases, so it cannot anchor `ins_seq` extraction.
+/// True if the CIGAR contains any hard clip (`H`).
 fn has_hard_clip(ops: &[(u8, i64)]) -> bool {
     ops.iter().any(|(op, _)| *op == b'H')
 }
 
-/// Reconstruct a read's full alignment-segment set from a SINGLE record's own
-/// alignment plus its `SA` tag. Coordinates land in that record's stored-SEQ frame
-/// (`self_is_reverse` is the reference orientation), so it works whether the
-/// anchoring record is the primary or a supplementary — the latter matters for
-/// mt-only BAMs, where a NUMT read's nuclear primary was dropped by the chrM
-/// extraction and only the chrM supplementary (with a nuclear `SA` entry) remains.
+/// Reconstruct a read's alignment segments from one record's alignment plus its `SA` tag.
 fn build_read_segments(
     self_contig: &str,
     self_is_reverse: bool,
@@ -696,12 +626,9 @@ fn build_read_segments(
     segs
 }
 
-/// Reconstruct each read's segment set (from that read's own CIGAR + SA tag) and
-/// collect nuclear<->mt junctions. Iterates the whole BAM linearly so junctions are
-/// found in BOTH directions (mt->nuclear and nuclear->mt) and regardless of which
-/// alignment of the read is the primary. Each read is emitted once (deduped by
-/// qname); the anchoring record must carry the full read SEQ (no hard clip) so the
-/// inserted sequence can be resolved.
+/// Reconstruct each read's segment set and collect nuclear<->mt junctions.
+/// Each read is emitted once (deduped by qname); the anchoring record must carry the full read SEQ
+/// (no hard clip) so the inserted sequence can be resolved.
 fn find_junctions(bam_file: &PathBuf, mt_contig: &str) -> Result<Vec<Junction>, Box<dyn std::error::Error>> {
     let mut bam = bam::Reader::from_path(bam_file)?;
     let header = bam.header().clone();
@@ -711,8 +638,7 @@ fn find_junctions(bam_file: &PathBuf, mt_contig: &str) -> Result<Vec<Junction>, 
 
     for r in bam.records() {
         let record = r?;
-        // Secondary alignments carry no reliable SEQ/SA; skip. Supplementary records
-        // ARE considered here (unlike before) so mt-only BAMs still resolve.
+        // Secondary alignments carry no reliable SEQ/SA; skip.
         if record.is_unmapped() || record.is_secondary() {
             continue;
         }
@@ -748,9 +674,7 @@ fn find_junctions(bam_file: &PathBuf, mt_contig: &str) -> Result<Vec<Junction>, 
             continue;
         }
 
-        // ins_seq is sliced from this record's SEQ, which is complete only when the
-        // record is not hard-clipped. If this alignment is hard-clipped, defer: a
-        // soft-clipped alignment of the same read (e.g. the primary) may follow.
+        // ins_seq is sliced from this record's SEQ, which is complete only when the record is not hard-clipped.
         if has_hard_clip(&self_ops) {
             hardclip_only.insert(qname);
             continue;
@@ -798,19 +722,13 @@ pub fn start(
         apply_filters(call, config);
     }
 
-    // Indexed random access (uses the .fai sidecar): O(1) memory instead of loading
-    // the whole combined mt+nuclear reference into RAM, and faidx honors htslib's
-    // remote/GCS backends when the crate is built with those features.
+    // Indexed random access: O(1) memory instead of loading the whole combined mt+nuclear reference into RAM.
     let fasta = faidx::Reader::from_path(reference_file)?;
 
     write_vcf(output_vcf, &calls, &fasta, sample_name, config.emit_bnd)?;
     println!("wrote {} NUMT calls to {}", calls.len(), output_vcf.display());
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -834,8 +752,7 @@ mod tests {
 
     #[test]
     fn cigar_metrics_sums_combined_hard_and_soft_clips() {
-        // Valid SAM clip runs (H outermost, S inner) must be summed, not truncated
-        // to the first op: "10H20S30M40S5H" -> lead 30, trail 45.
+        // Clip runs are summed, not truncated to the first op.
         let (rl, lead, trail, qlen) = cigar_metrics(&parse_cigar_str("10H20S30M40S5H"));
         assert_eq!((rl, lead, trail, qlen), (30, 30, 45, 30));
     }
@@ -850,10 +767,7 @@ mod tests {
 
     #[test]
     fn sa_opposite_strand_uses_trailing_clip() {
-        // primary is forward; an SA on the reverse strand (opposite) must flip to
-        // the trailing clip when placed in the record frame.
-        // SA cigar 70M30S (reverse): lead 0, trail 30, qlen 70 -> q_start = trail = 30? no:
-        // opposite uses trail as q_start: trail=30 -> q_start=30, q_end=100.
+        // Primary forward, SA reverse: the record-frame span starts at the SA's trailing clip.
         let s = seg("chr1", false, 2000, "70M30S", true, false, 60);
         assert_eq!((s.q_start, s.q_end), (30, 100));
     }
@@ -869,8 +783,7 @@ mod tests {
 
     #[test]
     fn forward_nuclear_then_mt_partial_junction() {
-        // Read (100bp): 0..60 aligns to chr1 (nuclear), 60..100 aligns to chrM (mt).
-        // primary = nuclear forward (60M40S); SA = mt forward (60S40M).
+        // Read (100bp): 0..60 on chr1 (nuclear primary), 60..100 on chrM (SA), both forward.
         let nuc = seg("chr1", false, 1000, "60M40S", false, false, 60);
         let mt = seg("chrM", true, 200, "60S40M", false, false, 60);
         let seq: Vec<u8> = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\
@@ -910,12 +823,8 @@ mod tests {
     #[test]
     fn reverse_nuclear_revcomps_inserted_sequence() {
         // primary = mt forward; nuclear SA on opposite strand -> ins_seq revcomp'd.
-        // Read frame (record frame = mt primary): mt 0..40 (40M60S).
         let mt = seg("chrM", true, 300, "40M60S", false, false, 60);
-        // nuclear SA opposite strand: cigar 40S60M reverse -> opposite uses trail(=0)
-        // as q_start -> q_start=0, q_end=60. That collides with mt (0..40); to place
-        // nuclear after mt in record frame we instead give it a leading clip of 40
-        // on the reverse read: cigar 60M40S reverse -> trail=40 -> q_start=40.
+        // Opposite strand uses the trailing clip: 60M40S reverse -> q_start 40, after the mt part.
         let nuc = seg("chr2", false, 8000, "60M40S", true, false, 60);
         let seq: Vec<u8> = b"ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT".iter().cloned()
             .chain(std::iter::repeat(b'T').take(60)).collect();
@@ -939,11 +848,7 @@ mod tests {
 
     #[test]
     fn build_read_segments_recovers_junction_from_mt_supplementary() {
-        // Real mt-only-BAM shape (HG002 chrM_100x): the read's nuclear PRIMARY on
-        // chr3 was dropped by the chrM extraction; only the chrM SUPPLEMENTARY
-        // remains, and it is soft-clipped (full SEQ) with the nuclear primary in SA.
-        //   chrM self:  11848S459=1D466=   (mt aligned, forward)
-        //   SA:         chr3,171111165,+,11831M17I925S,60,1
+        // mt-only BAM: the nuclear primary was dropped; the soft-clipped chrM supplementary carries it in SA.
         let self_ops = parse_cigar_str("11848S459=1D466=");
         let sa = "chr3,171111165,+,11831M17I925S,60,1;";
         let segs = build_read_segments("chrM", false, 5000, &self_ops, 60, sa, "chrM");
@@ -986,7 +891,6 @@ mod tests {
 
     #[test]
     fn distinct_nearby_insertions_stay_separate() {
-        // Two insertions 5kb apart must NOT merge (regression vs old 10kb gap merge).
         let js = vec![
             mkj("r1", 1000, 200),
             mkj("r2", 1005, 202),
@@ -1061,7 +965,6 @@ mod tests {
     fn multisplit_uses_real_read_length_not_insseq_len() {
         let cfg = CallNumtsConfig::default(); // max_splits=3, per_kb=0.1
         // A 10 kb read tiled into 4 segments is within allowance (3 + round(0.1*10) = 4).
-        // The old proxy used ins_seq.len() (40 bp) -> allowance 3 -> wrongly flagged.
         let mut c = mkcall(60, 200, 3, 0, false);
         c.max_n_splits = 4;
         c.max_split_read_len = 10_000;

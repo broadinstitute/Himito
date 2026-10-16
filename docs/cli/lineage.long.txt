@@ -1,0 +1,63 @@
+Infer mitochondrial lineage tree from Himito read_var matrix CSV and heteroplasmic variants
+
+Usage: Himito lineage [OPTIONS] --matrix-file <MATRIX_FILE> --output-prefix <OUTPUT_PREFIX>
+
+Options:
+  -m, --matrix-file <MATRIX_FILE>
+          Himito matrix CSV (<prefix>.matrix.csv)
+
+      --threads <THREADS>
+          worker threads for parallel stages
+
+  -v, --vcf-file <VCF_FILE>
+          Himito VCF; restricts the analysis to its heteroplasmic sites
+
+  -d, --data-type <DATA_TYPE>
+          sequencing data type; sets the SCITE error-rate preset
+          
+          [default: pacbio]
+          [possible values: pacbio, ont-r9, ont-r10, ont-denoised]
+
+  -o, --output-prefix <OUTPUT_PREFIX>
+          output prefix; writes <prefix>.haplotype_map.tsv and the trees
+
+      --min-hf <MIN_HF>
+          minimum heteroplasmic frequency (inclusive) of a variant
+          
+          [default: 0.01]
+
+      --max-hf <MAX_HF>
+          maximum heteroplasmic frequency (exclusive); excludes fixed variants
+          
+          [default: 0.95]
+
+      --fp-rate <FP_RATE>
+          SCITE false-positive rate (preset by data type)
+
+      --fn-rate <FN_RATE>
+          SCITE false-negative rate (preset by data type)
+
+      --hp-fp-rate <HP_FP_RATE>
+          SCITE false-positive rate in HP tracts (twice --fp-rate, capped at 0.5)
+
+      --hp-fn-rate <HP_FN_RATE>
+          SCITE false-negative rate in HP tracts (twice --fn-rate, capped at 0.5)
+
+      --collapse-hp
+          merge equivalent spellings inside known rCRS homopolymer tracts
+
+      --mcmc-iterations <MCMC_ITERATIONS>
+          MCMC iterations per chain
+          
+          [default: 5000]
+
+      --mcmc-chains <MCMC_CHAINS>
+          independent MCMC chains; the best tree is kept
+          
+          [default: 3]
+
+      --debug
+          also write raw_haplotype_map.tsv and raw_variant_cooccurrence.tsv
+
+  -h, --help
+          Print help (see a summary with '-h')

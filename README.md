@@ -57,14 +57,34 @@ If GitHub, Docker Hub, or `crates.io` are slow or unreachable, use the **Zenodo 
                                     -d pacbio
 
 ```
-If you are analyzing high coverage samples, remember to set ```--maximal-mt-depth``` to a reasonable number
+If you are analyzing high coverage samples, remember to set ```--maximal-mt-depth``` to a reasonable number. -d accepts: pacbio (default), ont-r9, ont-r10, ont-denoised
+
+`-h` lists only the common options of `quick-start`, `call` and `lineage`. The tuning
+options (for example `-k`, `-v`, `--p-value-threshold`, `--permutation-rounds`) still work
+but are listed only by `--help`. The full help text of each command is kept in
+[`docs/cli/`](docs/cli/).
+
+`quick-start` and `call` left-align indels by default; `--no-left-align` keeps the graph's
+indel spellings. See [call variants from graph](#call-variants-from-graph-default-for-pacbio) below.
+
 
 ## Details
-### build Himito graph
+
+### Filter NUMTs-derived reads
 ```
 # filter NUMTs-derived reads
 ./target/release/Himito filter -i <input.bam> -c <chromosome in bam, e.g. "chrM"> -m <mt_output.bam> -n <numts_output.bam>
+```
 
+### Update: Denoise ONT reads before graph construction
+For ONT R9 and R10 data, we recommend running Himito denoise to correct ONT reads in a BAM before graph construction. Denoising is a per-base model: it removes the *random* ONT error it can see, but leaves *systematic* error, which carries high base qualities, untouched. `ont-denoised` therefore keeps the ONT thresholds and the permutation co-occurrence test on SNPs (unlike `pacbio`, which exempts SNPs), and additionally makes the strand-bias filter **drop** strand-skewed low-VAF SNPs instead of only tagging them `FILTER=Strand_bias`. A call that is still strand-skewed after denoising has survived a filter designed to catch exactly that artifact, so it is discarded.
+
+```
+./target/release/Himito denoise -i <mt_output_bam> -r <NC_012920.1.fasta> -d <ont-r10/ont-r9> -o <denoised_bam> 
+```
+
+### build Himito graph
+```
 # construct graph
 ./target/release/Himito build -i <mt_output.bam> -k <kmer_size> -r <NC_012920.1.fasta> -o <output.gfa>
 
@@ -80,65 +100,49 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ./target/release/Himito correct -g <output.gfa> -b <bwt_file, e.g. sr_msbwt.npy> -o <corrected.gfa> -m <minimal_supporting_sr> -q <query_length, should be less than short read length>
 ```
 ### Downstream analysis
+#### call variants from graph, default for pacbio.
 ```
-# call variants from graph, default for pacbio, change <-d ont> to ont data
-./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -k <kmer_size> -s <sampleid> -o <output.vcf>
+./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -s <sampleid> -d <data_type> -o <output.vcf> -b <raw_mt.bam>
+```
 
-# extract major haplotype from graph
+`-b/--bam` takes the raw (pre-denoise) BAM of the same reads. It drives the strand-bias
+filter, ONT linkage rescue and `<output>.matrix.csv`. `--input-bam` is accepted as an alias.
+Without `-b`, the matrix comes from the graph and the strand filter and linkage rescue are off.
+The strand-bias action, permutation mode and genotyping gates are set by the data type.
+
+Indels are left-aligned against the reference by default, the way `bcftools norm`
+does, so that equivalent spellings of one event in a homopolymer or tandem repeat
+collapse into a single record with their supporting reads pooled. Pass `--no-left-align`
+to keep the graph's indel spellings instead.
+
+This changes the reported POS/REF/ALT, AC and HF of indels, and the variant names used
+as row labels in the output matrix, so it also shifts the coordinates seen by downstream
+lineage analysis. The VCF records it with a `##HimitoNormalization=left-aligned` header
+line. An indel that would shift past the start of the reference stops there rather than
+wrapping around the circular origin. Note that graphs built by `Himito build` already
+carry left-anchored indel CIGARs in practice, so on such graphs left-alignment is a
+guarantee rather than a transformation and typically changes nothing.
+#### extract major haplotype from graph
+```
 ./target/release/Himito asm -g <output.gfa>  -o <output.majorhaplotpe.fasta> -s <header string, e.g. "HG002 major haplotype">
+```
 
-# call methylation signals
+#### call methylation signals
+```
 ./target/release/Himito methyl -g <output.annotated.gfa> -p <min_prob> -b <mt_test.bam> -o <methyl.bed>
-
-# enumerate all possible haplotypes within windows
+```
+#### enumerate all possible haplotypes within windows (deprecated)
+```
 ./target/release/Himito minorhap -g <output.gfa> -o <output.allhaplotype.fasta> -s <sample_id>
 ```
-
-### Jan 20th 2026 Updates: NUMTs Breakpoint Calling (Under-construction)
-
-Himito can identify and call NUMTs (Nuclear Mitochondrial DNA segments) breakpoints from long-read BAM files. NUMTs are segments of mitochondrial DNA that have been inserted into the nuclear genome. The NUMTs calling functionality (`callnumts.rs`) works by:
-
-1. **Identifying NUMT reads**: Parses supplementary alignment (SA) tags in BAM files to identify reads that have:
-   - Primary alignment to mitochondrial DNA (chrM) and supplementary alignment to nuclear chromosomes, OR
-   - Primary alignment to nuclear chromosomes and supplementary alignment to mitochondrial DNA
-
-2. **Merging breakpoints**: Groups breakpoints by chromosome and merges consecutive breakpoints within a specified gap threshold (`max_gap_threshold`) to create intervals. 
-
-3. **Writing BND records**: Outputs breakend (BND) structural variant records in VCF format, representing the NUMT breakpoints. Each BND record includes:
-   - Breakpoint positions on both the nuclear chromosome and mitochondrial genome
-   - Strand orientation information
-   - Supporting read counts (allele depth)
-   - Properly formatted BND ALT fields based on strand orientations
-
-**Usage:**
-```bash
-./target/release/Himito call-numts -i sample.bam \
-                               -c chrM \
-                               -m 10000 \
-                               -r hg38.fa \
-                               -o numts_breakpoints.vcf \
-                               -s HG002 \
-                               -a 2
-```
-**Output format:**
-The output VCF file contains BND (breakend) records in standard VCFv4.3 format. Each record represents a NUMT breakpoint with:
-- `CHROM`: Nuclear chromosome where the breakpoint occurs
-- `POS`: Breakpoint position (1-based)
-- `ALT`: BND format string indicating the connection to mitochondrial DNA
-- `INFO`: Contains `SVTYPE=BND`
-- `FORMAT`: GT (genotype) and AD (allele depth/supporting read count)
-
-This will identify NUMT breakpoints where reads have alignments spanning both mitochondrial and nuclear genomes, merge breakpoints within 10kb, and output only those with at least 2 supporting reads. If you want to examine all possible NUMTs BND, adjust -a to <=1.
-
-ToDo: may perform local assembly to find sequence resolved NUMTs insertions
 
 ### July 14th 2026 Updates: Mitochondrial lineage inference (Under-construction)
 
 Himito includes a new function for inferring mitochondrial mutation history from heteroplasmic variants given the Infinite Sites assumption (ISA) that every variant can only mutate once and will exist on the lineage over the lifetime. 
 
-Given a Himito read–variant matrix (`<prefix>.matrix.csv` from `call`) and the corresponding VCF, the `lineage` command filters to informative heteroplasmic sites, deduplicates reads into haplotypes, and runs an MCMC search over mutation trees and identify a ML tree (algorithm adapted from SCITE, Kuipers J et al. Single-cell sequencing data reveals widespread recurrence and loss of mutational hits in the life histories of tumorus. Genome Research 2017; 27:1885-1894.). The initial tree is a Neighbor–Joining tree constructed from reads instead of a random tree though. Sequencing errors are modeled with configurable false-positive (defaul 0.001) and false-negative rates (defaul 0.05). 
+Given a Himito read–variant matrix (`<prefix>.matrix.csv` from `call`) and the corresponding VCF, the `lineage` command filters to informative heteroplasmic sites, deduplicates reads into haplotypes, and runs an MCMC search over mutation trees and identify a ML tree (algorithm adapted from SCITE, Kuipers J et al. Single-cell sequencing data reveals widespread recurrence and loss of mutational hits in the life histories of tumorus. Genome Research 2017; 27:1885-1894.). The initial tree is a Neighbor–Joining tree constructed from reads instead of a random tree though. Sequencing errors are modeled with false-positive and false-negative rates preset by `-d` (pacbio 0.005 / 0.05, ONT 0.005 / 0.02) and set with `--fp-rate` / `--fn-rate`. 
 
-Outputs include a mutation tree, read-level lineage Newick tree, cleaned read–variant matrix, variant co-occurrence tables, and haplotype maps.
+Outputs include a mutation tree, read-level lineage Newick tree, the cleaned read–variant matrix `<prefix>.cleaned_matrix_all_variants.csv`, the variant co-occurrence table `variant_cooccurrence.tsv`, and haplotype maps. The raw co-occurrence table and `raw_haplotype_map.tsv` are written only with `--debug`.
 
 ```
 ./target/release/Himito lineage -m <prefix>.matrix.csv \
@@ -148,9 +152,11 @@ Outputs include a mutation tree, read-level lineage Newick tree, cleaned read–
                                  --max-hf 0.95
 ```
 
-Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix.csv`, `<output_prefix>.raw_haplotype_map.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`.
+Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix_all_variants.csv`, `<output_prefix>.variant_cooccurrence.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv` and `<output_prefix>.raw_variant_cooccurrence.tsv`.
+
+`lineage` shows `-m -v -d -o --min-hf --max-hf` in `-h`; the error-rate, MCMC and `--debug`
+options are listed by `--help`.
 
 To Do: 
-1. mutation/error rate in homopolymer regions could be different (higher FP rate). 
-2. add four gamete test
-3. Add posteriors, convergence and confidence metrics
+1. add four gamete test
+2. Add posteriors, convergence and confidence metrics

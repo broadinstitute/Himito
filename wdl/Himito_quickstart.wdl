@@ -11,6 +11,7 @@ workflow Himito_quickstart {
         String? billing_project
         Int kmer_size
         String chromo
+        String? extra_args
     }
 
     call CalculateCoverage {
@@ -32,6 +33,7 @@ workflow Himito_quickstart {
             sample_id = sample_id,
             chromo = chromo,
             data_type = data_type,
+            extra_args = extra_args
 
     }
 
@@ -149,11 +151,21 @@ task QuickStart {
         String sample_id
         String data_type
         String chromo = "chrM"
+        String? extra_args
+
+        RuntimeAttr? runtime_attr_override
     }
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito quick-start -i ~{bam} -c ~{chromo} -o ~{prefix} -k ~{kmer_size} -r ~{reference_fa} -s ~{sample_id} -d ~{data_type}
+        /Himito/target/release/Himito quick-start -i ~{bam} \
+                                                  -c ~{chromo} \
+                                                  -o ~{prefix} \
+                                                  -k ~{kmer_size} \
+                                                  -r ~{reference_fa} \
+                                                  -s ~{sample_id} \
+                                                  -d ~{data_type} \
+                                                  ~{extra_args}
     >>>  
 
     output {
@@ -165,11 +177,24 @@ task QuickStart {
         File numts_bam = "~{prefix}.numts.bam"
         File vcf = "~{prefix}.vcf"
     }
-
+    #########################
+    RuntimeAttr default_attr = object {
+        cpu_cores:          1,
+        mem_gb:             10,
+        disk_gb:            100,
+        boot_disk_gb:       10,
+        preemptible_tries:  2,
+        max_retries:        1,
+        docker:             "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
+    }
+    RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])
     runtime {
-        docker: "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
-        memory: "4 GB"
-        cpu: 1
-        disks: "local-disk 200 SSD"
+        cpu:                    select_first([runtime_attr.cpu_cores,         default_attr.cpu_cores])
+        memory:                 select_first([runtime_attr.mem_gb,            default_attr.mem_gb]) + " GiB"
+        disks: "local-disk " +  select_first([runtime_attr.disk_gb,           default_attr.disk_gb]) + " SSD"
+        bootDiskSizeGb:         select_first([runtime_attr.boot_disk_gb,      default_attr.boot_disk_gb])
+        preemptible:            select_first([runtime_attr.preemptible_tries, default_attr.preemptible_tries])
+        maxRetries:             select_first([runtime_attr.max_retries,       default_attr.max_retries])
+        docker:                 select_first([runtime_attr.docker,            default_attr.docker])
     }
 }

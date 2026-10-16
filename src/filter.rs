@@ -10,18 +10,20 @@ pub fn downsample_list(
     max_reads: usize,
     seed: u64,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    if mt_readnames.len() <= max_reads {
-        return Ok(mt_readnames.iter().cloned().collect());
+    // HashSet iteration order varies per process; sort so the seeded sample is reproducible.
+    let mut names: Vec<String> = mt_readnames.iter().cloned().collect();
+    names.sort();
+    if names.len() <= max_reads {
+        return Ok(names);
     }
     let mut rng = StdRng::seed_from_u64(seed);
-    let downsampled_mt_readnames: Vec<String> = mt_readnames
+    let downsampled_mt_readnames: Vec<String> = names
         .iter()
         .choose_multiple(&mut rng, max_reads)
         .into_iter()
         .cloned()
         .collect();
     Ok(downsampled_mt_readnames)
-
 }
 
 
@@ -200,4 +202,20 @@ pub fn start(
     }
     
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downsample_list_is_deterministic_and_sorted() {
+        let names: Vec<String> = (0..200).map(|i| format!("read_{i:03}")).collect();
+        let forward: HashSet<String> = names.iter().cloned().collect();
+        let reverse: HashSet<String> = names.iter().rev().cloned().collect();
+        // The same seed picks the same reads whatever the HashSet iteration order.
+        assert_eq!(downsample_list(&forward, 50, 42).unwrap(), downsample_list(&reverse, 50, 42).unwrap());
+        // Under the cap every read is returned, sorted.
+        assert_eq!(downsample_list(&forward, 500, 1).unwrap(), names);
+    }
 }

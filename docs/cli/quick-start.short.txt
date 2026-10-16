@@ -1,0 +1,23 @@
+Quick start pipeline for mitochondrial assembly, variant calling and methylation aggregation
+
+Usage: Himito quick-start [OPTIONS] --input-bam <INPUT_BAM> --reference-path <REFERENCE_PATH> --sample-id <SAMPLE_ID> --output-prefix <OUTPUT_PREFIX>
+
+Options:
+  -i, --input-bam <INPUT_BAM>
+          input BAM of reads, coordinate-sorted
+      --threads <THREADS>
+          worker threads for parallel stages
+  -c, --chromo <CHROMO>
+          mitochondrial contig name in the BAM [default: chrM]
+  -r, --reference-path <REFERENCE_PATH>
+          reference FASTA (rCRS)
+  -s, --sample-id <SAMPLE_ID>
+          sample name written to the outputs
+  -d, --data-type <DATA_TYPE>
+          sequencing data type; sets the filter and denoise presets (pacbio, ont-r9, ont-r10, ont-denoised) [default: pacbio] [possible values: pacbio, ont-r9, ont-r10, ont-denoised]
+  -o, --output-prefix <OUTPUT_PREFIX>
+          output prefix for the BAM, GFA, VCF, matrix and BED outputs
+      --maximal-mt-depth <MAXIMAL_MT_DEPTH>
+          maximum mtDNA reads kept after downsampling [default: 50000]
+  -h, --help
+          Print help (see more with '--help')

@@ -1,10 +1,8 @@
 use crate::agg;
 use agg::*;
-use rayon::iter::WhileSome;
 use crate::build;
-use indicatif::ProgressBar;
 use rayon::prelude::*;
-use std::collections::{HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -12,13 +10,13 @@ use std::{collections::HashSet, path::PathBuf};
 use std::error::Error;
 use csv::Writer;
 use ndarray::{Array2, Axis, s};
-use rand::seq::SliceRandom;
-use rand::thread_rng;
-use statrs::distribution::{Normal, ContinuousCDF, Binomial, DiscreteCDF};
-use regex::Regex;
+use statrs::distribution::{Binomial, DiscreteCDF, Poisson};
 use adjustp::{adjust, Procedure};
 use bio::io::fasta::{Reader, Record};
-use rust_htslib::bam::{Read as HtsRead, Reader as BamReader};
+use crate::denoise_indel::{normalize_left, Allele};
+use crate::linkage::{self, LinkCall};
+use rust_htslib::bam::{Read as HtsRead, Reader as BamReader, Record as BamRecord};
+use rust_htslib::bam::ext::BamRecordExtensions;
 
 #[derive(Debug, Clone)]
 pub struct Variant {
@@ -207,11 +205,7 @@ fn edge_reads(graph: &GraphicalGenome, edge: &str) -> HashSet<String> {
 fn get_graph_intervals(graph:&GraphicalGenome, length: i64) -> HashMap<&String, (i64, i64)>{
     let mut graph_intervals_dict = HashMap::new();
     for edge in graph.edges.keys() {
-        // Edges with no computed variant record were never CIGAR-processed
-        // (get_variant skips them via this same empty-cigar check) - a read
-        // reaching a bubble only through such an edge was never genotyped
-        // there, and must not be credited as "covering" it, or it later
-        // defaults to a false ref (0) call instead of the correct NaN.
+        // Edges without a variant record were never genotyped; a read crossing a bubble only via one does not cover it.
         let has_variant = graph.edges[edge]
             .get("variants")
             .and_then(|v| v.as_str())
@@ -221,20 +215,27 @@ fn get_graph_intervals(graph:&GraphicalGenome, length: i64) -> HashMap<&String, 
         }
         let src = graph.edges[edge].get("src").unwrap().as_array().unwrap()[0].as_str().unwrap();
         let dst = graph.edges[edge].get("dst").unwrap().as_array().unwrap()[0].as_str().unwrap();
-        let startpos = graph.anchor
-            .get(src)
-            .and_then(|v| v.get("pos"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0) as i64;  
-        let endpos  = graph.anchor
-            .get(dst)
-            .and_then(|v| v.get("pos"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(length) as i64;  
-        if endpos > startpos {
-            graph_intervals_dict.insert(edge, (startpos, endpos));
-        }
-        
+        // SOURCE/SINK have no anchor coordinate, and get_variant skips those edges outright.
+        let anchor_pos = |name: &str| {
+            graph
+                .anchor
+                .get(name)
+                .and_then(|v| v.get("pos"))
+                .and_then(|v| v.as_i64())
+        };
+        let (Some(startpos), Some(endpos)) = (anchor_pos(src), anchor_pos(dst)) else {
+            continue;
+        };
+        // The graph is circular: the final anchor links straight back to the first.
+        let end_unwrapped = if endpos > startpos {
+            endpos
+        } else if endpos < startpos {
+            endpos + length
+        } else {
+            // Degenerate self-loop on one anchor: zero-width, nothing to cover.
+            continue;
+        };
+        graph_intervals_dict.insert(edge, (startpos, end_unwrapped));
     }
     graph_intervals_dict
 }
@@ -252,14 +253,10 @@ fn bubble_cover_reads(graph_intervals_dict: &HashMap<&String, (i64, i64)>, pos: 
     cover
 }
 
-/// Populates `read_record`/`cover_record` for one edge's variants.
-///
-/// `graph_intervals_dict` holds raw (unwrapped) anchor coordinates, including
-/// the duplicated wrap-around span past `ref_length` used to circularize the
-/// graph. `variants` carries that same raw position, while `variants_circular`
-/// carries the wrapped position used to key/name the variant. The bubble
-/// lookup must use the raw position - using the wrapped one would look up
-/// the wrong bubble (or none) for any variant on the wrap-around edge.
+/// Populates `read_record`/`cover_record` for one edge's variants: the raw position in `variants` finds the
+/// bubble, the matching `variants_circular` entry names the record.
+/// `graph_intervals_dict` holds raw (unwrapped) anchor coordinates: the closing bubble that crosses
+/// the origin is stored as `[src.pos, dst.pos + ref_length)` so it stays ordered and half-open.
 fn record_variant_reads(
     variants: &[Variant],
     variants_circular: &[Variant],
@@ -280,11 +277,13 @@ fn record_variant_reads(
     }
 }
 
+/// `left_align`: the reference to left-align indels against; `None` keeps the spelling of the graph.
 pub fn get_variant(
     graph: &mut GraphicalGenome,
     k: usize,
     ref_name: &str,
     ref_length: usize,
+    left_align: Option<&[u8]>,
 ) -> (
     Vec<Variant>,
     HashMap<usize, usize>,
@@ -357,7 +356,12 @@ pub fn get_variant(
             refstart as usize,
             allele_count,
         );
+        // Align BEFORE `var` is extended and before the read records are keyed.
         let variants_circular = circuliarize_variants(variants.clone(), ref_length);
+        let variants_circular = match left_align {
+            Some(refseq) => variants_circular.iter().map(|v| left_align_variant(v, refseq)).collect(),
+            None => variants_circular,
+        };
         var.extend(variants_circular.clone());
 
         for (pos, count) in poscounts.iter() {
@@ -386,6 +390,49 @@ pub fn get_variant(
         );
     }
     (var, coverage, read_record, cover_record)
+}
+
+/// Shift an indel maximally leftward so equivalent alignments get one canonical representation.
+fn left_align_variant(variant: &Variant, refseq: &[u8]) -> Variant {
+    // `normalize_left` indexes an indel by its anchor: the last reference base BEFORE the event.
+    if variant.pos == 0
+        || variant.ref_allele.is_empty()
+        || variant.alt_allele.is_empty()
+        || variant.ref_allele == "-"
+        || variant.alt_allele == "-"
+    {
+        return variant.clone();
+    }
+
+    let allele = match variant.variant_type.as_str() {
+        // ALT is the anchor base followed by the inserted sequence.
+        "INS" => Allele::Ins(variant.alt_allele.as_bytes()[1..].to_vec()),
+        // REF is the anchor base followed by the deleted sequence.
+        "DEL" => Allele::Del((variant.ref_allele.len() - 1) as u32),
+        _ => return variant.clone(),
+    };
+
+    let (anchor, normalized) = normalize_left(refseq, (variant.pos - 1) as u32, &allele);
+    let anchor = anchor as usize;
+
+    // Rebuild both alleles from the reference at the NEW anchor rather than editing the old strings.
+    let anchor_base = match refseq.get(anchor..anchor + 1) {
+        Some(base) => String::from_utf8_lossy(base).to_string(),
+        None => return variant.clone(),
+    };
+    let (ref_allele, alt_allele) = match &normalized {
+        Allele::Ins(inserted) => (
+            anchor_base.clone(),
+            format!("{}{}", anchor_base, String::from_utf8_lossy(inserted)),
+        ),
+        Allele::Del(n) => match refseq.get(anchor..anchor + 1 + *n as usize) {
+            Some(deleted) => (String::from_utf8_lossy(deleted).to_string(), anchor_base),
+            None => return variant.clone(),
+        },
+        Allele::Ref => return variant.clone(),
+    };
+
+    Variant { pos: anchor + 1, ref_allele, alt_allele, ..variant.clone() }
 }
 
 fn collapse_identical_records(variants: Vec<Variant>, ref_length: usize) -> Vec<Variant> {
@@ -425,7 +472,12 @@ fn collapse_identical_records(variants: Vec<Variant>, ref_length: usize) -> Vec<
         .collect()
 }
 
-fn format_vcf_record(variant: &Variant, coverage: HashMap<usize, usize>, indel_false_threshold: f64) -> String {
+fn format_vcf_record(
+    variant: &Variant,
+    coverage: HashMap<usize, usize>,
+    indel_false_threshold: f64,
+    skip_indel_artifact: bool,
+) -> String {
     // Add AC (allele count) to INFO field
     let read_depth = coverage.get(&variant.pos).unwrap_or(&0);
     let allele_frequency = if *read_depth == 0 {
@@ -441,15 +493,14 @@ fn format_vcf_record(variant: &Variant, coverage: HashMap<usize, usize>, indel_f
 
     let indel_len = (variant.ref_allele.len() as i32 - variant.alt_allele.len() as i32).abs();
     let is_small_indel = variant.variant_type != "SNP" && indel_len < 5;
-    // Combine any upstream flag (e.g. Strand_bias) with the indel-artifact check here, rather
-    // than letting one filter suppress the other, so a call can carry multiple FILTER reasons.
+    // Combine any upstream flag with the indel-artifact check here, rather than letting one filter suppress the other.
     let mut filters: Vec<String> = Vec::new();
     if let Some(existing) = variant.filter.as_deref() {
         if !existing.is_empty() {
             filters.push(existing.to_string());
         }
     }
-    if is_small_indel && allele_frequency < indel_false_threshold as f32 {
+    if is_small_indel && allele_frequency < indel_false_threshold as f32 && !skip_indel_artifact {
         filters.push("Potential_Artifact".to_string());
     }
     let filter = if filters.is_empty() {
@@ -508,20 +559,87 @@ fn filter_vcf_record(
         if ref_allele.contains("N") {
             continue;
         }
+        let alt_allele = variant.alt_allele.as_str();
+        if alt_allele.contains("N") {
+            continue;
+        }
         
         filtered_var.push(variant.clone());
     }
     filtered_var
 }
 
-fn write_vcf(
+/// Folds accepted linkage calls into the graph calls.
+pub(crate) fn merge_link_calls(variants: &[Variant], links: &[LinkCall]) -> (Vec<Variant>, Vec<LinkCall>) {
+    let key = |pos: usize, r: &str, a: &str| (pos, r.to_ascii_uppercase(), a.to_ascii_uppercase());
+    let by_allele: HashMap<(usize, String, String), &LinkCall> = links
+        .iter()
+        .map(|l| (key(l.pos, &l.ref_allele, &l.alt_allele), l))
+        .collect();
+    let mut seen: HashSet<(usize, String, String)> = HashSet::new();
+    let mut merged = variants.to_vec();
+    for v in merged.iter_mut().filter(|v| v.variant_type == "SNP") {
+        let k = key(v.pos, &v.ref_allele, &v.alt_allele);
+        if let Some(l) = by_allele.get(&k) {
+            if let Some(old) = v.filter.take() {
+                println!(
+                    "Linkage rescue cleared FILTER {} on {} (partner {}, log10p {:.2})",
+                    old,
+                    generate_variant_name(v),
+                    l.partner_name,
+                    l.log10p
+                );
+            }
+            seen.insert(k);
+        }
+    }
+    let new_calls = links
+        .iter()
+        .filter(|l| !seen.contains(&key(l.pos, &l.ref_allele, &l.alt_allele)))
+        .cloned()
+        .collect();
+    (merged, new_calls)
+}
+
+/// A rescued SNV as a matrix/genotyping `Variant`.
+fn link_variant(l: &LinkCall) -> Variant {
+    Variant {
+        pos: l.pos,
+        ref_allele: l.ref_allele.clone(),
+        alt_allele: l.alt_allele.clone(),
+        variant_type: "SNP".to_string(),
+        allele_count: l.ac as usize,
+        filter: None,
+    }
+}
+
+/// A rescued SNV record; DP/AD/HF are pileup counts.
+fn format_link_record(l: &LinkCall) -> String {
+    let hf = if l.dp == 0 { 0.0 } else { l.ac as f32 / l.dp as f32 };
+    format!(
+        "chrM\t{}\t.\t{}\t{}\t.\tPASS\tDP={};LINK={},{:.2}\tGT:AD:HF\t1:{}:{}",
+        l.pos + 1,
+        l.ref_allele,
+        l.alt_allele,
+        l.dp,
+        l.partner_name,
+        l.log10p,
+        l.ac,
+        hf
+    )
+}
+
+pub(crate) fn write_vcf(
     variants: &[Variant],
     coverage: &HashMap<usize, usize>,
     output_file: &PathBuf,
     sample_id: &str,
     referencename:&str,
     referencelength:usize,
-    indel_false_threshold: f64
+    indel_false_threshold: f64,
+    left_align: bool,
+    links: Option<&[LinkCall]>,
+    indel_artifact_exempt: &HashSet<String>,
 ) -> std::io::Result<()> {
     let mut file = File::create(Path::new(output_file))?;
 
@@ -529,10 +647,19 @@ fn write_vcf(
     writeln!(file, "##fileformat=VCFv4.2")?;
     writeln!(file, "##reference={}", referencename)?;
     writeln!(file, "##contig=<ID={},length={}>", referencename, referencelength)?;
+    if left_align {
+        writeln!(file, "##HimitoNormalization=left-aligned")?;
+    }
     writeln!(
         file,
         "##INFO=<ID=DP,Number=1,Type=Integer,Description=\"Read Depth\">"
     )?;
+    if links.is_some() {
+        writeln!(
+            file,
+            "##INFO=<ID=LINK,Number=2,Type=String,Description=\"Read-linkage rescue: the most strongly linked partner allele and the log10 hypergeometric p of their co-occurrence on co-covering reads (DP/AD/HF from the raw BAM pileup)\">"
+        )?;
+    }
     writeln!(
         file,
         "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">"
@@ -552,7 +679,7 @@ fn write_vcf(
     )?;
     writeln!(
         file,
-        "##FILTER=<ID=Strand_bias,Description=\"Alt-supporting reads are significantly skewed toward one strand relative to library composition\">"
+        "##FILTER=<ID=Strand_bias,Description=\"Alt-supporting reads are significantly skewed toward one strand relative to the reads covering the site\">"
     )?;
     writeln!(
         file,
@@ -574,10 +701,25 @@ fn write_vcf(
             .then(a.alt_allele.cmp(&b.alt_allele))
     });
 
-    // Write variant records
+    let mut sorted_links: Vec<&LinkCall> = links.unwrap_or(&[]).iter().collect();
+    sorted_links.sort_by(|a, b| a.pos.cmp(&b.pos).then(a.alt_allele.cmp(&b.alt_allele)));
+    let vcf_pos = |v: &Variant| if v.variant_type == "SNP" { v.pos + 1 } else { v.pos };
+    let mut li = 0;
     for variant in sorted_variants {
-
-        writeln!(file, "{}", format_vcf_record(&variant, coverage.clone(), indel_false_threshold))?;
+        while li < sorted_links.len() && sorted_links[li].pos + 1 < vcf_pos(&variant) {
+            writeln!(file, "{}", format_link_record(sorted_links[li]))?;
+            li += 1;
+        }
+        let name = generate_variant_name(&variant);
+        let skip = indel_artifact_exempt.contains(&name);
+        writeln!(
+            file,
+            "{}",
+            format_vcf_record(&variant, coverage.clone(), indel_false_threshold, skip)
+        )?;
+    }
+    for l in &sorted_links[li..] {
+        writeln!(file, "{}", format_link_record(l))?;
     }
 
     Ok(())
@@ -595,7 +737,6 @@ pub fn construct_matrix(
     read_record: &HashMap<String, Vec<serde_json::Value>>,
     cover_record: &HashMap<String, HashSet<String>>,
     variants: &[Variant],
-    minimal_ac: usize,
 ) -> (Array2<f64>, Vec<Variant>, Vec<String>) {
     let mut read_set: HashSet<String> = HashSet::new();
     for reads in cover_record.values() {
@@ -630,20 +771,12 @@ pub fn construct_matrix(
     for var in &var_vec {
         let name = generate_variant_name(var);
         let r_index = *var_record_dict.get(&name).unwrap();
-        let alt_reads: HashSet<String> = read_record
-            .get(&name)
-            .map(|reads| {
-                reads
-                    .iter()
-                    .filter_map(|read| read.as_str().map(|s| s.to_string()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let alt = alt_reads(read_record, &name);
         let cover_reads = cover_record.get(&name).cloned().unwrap_or_default();
 
         for read in cover_reads {
             if let Some(c_index) = read_set_dict.get(&read) {
-                matrix[[r_index, *c_index]] = if alt_reads.contains(&read) {
+                matrix[[r_index, *c_index]] = if alt.contains(read.as_str()) {
                     1.0
                 } else {
                     0.0
@@ -652,24 +785,327 @@ pub fn construct_matrix(
         }
     }
 
-    // Keep reads with more than minimal_ac alt calls across variants
-    let mut col_index = Vec::new();
-    for i in 0..matrix.ncols() {
-        let alt_count = matrix
-            .column(i)
-            .iter()
-            .filter(|&&x| x == 1.0)
-            .count();
-        if alt_count > minimal_ac {
-            col_index.push(i);
+    (matrix, var_vec, read_vec)
+}
+
+// ---- BAM genotyping ----
+
+/// `(start0, ref, alt)` where `start0` is the 0-based index of REF's first base on the reference.
+fn allele_span(v: &Variant) -> (usize, &str, &str) {
+    let start0 = if v.variant_type == "SNP" { v.pos } else { v.pos - 1 };
+    (start0, v.ref_allele.as_str(), v.alt_allele.as_str())
+}
+
+/// Bases added on each side of a genotyping site before the homopolymer push-out.
+const GENOTYPE_FLANK: usize = 10;
+/// Extra read bases kept on each side of the aligned window.
+const GENOTYPE_SLACK: usize = 4;
+/// ONT noise gate: a read segment whose best edit distance exceeds this is unusable.
+const GENOTYPE_MAX_ED_ONT: u32 = 4;
+
+fn is_ont(data_type: &str) -> bool {
+    matches!(data_type, "ont-r9" | "ont-r10" | "ont-denoised")
+}
+
+/// Reference window `[left, right)` of a site span `[start, end)`: widened by `GENOTYPE_FLANK`, pushed out of
+/// any homopolymer it ends in, then padded by 2. `None` when it leaves the reference (no wrap-around).
+fn genotype_window(refseq: &[u8], sites_span: (usize, usize)) -> Option<(usize, usize)> {
+    let len = refseq.len() as isize;
+    let mut left = sites_span.0 as isize - GENOTYPE_FLANK as isize;
+    let mut right = sites_span.1 as isize + GENOTYPE_FLANK as isize;
+    while 0 < left && left < len && refseq[left as usize] == refseq[left as usize - 1] {
+        left -= 1;
+    }
+    while 0 < right && right < len && refseq[right as usize] == refseq[right as usize - 1] {
+        right += 1;
+    }
+    let (left, right) = (left - 2, right + 2);
+    if left < 0 || right > len {
+        None
+    } else {
+        Some((left as usize, right as usize))
+    }
+}
+
+/// Indices into `variants` grouped into genotyping sites by overlapping REF spans; SNPs and indels never share one.
+fn group_sites(variants: &[Variant]) -> Vec<Vec<usize>> {
+    let mut sites: Vec<Vec<usize>> = Vec::new();
+    for want_indel in [false, true] {
+        let mut idx: Vec<usize> = (0..variants.len())
+            .filter(|&i| {
+                let (_, r, a) = allele_span(&variants[i]);
+                (r.len() != a.len()) == want_indel
+            })
+            .collect();
+        idx.sort_by_key(|&i| allele_span(&variants[i]).0); // stable
+        let mut cur: Vec<usize> = Vec::new();
+        let mut cur_end = 0usize;
+        for i in idx {
+            let (start, r, _) = allele_span(&variants[i]);
+            let end = start + r.len();
+            if !cur.is_empty() && start < cur_end {
+                cur.push(i);
+                cur_end = cur_end.max(end);
+            } else {
+                if !cur.is_empty() {
+                    sites.push(std::mem::take(&mut cur));
+                }
+                cur.push(i);
+                cur_end = end;
+            }
+        }
+        if !cur.is_empty() {
+            sites.push(cur);
         }
     }
-    let filtered_matrix = matrix.select(Axis(1), &col_index);
-    let filtered_read_vec: Vec<String> = col_index
-        .iter()
-        .map(|&i| read_vec[i].clone())
-        .collect();
-    (filtered_matrix, var_vec, filtered_read_vec)
+    sites
+}
+
+/// Outcome of scoring one read segment at one site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SegCall {
+    /// Best distance exceeds `max_ed`: the read is too noisy here to say.
+    TooNoisy,
+    /// Indices into the site's haplotype list tied at the minimum distance.
+    Best(BTreeSet<usize>),
+}
+
+fn unit_edit_cost(a: u8, b: u8) -> i32 {
+    if a == b { 0 } else { -1 }
+}
+
+type EditAligner = bio::alignment::pairwise::Aligner<fn(u8, u8) -> i32>;
+
+thread_local! {
+    // One aligner per rayon worker thread (its DP buffers are reused).
+    static EDIT_ALIGNER: std::cell::RefCell<EditAligner> = std::cell::RefCell::new(
+        bio::alignment::pairwise::Aligner::with_capacity(
+            64, 64, 0, -1, unit_edit_cost as fn(u8, u8) -> i32,
+        )
+    );
+}
+
+/// Infix edit distance of each haplotype against `seg`: the haplotype is aligned end to end.
+fn score_segment(haps: &[Vec<u8>], seg: &[u8], max_ed: u32) -> SegCall {
+    if haps.is_empty() {
+        return SegCall::TooNoisy;
+    }
+    let dists: Vec<u32> = EDIT_ALIGNER.with(|al| {
+        let mut al = al.borrow_mut();
+        haps.iter()
+            .map(|h| (-al.semiglobal(h, seg).score).max(0) as u32)
+            .collect()
+    });
+    let best = *dists.iter().min().unwrap();
+    if best > max_ed {
+        return SegCall::TooNoisy;
+    }
+    SegCall::Best(
+        dists
+            .iter()
+            .enumerate()
+            .filter(|(_, &d)| d == best)
+            .map(|(i, _)| i)
+            .collect(),
+    )
+}
+
+/// One genotyping site: a window on the reference and the haplotypes scored inside it.
+struct GenoSite {
+    left: usize,
+    right: usize,
+    members: Vec<usize>,
+    /// REF, then the haplotype of each member in order.
+    haps: Vec<Vec<u8>>,
+}
+
+/// Per (site, read) evidence merged over all of the read's usable alignments.
+#[derive(Default)]
+struct SiteAcc {
+    /// Hap indices that were the unique best of some alignment.
+    winners: BTreeSet<usize>,
+    /// Union of the best sets of all usable alignments.
+    any_best: BTreeSet<usize>,
+}
+
+fn build_geno_sites(refseq: &[u8], variants: &[Variant]) -> Vec<GenoSite> {
+    let mut sites = Vec::new();
+    for members in group_sites(variants) {
+        let spans: Vec<(usize, &str, &str)> =
+            members.iter().map(|&i| allele_span(&variants[i])).collect();
+        let lo = spans.iter().map(|s| s.0).min().unwrap();
+        let hi = spans.iter().map(|s| s.0 + s.1.len()).max().unwrap();
+        let (left, right) = match genotype_window(refseq, (lo, hi)) {
+            Some(w) => w,
+            None => continue, // crosses the circular origin: left NaN
+        };
+        let mut haps = vec![refseq[left..right].to_vec()];
+        for &(s, r, a) in &spans {
+            let mut h = refseq[left..s].to_vec();
+            h.extend_from_slice(a.as_bytes());
+            h.extend_from_slice(&refseq[s + r.len()..right]);
+            haps.push(h);
+        }
+        sites.push(GenoSite { left, right, members, haps });
+    }
+    sites.sort_by_key(|s| s.left);
+    sites
+}
+
+/// Score one alignment against every site whose window it fully spans.
+fn score_record_at_sites(
+    rec: &BamRecord,
+    sites: &[GenoSite],
+    lefts: &[usize],
+    max_ed: u32,
+) -> Vec<(usize, SegCall)> {
+    let mut out = Vec::new();
+    let rs = rec.pos().max(0) as usize;
+    let re = rec.reference_end().max(0) as usize;
+    let k0 = lefts.partition_point(|&l| l < rs);
+    if k0 >= sites.len() || sites[k0].left >= re {
+        return out;
+    }
+    let pairs: Vec<[i64; 2]> = rec.aligned_pairs().collect(); // matches only: [qpos, rpos]
+    if pairs.is_empty() {
+        return out;
+    }
+    let seq = rec.seq().as_bytes().to_ascii_uppercase();
+    for k in k0..sites.len() {
+        let site = &sites[k];
+        if site.left >= re {
+            break;
+        }
+        if site.right > re {
+            continue;
+        }
+        let a = pairs.partition_point(|p| (p[1] as usize) < site.left);
+        let b = pairs.partition_point(|p| (p[1] as usize) < site.right);
+        if b <= a {
+            continue;
+        }
+        let q_lo = pairs[a..b].iter().map(|p| p[0]).min().unwrap() as usize;
+        let q_hi = pairs[a..b].iter().map(|p| p[0]).max().unwrap() as usize;
+        let qa = q_lo.saturating_sub(GENOTYPE_SLACK);
+        let qb = (q_hi + 1 + GENOTYPE_SLACK).min(seq.len());
+        out.push((k, score_segment(&site.haps, &seq[qa..qb], max_ed)));
+    }
+    out
+}
+
+/// Re-genotype `variants` in every read of `bam` by local realignment against the REF.
+fn genotype_from_bam(
+    bam: &Path,
+    refseq: &[u8],
+    ref_name: &str,
+    variants: &[Variant],
+    max_ed: u32,
+) -> (HashMap<String, Vec<serde_json::Value>>, HashMap<String, HashSet<String>>) {
+    const BATCH: usize = 4096;
+    let sites = build_geno_sites(refseq, variants);
+    let lefts: Vec<usize> = sites.iter().map(|s| s.left).collect();
+
+    let mut qname_ids: HashMap<String, u32> = HashMap::new();
+    let mut qnames: Vec<String> = Vec::new();
+    let mut acc: HashMap<(u32, u32), SiteAcc> = HashMap::new();
+
+    let mut reader = BamReader::from_path(bam).unwrap_or_else(|e| {
+        eprintln!("Error: cannot open genotyping BAM {}: {}", bam.display(), e);
+        std::process::exit(1);
+    });
+    // Unknown name → empty genotype maps (ref pseudo-read only), no exit.
+    let target_tid: Option<i32> = match reader.header().tid(ref_name.as_bytes()) {
+        Some(t) => Some(t as i32),
+        None => {
+            eprintln!(
+                "Warning: reference contig '{}' not found in genotyping BAM {}; skipping all reads",
+                ref_name,
+                bam.display()
+            );
+            None
+        }
+    };
+
+    let mut flush = |batch: &mut Vec<BamRecord>| {
+        let scored: Vec<(String, Vec<(usize, SegCall)>)> = batch
+            .par_iter()
+            .map(|rec| {
+                (
+                    String::from_utf8_lossy(rec.qname()).to_string(),
+                    score_record_at_sites(rec, &sites, &lefts, max_ed),
+                )
+            })
+            .collect();
+        batch.clear();
+        for (qname, calls) in scored {
+            if calls.is_empty() {
+                continue;
+            }
+            let qid = *qname_ids.entry(qname.clone()).or_insert_with(|| {
+                qnames.push(qname.clone());
+                (qnames.len() - 1) as u32
+            });
+            for (k, call) in calls {
+                if let SegCall::Best(set) = call {
+                    let e = acc.entry((k as u32, qid)).or_default();
+                    if set.len() == 1 {
+                        e.winners.extend(set.iter().copied());
+                    }
+                    e.any_best.extend(set);
+                }
+            }
+        }
+    };
+
+    let mut batch: Vec<BamRecord> = Vec::with_capacity(BATCH);
+    for rec in reader.records() {
+        let rec = rec.expect("failed to read genotyping BAM record");
+        let Some(tid) = target_tid else { continue };
+        if rec.is_unmapped() || rec.is_secondary() || rec.seq_len() == 0 || rec.tid() != tid {
+            continue;
+        }
+        batch.push(rec);
+        if batch.len() >= BATCH {
+            flush(&mut batch);
+        }
+    }
+    flush(&mut batch);
+
+    // Merge per (site, read): one unique winner decides; several disagreeing winners -> missing;
+    // no winner -> REF unless the variant tied for best somewhere (missing).
+    let mut read_record: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+    let mut cover_record: HashMap<String, HashSet<String>> = HashMap::new();
+    for v in variants {
+        let name = generate_variant_name(v);
+        read_record.entry(name.clone()).or_default();
+        cover_record.entry(name).or_default().insert(ref_name.to_string());
+    }
+    let mut keys: Vec<(u32, u32)> = acc.keys().copied().collect();
+    keys.sort_unstable(); // deterministic output order
+    for key in keys {
+        let a = &acc[&key];
+        let site = &sites[key.0 as usize];
+        let qname = &qnames[key.1 as usize];
+        let call_for = |j: usize| -> Option<bool> {
+            if a.winners.is_empty() {
+                if a.any_best.contains(&(j + 1)) { None } else { Some(false) }
+            } else if a.winners.len() > 1 {
+                None
+            } else {
+                Some(a.winners.contains(&(j + 1)))
+            }
+        };
+        for (j, &vi) in site.members.iter().enumerate() {
+            if let Some(is_alt) = call_for(j) {
+                let name = generate_variant_name(&variants[vi]);
+                cover_record.get_mut(&name).unwrap().insert(qname.clone());
+                if is_alt {
+                    read_record.get_mut(&name).unwrap().push(serde_json::json!(qname));
+                }
+            }
+        }
+    }
+    (read_record, cover_record)
 }
 
 
@@ -722,155 +1158,8 @@ fn alt_frequency(vector: ndarray::ArrayView1<f64>) -> f64 {
     covered.iter().sum::<f64>() / covered.len() as f64
 }
 
-fn shuffle_genotypes(data: &[f64], rng: &mut impl rand::Rng) -> Vec<f64> {
-    let mut result = data.to_vec();
-    let covered_indices: Vec<usize> = result
-        .iter()
-        .enumerate()
-        .filter(|(_, x)| !x.is_nan())
-        .map(|(i, _)| i)
-        .collect();
-    let mut values: Vec<f64> = covered_indices.iter().map(|&i| result[i]).collect();
-    values.shuffle(rng);
-    for (idx, val) in covered_indices.iter().zip(values.iter()) {
-        result[*idx] = *val;
-    }
-    result
-}
-
-fn genotype_jaccard_similarity(a: &[f64], b: &[f64]) -> f64 {
-    assert_eq!(a.len(), b.len(), "Vectors must have the same length");
-
-    let mut intersection_count = 0;
-    let mut union_count = 0;
-
-    for (x, y) in a.iter().zip(b.iter()) {
-        if x.is_nan() || y.is_nan() {
-            continue;
-        }
-        let ax = *x > 0.5;
-        let by = *y > 0.5;
-        if ax && by {
-            intersection_count += 1;
-        }
-        if ax || by {
-            union_count += 1;
-        }
-    }
-
-    if union_count == 0 {
-        return 0.0;
-    }
-
-    intersection_count as f64 / union_count as f64
-}
-
-/// Generate a null distribution through permutation testing
-fn get_null_distribution(
-    filtered_var: &Vec<Variant>,
-    matrix: &Array2<f64>, 
-    permutation_round: usize,
-    threshold: f64
-) -> Vec<f64> {
-
-    let bar = ProgressBar::new(permutation_round as u64);
-    let summary_statistics = (0..permutation_round).into_par_iter().flat_map(|_|  {
-        bar.inc(1);
-        let mut local_stats = Vec::new();
-        let mut rng = thread_rng();
-
-        for (i, variant) in filtered_var.iter().enumerate() {
-            let index = generate_variant_name(variant);
-            let vector = matrix.slice(s![i, ..]);
-            
-            // Skip vectors with frequency > threshold
-            let frequency = alt_frequency(vector);
-            if frequency > threshold {
-                continue;
-            }
-
-            // Shuffle genotypes only among covered reads; keep NaN positions fixed
-            let vector_data: Vec<f64> = vector.iter().copied().collect();
-            let shuffled = shuffle_genotypes(&vector_data, &mut rng);
-
-            let mut all_coefficients = Vec::new();
-
-            for (j, other_variant) in filtered_var.iter().enumerate() {
-                let other_index = generate_variant_name(other_variant);
-                if index == other_index {
-                    continue;
-                }
-
-                let other_vector = matrix.slice(s![j, ..]);
-                let other_data: Vec<f64> = other_vector.iter().copied().collect();
-
-                let coor = genotype_jaccard_similarity(&shuffled, &other_data);
-                all_coefficients.push(coor);
-            }
-           
-            local_stats.push(all_coefficients.iter().sum());
-        }
-        local_stats
-    }).collect::<Vec<f64>>();
-    bar.finish();
-    summary_statistics
-    
-}
-
-/// Calculate statistics for observed data
-fn calculate_observation_statistics(
-    filtered_var: &Vec<Variant>,
-    index: usize,
-    matrix: &Array2<f64>, 
-) -> f64 {
-
-    let vector = matrix.slice(s![index, ..]);
-    let vector_data: Vec<f64> = vector.iter().copied().collect();
-    let mut all_coefficients = Vec::new();
-
-    for (i, variant) in filtered_var.iter().enumerate() {
-        if i == index {
-            continue;
-        }
-
-        let other_vector = matrix.slice(s![i, ..]);
-        let other_data: Vec<f64> = other_vector.iter().copied().collect();
-
-        let coor = genotype_jaccard_similarity(&vector_data, &other_data);
-        all_coefficients.push(coor);
-    }
-    
-    all_coefficients.iter().sum()
-}
-
-/// Calculate p-value using z-score approach
-fn calculate_p_value(statistics: &[f64], observation: f64) -> f64 {
-    let n = statistics.len() as f64;
-    
-    // Calculate mean
-    let mu = statistics.iter().sum::<f64>() / n;
-    
-    // Calculate standard deviation
-    let variance = statistics.iter()
-        .map(|&x| (x - mu).powi(2))
-        .sum::<f64>() / n;
-    let sigma = variance.sqrt();
-    // println!("{:?}, {}", statistics, observation);
-    
-    let z_score = (observation - mu) / sigma;
-    
-    // Calculate p-value using normal distribution CDF
-    let normal = Normal::new(0.0, 1.0).unwrap();
-    if z_score.is_nan() {
-        return 1.0;
-    }
-    return 1.0 - normal.cdf(z_score);
-}
-
-/// Build a map from read name (BAM qname) to strand (true = reverse, false = forward),
-/// using primary, mapped alignments only. Also returns the library-wide forward-strand
-/// fraction, which is the expected forward proportion for an unbiased allele.
-fn build_strand_map(bam_file: &PathBuf) -> (HashMap<String, bool>, f64) {
+/// Build a map from read name (BAM qname) to strand, using primary, mapped alignments only.
+fn build_strand_map(bam_file: &Path) -> (HashMap<String, bool>, f64) {
     let mut bam = BamReader::from_path(bam_file)
         .unwrap_or_else(|e| panic!("Failed to open BAM {:?}: {}", bam_file, e));
     let mut strand_map = HashMap::new();
@@ -895,11 +1184,8 @@ fn build_strand_map(bam_file: &PathBuf) -> (HashMap<String, bool>, f64) {
     (strand_map, fwd_frac)
 }
 
-/// Two-sided binomial-tail p-value that a variant's alt-supporting reads' forward/reverse
-/// split deviates from the library's expected forward fraction. A small p-value means the
-/// allele is strand-skewed, which is characteristic of systematic (e.g. homopolymer) errors
-/// rather than true heteroplasmies, which should be roughly strand-balanced.
-fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64) -> f64 {
+/// Two-sided binomial p-value that the alt reads' fwd/rev split deviates from the expected forward fraction.
+pub(crate) fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64) -> f64 {
     let n = (fwd + rev) as u64;
     if n == 0 {
         return 1.0;
@@ -913,28 +1199,105 @@ fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64) -> f64 {
     (2.0 * lower.min(upper)).min(1.0)
 }
 
-/// Flag (but never drop) variants whose alt-supporting reads are significantly strand-skewed
-/// relative to the library's forward/reverse composition; flagged variants get
-/// `filter = Some("Strand_bias")` so the call survives in the VCF with FILTER set accordingly.
-/// Variants with fewer than `min_reads`
-/// strand-resolved supporting reads are kept (too little evidence to judge). Near-homoplasmic
-/// variants (heteroplasmic frequency >= `homoplasmic_frequency_threshold`) are also kept
-/// without testing: a real single-strand-only sequencing artifact can only ever produce a
-/// low-to-moderate apparent frequency (it's absent from the unaffected strand's reads), so an
-/// allele present in nearly every read at the locus cannot be explained by strand-specific
-/// error and any measured strand skew there reflects fragmented read attribution across
-/// near-duplicate graph edges, not a real signal. Returns the kept variants together with the
-/// matrix subset to the corresponding rows.
+/// Strand skew: the binomial test against `null_frac` is significant AND the forward fraction is at least
+/// `STRAND_BIAS_MIN_EFFECT` away from it. Used by both denoisers; `filter_strand_bias` and the indel
+/// recount apply the same test via `StrandEvidence::skew`, whose values they also log.
+pub(crate) fn is_strand_skewed(fwd: usize, rev: usize, null_frac: f64, p_threshold: f64) -> bool {
+    strand_bias_pvalue(fwd, rev, null_frac) < p_threshold
+        && (fwd as f64 / (fwd + rev) as f64 - null_frac).abs() >= STRAND_BIAS_MIN_EFFECT
+}
+
+/// Minimum |alt forward fraction - null| for a significant strand split to count as skew.
+const STRAND_BIAS_MIN_EFFECT: f64 = 0.20;
+
+/// Fewer strand-resolved alt reads than this: too little evidence, the variant is kept untested.
+const STRAND_MIN_READS: usize = 2;
+/// Fewest strand-resolved covering reads for the site-local null; below it the library fraction is used.
+const STRAND_LOCAL_MIN_READS: usize = 20;
+/// Under `StrandBiasAction::Drop`, strand-skewed SNPs below this HF are dropped instead of flagged.
+const STRAND_BIAS_DROP_MAX_HF: f64 = 0.10;
+
+/// What `filter_strand_bias` does with a variant it finds strand-skewed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StrandBiasAction {
+    Flag,
+    /// Additionally REMOVE strand-skewed low-VAF SNPs outright.
+    Drop,
+}
+
+/// Names of the reads carrying `name`'s alt.
+fn alt_reads<'a>(read_record: &'a HashMap<String, Vec<serde_json::Value>>, name: &str) -> HashSet<&'a str> {
+    read_record
+        .get(name)
+        .map(|reads| reads.iter().filter_map(|r| r.as_str()).collect())
+        .unwrap_or_default()
+}
+
+/// `(forward, reverse)` counts of `reads`; reads absent from `strand_map` are not counted.
+fn strand_counts<'a>(reads: impl Iterator<Item = &'a str>, strand_map: &HashMap<String, bool>) -> (usize, usize) {
+    let (mut fwd, mut rev) = (0, 0);
+    for r in reads {
+        match strand_map.get(r) {
+            Some(true) => rev += 1,
+            Some(false) => fwd += 1,
+            None => {}
+        }
+    }
+    (fwd, rev)
+}
+
+/// Strand split of a variant's alt reads, and the forward fraction an unbiased alt would show.
+struct StrandEvidence {
+    fwd: usize,
+    rev: usize,
+    null_frac: f64,
+}
+
+impl StrandEvidence {
+    /// The null is the strand mix of the covering reads WITHOUT the alt, or `library_frac` when they are too few.
+    fn new(
+        alt: &HashSet<&str>,
+        cover: Option<&HashSet<String>>,
+        strand_map: &HashMap<String, bool>,
+        library_frac: f64,
+    ) -> Self {
+        let (fwd, rev) = strand_counts(alt.iter().copied(), strand_map);
+        let others = cover.into_iter().flatten().map(String::as_str).filter(|r| !alt.contains(r));
+        let (cfwd, crev) = strand_counts(others, strand_map);
+        let null_frac = if cfwd + crev >= STRAND_LOCAL_MIN_READS {
+            cfwd as f64 / (cfwd + crev) as f64
+        } else {
+            library_frac
+        };
+        StrandEvidence { fwd, rev, null_frac }
+    }
+
+    fn total(&self) -> usize {
+        self.fwd + self.rev
+    }
+
+    /// `(alt_frac, effect, p)`: the alt forward fraction, its distance from the null, and the binomial p.
+    fn skew(&self) -> (f64, f64, f64) {
+        let alt_frac = self.fwd as f64 / self.total() as f64;
+        let effect = (alt_frac - self.null_frac).abs();
+        (alt_frac, effect, strand_bias_pvalue(self.fwd, self.rev, self.null_frac))
+    }
+}
+
+/// Flags variants whose alt reads are strand-skewed (significant and at least `STRAND_BIAS_MIN_EFFECT`);
+/// under `Drop`, skewed SNPs below `STRAND_BIAS_DROP_MAX_HF` are removed instead.
+/// Near-homoplasmic variants (HF >= `homoplasmic_frequency_threshold`) are kept untested.
 fn filter_strand_bias(
     variants: &[Variant],
     matrix: &Array2<f64>,
     read_record: &HashMap<String, Vec<serde_json::Value>>,
     strand_map: &HashMap<String, bool>,
+    cover_record: &HashMap<String, HashSet<String>>,
     coverage: &HashMap<usize, usize>,
-    expected_fwd_frac: f64,
+    library_frac: f64,
     p_threshold: f64,
-    min_reads: usize,
     homoplasmic_frequency_threshold: f64,
+    action: StrandBiasAction,
 ) -> (Vec<Variant>, Array2<f64>) {
     let mut keep_idx = Vec::new();
     let mut kept = Vec::new();
@@ -945,48 +1308,29 @@ fn filter_strand_bias(
 
         let depth = coverage.get(&variant.pos).copied().unwrap_or(0);
         let hf = if depth == 0 { 0.0 } else { variant.allele_count as f64 / depth as f64 };
-        if hf >= homoplasmic_frequency_threshold {
-            keep_idx.push(i);
-            kept.push(variant);
-            continue;
-        }
-
-        let (mut fwd, mut rev) = (0usize, 0usize);
-        let mut seen = HashSet::new();
-
-        if let Some(reads) = read_record.get(&name) {
-            for read in reads {
-                if let Some(read_name) = read.as_str() {
-                    // count each supporting read once
-                    if !seen.insert(read_name.to_string()) {
+        if hf < homoplasmic_frequency_threshold {
+            let ev = StrandEvidence::new(&alt_reads(read_record, &name), cover_record.get(&name), strand_map, library_frac);
+            if ev.total() >= STRAND_MIN_READS {
+                let (alt_frac, effect, p_value) = ev.skew();
+                if p_value < p_threshold && effect >= STRAND_BIAS_MIN_EFFECT {
+                    if action == StrandBiasAction::Drop
+                        && variant.variant_type == "SNP"
+                        && hf < STRAND_BIAS_DROP_MAX_HF
+                    {
+                        println!(
+                            "Strand-biased (dropped), {:?}, fwd={}, rev={}, alt_frac={:.3}, null_frac={:.3}, hf={:.4}, p={:.3e}",
+                            name, ev.fwd, ev.rev, alt_frac, ev.null_frac, hf, p_value
+                        );
                         continue;
                     }
-                    match strand_map.get(read_name) {
-                        Some(true) => rev += 1,
-                        Some(false) => fwd += 1,
-                        None => {} // read absent from BAM (e.g. non-primary alignment)
-                    }
+                    // Flag but keep: the VCF FILTER combines this with the other filters.
+                    variant.filter = Some("Strand_bias".to_string());
+                    println!(
+                        "Strand-biased (flagged, kept), {:?}, fwd={}, rev={}, alt_frac={:.3}, null_frac={:.3}, p={:.3e}",
+                        name, ev.fwd, ev.rev, alt_frac, ev.null_frac, p_value
+                    );
                 }
             }
-        }
-
-        let total = fwd + rev;
-        if total < min_reads {
-            // not enough strand-resolved reads to make a call: keep, untested
-            keep_idx.push(i);
-            kept.push(variant);
-            continue;
-        }
-
-        let p_value = strand_bias_pvalue(fwd, rev, expected_fwd_frac);
-        if p_value < p_threshold {
-            // flag but keep: downstream FILTER combines this with other filters (e.g.
-            // Potential_Artifact) instead of dropping the call
-            variant.filter = Some("Strand_bias".to_string());
-            println!(
-                "Strand-biased (flagged, kept), {:?}, fwd={}, rev={}, p={:.3e}",
-                name, fwd, rev, p_value
-            );
         }
         keep_idx.push(i);
         kept.push(variant);
@@ -996,110 +1340,449 @@ fn filter_strand_bias(
     (kept, filtered_matrix)
 }
 
+fn is_strand_flagged_indel(v: &Variant) -> bool {
+    v.variant_type != "SNP" && v.filter.as_deref() == Some("Strand_bias")
+}
+
+/// Retest `Strand_bias`-flagged indels on BAM-genotyped alt/cover reads; a balanced split clears the flag.
+fn recount_indel_strand_bias(
+    variants: &[Variant],
+    bam_read_record: &HashMap<String, Vec<serde_json::Value>>,
+    bam_cover_record: &HashMap<String, HashSet<String>>,
+    strand_map: &HashMap<String, bool>,
+    library_frac: f64,
+    p_threshold: f64,
+) -> Vec<Variant> {
+    let mut out = variants.to_vec();
+    for variant in out.iter_mut().filter(|v| is_strand_flagged_indel(v)) {
+        let name = generate_variant_name(variant);
+        let alt = alt_reads(bam_read_record, &name);
+        let ev = StrandEvidence::new(&alt, bam_cover_record.get(&name), strand_map, library_frac);
+        if ev.total() < STRAND_MIN_READS {
+            println!(
+                "Strand-bias BAM recount, {:?}, BAM alt reads={} < {}: kept flagged",
+                name, ev.total(), STRAND_MIN_READS
+            );
+            continue;
+        }
+        let (alt_frac, effect, p_value) = ev.skew();
+        let cleared = p_value >= p_threshold || effect < STRAND_BIAS_MIN_EFFECT;
+        println!(
+            "Strand-bias BAM recount, {:?}, BAM fwd={}, rev={}, alt_frac={:.3}, null_frac={:.3}, effect={:.3}, p={:.3e}: {}",
+            name, ev.fwd, ev.rev, alt_frac, ev.null_frac, effect, p_value,
+            if cleared { "cleared" } else { "kept flagged" }
+        );
+        if cleared {
+            variant.filter = None;
+        }
+    }
+    out
+}
+
+/// Genotype only the `Strand_bias`-flagged indels in `bam` and retest their strand split there.
+fn recount_flagged_indels_from_bam(
+    variants: &[Variant],
+    bam: &Path,
+    strand_map: &HashMap<String, bool>,
+    library_frac: f64,
+    refseq: &[u8],
+    ref_name: &str,
+    p_threshold: f64,
+) -> Vec<Variant> {
+    let flagged: Vec<Variant> = variants.iter().filter(|v| is_strand_flagged_indel(v)).cloned().collect();
+    if flagged.is_empty() {
+        return variants.to_vec();
+    }
+    // Ungated: the matrix noise gate must not move the VCF.
+    let (read_record, cover_record) = genotype_from_bam(bam, refseq, ref_name, &flagged, u32::MAX);
+    println!(
+        "Strand-bias BAM recount: {} flagged indel(s) from {} (forward fraction {:.3})",
+        flagged.len(),
+        bam.display(),
+        library_frac
+    );
+    recount_indel_strand_bias(variants, &read_record, &cover_record, strand_map, library_frac, p_threshold)
+}
+
+// ---- adaptive permutation ----
+
+/// Stop drawing for a variant once this many null draws reached its observation.
+const PERM_STOP_AFTER: u32 = 10;
+/// Floor-resolving target: `PERM_HEADROOM * m / (alpha * k0)` rounds, so the floor p clears BH.
+const PERM_HEADROOM: f64 = 5.0;
+/// Cap on the rounds of any one variant.
+const PERM_MAX_ROUNDS: usize = 100_000;
+/// Base RNG seed; each variant's stream is this XOR a hash of its name.
+const PERM_SEED: u64 = 42;
+/// Draws per batch; the early-stop test runs between batches.
+const PERM_BATCH: u32 = 100;
+/// Most floor-resolving passes (each only ever raises the target).
+const PERM_MAX_STAGE2_PASSES: usize = 5;
+/// Majority-lineage exemption: SNPs at or above this HF and `COOC_EXEMPT_MIN_AC` skip the test.
+const COOC_EXEMPT_HF: f64 = 0.10;
+const COOC_EXEMPT_MIN_AC: usize = 20;
+
+/// PacBio hot-allele error rate and noise tail of the depth-aware AC floor T(DP).
+const PB_HOT_ERR: f64 = 0.002;
+const PB_NOISE_TAIL: f64 = 0.002;
+/// PacBio co-occurrence partners closer than this (bp, circular) are ignored.
+const PB_PARTNER_MIN_DIST: usize = 20;
+
+/// T(DP): the smallest k with P(Poisson(PB_HOT_ERR * DP) >= k) < PB_NOISE_TAIL, at least 3.
+fn pb_noise_threshold(dp: usize) -> usize {
+    let lambda = PB_HOT_ERR * dp as f64;
+    // `Poisson::new` rejects a zero rate; the floor applies.
+    if lambda == 0.0 {
+        return 3;
+    }
+    let pois = Poisson::new(lambda).expect("PB_HOT_ERR * dp is a valid Poisson rate");
+    // P(X >= k) = 1 - F(k - 1), which reaches 0, so the search ends.
+    (1..).find(|&k: &usize| 1.0 - pois.cdf((k - 1) as u64) < PB_NOISE_TAIL).unwrap().max(3)
+}
+
+/// A genotype row as bitsets over reads.
+struct BitRow {
+    alt: Vec<u64>,
+    cov: Vec<u64>,
+    /// Indices of the covered reads: the pool a shuffle draws its alt reads from.
+    covered_idx: Vec<u32>,
+    n_alt: u32,
+}
+
+impl BitRow {
+    fn from_row(row: &[f64]) -> BitRow {
+        let words = (row.len() + 63) / 64;
+        let mut alt = vec![0u64; words];
+        let mut cov = vec![0u64; words];
+        let mut covered_idx = Vec::new();
+        let mut n_alt = 0u32;
+        for (j, &v) in row.iter().enumerate() {
+            if v.is_nan() {
+                continue;
+            }
+            cov[j >> 6] |= 1u64 << (j & 63);
+            covered_idx.push(j as u32);
+            if v > 0.5 {
+                alt[j >> 6] |= 1u64 << (j & 63);
+                n_alt += 1;
+            }
+        }
+        BitRow { alt, cov, covered_idx, n_alt }
+    }
+}
+
+/// Jaccard of the alt reads of a (possibly shuffled) row `x` and row `y`, over the reads both cover.
+#[inline]
+fn jaccard_bits(x_alt: &[u64], x_cov: &[u64], y: &BitRow) -> f64 {
+    let mut inter = 0u32;
+    let mut union = 0u32;
+    for w in 0..x_alt.len() {
+        inter += (x_alt[w] & y.alt[w]).count_ones();
+        union += ((x_alt[w] & y.cov[w]) | (y.alt[w] & x_cov[w])).count_ones();
+    }
+    if union == 0 {
+        0.0
+    } else {
+        inter as f64 / union as f64
+    }
+}
+
+/// Mitochondrial reference length (circular) for partner distance.
+const MT_LEN: usize = 16569;
+
+fn circ_dist(a: usize, b: usize) -> usize {
+    let d = a.abs_diff(b);
+    d.min(MT_LEN.saturating_sub(d))
+}
+
+fn is_snp_variant(v: &Variant) -> bool {
+    v.ref_allele.len() == 1 && v.alt_allele.len() == 1
+}
+
+/// Co-occurrence partners of each `tested` row: every other row, except on PacBio, where only SNPs with
+/// AC >= T(DP) that are not `Strand_bias`-flagged and at least `PB_PARTNER_MIN_DIST` away qualify.
+fn partners_of(
+    tested: &[usize],
+    variants: &[Variant],
+    coverage: &HashMap<usize, usize>,
+    data_type: &str,
+) -> Vec<Vec<usize>> {
+    let pacbio = data_type == "pacbio";
+    let pool: Vec<usize> = (0..variants.len())
+        .filter(|&j| {
+            let v = &variants[j];
+            !pacbio
+                || (is_snp_variant(v)
+                    && v.filter.as_deref() != Some("Strand_bias")
+                    && v.allele_count >= pb_noise_threshold(coverage.get(&v.pos).copied().unwrap_or(0)))
+        })
+        .collect();
+    let min_dist = if pacbio { PB_PARTNER_MIN_DIST } else { 0 };
+    tested
+        .iter()
+        .map(|&i| {
+            pool.iter()
+                .copied()
+                .filter(|&j| j != i && circ_dist(variants[i].pos, variants[j].pos) >= min_dist)
+                .collect()
+        })
+        .collect()
+}
+
+/// The co-occurrence statistic: summed Jaccard of row `x` against its `partners`.
+#[inline]
+fn sum_jaccard_bits(x_alt: &[u64], x_cov: &[u64], partners: &[usize], rows: &[BitRow]) -> f64 {
+    partners.iter().map(|&j| jaccard_bits(x_alt, x_cov, &rows[j])).sum()
+}
+
+/// Shuffle a row's alt calls among its covered reads (uncovered reads stay uncovered) into `out_alt`.
+fn shuffle_bits(
+    row: &BitRow,
+    scratch: &mut Vec<u32>,
+    out_alt: &mut [u64],
+    rng: &mut impl rand::Rng,
+) {
+    scratch.clear();
+    scratch.extend_from_slice(&row.covered_idx);
+    out_alt.fill(0);
+    let len = scratch.len();
+    for t in 0..row.n_alt as usize {
+        let j = rng.random_range(t..len);
+        scratch.swap(t, j);
+        let r = scratch[t] as usize;
+        out_alt[r >> 6] |= 1u64 << (r & 63);
+    }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Null draws of one tested variant: how many reached the observation, out of how many.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PermOutcome {
+    exceed: u32,
+    draws: u32,
+}
+
+impl PermOutcome {
+    fn p_value(&self) -> f64 {
+        (self.exceed + 1) as f64 / (self.draws + 1) as f64
+    }
+}
+
+struct PermState {
+    rng: rand::rngs::StdRng,
+    exceed: u32,
+    draws: u32,
+}
+
+/// Permutation null of each `tested` row (one outcome each, same order) against its `partners` (one list per
+/// tested row). Stage 1 draws up to `min_rounds` per variant, stopping early after `PERM_STOP_AFTER`
+/// exceedances; stage 2 extends the variants still at the p floor (no exceedance) until that floor can pass
+/// BH at `alpha`.
+fn adaptive_permutation(
+    matrix: &Array2<f64>,
+    tested: &[usize],
+    partners: &[Vec<usize>],
+    names: &[String],
+    min_rounds: usize,
+    alpha: f64,
+) -> Vec<PermOutcome> {
+    use rand::SeedableRng;
+    let started = std::time::Instant::now();
+    let m = tested.len();
+    if m == 0 || min_rounds == 0 {
+        return vec![PermOutcome { exceed: 0, draws: 0 }; m];
+    }
+    let bits: Vec<BitRow> = matrix.outer_iter().map(|r| BitRow::from_row(&r.to_vec())).collect();
+    let words = bits.first().map_or(0, |b| b.alt.len());
+    let obs: Vec<f64> = tested
+        .iter()
+        .zip(partners)
+        .map(|(&i, p)| sum_jaccard_bits(&bits[i].alt, &bits[i].cov, p, &bits))
+        .collect();
+    let mut states: Vec<PermState> = tested
+        .iter()
+        .map(|&i| PermState {
+            rng: rand::rngs::StdRng::seed_from_u64(PERM_SEED ^ fnv1a64(names[i].as_bytes())),
+            exceed: 0,
+            draws: 0,
+        })
+        .collect();
+
+    // Extend the variants in `which` (indices into `tested`) to `target` draws.
+    let extend = |states: &mut Vec<PermState>, which: &[usize], target: usize| {
+        let target = target as u32;
+        // Disjoint &mut access to the chosen states, one rayon task per variant.
+        let mut picked: Vec<(usize, &mut PermState)> = Vec::with_capacity(which.len());
+        let mut want = which.iter().copied().peekable();
+        for (k, st) in states.iter_mut().enumerate() {
+            if want.peek() == Some(&k) {
+                picked.push((k, st));
+                want.next();
+            }
+        }
+        picked.into_par_iter().for_each_init(
+            || (Vec::<u32>::new(), vec![0u64; words]),
+            |(scratch, buf), (k, st)| {
+                let i = tested[k];
+                let row = &bits[i];
+                let threshold = obs[k] - 1e-9;
+                while st.draws < target && st.exceed < PERM_STOP_AFTER {
+                    let n = PERM_BATCH.min(target - st.draws);
+                    for _ in 0..n {
+                        shuffle_bits(row, scratch, buf, &mut st.rng);
+                        if sum_jaccard_bits(buf, &row.cov, &partners[k], &bits) >= threshold {
+                            st.exceed += 1;
+                        }
+                    }
+                    st.draws += n;
+                }
+            },
+        );
+    };
+    let total = |states: &Vec<PermState>| states.iter().map(|s| s.draws as u64).sum::<u64>();
+
+    let all: Vec<usize> = (0..m).collect();
+    extend(&mut states, &all, min_rounds);
+    let mut target = min_rounds;
+    let k0 = states.iter().filter(|s| s.exceed == 0).count();
+    println!(
+        "Permutation stage 1: m={} k0={} R_target={} draws={} time={:.1}s",
+        m, k0, target, total(&states), started.elapsed().as_secs_f64()
+    );
+
+    for pass in 0..PERM_MAX_STAGE2_PASSES {
+        let floor: Vec<usize> = (0..m).filter(|&k| states[k].exceed == 0).collect();
+        if floor.is_empty() {
+            break;
+        }
+        let new_target = PERM_MAX_ROUNDS
+            .min((PERM_HEADROOM * m as f64 / (alpha * floor.len() as f64)).ceil() as usize);
+        if new_target <= target {
+            break;
+        }
+        target = new_target;
+        extend(&mut states, &floor, target);
+        println!(
+            "Permutation stage 2.{}: m={} k0={} R_target={} draws={} time={:.1}s",
+            pass + 1, m, floor.len(), target, total(&states), started.elapsed().as_secs_f64()
+        );
+    }
+
+    states.iter().map(|s| PermOutcome { exceed: s.exceed, draws: s.draws }).collect()
+}
+
+/// Whether `v` overlaps a known HP tract or starts in its padded window (D310 301-316, CA 512-526,
+/// HVS-I 16181-16194).
+fn indel_in_hp_tract(v: &Variant) -> bool {
+    let name = generate_variant_name(v);
+    let span = crate::scite::variant_spans(std::slice::from_ref(&name))[0];
+    crate::tracts::overlaps_tract(&span) || matches!(span.start, 301..=316 | 512..=526 | 16181..=16194)
+}
+
+/// Opt-in PacBio promotion (`--indel-linked-min-hf`): an out-of-tract small indel with HF in
+/// `[min_hf, indel_false_threshold)` is permutation-tested and, if it survives, written as PASS.
+fn promoted_pb_indel(v: &Variant, hf: f64, data_type: &str, indel_false_threshold: f64, min_hf: Option<f64>) -> bool {
+    let indel_len = (v.ref_allele.len() as i32 - v.alt_allele.len() as i32).abs();
+    min_hf.is_some_and(|f| {
+        data_type == "pacbio"
+            && !is_snp_variant(v)
+            && indel_len < 5
+            && hf >= f
+            && hf < indel_false_threshold
+            && !indel_in_hp_tract(v)
+    })
+}
+
+/// Co-occurrence permutation test: drops admitted variants whose BH q exceeds `p_value_threshold`.
 fn permutation_test(
     matrix: &Array2<f64>,
     p_value_threshold: f64,
-    heteroplasmic_error_threshold:f64,
+    heteroplasmic_error_threshold: f64,
     permutation_round: usize,
-    filtered_var: &Vec<Variant>,
+    filtered_var: &[Variant],
     coverage: &HashMap<usize, usize>,
-    permutation_frequency_threshold:f64,
-    data_type: &str
-) -> (Vec<Variant>, Array2<f64>, Vec<String>) {
-
-    let bar = ProgressBar::new(filtered_var.len() as u64);
-    let statistics = get_null_distribution(filtered_var, &matrix, permutation_round, permutation_frequency_threshold);
-    let (indices, collected_values): (Vec<_>, Vec<_>) = (0..filtered_var.len()).into_par_iter().map(|i| {
-        bar.inc(1);
-        let current_variant = filtered_var[i].clone();
-        let index = generate_variant_name(&current_variant);
-        // let frequency = filtered_var[i].allele_count as f64 / *coverage.get(&filtered_var[i].pos).unwrap() as f64;
-        // let frequency = row.sum() / row.len() as f64;
-        let frequency = current_variant.allele_count as f64 / *coverage.get(&current_variant.pos).unwrap() as f64;
+    permutation_frequency_threshold: f64,
+    data_type: &str,
+    indel_false_threshold: f64,
+    indel_linked_min_hf: Option<f64>,
+) -> (Vec<Variant>, Array2<f64>) {
+    // Admission: which variants are candidates for the permutation test at all.
+    let admitted = |current_variant: &Variant| -> bool {
+        // A variant whose position carries no coverage entry cannot be scored.
+        let depth = coverage.get(&current_variant.pos).copied().unwrap_or(0);
+        let frequency = if depth == 0 {
+            0.0
+        } else {
+            current_variant.allele_count as f64 / depth as f64
+        };
 
         if frequency > heteroplasmic_error_threshold {
-            return (Ok(i), None);
+            return false;
         }
+        let indel_len = (current_variant.ref_allele.len() as i32 - current_variant.alt_allele.len() as i32).abs();
         // exclude large indel
-        if (current_variant.ref_allele.len() as i32 - current_variant.alt_allele.len() as i32).abs() > 50 {
-            return (Ok(i), None);
+        if indel_len > 50 {
+            return false;
         }
 
-        let variant = filtered_var[i].clone();
-        let ref_allele = variant.ref_allele;
-        let alt_allele = variant.alt_allele;
+        let is_snp = is_snp_variant(current_variant);
 
-        // For PacBio: exclude SNPs from permutation test (PacBio has high accuracy for SNPs)
-        // For ONT: include SNPs in permutation test but with stricter filtering
-        // ONT has higher error rates, so we need the permutation test to filter false positives
-        if (ref_allele.len() == 1 && alt_allele.len() == 1) && (data_type == "pacbio") {
-            return (Ok(i), None);
+        // Jaccard co-occurrence penalizes variants on the majority lineage, so exempt high-HF, high-AC variants.
+        if is_snp
+            && current_variant.filter.is_none()
+            && frequency >= COOC_EXEMPT_HF
+            && current_variant.allele_count >= COOC_EXEMPT_MIN_AC
+        {
+            return false;
         }
-        // Note: For ONT, SNPs go through permutation test which should help filter false positives
-        // If precision is still low, consider adjusting p_value_threshold or frequency_threshold
 
-        let observation = calculate_observation_statistics(&filtered_var,  i, &matrix);
-        let p_value = calculate_p_value(&statistics, observation);
-        (Err(index.clone()), Some((p_value, index.clone())))
+        // PacBio: test SNPs only in the gray zone 3 ≤ AC < T(DP); AC ≥ T(DP) are exempt.
+        if is_snp && data_type == "pacbio" {
+            return current_variant.allele_count < pb_noise_threshold(depth);
+        }
+        // PacBio: a small indel below `indel_false_threshold` can never PASS, so it is tested only if promoted.
+        if !is_snp && data_type == "pacbio" && indel_len < 5 && frequency < indel_false_threshold {
+            return promoted_pb_indel(current_variant, frequency, data_type, indel_false_threshold, indel_linked_min_hf);
+        }
+        true
+    };
 
- 
-    }).unzip(); 
-
-
-    let mut raw_p_values = Vec::new();
-    let mut test_index = Vec::new();
-
-    for item in collected_values.into_iter().flatten() {
-        let (p_value, index) = item;
-        raw_p_values.push(p_value);
-        test_index.push(index.clone());
-    }
-
-    // adjust pvalues, create excluded_index list
-    let mut excluded_index = Vec::new();
-    // println!("{:?}", raw_p_values);
+    let names: Vec<String> = filtered_var.iter().map(generate_variant_name).collect();
+    // No null for a variant above `permutation_frequency_threshold` by MATRIX alt frequency.
+    let tested: Vec<usize> = (0..filtered_var.len())
+        .filter(|&i| {
+            admitted(&filtered_var[i])
+                && alt_frequency(matrix.slice(s![i, ..])) <= permutation_frequency_threshold
+        })
+        .collect();
+    let partners = partners_of(&tested, filtered_var, coverage, data_type);
+    let outcomes = adaptive_permutation(matrix, &tested, &partners, &names, permutation_round, p_value_threshold);
+    // A variant without draws is untested: missing evidence, not evidence of an artifact, so it skips BH.
+    let (test_index, raw_p_values): (Vec<&str>, Vec<f64>) = tested
+        .iter()
+        .zip(&outcomes)
+        .filter(|(_, o)| o.draws > 0)
+        .map(|(&i, o)| (names[i].as_str(), o.p_value()))
+        .unzip();
     let qvalues = adjust(&raw_p_values, Procedure::BenjaminiHochberg);
+    let excluded: HashSet<&str> = test_index
+        .into_iter()
+        .zip(qvalues)
+        .filter(|(_, q)| *q > p_value_threshold)
+        .map(|(name, _)| name)
+        .collect();
 
-    for (qi, q_value) in qvalues.iter().enumerate(){
-        let test_index_value = &test_index[qi];
-        // println!("Tested index, {:?}, {:?}", test_index_value, q_value);
-        if q_value > &p_value_threshold{
-            excluded_index.push(test_index_value);
-            // println!("Excluded index, {:?}, {:?}", test_index_value, q_value);
-        }
-    }
-    // println!("Excluded index, {:?}", excluded_index);
-
-    // println!("{:?}", excluded_index);
-    bar.finish();
-
-
-    // filter variants
-    let mut index_list = Vec::new();
-    let mut f_variant: Vec<Variant> = Vec::new();
-    let mut var_list: Vec<String> = Vec::new();
-    // get index list and var_list
-    for (r, rvariant) in filtered_var.iter().enumerate(){
-        let rindex = generate_variant_name(rvariant);
-        if !excluded_index.contains(&&rindex.clone()){
-            index_list.push(r);
-            var_list.push(rindex.clone());
-        }
-    }
-
-    for v in filtered_var {
-        let key = generate_variant_name(&v.clone());
-        if excluded_index.contains(&&key.clone()) {
-            continue;
-        }
-        f_variant.push(v.clone());
-    }
-    // filter matrix
-    let filtered_matrix = matrix.select(Axis(0), &index_list);
-    // println!("{}, {}, {:?}", f_variant.len(), index_list.len(), filtered_matrix.dim());
-    
-    (f_variant, filtered_matrix, var_list)
-    
+    let keep: Vec<usize> = (0..filtered_var.len()).filter(|&i| !excluded.contains(names[i].as_str())).collect();
+    let kept = keep.iter().map(|&i| filtered_var[i].clone()).collect();
+    (kept, matrix.select(Axis(0), &keep))
 }
 
 pub fn resolve_thresholds(
@@ -1110,10 +1793,8 @@ pub fn resolve_thresholds(
 ) -> (f64, f64, f64) {
     let (default_p, default_f, default_perm) = if data_type == "ont-r9" {
         (0.0001, 0.5, 0.7)
-    } else if data_type == "ont-r10" {
-        (0.01, 0.2, 0.7)
     } else {
-        (0.01, 0.2, 0.8)
+        (0.01, 0.2, 0.7)
     };
 
     (
@@ -1121,6 +1802,15 @@ pub fn resolve_thresholds(
         frequency_threshold.unwrap_or(default_f),
         permutation_frequency_threshold.unwrap_or(default_perm),
     )
+}
+
+pub fn resolve_indel_false_threshold(data_type: &str, explicit: Option<f64>) -> f64 {
+    explicit.unwrap_or(if is_ont(data_type) { 0.015 } else { 0.1 })
+}
+
+/// Floor on heteroplasmic frequency for calling (`-v`). PacBio defaults to 0.002; others to 0.01.
+pub fn resolve_vaf(data_type: &str, explicit: Option<f32>) -> f32 {
+    explicit.unwrap_or(if data_type == "pacbio" { 0.002 } else { 0.01 })
 }
 
 pub fn start(
@@ -1134,65 +1824,123 @@ pub fn start(
     data_type: &str,
     p_value_threshold: f64,
     heteroplasmic_frequency_threshold: f64,
-    bam_file: Option<&PathBuf>,
+    // Raw (pre-denoise) BAM of the same reads: strand map, linkage rescue and the matrix.
+    bam: Option<&Path>,
     strand_bias_threshold: f64,
     indel_false_threshold: f64,
     permutation_frequency_threshold: f64,
+    permutation_rounds: usize,
+    left_align: bool,
+    no_linkage_rescue: bool,
+    indel_linked_min_hf: Option<f64>,
 ) {
-    if data_type != "pacbio" && data_type != "ont-r9" && data_type != "ont-r10" {
-        eprintln!("Error: data type must be pacbio or ont-r9 or ont-r10");
-        std::process::exit(1);
-    }
     // reference fasta information
     let ref_reader = Reader::from_file(fasta_reference).unwrap();
     let reference_sequence: Vec<Record> = ref_reader.records().map(|r| r.unwrap()).collect();
     let ref_seq = String::from_utf8_lossy(reference_sequence[0].seq()).to_string();
     let ref_header = reference_sequence[0].id().to_string();
-    
+
     // read in graphical genome
     let graph = agg::GraphicalGenome::load_graph(graph_file).unwrap();
-    
+
     let (variants, coverage, read_record, cover_record) =
-        get_variant(&mut graph.clone(), k, &ref_header, ref_seq.len());
+        get_variant(
+            &mut graph.clone(),
+            k,
+            &ref_header,
+            ref_seq.len(),
+            if left_align { Some(ref_seq.as_bytes()) } else { None },
+        );
     let collapsed_var = collapse_identical_records(variants, ref_seq.len());
     let filtered_var = filter_vcf_record(&collapsed_var, &coverage, minimal_ac, hf_threshold);
     // modified, exclude filtered data for FPs
 
     // modified, exclude filtered data
     let (matrix, var_record, read_set) =
-        construct_matrix(&read_record, &cover_record, &filtered_var, minimal_ac);
+        construct_matrix(&read_record, &cover_record, &filtered_var);
     let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
     let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
 
-    // // use matrix information to filter vcf
-    // Use stricter thresholds for ONT data due to higher error rates
-    // let (p_value_threshold, frequency_threshold) = if data_type == "ont" {
-    //     (0.0001, 0.15)  // Stricter: lower p-value threshold, lower frequency threshold
-    // } else {
-    //     (0.001, 0.2)    // PacBio: original thresholds
-    // };
-    let (permu_filtered_var, filtered_matrix, _filtered_name) = permutation_test(&matrix, p_value_threshold, heteroplasmic_frequency_threshold, 100, &var_record, &coverage, permutation_frequency_threshold, data_type);
-
-    // strand-bias filter: drop variants whose alt reads are strand-skewed relative to the
-    // library composition (only when a BAM is provided so per-read strand is available)
-    let (permu_filtered_var, filtered_matrix) = match bam_file {
+    // Strand-bias filtering runs before the permutation test so artifacts do not feed its null.
+    let action = if data_type == "ont-denoised" { StrandBiasAction::Drop } else { StrandBiasAction::Flag };
+    // Linkage rescue runs on ONT only; PacBio is not evaluated.
+    let linkage_bam = bam.filter(|_| is_ont(data_type) && !no_linkage_rescue);
+    let (sb_filtered_var, sb_matrix) = match bam {
         Some(bam) => {
             let (strand_map, fwd_frac) = build_strand_map(bam);
             println!("Library forward-strand fraction: {:.3}", fwd_frac);
-            filter_strand_bias(
-                &permu_filtered_var,
-                &filtered_matrix,
+            println!("Strand-bias action: {:?} (SNPs below HF {:.3})", action, STRAND_BIAS_DROP_MAX_HF);
+            let (sb_var, sb_matrix) = filter_strand_bias(
+                &var_record,
+                &matrix,
                 &read_record,
                 &strand_map,
+                &cover_record,
                 &coverage,
                 fwd_frac,
                 strand_bias_threshold,
-                2,
                 permutation_frequency_threshold,
-            )
+                action,
+            );
+            let sb_var = recount_flagged_indels_from_bam(
+                &sb_var,
+                bam,
+                &strand_map,
+                fwd_frac,
+                ref_seq.as_bytes(),
+                &ref_header,
+                strand_bias_threshold,
+            );
+            (sb_var, sb_matrix)
         }
-        None => (permu_filtered_var, filtered_matrix),
+        None => (var_record.clone(), matrix.clone()),
     };
+
+    let (permu_filtered_var, filtered_matrix) = permutation_test(
+        &sb_matrix,
+        p_value_threshold,
+        heteroplasmic_frequency_threshold,
+        permutation_rounds,
+        &sb_filtered_var,
+        &coverage,
+        permutation_frequency_threshold,
+        data_type,
+        indel_false_threshold,
+        indel_linked_min_hf,
+    );
+
+    let link_calls: Option<Vec<LinkCall>> = linkage_bam.and_then(|bam| {
+        match linkage::rescue(bam, ref_seq.as_bytes(), &ref_header) {
+            Ok((calls, _summary)) => Some(calls),
+            Err(e) => {
+                eprintln!("Warning: linkage rescue failed ({e:#}); continuing without it.");
+                None
+            }
+        }
+    });
+    let (permu_filtered_var, new_links) = match &link_calls {
+        Some(calls) => merge_link_calls(&permu_filtered_var, calls),
+        None => (permu_filtered_var, Vec::new()),
+    };
+    for l in &new_links {
+        println!(
+            "LINK m.{}{}>{} AC {} DP {} ({}/{}) partner {} shared {} enrich {:.1} log10p {:.2}",
+            l.pos + 1, l.ref_allele, l.alt_allele, l.ac, l.dp, l.fwd, l.rev,
+            l.partner_name, l.shared, l.enrich, l.log10p
+        );
+    }
+    let rescued_var: Vec<Variant> = new_links.iter().map(link_variant).collect();
+
+    // Promoted PacBio indels that survived the test are PASS, not Potential_Artifact.
+    let indel_artifact_exempt: HashSet<String> = permu_filtered_var
+        .iter()
+        .filter(|v| {
+            let depth = coverage.get(&v.pos).copied().unwrap_or(0);
+            let hf = if depth == 0 { 0.0 } else { v.allele_count as f64 / depth as f64 };
+            promoted_pb_indel(v, hf, data_type, indel_false_threshold, indel_linked_min_hf)
+        })
+        .map(generate_variant_name)
+        .collect();
 
     // write filtered vcf
     let _ = write_vcf(
@@ -1202,141 +1950,866 @@ pub fn start(
         sample_id,
         &ref_header,
         ref_seq.len(),
-        indel_false_threshold
+        indel_false_threshold,
+        left_align,
+        link_calls.as_ref().map(|_| new_links.as_slice()),
+        &indel_artifact_exempt,
     );
-    // write matrix
+    // The VCF and every filter above run on the graph; only the lineage matrix is BAM-genotyped.
+    let genotype_src = bam.map(|bam| GenotypeSource {
+        bam,
+        refseq: ref_seq.as_bytes(),
+        ref_name: &ref_header,
+        max_ed: if is_ont(data_type) { GENOTYPE_MAX_ED_ONT } else { u32::MAX },
+    });
+    if let Err(e) = write_final_matrix(
+        output_file,
+        &filtered_matrix,
+        &permu_filtered_var,
+        &rescued_var,
+        &read_set,
+        genotype_src.as_ref(),
+    ) {
+        eprintln!("Error writing matrix: {e}");
+    }
+}
+
+/// Where to re-genotype the final variants from.
+struct GenotypeSource<'a> {
+    bam: &'a Path,
+    refseq: &'a [u8],
+    ref_name: &'a str,
+    max_ed: u32,
+}
+
+/// Writes `<output>.matrix.csv`: re-genotyped from the BAM when one is given, else the graph matrix.
+fn write_final_matrix(
+    output_file: &Path,
+    graph_matrix: &Array2<f64>,
+    variants: &[Variant],
+    rescued: &[Variant],
+    graph_reads: &[String],
+    genotype: Option<&GenotypeSource>,
+) -> Result<(), Box<dyn Error>> {
     let matrix_output = output_file.with_extension("matrix.csv");
-    let _ = write_matrix_to_csv(&filtered_matrix, &permu_filtered_var, &read_set, matrix_output);
+    match genotype {
+        None => {
+            eprintln!("Warning: no --bam given; matrix.csv comes from the graph, not from re-genotyped reads.");
+            write_matrix_to_csv(graph_matrix, variants, graph_reads, matrix_output)
+        }
+        Some(src) => {
+            let all: Vec<Variant> = variants.iter().chain(rescued).cloned().collect();
+            let (read_record, cover_record) =
+                genotype_from_bam(src.bam, src.refseq, src.ref_name, &all, src.max_ed);
+            let (matrix, var_record, read_set) =
+                construct_matrix(&read_record, &cover_record, &all);
+            println!(
+                "Genotyped {} variants x {} reads from {}",
+                var_record.len(),
+                read_set.len(),
+                src.bam.display()
+            );
+            write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
     use serde_json::json;
 
-    /// Two bubbles: a normal one spanning raw positions [0, 5), and a
-    /// wrap-around bubble spanning raw positions [8, 12) - i.e. it crosses
-    /// the circular origin for a 10bp reference.
-    fn wraparound_test_graph() -> GraphicalGenome {
-        let mut anchor = HashMap::new();
-        anchor.insert("A1".to_string(), json!({"pos": 0}));
-        anchor.insert("A2".to_string(), json!({"pos": 5}));
-        anchor.insert("A3".to_string(), json!({"pos": 8}));
-        anchor.insert("A4".to_string(), json!({"pos": 12}));
-
-        let mut edges = HashMap::new();
-        edges.insert(
-            "E1".to_string(),
-            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1", "r2"], "variants": "5="}),
-        );
-        edges.insert(
-            "E2".to_string(),
-            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r3"], "variants": "2=1X2="}),
-        );
-        edges.insert(
-            "E3".to_string(),
-            json!({"src": ["A3"], "dst": ["A4"], "reads": ["r4"], "variants": "4="}),
-        );
-        edges.insert(
-            "E4".to_string(),
-            json!({"src": ["A3"], "dst": ["A4"], "reads": ["r5"], "variants": "1=1X2="}),
-        );
-
-        GraphicalGenome {
-            anchor,
-            edges,
+    /// A graph from named anchors and edges (each edge JSON carries `src`/`dst`); adjacency follows the edges.
+    fn graph(anchors: &[(&str, serde_json::Value)], edges: &[(&str, serde_json::Value)]) -> GraphicalGenome {
+        let mut g = GraphicalGenome {
+            anchor: anchors.iter().map(|(n, a)| (n.to_string(), a.clone())).collect(),
+            edges: HashMap::new(),
             outgoing: HashMap::new(),
             incoming: HashMap::new(),
+        };
+        for (name, e) in edges {
+            let src = e["src"][0].as_str().unwrap().to_string();
+            let dst = e["dst"][0].as_str().unwrap().to_string();
+            g.outgoing.entry(src.clone()).or_default().push(name.to_string());
+            g.incoming.entry(dst.clone()).or_default().push(name.to_string());
+            g.incoming.insert(name.to_string(), vec![src]);
+            g.outgoing.insert(name.to_string(), vec![dst]);
+            g.edges.insert(name.to_string(), e.clone());
         }
+        g
+    }
+
+    fn sorted(reads: HashSet<String>) -> Vec<String> {
+        let mut v: Vec<String> = reads.into_iter().collect();
+        v.sort();
+        v
+    }
+
+    /// Typed the way `get_variants_from_cigar` types it: equal lengths SNP, longer REF DEL, else INS.
+    fn var(pos: usize, ref_allele: &str, alt: &str, allele_count: usize) -> Variant {
+        let variant_type = match ref_allele.len().cmp(&alt.len()) {
+            std::cmp::Ordering::Equal => "SNP",
+            std::cmp::Ordering::Greater => "DEL",
+            std::cmp::Ordering::Less => "INS",
+        };
+        Variant {
+            pos,
+            ref_allele: ref_allele.to_string(),
+            alt_allele: alt.to_string(),
+            variant_type: variant_type.to_string(),
+            allele_count,
+            filter: None,
+        }
+    }
+
+    fn snp(pos: usize, alt: &str, allele_count: usize) -> Variant {
+        var(pos, "T", alt, allele_count)
     }
 
     #[test]
     fn record_variant_reads_uses_raw_position_for_wraparound_bubble() {
-        let graph = wraparound_test_graph();
-        let ref_length = 10usize;
-        let graph_intervals_dict = get_graph_intervals(&graph, ref_length as i64);
-
-        // Raw position 11 lies on the wrap-around bubble [8, 12) and
-        // circularizes down to wrapped position 1.
-        let raw_variant = Variant {
-            pos: 11,
-            ref_allele: "A".to_string(),
-            alt_allele: "G".to_string(),
-            variant_type: "SNP".to_string(),
-            allele_count: 1,
-            filter: None,
-        };
-        let variants = vec![raw_variant];
-        let variants_circular = circuliarize_variants(variants.clone(), ref_length);
-        assert_eq!(variants_circular[0].pos, 1, "sanity check: position should wrap");
-
-        let readlist = vec![json!("r4"), json!("r5")];
-        let mut read_record = HashMap::new();
-        let mut cover_record = HashMap::new();
-
-        record_variant_reads(
-            &variants,
-            &variants_circular,
-            &graph_intervals_dict,
-            &graph,
-            &readlist,
-            &mut read_record,
-            &mut cover_record,
+        // Bubbles [0, 5) and [8, 12): in raw coordinates the second crosses the origin of a 10 bp reference.
+        let g = graph(
+            &[("A1", json!({"pos": 0})), ("A2", json!({"pos": 5})), ("A3", json!({"pos": 8})), ("A4", json!({"pos": 12}))],
+            &[
+                ("E1", json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1", "r2"], "variants": "5="})),
+                ("E2", json!({"src": ["A1"], "dst": ["A2"], "reads": ["r3"], "variants": "2=1X2="})),
+                ("E3", json!({"src": ["A3"], "dst": ["A4"], "reads": ["r4"], "variants": "4="})),
+                ("E4", json!({"src": ["A3"], "dst": ["A4"], "reads": ["r5"], "variants": "1=1X2="})),
+            ],
         );
+        let dict = get_graph_intervals(&g, 10);
+        // Raw position 11 wraps to 1, which lies in the other bubble.
+        let raw = vec![snp(11, "G", 1)];
+        let wrapped = circuliarize_variants(raw.clone(), 10);
+        assert_eq!(wrapped[0].pos, 1);
 
-        let key = generate_variant_name(&variants_circular[0]);
-        let mut cover: Vec<String> = cover_record.get(&key).cloned().unwrap_or_default().into_iter().collect();
-        cover.sort();
-
-        // The wrap-around bubble's true reads are r4/r5. Using the wrapped
-        // position (1) instead of the raw one (11) would incorrectly match
-        // the unrelated bubble at [0, 5), pulling in r1/r2/r3 instead.
-        assert_eq!(cover, vec!["r4".to_string(), "r5".to_string()]);
-    }
-
-    /// A bubble at raw positions [0, 10) carries the real variant (edge
-    /// `E_real`, cigar `5=1X4=`), with reads r1/r2. A read that couldn't be
-    /// assembled through the fine-grained anchor chain instead crosses the
-    /// same span via a private "skip-over" edge with no computed CIGAR
-    /// (`E_private`, read r3) - mirroring what Himito's own graph does for
-    /// reads it can't cleanly anchor (see e.g. E00001050 in a real run).
-    fn skip_edge_test_graph() -> GraphicalGenome {
-        let mut anchor = HashMap::new();
-        anchor.insert("A1".to_string(), json!({"pos": 0}));
-        anchor.insert("A2".to_string(), json!({"pos": 10}));
-
-        let mut edges = HashMap::new();
-        edges.insert(
-            "E_real".to_string(),
-            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1", "r2"], "variants": "5=1X4="}),
-        );
-        edges.insert(
-            "E_private".to_string(),
-            json!({"src": ["A1"], "dst": ["A2"], "reads": ["r3"]}),
-        );
-
-        GraphicalGenome {
-            anchor,
-            edges,
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-        }
+        let (mut read_record, mut cover_record) = (HashMap::new(), HashMap::new());
+        record_variant_reads(&raw, &wrapped, &dict, &g, &[json!("r4"), json!("r5")], &mut read_record, &mut cover_record);
+        assert_eq!(sorted(cover_record[&generate_variant_name(&wrapped[0])].clone()), ["r4", "r5"]);
     }
 
     #[test]
     fn bubble_cover_reads_excludes_edges_with_no_computed_variant() {
-        let graph = skip_edge_test_graph();
-        let graph_intervals_dict = get_graph_intervals(&graph, 10);
+        // r3 crosses the bubble only via E_private, which has no CIGAR and so was never genotyped.
+        let g = graph(
+            &[("A1", json!({"pos": 0})), ("A2", json!({"pos": 10}))],
+            &[
+                ("E_real", json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1", "r2"], "variants": "5=1X4="})),
+                ("E_private", json!({"src": ["A1"], "dst": ["A2"], "reads": ["r3"]})),
+            ],
+        );
+        let dict = get_graph_intervals(&g, 10);
+        assert_eq!(sorted(bubble_cover_reads(&dict, 5, &g)), ["r1", "r2"]);
+    }
 
-        let cover = bubble_cover_reads(&graph_intervals_dict, 5, &graph);
-        let mut cover: Vec<String> = cover.into_iter().collect();
-        cover.sort();
+    #[test]
+    fn origin_spanning_bubble_covers_its_reads_on_both_sides_of_the_origin() {
+        // E_wrap closes the circle: 8 -> 10 (== ref_length) -> 2.
+        let g = graph(
+            &[("A_first", json!({"pos": 2})), ("A_mid", json!({"pos": 5})), ("A_last", json!({"pos": 8}))],
+            &[
+                ("E_mid", json!({"src": ["A_first"], "dst": ["A_mid"], "reads": ["r1"], "variants": "3="})),
+                ("E_wrap", json!({"src": ["A_last"], "dst": ["A_first"], "reads": ["rw1", "rw2"], "variants": "2=1X1="})),
+            ],
+        );
+        let dict = get_graph_intervals(&g, 10);
+        for raw_pos in [8, 10] {
+            assert_eq!(sorted(bubble_cover_reads(&dict, raw_pos, &g)), ["rw1", "rw2"], "raw pos {raw_pos}");
+        }
+        assert_eq!(sorted(bubble_cover_reads(&dict, 3, &g)), ["r1"]);
+    }
 
-        // r3 only reaches this span via E_private, which was never CIGAR-
-        // processed (get_variant would skip it via the empty-cigar check).
-        // It must not be credited as "covering" the variant - crediting it
-        // as covered-but-not-alt would wrongly call it ref (0) in the
-        // matrix instead of the correct NaN (unassembled/unknown).
-        assert_eq!(cover, vec!["r1".to_string(), "r2".to_string()]);
+    #[test]
+    fn source_and_sink_edges_get_no_interval() {
+        // SOURCE/SINK have no anchor coordinate.
+        let g = graph(
+            &[("A1", json!({"pos": 900})), ("A2", json!({"pos": 910}))],
+            &[
+                ("E_real", json!({"src": ["A1"], "dst": ["A2"], "reads": ["r1"], "variants": "5=1X4="})),
+                ("E_source", json!({"src": ["SOURCE"], "dst": ["A2"], "reads": ["rs"], "variants": "5="})),
+                ("E_sink", json!({"src": ["A1"], "dst": ["SINK"], "reads": ["rk"], "variants": "5="})),
+            ],
+        );
+        let dict = get_graph_intervals(&g, 16569);
+        assert_eq!(dict.len(), 1);
+        assert!(bubble_cover_reads(&dict, 42, &g).is_empty());
+        assert_eq!(sorted(bubble_cover_reads(&dict, 905, &g)), ["r1"]);
+    }
+
+    // ---- permutation test ----
+
+    #[test]
+    fn permutation_test_rejects_a_scattered_snp_except_on_pacbio() {
+        // A SNP and an indel carried by the same 3 of 30 reads, and a SNP scattered over 3 other reads.
+        let variants = vec![snp(100, "A", 3), var(200, "TT", "T", 3), snp(300, "G", 3)];
+        let mut matrix = Array2::<f64>::zeros((3, 30));
+        matrix.slice_mut(s![0..2, 0..3]).fill(1.0);
+        for j in [10, 17, 24] {
+            matrix[[2, j]] = 1.0;
+        }
+        let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, 30)).collect();
+        let artifact = generate_variant_name(&variants[2]);
+        // Denoising leaves systematic error behind, so ont-denoised tests SNPs; PacBio SNPs are exempt.
+        for (data_type, artifact_kept) in [("ont-denoised", false), ("pacbio", true)] {
+            let (kept, _) = permutation_test(&matrix, 0.5, 0.9, 200, &variants, &coverage, 0.9, data_type, resolve_indel_false_threshold(data_type, None), None);
+            let names: Vec<String> = kept.iter().map(generate_variant_name).collect();
+            assert_eq!(names.contains(&artifact), artifact_kept, "{data_type}");
+            assert_eq!(names.len(), 2 + artifact_kept as usize, "{data_type}: the lineage pair survives");
+        }
+    }
+
+    #[test]
+    fn permutation_test_keeps_variants_it_cannot_test() {
+        // Alt in 9 of 10 matrix reads: above the 0.7 permutation frequency threshold, so no null is drawn,
+        // although allele_count / depth = 0.02 admits both variants.
+        let variants = vec![snp(100, "A", 2), snp(200, "C", 2)];
+        let mut matrix = Array2::<f64>::zeros((2, 10));
+        matrix.slice_mut(s![.., ..9]).fill(1.0);
+        let coverage: HashMap<usize, usize> = [(100, 100), (200, 100)].into_iter().collect();
+        let (kept, _) = permutation_test(&matrix, 0.5, 0.5, 16, &variants, &coverage, 0.7, "ont-denoised", 0.015, None);
+        assert_eq!(kept.len(), 2, "an untested variant must be kept, not dropped");
+    }
+
+    /// X sits on 45 random reads of the majority lineage A (reads 0..240), next to minor lineages B and C.
+    fn run_majority_lineage(x: Variant) -> Vec<String> {
+        let n_reads = 300;
+        let lineages = [(0usize, 240usize, 3usize), (240, 276, 15), (276, 300, 15)];
+        let n_markers: usize = lineages.iter().map(|l| l.2).sum();
+        let mut matrix = Array2::<f64>::zeros((1 + n_markers, n_reads));
+        let mut rng = StdRng::seed_from_u64(12969);
+        let mut placed = 0;
+        while placed < 45 {
+            let j = rng.random_range(0..240);
+            if matrix[[0, j]] == 0.0 {
+                matrix[[0, j]] = 1.0;
+                placed += 1;
+            }
+        }
+        let mut variants = vec![x];
+        for (lo, hi, n) in lineages {
+            for _ in 0..n {
+                matrix.slice_mut(s![variants.len(), lo..hi]).fill(1.0);
+                variants.push(snp(1000 + 10 * (variants.len() - 1), "G", hi - lo));
+            }
+        }
+        let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, n_reads)).collect();
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10", 0.015, None);
+        // A untested, B/C tested: all lineage markers survive.
+        assert_eq!(kept.iter().filter(|v| v.pos >= 1000).count(), n_markers, "lineage markers must survive");
+        kept.iter().map(generate_variant_name).collect()
+    }
+
+    #[test]
+    fn cooccurrence_test_exempts_strong_balanced_snps() {
+        // The co-occurrence statistic punishes a variant that sits on the MAJORITY lineage.
+        let x = snp(500, "C", 45);
+        let name = generate_variant_name(&x);
+        assert!(
+            run_majority_lineage(x.clone()).contains(&name),
+            "a strong strand-balanced SNP must be exempt from the co-occurrence veto"
+        );
+        let biased = Variant { filter: Some("Strand_bias".into()), ..x };
+        assert!(!run_majority_lineage(biased).contains(&name), "a strand-biased SNP must still be tested and rejected");
+        let indel = var(500, "TT", "T", 45);
+        let name = generate_variant_name(&indel);
+        assert!(!run_majority_lineage(indel).contains(&name), "an indel with the same evidence must still be tested");
+    }
+
+    /// `n` random genotype cells: ~20% NaN (uncovered), ~10% alt.
+    fn random_genotype_row(rng: &mut StdRng, n: usize) -> Vec<f64> {
+        (0..n)
+            .map(|_| match rng.random::<f64>() {
+                u if u < 0.20 => f64::NAN,
+                u if u < 0.30 => 1.0,
+                _ => 0.0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn bit_jaccard_matches_f64_jaccard() {
+        // Reference: alt = > 0.5, reads uncovered in either row skipped.
+        let jaccard_f64 = |a: &[f64], b: &[f64]| {
+            let (mut inter, mut union) = (0, 0);
+            for (x, y) in a.iter().zip(b).filter(|(x, y)| !x.is_nan() && !y.is_nan()) {
+                inter += (*x > 0.5 && *y > 0.5) as u32;
+                union += (*x > 0.5 || *y > 0.5) as u32;
+            }
+            if union == 0 { 0.0 } else { inter as f64 / union as f64 }
+        };
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..200 {
+            let a = random_genotype_row(&mut rng, 300);
+            let b = random_genotype_row(&mut rng, 300);
+            let (ba, bb) = (BitRow::from_row(&a), BitRow::from_row(&b));
+            assert_eq!(jaccard_bits(&ba.alt, &ba.cov, &bb), jaccard_f64(&a, &b));
+        }
+    }
+
+    #[test]
+    fn bit_shuffle_preserves_alt_count_and_coverage() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let br = BitRow::from_row(&random_genotype_row(&mut rng, 300));
+        let mut scratch: Vec<u32> = Vec::new();
+        let mut alt = vec![0u64; br.alt.len()];
+        for _ in 0..1000 {
+            shuffle_bits(&br, &mut scratch, &mut alt, &mut rng);
+            assert_eq!(alt.iter().map(|x| x.count_ones()).sum::<u32>(), br.n_alt, "shuffle must preserve the alt count");
+            assert!(alt.iter().zip(&br.cov).all(|(a, c)| a & !c == 0), "shuffled alts must stay inside the covered reads");
+        }
+    }
+
+    #[test]
+    fn adaptive_permutation_resolves_the_bh_floor() {
+        // 10 identical lineage rows (alt in the same 24 of 400 reads) plus 120 independent 8-read noise rows.
+        let n_reads = 400;
+        let mut rng = StdRng::seed_from_u64(2026);
+        let mut variants = Vec::new();
+        let mut matrix = Array2::<f64>::zeros((130, n_reads));
+        for i in 0..130 {
+            variants.push(snp(100 + i, "A", if i < 10 { 24 } else { 8 }));
+            if i < 10 {
+                matrix.slice_mut(s![i, ..24]).fill(1.0);
+            } else {
+                let mut placed = 0;
+                while placed < 8 {
+                    let j = rng.random_range(0..n_reads);
+                    if matrix[[i, j]] == 0.0 {
+                        matrix[[i, j]] = 1.0;
+                        placed += 1;
+                    }
+                }
+            }
+        }
+        let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, n_reads)).collect();
+
+        // 1000 rounds alone put the lineage rows at p = 1/1001, BH q = 0.013 > 0.01: stage 2 must lift that floor.
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10", 0.015, None);
+        let lineage = kept.iter().filter(|v| v.pos < 110).count();
+        assert_eq!(lineage, 10, "every lineage row must be kept");
+        assert!(kept.len() - lineage <= 1, "at most one noise row may survive, got {}", kept.len() - lineage);
+
+        let tested: Vec<usize> = (0..130).collect();
+        let names: Vec<String> = variants.iter().map(generate_variant_name).collect();
+        let partners = partners_of(&tested, &variants, &coverage, "ont-r10");
+        let outcomes = adaptive_permutation(&matrix, &tested, &partners, &names, 1000, 0.01);
+        let needed = (PERM_HEADROOM * 130.0 / (0.01 * 10.0)).ceil() as u32;
+        let max_draws = outcomes.iter().map(|o| o.draws).max().unwrap();
+        assert!(max_draws >= needed, "{needed} rounds needed, drew at most {max_draws}");
+        // Clear nulls stop early.
+        let clear: Vec<&PermOutcome> = outcomes.iter().filter(|o| o.p_value() > 0.1).collect();
+        assert!(clear.len() > 50, "expected many clear nulls, saw {}", clear.len());
+        assert!(clear.iter().all(|o| o.draws < 1000), "clear nulls must stop before 1000 draws");
+        // Per-variant seeds make the outcome independent of thread scheduling.
+        assert_eq!(adaptive_permutation(&matrix, &tested, &partners, &names, 1000, 0.01), outcomes);
+    }
+
+    // ---- PacBio permutation rules ----
+
+    /// One matrix row per entry of `alt_reads` (the reads carrying that row's alt) over `n_reads` reads.
+    fn alt_matrix(n_reads: usize, alt_reads: &[Vec<usize>]) -> Array2<f64> {
+        let mut m = Array2::<f64>::zeros((alt_reads.len(), n_reads));
+        for (i, reads) in alt_reads.iter().enumerate() {
+            for &j in reads {
+                m[[i, j]] = 1.0;
+            }
+        }
+        m
+    }
+
+    /// Positions the PacBio permutation test keeps at uniform `depth` (p 0.01, f 0.2, indel false threshold 0.1).
+    fn pb_kept(variants: &[Variant], alt_reads: &[Vec<usize>], n_reads: usize, depth: usize, min_hf: Option<f64>) -> Vec<usize> {
+        let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, depth)).collect();
+        let matrix = alt_matrix(n_reads, alt_reads);
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 500, variants, &coverage, 0.7, "pacbio", 0.1, min_hf);
+        kept.iter().map(|v| v.pos).collect()
+    }
+
+    #[test]
+    fn pb_noise_threshold_matches_poisson_table() {
+        for (dp, t) in [(0, 3), (6, 3), (88, 3), (268, 5), (970, 8), (6494, 25)] {
+            assert_eq!(pb_noise_threshold(dp), t, "DP {dp}");
+        }
+    }
+
+    #[test]
+    fn presets_by_data_type() {
+        for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
+            let want = if dt == "ont-r9" { (0.0001, 0.5, 0.7) } else { (0.01, 0.2, 0.7) };
+            assert_eq!(resolve_thresholds(dt, None, None, None), want, "{dt}");
+            assert_eq!(resolve_vaf(dt, None), 0.01, "{dt}");
+        }
+        assert_eq!(resolve_vaf("pacbio", None), 0.002);
+        // An explicit value wins, 0 included.
+        assert_eq!(resolve_vaf("pacbio", Some(0.05)), 0.05);
+        assert_eq!(resolve_vaf("ont-r10", Some(0.0)), 0.0);
+    }
+
+    #[test]
+    fn pacbio_snps_are_tested_only_in_gray_zone() {
+        // DP 6500, T = 25: the AC-20 SNPs are tested, the AC-30 backbone (the only partner) is exempt.
+        // The two AC-20 SNPs on the backbone's reads survive; the scattered one is dropped.
+        let variants = [snp(1000, "A", 20), snp(3000, "A", 20), snp(5000, "C", 30), snp(7000, "G", 20)];
+        let reads = [(0..20).collect(), (0..20).collect(), (0..30).collect(), (50..70).collect()];
+        assert_eq!(pb_kept(&variants, &reads, 200, 6500, None), vec![1000, 3000, 5000]);
+        // DP 90, T = 3: every SNP with AC >= 3 is exempt, linked or not.
+        let variants = [snp(100, "A", 3), snp(200, "C", 5)];
+        assert_eq!(pb_kept(&variants, &[vec![10, 17, 24], (0..5).collect()], 30, 90, None).len(), 2);
+    }
+
+    #[test]
+    fn pacbio_small_indel_is_tested_only_above_the_false_threshold_or_when_promoted() {
+        // HF 0.05 < 0.1: never PASS, so untested and kept; HF 0.12: tested and, with no partner, dropped.
+        let variants = [var(1000, "TT", "T", 50), var(3000, "TT", "T", 120)];
+        assert_eq!(pb_kept(&variants, &[(0..50).collect(), (60..180).collect()], 200, 1000, None), vec![1000]);
+
+        // Promotion (min HF 0.01) tests an out-of-tract 3% indel: linked to the backbone it stays ...
+        let backbone = snp(5000, "G", 30);
+        let outside = var(247, "GA", "G", 30);
+        let inside = var(16182, "A", "ACC", 20);
+        assert!(!indel_in_hp_tract(&outside) && indel_in_hp_tract(&inside));
+        let variants = [outside, inside, backbone.clone()];
+        let reads = [(0..30).collect(), (100..120).collect(), (0..60).collect()];
+        // ... and the in-tract 2% indel is not promoted, so it stays untested.
+        assert_eq!(pb_kept(&variants, &reads, 200, 1000, Some(0.01)), vec![247, 16182, 5000]);
+        // ... while an unlinked promoted indel is dropped.
+        let variants = [var(900, "GA", "G", 30), backbone];
+        assert_eq!(pb_kept(&variants, &[(100..130).collect(), (0..30).collect()], 200, 1000, Some(0.01)), vec![5000]);
+    }
+
+    #[test]
+    fn pacbio_partners_exclude_adjacent_and_subthreshold_rows() {
+        // An adjacent pair on the same reads has no partner >= PB_PARTNER_MIN_DIST away: both dropped.
+        let variants = [snp(100, "A", 5), snp(101, "C", 5), snp(5000, "G", 30)];
+        assert_eq!(pb_kept(&variants, &[(0..5).collect(), (0..5).collect(), (20..50).collect()], 100, 6500, None), vec![5000]);
+        // Gray-zone rows sharing reads only with each other have no partner at all: all dropped.
+        let variants = [snp(1000, "A", 6), snp(3000, "C", 6), snp(5000, "G", 6)];
+        assert!(pb_kept(&variants, &[(0..6).collect(), (0..6).collect(), (0..6).collect()], 100, 6500, None).is_empty());
+    }
+
+    #[test]
+    fn ont_permutation_outcomes_are_pinned() {
+        // Lineage A (AC 20), lineage B (AC 6), an adjacent error pair, a scattered SNP, a 1 bp deletion and an
+        // AC-30 SNP on reads no other row uses, all at depth 6500. The scattered and AC-30 SNPs look like the
+        // null (p ~ 1) and are rejected; every other row sits at the p floor.
+        let variants = vec![
+            snp(1000, "A", 20), snp(3000, "A", 20), snp(5000, "A", 20), snp(7000, "C", 6), snp(9000, "C", 6),
+            snp(11000, "G", 3), snp(11001, "G", 3), snp(13000, "A", 3), var(15000, "TT", "T", 10), snp(17000, "C", 30),
+        ];
+        let reads: Vec<Vec<usize>> = vec![
+            (0..20).collect(), (0..20).collect(), (0..20).collect(), (20..26).collect(), (20..26).collect(),
+            (30..33).collect(), (30..33).collect(), vec![40, 90, 150], (0..10).collect(), (100..130).collect(),
+        ];
+        let matrix = alt_matrix(200, &reads);
+        let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, 6500)).collect();
+        let names: Vec<String> = variants.iter().map(generate_variant_name).collect();
+        let tested: Vec<usize> = (0..variants.len()).collect();
+        let mut want_outcomes = vec![(0, 1000); 10];
+        want_outcomes[7] = (100, 100);
+        want_outcomes[9] = (100, 100);
+        for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
+            let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, dt, 0.015, None);
+            let kept: Vec<usize> = kept.iter().map(|v| v.pos).collect();
+            assert_eq!(kept, vec![1000, 3000, 5000, 7000, 9000, 11000, 11001, 15000], "{dt}");
+            let partners = partners_of(&tested, &variants, &coverage, dt);
+            let outcomes = adaptive_permutation(&matrix, &tested, &partners, &names, 1000, 0.01);
+            let got: Vec<(u32, u32)> = outcomes.iter().map(|o| (o.exceed, o.draws)).collect();
+            assert_eq!(got, want_outcomes, "{dt}");
+        }
+    }
+
+    // ---- strand bias ----
+
+    /// One variant's strand evidence: alt reads per strand, plus further covering reads per strand.
+    struct SbCase {
+        variants: Vec<Variant>,
+        matrix: Array2<f64>,
+        read_record: HashMap<String, Vec<serde_json::Value>>,
+        strand_map: HashMap<String, bool>,
+        cover_record: HashMap<String, HashSet<String>>,
+        coverage: HashMap<usize, usize>,
+    }
+
+    fn sb_case(variant: Variant, alt_fwd: usize, alt_rev: usize, cover_fwd: usize, cover_rev: usize, depth: usize) -> SbCase {
+        let name = generate_variant_name(&variant);
+        let (mut strand_map, mut alt, mut cover) = (HashMap::new(), Vec::new(), HashSet::new());
+        for (prefix, n, is_rev, is_alt) in
+            [("af", alt_fwd, false, true), ("ar", alt_rev, true, true), ("cf", cover_fwd, false, false), ("cr", cover_rev, true, false)]
+        {
+            for i in 0..n {
+                let read = format!("{prefix}{i}");
+                strand_map.insert(read.clone(), is_rev);
+                if is_alt {
+                    alt.push(json!(read));
+                }
+                // As in `get_variant`, the cover set includes the alt reads.
+                cover.insert(read);
+            }
+        }
+        SbCase {
+            matrix: Array2::zeros((1, 1)),
+            read_record: [(name.clone(), alt)].into_iter().collect(),
+            cover_record: [(name, cover)].into_iter().collect(),
+            coverage: [(variant.pos, depth)].into_iter().collect(),
+            variants: vec![variant],
+            strand_map,
+        }
+    }
+
+    fn run_sb(case: &SbCase, library_frac: f64, action: StrandBiasAction) -> (Vec<Variant>, Array2<f64>) {
+        filter_strand_bias(
+            &case.variants, &case.matrix, &case.read_record, &case.strand_map, &case.cover_record, &case.coverage,
+            library_frac, 0.01, 0.7, action,
+        )
+    }
+
+    #[test]
+    fn strand_bias_drop_removes_only_low_hf_snps() {
+        // 10 forward-only alt reads against a balanced library.
+        let flagged = |kept: &[Variant]| kept.len() == 1 && kept[0].filter.as_deref() == Some("Strand_bias");
+        let low = sb_case(snp(100, "A", 10), 10, 0, 0, 0, 200); // HF 0.05
+        assert!(flagged(&run_sb(&low, 0.5, StrandBiasAction::Flag).0));
+        let (kept, kept_matrix) = run_sb(&low, 0.5, StrandBiasAction::Drop);
+        assert!(kept.is_empty() && kept_matrix.nrows() == 0, "dropped together with its matrix row");
+        // At HF 0.20 (above STRAND_BIAS_DROP_MAX_HF), or as an indel: flagged, never dropped.
+        let high = sb_case(snp(100, "A", 10), 10, 0, 0, 0, 50);
+        assert!(flagged(&run_sb(&high, 0.5, StrandBiasAction::Drop).0));
+        let indel = sb_case(var(100, "TT", "T", 10), 10, 0, 0, 0, 200);
+        assert!(flagged(&run_sb(&indel, 0.5, StrandBiasAction::Drop).0));
+    }
+
+    #[test]
+    fn strand_bias_tests_against_the_site_local_null() {
+        assert!(strand_bias_pvalue(600, 400, 0.5) < 0.01);
+        // (case, library forward fraction, flagged)
+        let cases = [
+            // 7805G>A: alt 45F/27R is skewed against the library but not against its 54%-forward site.
+            (sb_case(snp(7805, "A", 72), 45, 27, 54, 46, 1000), 0.498, false),
+            // 600F/400R is significant, but its 0.10 effect is below STRAND_BIAS_MIN_EFFECT.
+            (sb_case(snp(500, "A", 1000), 600, 400, 50, 50, 5000), 0.5, false),
+            // 33CG>C: the 34 reverse-only alt reads are left out of the null, or they would hide their own skew.
+            (sb_case(var(33, "CG", "C", 34), 0, 34, 2, 2, 302), 0.498, true),
+            // Only 10 covering reads without the alt: too few for a local null, so the library fraction is used.
+            (sb_case(snp(100, "A", 10), 10, 0, 10, 0, 200), 0.5, true),
+        ];
+        for (i, (case, library_frac, flagged)) in cases.iter().enumerate() {
+            let kept = run_sb(case, *library_frac, StrandBiasAction::Flag).0;
+            assert_eq!(kept.len(), 1, "case {i}");
+            assert_eq!(kept[0].filter.is_some(), *flagged, "case {i}");
+        }
+    }
+
+    #[test]
+    fn bam_recount_retests_only_strand_flagged_indels() {
+        let sb = Some("Strand_bias");
+        // (variant, FILTER before, BAM alt fwd/rev at a balanced site, FILTER after)
+        let cases = [
+            (var(302, "A", "ACC", 20), sb, 9, 11, None), // balanced in the BAM: cleared
+            (var(33, "CG", "C", 20), sb, 1, 19, sb),     // still skewed
+            (var(302, "A", "ACC", 20), sb, 1, 0, sb),    // too few BAM alt reads to retest
+            (snp(500, "A", 20), sb, 9, 11, sb),          // SNVs are not recounted
+            (var(302, "A", "ACC", 20), Some("Potential_Artifact"), 9, 11, Some("Potential_Artifact")),
+        ];
+        for (v, before, fwd, rev, after) in cases {
+            let v = Variant { filter: before.map(String::from), ..v };
+            let bam = sb_case(v.clone(), fwd, rev, 50, 50, 1000);
+            let out = recount_indel_strand_bias(&[v], &bam.read_record, &bam.cover_record, &bam.strand_map, 0.5, 0.01);
+            assert_eq!(out[0].filter.as_deref(), after, "{} {fwd}/{rev}", generate_variant_name(&out[0]));
+        }
+    }
+
+    // ---- left alignment ----
+
+    /// `TCAAAAGCTT` - a 4bp A-run at indices 2..6 preceded by a C.
+    const HOMOPOLYMER_REF: &[u8] = b"TCAAAAGCTT";
+
+    /// Build a DEL the way `get_variants_from_cigar` does.
+    fn del_at(refseq: &[u8], pos: usize, len: usize, allele_count: usize) -> Variant {
+        let s = |r: std::ops::Range<usize>| std::str::from_utf8(&refseq[r]).unwrap().to_string();
+        var(pos, &s(pos - 1..pos + len), &s(pos - 1..pos), allele_count)
+    }
+
+    /// Build an INS the way `get_variants_from_cigar` does.
+    fn ins_at(refseq: &[u8], pos: usize, inserted: &str, allele_count: usize) -> Variant {
+        let anchor = std::str::from_utf8(&refseq[pos - 1..pos]).unwrap();
+        var(pos, anchor, &format!("{anchor}{inserted}"), allele_count)
+    }
+
+    #[test]
+    fn left_align_variant_shifts_indels_to_the_leftmost_anchor() {
+        let hp = HOMOPOLYMER_REF;
+        // rCRS 560..=580, covering the poly-C run at 568-573: slice index `i` is 1-based coordinate 560 + i.
+        let rcrs: &[u8] = b"CAAAGACACCCCCCACAGTTT";
+        let anchorless = Variant { variant_type: "INS".into(), ..var(3, "-", "-", 2) };
+        // (reference, input, expected (pos, REF, ALT))
+        let cases = [
+            // The deleted / inserted A moves to the base before the A-run, as `bcftools norm` reports it.
+            (hp, del_at(hp, 5, 1, 3), (2, "CA", "C")),
+            (hp, ins_at(hp, 6, "A", 3), (2, "C", "CA")),
+            // A multi-base insertion rotates across an AG repeat.
+            (b"TTAGAGAGC" as &[u8], ins_at(b"TTAGAGAGC", 8, "AG", 2), (2, "T", "TAG")),
+            // A run reaching the reference start stops at the first possible anchor.
+            (b"AAAAC", del_at(b"AAAAC", 3, 1, 2), (1, "AA", "A")),
+            // Unique sequence, SNPs, anchorless and origin indels stay put.
+            (b"ACGTTGCA", del_at(b"ACGTTGCA", 5, 1, 4), (5, "TG", "T")),
+            (hp, var(4, "A", "G", 7), (4, "A", "G")),
+            (hp, anchorless, (3, "-", "-")),
+            (hp, var(0, "TC", "T", 5), (0, "TC", "T")),
+            // rCRS 572 CC>C and 573 C>CC both normalize to 567 (cross-checked with `bcftools norm`).
+            (rcrs, del_at(rcrs, 13, 1, 4), (567 - 559, "AC", "A")),
+            (rcrs, ins_at(rcrs, 14, "C", 4), (567 - 559, "A", "AC")),
+        ];
+        for (refseq, v, want) in cases {
+            let got = left_align_variant(&v, refseq);
+            assert_eq!((got.pos, got.ref_allele.as_str(), got.alt_allele.as_str()), want, "{v:?}");
+            assert_eq!((got.variant_type, got.allele_count), (v.variant_type, v.allele_count), "evidence is untouched");
+        }
+    }
+
+    /// One bubble with two alt edges spelling the same 1 bp A-run deletion at different anchors.
+    fn homopolymer_bubble_graph() -> GraphicalGenome {
+        graph(
+            &[("A1", json!({"pos": 0, "seq": "TCA"})), ("A2", json!({"pos": 7, "seq": "CTT"}))],
+            &[
+                ("E_ref", json!({"src": ["A1"], "dst": ["A2"], "seq": "AAAG", "reads": ["chrM_ref"], "variants": "7="})),
+                ("E_alt1", json!({"src": ["A1"], "dst": ["A2"], "seq": "AAG", "reads": ["r1", "r2", "r3"], "variants": "5=1D1="})),
+                ("E_alt2", json!({"src": ["A1"], "dst": ["A2"], "seq": "AAG", "reads": ["r4", "r5", "r6", "r7"], "variants": "3=1D3="})),
+            ],
+        )
+    }
+
+    #[test]
+    fn get_variant_left_align_merges_equivalent_spellings_and_their_reads() {
+        let n = HOMOPOLYMER_REF.len();
+        // Without alignment the two spellings stay separate records at their original anchors.
+        let (variants, _, read_record, _) = get_variant(&mut homopolymer_bubble_graph(), 3, "chrM_ref", n, None);
+        let mut names: Vec<String> = variants.iter().map(generate_variant_name).collect();
+        names.sort();
+        assert_eq!(names, ["m.3AA>A", "m.5AA>A"]);
+        assert!(read_record.keys().all(|k| names.contains(k)));
+
+        // Aligned, both records are keyed by the one name `construct_matrix` looks rows up by.
+        let (variants, _, read_record, cover_record) =
+            get_variant(&mut homopolymer_bubble_graph(), 3, "chrM_ref", n, Some(HOMOPOLYMER_REF));
+        assert!(variants.iter().all(|v| generate_variant_name(v) == "m.2CA>C"));
+        assert!(read_record.keys().chain(cover_record.keys()).all(|k| k == "m.2CA>C"));
+        let mut alt: Vec<&str> = read_record["m.2CA>C"].iter().map(|r| r.as_str().unwrap()).collect();
+        alt.sort();
+        assert_eq!(alt, ["r1", "r2", "r3", "r4", "r5", "r6", "r7"]);
+        let collapsed = collapse_identical_records(variants, n);
+        assert_eq!((collapsed.len(), collapsed[0].allele_count), (1, 7), "evidence from both spellings sums");
+    }
+
+    #[test]
+    fn vcf_header_declares_left_alignment_only_when_on() {
+        for left_align in [true, false] {
+            let path = std::env::temp_dir().join(format!("himito_left_align_{left_align}_{}.vcf", std::process::id()));
+            let coverage: HashMap<usize, usize> = [(5, 30)].into_iter().collect();
+            write_vcf(&[del_at(HOMOPOLYMER_REF, 5, 1, 3)], &coverage, &path, "s1", "chrM", 10, 0.1, left_align, None, &HashSet::new()).unwrap();
+            let vcf = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(vcf.contains("##HimitoNormalization=left-aligned"), left_align);
+        }
+    }
+
+    #[test]
+    fn small_indel_at_ont_threshold_passes_above_and_is_artifact_below() {
+        let cov: HashMap<usize, usize> = [(100, 1000)].into_iter().collect();
+        let rec = format_vcf_record(&var(100, "GA", "G", 18), cov.clone(), 0.015, false);
+        assert!(rec.contains("\tPASS\t"), "HF 0.018 should pass at 0.015: {rec}");
+        let rec = format_vcf_record(&var(100, "GA", "G", 11), cov, 0.015, false);
+        assert!(rec.contains("Potential_Artifact"), "HF 0.011 should be flagged: {rec}");
+    }
+
+    #[test]
+    fn indel_false_threshold_preset_by_data_type() {
+        for (dt, preset) in [("ont-r9", 0.015), ("ont-r10", 0.015), ("ont-denoised", 0.015), ("pacbio", 0.1)] {
+            assert_eq!(resolve_indel_false_threshold(dt, None), preset, "{dt}");
+            assert_eq!(resolve_indel_false_threshold(dt, Some(0.05)), 0.05, "{dt}: an explicit value wins");
+        }
+    }
+
+    // ---- BAM genotyping ----
+
+    #[test]
+    fn allele_span_starts_at_the_first_ref_base() {
+        for (v, want) in [
+            (snp(100, "A", 5), (100, "T", "A")),
+            (del_at(HOMOPOLYMER_REF, 5, 1, 3), (4, "AA", "A")),
+            (ins_at(HOMOPOLYMER_REF, 6, "A", 3), (5, "A", "AA")),
+        ] {
+            assert_eq!(allele_span(&v), want);
+            // The variant name carries the same position, 1-based.
+            assert!(generate_variant_name(&v).starts_with(&format!("m.{}", want.0 + 1)));
+        }
+    }
+
+    #[test]
+    fn genotype_window_flanks_pushes_out_of_homopolymers_and_pads() {
+        let unique: Vec<u8> = b"ACGT".iter().cycle().take(40).copied().collect();
+        // SNP at 20: [20 - 10, 21 + 10), then 2 more on each side.
+        assert_eq!(genotype_window(&unique, (20, 21)), Some((8, 33)));
+        // Leaving the reference on either side: no window.
+        assert_eq!(genotype_window(&unique, (3, 4)), None);
+        assert_eq!(genotype_window(&unique, (36, 37)), None);
+        // Window ends inside A-runs are pushed out of them before padding.
+        let mut hp = unique.clone();
+        hp[8..12].fill(b'A');
+        hp[30..34].fill(b'A');
+        assert_eq!(genotype_window(&hp, (20, 21)), Some((6, 36)));
+    }
+
+    #[test]
+    fn group_sites_merges_overlapping_ref_spans_but_never_a_snp_with_an_indel() {
+        for (vs, want) in [
+            // SNPs at the same base; m.302A>AC and m.302A>ACC, both anchored on base 302.
+            (vec![snp(100, "A", 5), snp(100, "C", 4)], vec![vec![0, 1]]),
+            (vec![var(302, "A", "AC", 3), var(302, "A", "ACC", 3)], vec![vec![0, 1]]),
+            // Adjacent SNPs, and DELs whose REF spans [9, 11) and [11, 13) merely touch.
+            (vec![snp(100, "A", 5), snp(101, "A", 5)], vec![vec![0], vec![1]]),
+            (vec![var(10, "CA", "C", 3), var(12, "GT", "G", 3)], vec![vec![0], vec![1]]),
+            // ONT: m.8170AT>A is the deletion error of the very T in m.8171T>A.
+            (vec![var(8170, "AT", "A", 9), snp(8170, "A", 7)], vec![vec![1], vec![0]]),
+        ] {
+            assert_eq!(group_sites(&vs), want, "{vs:?}");
+        }
+    }
+
+    #[test]
+    fn score_segment_calls_the_best_haplotypes_and_gates_noise() {
+        const REF: &[u8] = b"GATCCTAGGCATTGCAAGTCCGATAC";
+        let mut alt = REF.to_vec();
+        alt[12] = b'A'; // m.13T>A
+        let haps = vec![REF.to_vec(), alt.clone()];
+        let mut del = REF.to_vec();
+        del.remove(12); // the SNP base is deleted from the read
+        let mut noisy = REF.to_vec(); // 6 substitutions away from REF
+        for i in [0, 3, 6, 9, 15, 18] {
+            noisy[i] = if noisy[i] == b'A' { b'C' } else { b'A' };
+        }
+        // Junk read bases around the window must not count against any haplotype.
+        let seg = |core: &[u8]| [&b"GGAC"[..], core, &b"CATT"[..]].concat();
+        let best = |s: &[usize]| SegCall::Best(s.iter().copied().collect());
+        assert_eq!(score_segment(&haps, &seg(REF), u32::MAX), best(&[0]));
+        assert_eq!(score_segment(&haps, &seg(&alt), u32::MAX), best(&[1]));
+        // A tie comes back as both indices: missing downstream, not REF.
+        assert_eq!(score_segment(&haps, &seg(&del), u32::MAX), best(&[0, 1]));
+        assert_eq!(score_segment(&haps, &seg(&noisy), 4), SegCall::TooNoisy);
+        assert!(matches!(score_segment(&haps, &seg(&noisy), u32::MAX), SegCall::Best(_)));
+    }
+
+    const GENO_REF: &str = "GCTAGACATACATACATACACGTCAGCACGACTGTGCAGTGTGATCGCTAGTAGTAGTGT";
+
+    /// GENO_REF[30] == 'A': m.31A>T.
+    fn geno_snp() -> Variant {
+        var(30, "A", "T", 5)
+    }
+
+    fn geno_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test_data/genotype").join(name)
+    }
+
+    fn run_geno(
+        sam: &str,
+        variants: &[Variant],
+    ) -> (HashMap<String, Vec<serde_json::Value>>, HashMap<String, HashSet<String>>) {
+        genotype_from_bam(&geno_path(sam), GENO_REF.as_bytes(), "chrM", variants, u32::MAX)
+    }
+
+    #[test]
+    fn genotype_from_bam_calls_ref_alt_and_leaves_ambiguous_reads_missing() {
+        let name = "m.31A>T";
+        let (rr, cr) = run_geno("reads.sam", &[geno_snp()]);
+        let alt = alt_reads(&rr, name);
+        let cover = &cr[name];
+
+        assert!(cover.contains("r_ref") && !alt.contains("r_ref"), "r_ref is a decisive 0");
+        assert!(cover.contains("r_alt") && alt.contains("r_alt"), "r_alt is a decisive 1");
+        assert!(!cover.contains("r_del"), "SNP base deleted: REF/ALT tie -> NaN, not 0");
+        assert!(!cover.contains("r_short"), "read ends inside the window -> not covered");
+        // Primary + supplementary agree (both ALT): one call.
+        assert!(cover.contains("r_split") && alt.contains("r_split"));
+        // Reference pseudo-read: covered, never alt (an all-0 column).
+        assert!(cover.contains("chrM") && !alt.contains("chrM"));
+    }
+
+    #[test]
+    fn genotype_from_bam_disagreeing_alignments_of_one_read_are_missing() {
+        let name = "m.31A>T";
+        let (rr, cr) = run_geno("split_disagree.sam", &[geno_snp()]);
+        assert!(!cr[name].contains("r_split"));
+        assert!(!alt_reads(&rr, name).contains("r_split"));
+        assert!(cr[name].contains("chrM"));
+    }
+
+    #[test]
+    fn genotype_from_bam_scores_an_indel_site_and_feeds_construct_matrix() {
+        let del = del_at(GENO_REF.as_bytes(), 30, 1, 4); // r_del carries it
+        let (sname, dname) = ("m.31A>T", generate_variant_name(&del));
+        let variants = vec![geno_snp(), del];
+        let (rr, cr) = run_geno("reads.sam", &variants);
+        assert!(alt_reads(&rr, &dname).contains("r_del"));
+        assert!(cr[&dname].contains("r_ref") && !alt_reads(&rr, &dname).contains("r_ref"));
+
+        let (m, vars, reads) = construct_matrix(&rr, &cr, &variants);
+        let col = |n: &str| reads.iter().position(|r| r == n).unwrap();
+        let row = |n: &str| vars.iter().position(|v| generate_variant_name(v) == n).unwrap();
+        assert_eq!(m[[row(sname), col("r_alt")]], 1.0);
+        assert_eq!(m[[row(sname), col("r_ref")]], 0.0);
+        assert!(m[[row(sname), col("r_del")]].is_nan());
+        assert_eq!(m[[row(&dname), col("r_del")]], 1.0);
+        assert_eq!(m[[row(sname), col("chrM")]], 0.0);
+        assert_eq!(m[[row(&dname), col("chrM")]], 0.0);
+    }
+
+    #[test]
+    fn genotype_from_bam_variant_without_a_window_is_only_the_ref_column() {
+        // The window would cross the origin: no read can call it.
+        let v = var(3, "A", "T", 5);
+        let name = generate_variant_name(&v);
+        let (rr, cr) = run_geno("reads.sam", &[v]);
+        assert!(alt_reads(&rr, &name).is_empty());
+        assert_eq!(sorted(cr[&name].clone()), ["chrM"]);
+    }
+
+    #[test]
+    fn genotype_from_bam_matches_ref_name_when_chrm_is_not_tid_zero() {
+        let name = "m.31A>T";
+        let (rr, cr) = run_geno("reads_second_contig.sam", &[geno_snp()]);
+        let (rr0, cr0) = run_geno("reads.sam", &[geno_snp()]);
+        assert!(alt_reads(&rr, name).contains("r_alt"));
+        assert_eq!(alt_reads(&rr, name), alt_reads(&rr0, name));
+        assert_eq!(cr[name], cr0[name]);
+    }
+
+    #[test]
+    fn genotype_from_bam_unknown_ref_name_returns_ref_column_only() {
+        let name = "m.31A>T";
+        let (rr, cr) = genotype_from_bam(
+            &geno_path("reads_second_contig.sam"), GENO_REF.as_bytes(), "not_a_contig", &[geno_snp()], u32::MAX,
+        );
+        assert!(alt_reads(&rr, name).is_empty());
+        assert_eq!(sorted(cr[name].clone()), ["not_a_contig"]);
+    }
+
+    #[test]
+    fn write_final_matrix_regenotypes_from_the_bam_when_given() {
+        let dir = std::env::temp_dir().join(format!("himito_final_matrix_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.vcf");
+        let graph_matrix = Array2::from_shape_vec((1, 2), vec![1.0, f64::NAN]).unwrap();
+        let graph_reads = ["g1".to_string(), "g2".to_string()];
+        let matrix_csv = || std::fs::read_to_string(out.with_extension("matrix.csv")).unwrap();
+
+        write_final_matrix(&out, &graph_matrix, &[geno_snp()], &[], &graph_reads, None).unwrap();
+        assert_eq!(matrix_csv(), "variant,g1,g2\nm.31A>T,1,\n");
+
+        let bam = geno_path("reads.sam");
+        let src = GenotypeSource { bam: &bam, refseq: GENO_REF.as_bytes(), ref_name: "chrM", max_ed: u32::MAX };
+        write_final_matrix(&out, &graph_matrix, &[geno_snp()], &[], &graph_reads, Some(&src)).unwrap();
+        // Reads sorted by name, the ref pseudo-read all 0, r_del (tie) and r_short (partial) missing.
+        assert_eq!(matrix_csv(), "variant,chrM,r_alt,r_ref,r_split\nm.31A>T,0,1,0,1\n");
     }
 }

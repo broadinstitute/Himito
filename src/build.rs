@@ -18,8 +18,7 @@ use rustc_hash::FxHashMap;
 
 
 pub fn reverse_complement(kmer: &str) -> String {
-    // Byte-level: ACGTN is pure ASCII, so this avoids UTF-8 char decoding/boundary
-    // checks that `.chars()` pays on every element.
+    // Byte-level: ACGTN is pure ASCII, so no UTF-8 char decoding is needed.
     let bytes = kmer.as_bytes();
     let mut out = vec![0u8; bytes.len()];
     for (dst, &b) in out.iter_mut().rev().zip(bytes.iter()) {
@@ -48,8 +47,7 @@ fn base_to_bits(b: u8) -> Option<u64> {
     }
 }
 
-/// Encode a short (<=32bp) sequence into a 2-bit-packed u64. Returns `None` if it
-/// contains any non-ACGT base or exceeds 32bp (u64 capacity).
+/// Encode a short (<=32bp) sequence into a 2-bit-packed u64.
 fn encode_kmer(bytes: &[u8]) -> Option<u64> {
     if bytes.len() > 32 {
         return None;
@@ -61,11 +59,7 @@ fn encode_kmer(bytes: &[u8]) -> Option<u64> {
     Some(code)
 }
 
-/// Hashable identity for a kmer window. `Bits` is the fast, allocation-free path for
-/// pure-ACGT windows (the overwhelming majority in real sequence data). `Raw` is an
-/// exact byte-slice fallback for anything that can't be 2-bit packed (an ambiguous
-/// base like the single historical `N` at rCRS position 3107, or k > 32) so uniqueness
-/// is decided by the same exact-match semantics as the original `String` comparison.
+/// Hashable identity for a kmer window.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum KmerKey {
     Bits(u64),
@@ -79,10 +73,7 @@ fn encode_kmer_key(bytes: &[u8]) -> KmerKey {
     }
 }
 
-/// Rolling k-mer scan over `contig`, calling `visit(key, pos)` for every window,
-/// including ones spanning an ambiguous base. Runs in O(n) with zero per-position
-/// allocation for the common all-ACGT case, only falling back to an owned byte slice
-/// for the rare window that can't be 2-bit packed.
+/// Rolling k-mer scan over `contig`, calling `visit(key, pos)` for every window.
 fn scan_kmers<F: FnMut(KmerKey, usize)>(contig: &[u8], k: usize, mut visit: F) {
     if k == 0 || contig.len() < k {
         return;
@@ -160,8 +151,7 @@ pub fn create_anchors(
 ) -> HashMap<String, AnchorInfo> {
     let mut anchor_info = HashMap::new();
 
-    // Kmers that appear exactly once become anchors; the sequence is recovered by
-    // slicing the original contig at that position rather than storing it as a key.
+    // Kmers that appear exactly once become anchors.
     for positions in position_dict.values() {
         if positions.len() == 1 {
             let pos = positions[0];
@@ -214,8 +204,7 @@ pub fn mapping_info(
     contig: &str,
     k: usize,
 ) -> (HashMap<String, usize>, HashMap<String, Vec<usize>>) {
-    // Seed the position dict with the encoded forward and reverse-complement kmer for
-    // every anchor (anchor kmers are few, so encoding them isn't hot).
+    // Seed the position dict with the encoded forward and reverse-complement kmer for every anchor.
     let mut position_dict: FxHashMap<KmerKey, Vec<usize>> = FxHashMap::default();
     for info in anchor_info.values() {
         let anchor_seq = &info.seq;
@@ -339,7 +328,6 @@ pub fn construct_edges(
 
 
 /// Build the edges contributed by a single contig, with no shared/cross-contig state.
-/// Kept separate so `create_edge_file` can run this per-contig work in parallel.
 fn edges_for_contig(
     contig_name: &str,
     contig: &str,
@@ -413,15 +401,13 @@ pub fn create_edge_file(
         .map(|(anchor, info)| (info.seq.clone(), anchor.clone()))
         .collect();
 
-    // Sort for deterministic iteration order (a plain HashMap iteration order isn't
-    // stable, and we want reproducible output regardless of thread scheduling).
+    // Sort for deterministic iteration order.
     let mut contigs: Vec<(&String, &String)> = all_seq.iter().collect();
     contigs.sort_by(|a, b| a.0.cmp(b.0));
 
     let bar = ProgressBar::new(contigs.len() as u64);
 
-    // Each contig's edges are computed independently in parallel; no shared state is
-    // touched until the sequential merge below.
+    // Each contig's edges are computed independently in parallel.
     let per_contig_edges: Vec<Vec<EdgeInfo>> = contigs
         .par_iter()
         .map(|(contig_name, contig)| {
@@ -432,8 +418,7 @@ pub fn create_edge_file(
         .collect();
     bar.finish();
 
-    // Sequential merge: dedup edges globally by (src, dst, seq) in O(1) amortized per
-    // edge via a lookup map, instead of an O(m) linear scan of each src's edge list.
+    // Sequential merge: dedup edges globally by (src, dst, seq) in O(1) amortized per edge via a lookup map.
     let mut edge_info: HashMap<String, EdgeInfo> = HashMap::new();
     let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
     let mut edge_key_to_name: FxHashMap<(String, String, String), String> = FxHashMap::default();
@@ -621,9 +606,9 @@ fn alignment_to_cigar(operations: &[AlignmentOperation]) -> String {
 }
 
 fn gap_open_aligner(reference: &str, sequence: &str) -> String {
-    let score = |a: u8, b: u8| if a == b { 1i32 } else { -1i32 };
-    // Create an aligner with the same scoring parameters
-    let mut aligner = Aligner::with_capacity(sequence.len(), reference.len(), -5, -1, &score); // match_score=0, mismatch_score=-6, gap_open=-5, gap_extend=-3
+    // match=0, mismatch=-6, gap_open=-5, gap_extend=-3.
+    let score = |a: u8, b: u8| if a == b { 0i32 } else { -6i32 };
+    let mut aligner = Aligner::with_capacity(sequence.len(), reference.len(), -5, -3, &score);
 
     // Perform the alignment
     let alignment = aligner.global(sequence.as_bytes(), reference.as_bytes());
@@ -632,24 +617,11 @@ fn gap_open_aligner(reference: &str, sequence: &str) -> String {
     let cigar = alignment_to_cigar(&alignment.operations);
     // println!("{:?}", cigar);
 
-    // A single gap-open (-5) is pricier than a single mismatch (-1), so inside
-    // a homopolymer/tandem-repeat run the optimal-scoring alignment above will
-    // sometimes fold part of a real indel into an adjacent base as a spurious
-    // substitution instead of a clean insertion/deletion (e.g. chrM:310, a
-    // lone T flanked by poly-C, gets reported as a false near-homoplasmic
-    // T>C "SNP" alongside a same-run C insertion). That substitution is
-    // score-optimal but not the minimal/correct edit - normalize it away.
+    // Safety net for a mismatch still folded into a homopolymer indel.
     normalize_homopolymer_indels(&cigar, reference, sequence)
 }
 
-/// Rewrites a CIGAR to eliminate a length-1 `X` sitting directly against an
-/// `I` or `D` run whenever the X's "orphaned" base (the one with no partner
-/// on the gapped side) also occurs inside that run. In that case the run can
-/// be losslessly re-anchored so the X becomes a plain match and the indel is
-/// redistributed around it: same total ref/alt content, no substitution.
-/// Left untouched when the orphaned base doesn't occur in the adjacent run -
-/// that's very likely a genuine substitution, not a homopolymer-registration
-/// artifact.
+/// Rewrite a CIGAR to remove a length-1 `X` adjacent to an `I`/`D` run when its base also occurs in the run.
 fn normalize_homopolymer_indels(cigar: &str, ref_seq: &str, alt_seq: &str) -> String {
     let ops = parse_cigar(cigar);
     let ref_bytes = ref_seq.as_bytes();
@@ -676,8 +648,7 @@ fn normalize_homopolymer_indels(cigar: &str, ref_seq: &str, alt_seq: &str) -> St
     while i < ops.len() {
         let (len, op) = ops[i];
 
-        // I(n) immediately followed by a single mismatch: the mismatch's ref
-        // base may really belong inside the insertion run.
+        // I(n) immediately followed by a single mismatch: the mismatch's ref base may really belong inside the insertion run.
         if op == 'I' && i + 1 < ops.len() && ops[i + 1] == (1, 'X') {
             let ins = &alt_bytes[alt_pos..alt_pos + len];
             let ref_x = ref_bytes[ref_pos];
@@ -708,8 +679,7 @@ fn normalize_homopolymer_indels(cigar: &str, ref_seq: &str, alt_seq: &str) -> St
             }
         }
 
-        // D(n) immediately followed by a single mismatch: mirror of I+X with
-        // ref/alt roles swapped.
+        // D(n) immediately followed by a single mismatch: mirror of I+X with ref/alt roles swapped.
         if op == 'D' && i + 1 < ops.len() && ops[i + 1] == (1, 'X') {
             let del = &ref_bytes[ref_pos..ref_pos + len];
             let alt_x = alt_bytes[alt_pos];
@@ -798,7 +768,8 @@ pub fn generate_cigar(
                 })
                 .len();
 
-            if allele_count <= minimal_read_count {
+            // Inclusive gate: an edge needs at least `minimal_read_count` reads.
+            if allele_count < minimal_read_count {
                 return (edge.clone(), None);
             }
 
@@ -883,7 +854,56 @@ pub fn generate_cigar(
 }
 
 
-pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &PathBuf, maxlength: usize) {
+/// Reads supporting the spliced edge that circularizes the reference path: those on both its tail and head.
+fn circularized_edge_reads(tail: &HashSet<String>, head: &[String]) -> HashSet<String> {
+    let head_set: HashSet<&String> = head.iter().collect();
+    tail.iter()
+        .filter(|r| head_set.contains(r))
+        .cloned()
+        .collect()
+}
+
+/// Read name -> SEQ of its primary record. Secondary, supplementary and empty-SEQ records are skipped:
+/// under default minimap2 the soft-clipped primary carries the full read, a clipped supplementary does not.
+fn read_sequences_from_bam(path: &std::path::Path) -> HashMap<String, String> {
+    let mut read_dictionary: HashMap<String, String> = HashMap::new();
+    let mut hardclipped_primaries = 0u64;
+    let mut bam = bam::Reader::from_path(path).expect("Failed to open BAM/SAM");
+    for record in bam.records() {
+        let r = record.expect("Failed to read BAM record");
+        if r.is_secondary() || r.is_supplementary() || r.seq_len() == 0 {
+            continue;
+        }
+        if !r.is_unmapped() && r.cigar().iter().any(|op| matches!(op, bam::record::Cigar::HardClip(_))) {
+            hardclipped_primaries += 1;
+        }
+        let contig = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
+        let contig_name = String::from_utf8_lossy(r.qname()).to_string();
+        match read_dictionary.get(&contig_name) {
+            Some(existing) if existing.len() >= contig.len() => {}
+            Some(_) => {
+                eprintln!(
+                    "[warn] build: multiple primary SEQ for {}; keeping longer",
+                    contig_name
+                );
+                read_dictionary.insert(contig_name, contig);
+            }
+            None => {
+                read_dictionary.insert(contig_name, contig);
+            }
+        }
+    }
+    if hardclipped_primaries > 0 {
+        eprintln!(
+            "[warn] build: {} primary record(s) contain hard clips (H); \
+             their SEQ may not be the full read",
+            hardclipped_primaries
+        );
+    }
+    read_dictionary
+}
+
+pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &PathBuf, maxlength: usize, min_edge_reads: usize) {
     // Read reference records into a vector
     let ref_reader = Reader::from_file(reference_path).unwrap();
     let reference_sequence: Vec<Record> = ref_reader.records().map(|r| r.unwrap()).collect();
@@ -911,16 +931,9 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
                 read_dictionary.insert(contig_name, contig);
             }
         }
-        Some("bam") => {
-            // Handle BAM files
+        Some("bam") | Some("sam") => {
             println!("Processing BAM file");
-            let mut bam = bam::Reader::from_path(read_path).unwrap();
-            for record in bam.records(){
-                let r = record.expect("Failed to read BAM record");
-                let contig = String::from_utf8_lossy(&r.seq().as_bytes()).to_string();
-                let contig_name = String::from_utf8_lossy(&r.qname()).to_string();
-                read_dictionary.insert(contig_name, contig);
-            }
+            read_dictionary = read_sequences_from_bam(read_path);
         },
         _ => {
             // Handle unknown file types
@@ -979,17 +992,29 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
         l_ref_seq.push_str(&edge.seq.clone());
         l_ref_reads.extend(edge.reads.clone().iter().cloned());
     }
+    let mut head_read_count = 0usize;
+    let tail_read_count = l_ref_reads.len();
     if let Some(edge) = edge_info.get(&f_ref_edge) {
         l_ref_seq.push_str(&edge.seq.clone());
-        l_ref_reads.intersection(&edge.reads.clone().iter().cloned().collect::<HashSet<_>>());
+        head_read_count = edge.reads.len();
+        l_ref_reads = circularized_edge_reads(&l_ref_reads, &edge.reads);
     }
+    println!(
+        "circularized reference edge: {} reads (tail {}, head {})",
+        l_ref_reads.len(),
+        tail_read_count,
+        head_read_count
+    );
+    // Sorted so the GFA is reproducible: HashSet iteration order is not stable across runs.
+    let mut l_ref_reads: Vec<String> = l_ref_reads.into_iter().collect();
+    l_ref_reads.sort();
     edge_info.remove(&l_ref_edge);
     edge_info.remove(&f_ref_edge);
     edge_info.insert(l_ref_edge.clone(), EdgeInfo {
         seq: l_ref_seq,
         src: f_src_anchor.clone(),
         dst: f_dst_anchor.clone(),
-        reads: l_ref_reads.iter().cloned().collect(),
+        reads: l_ref_reads,
         samples: HashSet::new(),
     });
     // Write final graph to disk.
@@ -1002,7 +1027,7 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
     let mut graph = agg::GraphicalGenome::load_graph(&tmp_gfa_path).unwrap();
 
     // generate cigar
-    generate_cigar(&mut graph, &ref_header, k, maxlength, 2);
+    generate_cigar(&mut graph, &ref_header, k, maxlength, min_edge_reads);
     let graph_output = output.with_extension("gfa");
     let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph);
 }
@@ -1011,10 +1036,32 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
 mod tests {
     use super::*;
 
-    /// Reconstructs the alt sequence a CIGAR implies, given the same ref_seq
-    /// and alt_seq the CIGAR was computed from, so tests can prove a
-    /// rewritten CIGAR still encodes exactly the same edit as the original
-    /// rather than merely "having no X".
+    /// A clipped supplementary must not replace the primary's SEQ; secondaries are skipped.
+    #[test]
+    fn read_sequences_from_bam_keeps_primary_full_seq() {
+        let dir = std::env::temp_dir().join("himito_build_bam_seq");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sam = dir.join("reads.sam");
+        let lines = [
+            "@HD\tVN:1.6\tSO:coordinate",
+            "@SQ\tSN:chrM\tLN:100",
+            "r_hard\t0\tchrM\t1\t60\t6S4M\t*\t0\t0\tACGTACGTAA\t*",
+            "r_hard\t2048\tchrM\t50\t60\t8H4M\t*\t0\t0\tACGT\t*",
+            "r_soft\t0\tchrM\t2\t60\t6S4M\t*\t0\t0\tGGGGCCCCAA\t*",
+            "r_soft\t2048\tchrM\t60\t60\t6S4M\t*\t0\t0\tGGGGCCCCAT\t*",
+            "r_lone\t0\tchrM\t3\t60\t8M\t*\t0\t0\tTTTTAAAA\t*",
+            "r_sec\t256\tchrM\t4\t0\t4M\t*\t0\t0\t*\t*",
+        ];
+        std::fs::write(&sam, lines.join("\n") + "\n").unwrap();
+
+        let mut got: Vec<(String, String)> = read_sequences_from_bam(&sam).into_iter().collect();
+        got.sort();
+        let want = [("r_hard", "ACGTACGTAA"), ("r_lone", "TTTTAAAA"), ("r_soft", "GGGGCCCCAA")];
+        assert_eq!(got, want.map(|(n, s)| (n.to_string(), s.to_string())));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reconstructs the alt sequence a CIGAR implies.
     fn reconstruct_alt(cigar: &str, _ref_seq: &str, alt_seq: &str) -> String {
         let alt_bytes = alt_seq.as_bytes();
         let mut ref_pos = 0usize;
@@ -1064,14 +1111,64 @@ mod tests {
         total
     }
 
+    /// Only reads on both halves, i.e. wrapping the origin, support the spliced edge.
+    #[test]
+    fn circularized_edge_reads_intersects_halves() {
+        let set = |names: &[&str]| -> HashSet<String> { names.iter().map(|s| s.to_string()).collect() };
+        let cases: [(&[&str], &[&str], &[&str]); 5] = [
+            (&["w1", "tail_only", "w2"], &["w1", "head_only", "w2"], &["w1", "w2"]),
+            (&["a", "b"], &["c"], &[]),
+            // An empty half gives no support, never the other half.
+            (&[], &["a"], &[]),
+            (&["a"], &[], &[]),
+            // EdgeInfo.reads is a Vec, so the head half can repeat a read name.
+            (&["a", "b"], &["a", "a"], &["a"]),
+        ];
+        for (tail, head, want) in cases {
+            let head: Vec<String> = head.iter().map(|s| s.to_string()).collect();
+            assert_eq!(circularized_edge_reads(&set(tail), &head), set(want), "{tail:?} {head:?}");
+        }
+    }
+
+    /// Scoring must favor the clean two-gap edit over one gap plus a mismatch in a homopolymer run.
+    #[test]
+    fn aligner_emits_no_spurious_snp_in_polyc_run() {
+        let ref_seq = "AAAAATTTCCACCAAACCCCCCCTCCCCCGCTTCTGGCCACAGC";
+        let alt_seq = "AAAAATTTCCACCAAACCCCCCCCCCTCCCCCCGCTTCTGGCCACAGC";
+
+        // Insertion direction, and its exact ref<->alt mirror.
+        for (r, a) in [(ref_seq, alt_seq), (alt_seq, ref_seq)] {
+            let cigar = gap_open_aligner(r, a);
+            assert!(
+                !cigar.contains('X'),
+                "poly-C indel must not be reported as a substitution, got {}",
+                cigar
+            );
+            assert_eq!(ref_consumed(&cigar), r.len());
+            assert_eq!(reconstruct_alt(&cigar, r, a), a);
+        }
+    }
+
+    /// The gap-friendly scoring keeps plain edits: an isolated SNP, identity, an empty alt and a deletion.
+    #[test]
+    fn aligner_keeps_plain_edits() {
+        for (r, a, want) in [
+            ("ACGTACGTACGTACGT", "ACGTACGAACGTACGT", "7=1X8="),
+            ("ACGTACGTAC", "ACGTACGTAC", "10="),
+            ("ACGTACGTAC", "", "10D"),
+        ] {
+            assert_eq!(gap_open_aligner(r, a), want);
+        }
+        let (r, a) = ("ACGTACGTTTTACGTACGT", "ACGTACGTACGTACGT");
+        let del = gap_open_aligner(r, a);
+        assert!(del.contains('D') && !del.contains('X'), "got {}", del);
+        assert_eq!(ref_consumed(&del), r.len());
+        assert_eq!(reconstruct_alt(&del, r, a), a);
+    }
+
     #[test]
     fn homopolymer_insertion_absorbs_adjacent_mismatch() {
-        // Real chrM 287-330 window from an NA12877 poly-C tract (7 C's, a
-        // lone T at what would be chrM:310, then 5 more C's). The sample's
-        // edge inserts 4 extra C's in that stretch; the raw aligner's optimal
-        // scoring path represents 3 of them as a clean "I" but folds the 4th
-        // together with the flanking T into a spurious "1X" (T>C) - a false
-        // homoplasmic SNP that doesn't exist in any real read.
+        // chrM poly-C tract: the edge inserts 4 C's; the raw CIGAR folds the 4th and a lone T into a spurious T>C.
         let ref_seq = "AAAAATTTCCACCAAACCCCCCCTCCCCCGCTTCTGGCCACAGC";
         let alt_seq = "AAAAATTTCCACCAAACCCCCCCCCCTCCCCCCGCTTCTGGCCACAGC";
         let raw_cigar = "23=4I1X20=";
@@ -1090,10 +1187,7 @@ mod tests {
 
     #[test]
     fn genuine_snp_next_to_unrelated_indel_is_left_alone() {
-        // A real substitution (ref 'G', alt 'A') sitting right next to an
-        // insertion whose inserted base never equals the mismatched ref base
-        // - there is no way to re-anchor this without changing content, so
-        // it must be left as a real X.
+        // A real substitution next to an insertion whose bases never equal the mismatched ref base.
         let ref_seq = "ACGTACGTG";
         let alt_seq = "ACGTACGTTTA"; // insert "TT" then mismatch G->A
         let raw_cigar = "8=2I1X";
@@ -1106,9 +1200,7 @@ mod tests {
 
     #[test]
     fn homopolymer_deletion_absorbs_adjacent_mismatch() {
-        // Exact role-swap (ref<->alt, I<->D) of homopolymer_insertion_absorbs_adjacent_mismatch:
-        // a deletion is just an insertion viewed from the other sequence, so
-        // this is the same real chrM poly-C edit, mirrored.
+        // Exact role-swap of homopolymer_insertion_absorbs_adjacent_mismatch.
         let ref_seq = "AAAAATTTCCACCAAACCCCCCCCCCTCCCCCCGCTTCTGGCCACAGC";
         let alt_seq = "AAAAATTTCCACCAAACCCCCCCTCCCCCGCTTCTGGCCACAGC";
         let raw_cigar = "23=4D1X20=";

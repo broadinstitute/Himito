@@ -174,7 +174,7 @@ task CalculateCoverage {
     output {
         Float coverage = read_float("coverage.txt")
         File subsetbam =  "~{prefix}.bam"
-        File subsetbai = " ~{prefix}.bam.bai"
+        File subsetbai = "~{prefix}.bam.bai"
     }
 
     #########################

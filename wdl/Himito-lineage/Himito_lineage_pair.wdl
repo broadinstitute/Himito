@@ -161,7 +161,9 @@ task CalculateCoverage {
     command <<<
         set -euxo pipefail
         
+        set +x
         export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
+        set -x
         export GCS_REQUESTER_PAYS_PROJECT="~{billing_project}"
         samtools view -bhX ~{bam} ~{bai} ~{locus} > ~{prefix}.bam
         samtools index ~{prefix}.bam

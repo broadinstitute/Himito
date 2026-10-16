@@ -36,13 +36,6 @@ cd Himito
 cargo build --release
 ```
 
-**Or download a prebuilt Linux binary** from [GitHub Releases](https://github.com/broadinstitute/Himito/releases):
-```bash
-wget https://github.com/broadinstitute/Himito/releases/download/v1.1.2/Himito
-chmod +x Himito
-./Himito --help
-```
-
 ### Restricted network environments (incl. China)
 
 If GitHub, Docker Hub, or `crates.io` are slow or unreachable, use the **Zenodo source archive**, Cargo/rustup mirrors, or an offline `cargo build --offline` workflow. See **[Installation in restricted network environments](docs/install_restricted_network.md)**.

@@ -29,7 +29,8 @@ workflow Modkit_entropy{
         input:
             bam = select_first([SubsetBam.subset_bam, bam]),
             bai = select_first([SubsetBam.subset_bai, bai]),
-            prefix = output_prefix
+            prefix = output_prefix,
+            locus = select_first([locus])
     }
 
     call Modkit_entropy_task{input:
@@ -210,13 +211,14 @@ task Filter {
         File bam
         File bai
         String prefix
+        String locus
 
         RuntimeAttr? runtime_attr_override
     }
 
     command <<<
         set -euxo pipefail
-        /Himito/target/release/Himito filter -i ~{bam} -c chrM -m ~{prefix}_mt.bam -n ~{prefix}_numts.bam
+        /Himito/target/release/Himito filter -i ~{bam} -c ~{locus} -m ~{prefix}_mt.bam -n ~{prefix}_numts.bam
     >>>
 
     Int disk_size = 4*ceil(size([bam, bai], "GB"))

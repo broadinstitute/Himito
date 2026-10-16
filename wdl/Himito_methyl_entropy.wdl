@@ -170,7 +170,9 @@ task SubsetBam {
     command <<<
         set -euxo pipefail
 
+        set +x
         export GCS_OAUTH_TOKEN=$(gcloud auth application-default print-access-token)
+        set -x
 
         samtools view -bhX ~{bam} ~{bai} ~{locus} > ~{prefix}.bam
         samtools index ~{prefix}.bam

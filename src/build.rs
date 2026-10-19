@@ -444,6 +444,56 @@ pub fn create_edge_file(
     (edge_info, outgoing)
 }
 
+/// Convert build-time anchor/edge maps into a `GraphicalGenome` in memory.
+/// Avoids the old write-`tmp.gfa`/reload round-trip (large, cwd-dependent, truncatable).
+pub fn graphical_genome_from_build(
+    final_anchor: &HashMap<String, AnchorInfo>,
+    edge_info: &HashMap<String, EdgeInfo>,
+) -> GraphicalGenome {
+    let mut anchor = HashMap::new();
+    for (name, info) in final_anchor {
+        anchor.insert(
+            name.clone(),
+            serde_json::json!({
+                "pos": info.pos,
+                "seq": info.seq,
+            }),
+        );
+    }
+
+    let mut edges = HashMap::new();
+    let mut outgoing: HashMap<String, Vec<String>> = HashMap::new();
+    let mut incoming: HashMap<String, Vec<String>> = HashMap::new();
+
+    let mut edge_keys: Vec<_> = edge_info.keys().collect();
+    edge_keys.sort();
+    for edge in edge_keys {
+        let e = &edge_info[edge];
+        let samples: Vec<String> = e.samples.iter().cloned().collect();
+        edges.insert(
+            edge.clone(),
+            serde_json::json!({
+                "seq": e.seq,
+                "reads": e.reads,
+                "samples": samples,
+                "src": [e.src.clone()],
+                "dst": [e.dst.clone()],
+            }),
+        );
+        outgoing.entry(e.src.clone()).or_default().push(edge.clone());
+        incoming.entry(edge.clone()).or_default().push(e.src.clone());
+        outgoing.entry(edge.clone()).or_default().push(e.dst.clone());
+        incoming.entry(e.dst.clone()).or_default().push(edge.clone());
+    }
+
+    GraphicalGenome {
+        anchor,
+        edges,
+        outgoing,
+        incoming,
+    }
+}
+
 pub fn write_gfa(
     final_anchor: &HashMap<String, AnchorInfo>,
     edge_info: &HashMap<String, EdgeInfo>,
@@ -507,21 +557,23 @@ pub fn write_gfa(
             )
         };
         edge_output.push(formatted_string);
-        
+
         link_output.push(format!("L\t{}\t+\t{}\t+\t0M", src, edge));
         link_output.push(format!("L\t{}\t+\t{}\t+\t0M", edge, dst));
-
     }
 
+    // Write L lines before bulky edge S lines so topology survives if the write is truncated
+    // (edge records embed full read-name lists and can be tens of MB).
     for s in anchor_output {
-        writeln!(file, "{}", s)?;
-    }
-    for s in edge_output {
         writeln!(file, "{}", s)?;
     }
     for l in link_output {
         writeln!(file, "{}", l)?;
     }
+    for s in edge_output {
+        writeln!(file, "{}", s)?;
+    }
+    file.flush()?;
     Ok(())
 }
 
@@ -1017,19 +1069,13 @@ pub fn start(output: &PathBuf, k: usize, read_path: &PathBuf, reference_path: &P
         reads: l_ref_reads,
         samples: HashSet::new(),
     });
-    // Write final graph to disk.
-    let _ = write_gfa(
-        &final_anchor,
-        &edge_info,
-        "tmp.gfa",
-    );
-    let tmp_gfa_path = PathBuf::from("tmp.gfa");
-    let mut graph = agg::GraphicalGenome::load_graph(&tmp_gfa_path).unwrap();
+    let mut graph = graphical_genome_from_build(&final_anchor, &edge_info);
 
     // generate cigar
     generate_cigar(&mut graph, &ref_header, k, maxlength, min_edge_reads);
     let graph_output = output.with_extension("gfa");
-    let _ = write_graph_from_graph(graph_output.to_str().unwrap(), &graph);
+    write_graph_from_graph(graph_output.to_str().unwrap(), &graph)
+        .unwrap_or_else(|e| panic!("failed to write graph {}: {e}", graph_output.display()));
 }
 
 #[cfg(test)]
@@ -1059,6 +1105,42 @@ mod tests {
         let want = [("r_hard", "ACGTACGTAA"), ("r_lone", "TTTTAAAA"), ("r_soft", "GGGGCCCCAA")];
         assert_eq!(got, want.map(|(n, s)| (n.to_string(), s.to_string())));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn graphical_genome_from_build_wires_topology() {
+        let mut anchors = HashMap::new();
+        anchors.insert(
+            "A000001".to_string(),
+            AnchorInfo {
+                seq: "ACGT".to_string(),
+                pos: 1,
+            },
+        );
+        anchors.insert(
+            "A000010".to_string(),
+            AnchorInfo {
+                seq: "TGCA".to_string(),
+                pos: 10,
+            },
+        );
+        let mut edges = HashMap::new();
+        edges.insert(
+            "E00000001".to_string(),
+            EdgeInfo {
+                seq: "NNNN".to_string(),
+                src: "A000001".to_string(),
+                dst: "A000010".to_string(),
+                reads: vec!["r1".to_string()],
+                samples: HashSet::new(),
+            },
+        );
+
+        let g = graphical_genome_from_build(&anchors, &edges);
+        assert_eq!(g.incoming["E00000001"], vec!["A000001".to_string()]);
+        assert_eq!(g.outgoing["E00000001"], vec!["A000010".to_string()]);
+        assert_eq!(g.edges["E00000001"]["seq"], "NNNN");
+        assert_eq!(g.anchor["A000001"]["pos"], 1);
     }
 
     /// Reconstructs the alt sequence a CIGAR implies.

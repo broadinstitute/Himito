@@ -24,6 +24,47 @@ pub fn add_unique(vec: &mut Vec<String>, item: String) {
     }
 }
 
+/// Edge endpoints stored in PG:J as `"src":["A…"]` / `"dst":["A…"]` (see `build::write_gfa`).
+fn edge_endpoints(edge_data: &Value) -> Option<(String, String)> {
+    let src = edge_data
+        .get("src")?
+        .as_array()?
+        .first()?
+        .as_str()?
+        .to_string();
+    let dst = edge_data
+        .get("dst")?
+        .as_array()?
+        .first()?
+        .as_str()?
+        .to_string();
+    Some((src, dst))
+}
+
+/// Ensure every edge has incoming/outgoing adjacency, recovering from PG:J when L lines were missing.
+fn ensure_edge_topology(
+    edges: &HashMap<String, Value>,
+    outgoing: &mut HashMap<String, Vec<String>>,
+    incoming: &mut HashMap<String, Vec<String>>,
+) {
+    for (edge, data) in edges {
+        if incoming.contains_key(edge) && outgoing.contains_key(edge) {
+            continue;
+        }
+        let Some((src, dst)) = edge_endpoints(data) else {
+            continue;
+        };
+        if !incoming.contains_key(edge) {
+            incoming.insert(edge.clone(), vec![src.clone()]);
+            add_unique(outgoing.entry(src).or_default(), edge.clone());
+        }
+        if !outgoing.contains_key(edge) {
+            outgoing.insert(edge.clone(), vec![dst.clone()]);
+            add_unique(incoming.entry(dst).or_default(), edge.clone());
+        }
+    }
+}
+
 
 #[must_use]
 pub fn reverse_complement(kmer: &str) -> String {
@@ -90,6 +131,8 @@ impl GraphicalGenome {
                     .push(src.to_string());
             }
         }
+        // Truncated GFAs (e.g. write failed after S lines, before L) still carry src/dst in PG:J.
+        ensure_edge_topology(&edge_dict, &mut outgoing, &mut incoming);
         Ok(GraphicalGenome {
             anchor: anchor_dict,
             edges: edge_dict,
@@ -305,8 +348,18 @@ pub fn write_graph_from_graph(filename: &str, graph: &GraphicalGenome) -> std::i
     for edge in edge_keys.iter() {
         let edge_data = &graph.edges[*edge];
         let seq = edge_data["seq"].as_str().unwrap_or_default();
-        let src = graph.incoming[*edge][0].clone();
-        let dst = graph.outgoing[*edge][0].clone();
+        let (src, dst) = edge_endpoints(edge_data)
+            .or_else(|| {
+                let src = graph.incoming.get(*edge)?.first()?.clone();
+                let dst = graph.outgoing.get(*edge)?.first()?.clone();
+                Some((src, dst))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "edge {} missing src/dst (no PG:J endpoints and no L-derived adjacency)",
+                    edge
+                )
+            });
         let mut edge_data_clone = edge_data.clone();
         edge_data_clone.as_object_mut().unwrap().remove("seq");
         let json_string =
@@ -334,11 +387,12 @@ pub fn write_graph_from_graph(filename: &str, graph: &GraphicalGenome) -> std::i
         link_output.push(format!("L\t{}\t+\t{}\t+\t0M", src, edge));
         link_output.push(format!("L\t{}\t+\t{}\t+\t0M", edge, dst));
     }
-    for s in edge_output {
-        writeln!(file, "{}", s)?;
-    }
+    // Links before edge segments: edge S lines can be huge (embedded read lists).
     for l in link_output {
         writeln!(file, "{}", l)?;
+    }
+    for s in edge_output {
+        writeln!(file, "{}", s)?;
     }
     Ok(())
 }
@@ -494,4 +548,78 @@ pub fn construct_major_haplotype_entitylist(graph:&GraphicalGenome) -> Vec<Strin
     haplotype.push(next_edge.clone());
     haplotype
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// GFA with edge src/dst in PG:J but no L lines (truncated write / ignored IO error).
+    fn gfa_edges_without_links(path: &std::path::Path) {
+        let mut f = File::create(path).unwrap();
+        writeln!(f, "H\tVN:Z:1.0").unwrap();
+        writeln!(f, "S\tA000001\tACGT\tPG:J:{{\"pos\":1}}").unwrap();
+        writeln!(f, "S\tA000002\tTGCA\tPG:J:{{\"pos\":10}}").unwrap();
+        writeln!(
+            f,
+            "S\tE00000001\tNNNN\tPG:J:{{\"src\":[\"A000001\"],\"dst\":[\"A000002\"],\"reads\":[\"r1\"]}}\tRC:i:1"
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn load_graph_recovers_topology_from_edge_json_without_l_lines() {
+        let dir = std::env::temp_dir().join(format!("himito_agg_nolinks_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nolinks.gfa");
+        gfa_edges_without_links(&path);
+
+        let graph = GraphicalGenome::load_graph(&path).unwrap();
+        assert!(graph.edges.contains_key("E00000001"));
+        assert_eq!(graph.incoming["E00000001"], vec!["A000001".to_string()]);
+        assert_eq!(graph.outgoing["E00000001"], vec!["A000002".to_string()]);
+        assert_eq!(graph.outgoing["A000001"], vec!["E00000001".to_string()]);
+        assert_eq!(graph.incoming["A000002"], vec!["E00000001".to_string()]);
+    }
+
+    #[test]
+    fn write_graph_from_graph_uses_edge_json_when_incoming_missing() {
+        let dir = std::env::temp_dir().join(format!("himito_agg_write_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.gfa");
+
+        let mut edges = HashMap::new();
+        edges.insert(
+            "E00000001".to_string(),
+            serde_json::json!({
+                "seq": "NNNN",
+                "src": ["A000001"],
+                "dst": ["A000002"],
+                "reads": ["r1"]
+            }),
+        );
+        let mut anchor = HashMap::new();
+        anchor.insert("A000001".to_string(), serde_json::json!({"seq": "ACGT", "pos": 1}));
+        anchor.insert("A000002".to_string(), serde_json::json!({"seq": "TGCA", "pos": 10}));
+
+        let graph = GraphicalGenome {
+            anchor,
+            edges,
+            // Simulate load after a truncated GFA with no L lines.
+            outgoing: HashMap::new(),
+            incoming: HashMap::new(),
+        };
+
+        write_graph_from_graph(out.to_str().unwrap(), &graph).unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert!(
+            text.contains("L\tA000001\t+\tE00000001\t+\t0M"),
+            "missing src->edge link:\n{text}"
+        );
+        assert!(
+            text.contains("L\tE00000001\t+\tA000002\t+\t0M"),
+            "missing edge->dst link:\n{text}"
+        );
+    }
 }

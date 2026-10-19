@@ -100,7 +100,7 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 2, hide_short_help = true)]
         minimal_ac: usize,
 
-        /// minimum heteroplasmic frequency for a variant (preset by data type)
+        /// minimum heteroplasmic frequency for a variant [default: 0.01]
         #[clap(short, long, value_parser, hide_short_help = true)]
         vaf_threshold: Option<f32>,
 
@@ -113,7 +113,7 @@ enum Commands {
         heteroplasmic_frequency_threshold: Option<f64>,
 
         /// p-value cutoff of the strand-bias filter
-        #[clap(long, value_parser, default_value_t = 0.05, hide_short_help = true)]
+        #[clap(long, value_parser, default_value_t = 0.01, hide_short_help = true)]
         strand_bias_threshold: f64,
 
         /// indels below this HF are flagged Potential_Artifact (preset by data type)
@@ -132,7 +132,7 @@ enum Commands {
         #[clap(long = "no-left-align", action, hide_short_help = true)]
         no_left_align: bool,
 
-        /// turn off read-linkage rescue of low-frequency SNVs (ONT only)
+        /// turn off read-linkage rescue of low-frequency SNVs
         #[clap(long = "no-linkage-rescue", action, hide_short_help = true)]
         no_linkage_rescue: bool,
 
@@ -140,8 +140,8 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = DENOISE_KEEP_VAF, hide_short_help = true)]
         denoise_keep_vaf: f64,
 
-        /// PacBio opt-in: admit out-of-tract small indels with HF ≥ this (still < indel_false_threshold)
-        #[clap(long, value_parser, hide = true)]
+        /// PacBio: out-of-tract small indels with HF from this up to --indel-false-threshold PASS only if they pass the linkage test; a value at or above --indel-false-threshold turns this off [default: 0.015]
+        #[clap(long, value_parser, hide_short_help = true)]
         indel_linked_min_hf: Option<f64>,
     },
 
@@ -309,7 +309,7 @@ enum Commands {
         #[clap(short, long, value_parser, default_value_t = 2, hide_short_help = true)]
         minimal_ac: usize,
 
-        /// minimum heteroplasmic frequency for a variant (preset by data type)
+        /// minimum heteroplasmic frequency for a variant [default: 0.01]
         #[clap(short, long, value_parser, hide_short_help = true)]
         vaf_threshold: Option<f32>,
 
@@ -341,8 +341,8 @@ enum Commands {
         #[clap(long = "no-left-align", action, hide_short_help = true)]
         no_left_align: bool,
 
-        /// PacBio opt-in: admit out-of-tract small indels with HF ≥ this (still < indel_false_threshold)
-        #[clap(long, value_parser, hide = true)]
+        /// PacBio: out-of-tract small indels with HF from this up to --indel-false-threshold PASS only if they pass the linkage test; a value at or above --indel-false-threshold turns this off [default: 0.015]
+        #[clap(long, value_parser, hide_short_help = true)]
         indel_linked_min_hf: Option<f64>,
     },
 
@@ -589,6 +589,7 @@ fn main() {
                 call::resolve_thresholds(&data_type, p_value_threshold, heteroplasmic_frequency_threshold, permutation_frequency_threshold);
             let indel_false_threshold = call::resolve_indel_false_threshold(&data_type, indel_false_threshold);
             let vaf_threshold = call::resolve_vaf(&data_type, vaf_threshold);
+            let indel_linked_min_hf = call::resolve_indel_linked_min_hf(indel_linked_min_hf);
             let mt_output = output_prefix.with_extension("mt.bam");
             let numts_output = output_prefix.with_extension("numts.bam");
             let _ = filter::start(
@@ -735,6 +736,7 @@ fn main() {
                 call::resolve_thresholds(&data_type, p_value_threshold, frequency_threshold, permutation_frequency_threshold);
             let indel_false_threshold = call::resolve_indel_false_threshold(&data_type, indel_false_threshold);
             let vaf_threshold = call::resolve_vaf(&data_type, vaf_threshold);
+            let indel_linked_min_hf = call::resolve_indel_linked_min_hf(indel_linked_min_hf);
             call::start(
                 &graphfile,
                 &reference_fasta,

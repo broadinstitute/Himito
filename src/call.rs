@@ -9,7 +9,7 @@ use std::path::Path;
 use std::{collections::HashSet, path::PathBuf};
 use std::error::Error;
 use csv::Writer;
-use ndarray::{Array2, Axis, s};
+use ndarray::{Array2, Axis};
 use statrs::distribution::{Binomial, DiscreteCDF, Poisson};
 use adjustp::{adjust, Procedure};
 use bio::io::fasta::{Reader, Record};
@@ -1150,12 +1150,14 @@ fn write_matrix_to_csv<P: AsRef<Path>>(
     Ok(())
 }
 
-fn alt_frequency(vector: ndarray::ArrayView1<f64>) -> f64 {
-    let covered: Vec<f64> = vector.iter().filter(|x| !x.is_nan()).copied().collect();
-    if covered.is_empty() {
-        return 0.0;
+/// A variant's HF at its site as written to the VCF: allele count over graph depth (0 without coverage).
+fn site_hf(v: &Variant, coverage: &HashMap<usize, usize>) -> f64 {
+    let depth = coverage.get(&v.pos).copied().unwrap_or(0);
+    if depth == 0 {
+        0.0
+    } else {
+        v.allele_count as f64 / depth as f64
     }
-    covered.iter().sum::<f64>() / covered.len() as f64
 }
 
 /// Build a map from read name (BAM qname) to strand, using primary, mapped alignments only.
@@ -1687,7 +1689,7 @@ fn indel_in_hp_tract(v: &Variant) -> bool {
     crate::tracts::overlaps_tract(&span) || matches!(span.start, 301..=316 | 512..=526 | 16181..=16194)
 }
 
-/// Opt-in PacBio promotion (`--indel-linked-min-hf`): an out-of-tract small indel with HF in
+/// PacBio promotion (`--indel-linked-min-hf`, default `PB_INDEL_LINKED_MIN_HF`): an out-of-tract small indel with HF in
 /// `[min_hf, indel_false_threshold)` is permutation-tested and, if it survives, written as PASS.
 fn promoted_pb_indel(v: &Variant, hf: f64, data_type: &str, indel_false_threshold: f64, min_hf: Option<f64>) -> bool {
     let indel_len = (v.ref_allele.len() as i32 - v.alt_allele.len() as i32).abs();
@@ -1756,11 +1758,13 @@ fn permutation_test(
     };
 
     let names: Vec<String> = filtered_var.iter().map(generate_variant_name).collect();
-    // No null for a variant above `permutation_frequency_threshold` by MATRIX alt frequency.
+    // No null for a variant above `permutation_frequency_threshold`. The gate reads the site HF (AC / DP, as in the
+    // VCF), not the matrix row: a row whose matrix covers only its carriers (m.33, next to the origin) reads 1.0
+    // there and would otherwise skip the test.
     let tested: Vec<usize> = (0..filtered_var.len())
         .filter(|&i| {
-            admitted(&filtered_var[i])
-                && alt_frequency(matrix.slice(s![i, ..])) <= permutation_frequency_threshold
+            let v = &filtered_var[i];
+            admitted(v) && site_hf(v, coverage) <= permutation_frequency_threshold
         })
         .collect();
     let partners = partners_of(&tested, filtered_var, coverage, data_type);
@@ -1808,9 +1812,19 @@ pub fn resolve_indel_false_threshold(data_type: &str, explicit: Option<f64>) -> 
     explicit.unwrap_or(if is_ont(data_type) { 0.015 } else { 0.1 })
 }
 
-/// Floor on heteroplasmic frequency for calling (`-v`). PacBio defaults to 0.002; others to 0.01.
-pub fn resolve_vaf(data_type: &str, explicit: Option<f32>) -> f32 {
-    explicit.unwrap_or(if data_type == "pacbio" { 0.002 } else { 0.01 })
+/// Floor on heteroplasmic frequency for calling (`-v`): 0.01 for every data type.
+pub fn resolve_vaf(_data_type: &str, explicit: Option<f32>) -> f32 {
+    explicit.unwrap_or(0.01)
+}
+
+/// Default lower HF bound of PacBio small-indel promotion (`--indel-linked-min-hf`): out-of-tract small indels
+/// with HF in `[this, indel_false_threshold)` are linkage-tested and written as PASS if they survive.
+pub const PB_INDEL_LINKED_MIN_HF: f64 = 0.015;
+
+/// `--indel-linked-min-hf`, defaulting to `PB_INDEL_LINKED_MIN_HF`; only PacBio reads it (`promoted_pb_indel`).
+/// A value at or above `indel_false_threshold` promotes nothing.
+pub fn resolve_indel_linked_min_hf(explicit: Option<f64>) -> Option<f64> {
+    Some(explicit.unwrap_or(PB_INDEL_LINKED_MIN_HF))
 }
 
 pub fn start(
@@ -1859,12 +1873,12 @@ pub fn start(
     let (matrix, var_record, read_set) =
         construct_matrix(&read_record, &cover_record, &filtered_var);
     let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
-    let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
+    // let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
 
     // Strand-bias filtering runs before the permutation test so artifacts do not feed its null.
     let action = if data_type == "ont-denoised" { StrandBiasAction::Drop } else { StrandBiasAction::Flag };
-    // Linkage rescue runs on ONT only; PacBio is not evaluated.
-    let linkage_bam = bam.filter(|_| is_ont(data_type) && !no_linkage_rescue);
+    // Linkage rescue runs on every data type (with a BAM, unless `--no-linkage-rescue`).
+    let linkage_bam = bam.filter(|_| !no_linkage_rescue);
     let (sb_filtered_var, sb_matrix) = match bam {
         Some(bam) => {
             let (strand_map, fwd_frac) = build_strand_map(bam);
@@ -2017,6 +2031,7 @@ fn write_final_matrix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::s;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use serde_json::json;
@@ -2162,15 +2177,30 @@ mod tests {
     }
 
     #[test]
-    fn permutation_test_keeps_variants_it_cannot_test() {
-        // Alt in 9 of 10 matrix reads: above the 0.7 permutation frequency threshold, so no null is drawn,
-        // although allele_count / depth = 0.02 admits both variants.
+    fn permutation_test_keeps_variants_without_draws() {
+        // No permutation rounds, so no null is drawn: missing evidence, not evidence of an artifact.
         let variants = vec![snp(100, "A", 2), snp(200, "C", 2)];
         let mut matrix = Array2::<f64>::zeros((2, 10));
         matrix.slice_mut(s![.., ..9]).fill(1.0);
         let coverage: HashMap<usize, usize> = [(100, 100), (200, 100)].into_iter().collect();
-        let (kept, _) = permutation_test(&matrix, 0.5, 0.5, 16, &variants, &coverage, 0.7, "ont-denoised", 0.015, None);
+        let (kept, _) = permutation_test(&matrix, 0.5, 0.5, 0, &variants, &coverage, 0.7, "ont-denoised", 0.015, None);
         assert_eq!(kept.len(), 2, "an untested variant must be kept, not dropped");
+    }
+
+    #[test]
+    fn permutation_test_gates_on_site_hf_not_matrix_coverage() {
+        // The m.33 case: the matrix row covers only its 9 carriers (matrix alt frequency 1.0) while AC / DP is
+        // 9 / 150. It is tested on its site HF, shows no linkage and is dropped; the lineage pair survives.
+        let variants = vec![snp(100, "A", 3), snp(200, "C", 3), var(33, "CG", "C", 9)];
+        let mut matrix = Array2::<f64>::zeros((3, 30));
+        matrix.slice_mut(s![0..2, 0..3]).fill(1.0);
+        matrix.slice_mut(s![2, ..]).fill(f64::NAN);
+        matrix.slice_mut(s![2, 10..19]).fill(1.0);
+        let coverage: HashMap<usize, usize> = [(100, 30), (200, 30), (33, 150)].into_iter().collect();
+        let (kept, _) = permutation_test(&matrix, 0.5, 0.2, 200, &variants, &coverage, 0.7, "ont-r10", 0.015, None);
+        let names: Vec<String> = kept.iter().map(generate_variant_name).collect();
+        assert!(!names.contains(&generate_variant_name(&variants[2])), "a carriers-only row must not skip the test");
+        assert_eq!(names.len(), 2, "the lineage pair survives");
     }
 
     /// X sits on 45 random reads of the majority lineage A (reads 0..240), next to minor lineages B and C.
@@ -2342,10 +2372,12 @@ mod tests {
             assert_eq!(resolve_thresholds(dt, None, None, None), want, "{dt}");
             assert_eq!(resolve_vaf(dt, None), 0.01, "{dt}");
         }
-        assert_eq!(resolve_vaf("pacbio", None), 0.002);
+        assert_eq!(resolve_vaf("pacbio", None), 0.01);
         // An explicit value wins, 0 included.
         assert_eq!(resolve_vaf("pacbio", Some(0.05)), 0.05);
         assert_eq!(resolve_vaf("ont-r10", Some(0.0)), 0.0);
+        assert_eq!(resolve_indel_linked_min_hf(None), Some(PB_INDEL_LINKED_MIN_HF));
+        assert_eq!(resolve_indel_linked_min_hf(Some(1.0)), Some(1.0));
     }
 
     #[test]

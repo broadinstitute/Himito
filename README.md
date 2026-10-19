@@ -99,7 +99,7 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ```
 
 `-b/--bam` takes the raw (pre-denoise) BAM of the same reads. It drives the strand-bias
-filter, ONT linkage rescue and `<output>.matrix.csv`. `--input-bam` is accepted as an alias.
+filter, linkage rescue and `<output>.matrix.csv`. `--input-bam` is accepted as an alias.
 Without `-b`, the matrix comes from the graph and the strand filter and linkage rescue are off.
 The strand-bias action, permutation mode and genotyping gates are set by the data type.
 

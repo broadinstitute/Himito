@@ -55,7 +55,7 @@ Options:
           [default: 2]
 
   -v, --vaf-threshold <VAF_THRESHOLD>
-          minimum heteroplasmic frequency for a variant (preset by data type)
+          minimum heteroplasmic frequency for a variant [default: 0.01]
 
       --p-value-threshold <P_VALUE_THRESHOLD>
           permutation-test p-value cutoff; 1 disables it (preset by data type)
@@ -66,7 +66,7 @@ Options:
       --strand-bias-threshold <STRAND_BIAS_THRESHOLD>
           p-value cutoff of the strand-bias filter
           
-          [default: 0.05]
+          [default: 0.01]
 
       --indel-false-threshold <INDEL_FALSE_THRESHOLD>
           indels below this HF are flagged Potential_Artifact (preset by data type)
@@ -83,12 +83,15 @@ Options:
           keep the graph's indel spellings instead of left-aligning them
 
       --no-linkage-rescue
-          turn off read-linkage rescue of low-frequency SNVs (ONT only)
+          turn off read-linkage rescue of low-frequency SNVs
 
       --denoise-keep-vaf <DENOISE_KEEP_VAF>
           keep threshold of the denoise site model (ont-denoised only)
           
           [default: 0.03]
+
+      --indel-linked-min-hf <INDEL_LINKED_MIN_HF>
+          PacBio: out-of-tract small indels with HF from this up to --indel-false-threshold PASS only if they pass the linkage test; a value at or above --indel-false-threshold turns this off [default: 0.015]
 
   -h, --help
           Print help (see a summary with '-h')

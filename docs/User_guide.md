@@ -139,7 +139,7 @@ Required Parameters:
 
 Optional:
 - -b, --bam <FILE>: raw (pre-denoise) BAM of the same reads. It drives the strand-bias filter,
-  ONT linkage rescue and `<output>.matrix.csv`. `--input-bam` is an alias. Without it the matrix
+  linkage rescue and `<output>.matrix.csv`. `--input-bam` is an alias. Without it the matrix
   comes from the graph and the strand filter and linkage rescue are off.
 
 Advanced options are hidden from `-h` and listed by `--help`: `-k`, `-m`, `-v`, `-p`, `-f`,

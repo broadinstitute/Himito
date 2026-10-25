@@ -1253,20 +1253,24 @@ pub fn write_variant_cooccurrence(matrix: &CleanedMatrix, n: usize, path: &str) 
     write_cooccurrence(&matrix.variants[..n], matrix.reads.len(), |v, r| Some(matrix.data[v][r]), path)
 }
 
-/// One row per annotate-only tract allele: its observed linkage to the informative variants.
+/// One row per reported tract allele (placed or withheld): its observed linkage to the other informative variants.
 /// `best_partner` is the informative variant with odds ratio > 1 and the smallest BH q (ties: smaller p, then
 /// matrix order); `linked` says whether that q is <= 0.05. The q values are corrected over the annotated x
 /// informative pairs only, so they differ from the same pair's q in `variant_cooccurrence.tsv`.
 fn write_tract_annotation(
     matrix: &BinaryMatrix,
-    annotated: &[usize],
+    reported: &[usize],
     informative: &[usize],
-    annotate: &[Option<TractAnnotation>],
+    tract: &[Option<TractReport>],
     path: &str,
 ) -> Result<()> {
     let mut pairs: Vec<(usize, usize, PairCooccurrence)> = Vec::new();
-    for &a in annotated {
+    for &a in reported {
         for &u in informative {
+            // A placed allele is itself informative; it has no linkage to itself.
+            if u == a {
+                continue;
+            }
             let (mut n11, mut n10, mut n01, mut n00) = (0usize, 0usize, 0usize, 0usize);
             for r in 0..matrix.reads.len() {
                 if let (Some(x), Some(y)) = (matrix.data[a][r], matrix.data[u][r]) {
@@ -1289,10 +1293,10 @@ fn write_tract_annotation(
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
     writeln!(
         w,
-        "variant\thf\trun_class\trun_length\tbest_partner\tn_co\tn11\todds_ratio\tfisher_p\tfisher_q\tlinked\treason"
+        "variant\thf\trun_class\trun_length\tplaced\tbest_partner\tn_co\tn11\todds_ratio\tfisher_p\tfisher_q\tlinked\treason"
     )?;
-    for &a in annotated {
-        let info = annotate[a].as_ref().expect("annotated variants carry an annotation");
+    for &a in reported {
+        let info = tract[a].as_ref().expect("reported variants carry a tract report");
         let (_, _, hf) = crate::lineage::row_hf(&matrix.data[a]);
         let best = pairs
             .iter()
@@ -1316,10 +1320,11 @@ fn write_tract_annotation(
         };
         writeln!(
             w,
-            "{}\t{hf:.6}\t{}\t{}\t{}\t{}",
+            "{}\t{hf:.6}\t{}\t{}\t{}\t{}\t{}",
             matrix.variants[a],
             info.run_class,
             info.run_length,
+            if info.placed { "yes" } else { "no" },
             fields.join("\t"),
             info.reason
         )?;
@@ -1916,11 +1921,15 @@ fn resolve_span_conflicts(
     rb
 }
 
-/// Why a tract allele is reported but kept out of the tree search.
+/// What `lineage` measured about a homopolymer-tract allele, and whether the tree places it.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TractAnnotation {
+pub struct TractReport {
     pub run_class: String,
     pub run_length: usize,
+    /// Placed as a tree node. `false` only under `--tract-alleles annotate`.
+    pub placed: bool,
+    /// `calibrated (run L <= calibrated M)`, `beyond_calibration (run L > calibrated M)`,
+    /// or `--tract-alleles annotate`.
     pub reason: String,
 }
 
@@ -1929,8 +1938,8 @@ pub struct TractAnnotation {
 pub struct VariantModel {
     /// `(fp, fn)` of every variant: SCITE scoring, and `.1` as its root-block dropout.
     pub rates: Vec<(f64, f64)>,
-    /// `Some` for tract alleles that are reported but never placed; empty means none.
-    pub annotate: Vec<Option<TractAnnotation>>,
+    /// `Some` for every variant recognised as a homopolymer-tract allele; empty means none were.
+    pub tract: Vec<Option<TractReport>>,
     /// Homopolymer-tract sites to score as categorical characters, with recurrent states.
     pub sites: Vec<SiteSpec>,
 }
@@ -2014,10 +2023,10 @@ pub fn run_scite_pipeline(
     if let Some(m) = model {
         anyhow::ensure!(
             m.rates.len() == binary.variants.len()
-                && (m.annotate.is_empty() || m.annotate.len() == binary.variants.len()),
-            "variant model covers {} rates / {} annotations for {} variants",
+                && (m.tract.is_empty() || m.tract.len() == binary.variants.len()),
+            "variant model covers {} rates / {} tract reports for {} variants",
             m.rates.len(),
-            m.annotate.len(),
+            m.tract.len(),
             binary.variants.len()
         );
     }
@@ -2030,7 +2039,7 @@ pub fn run_scite_pipeline(
             .collect(),
     };
     let not_searched: Vec<bool> = match model {
-        Some(m) if !m.annotate.is_empty() => m.annotate.iter().map(|a| a.is_some()).collect(),
+        Some(m) if !m.tract.is_empty() => m.tract.iter().map(|t| t.as_ref().is_some_and(|t| !t.placed)).collect(),
         _ => Vec::new(),
     };
     let rb = resolve_span_conflicts(
@@ -2050,19 +2059,20 @@ pub fn run_scite_pipeline(
             block_names.join(", ")
         );
     }
-    // Annotate-only tract alleles leave the informative set: reported with their observed linkage, never placed.
-    let annotated: Vec<usize> = match model {
-        Some(m) if !m.annotate.is_empty() => {
-            rb.informative.iter().copied().filter(|&v| m.annotate[v].is_some()).collect()
+    // Tract alleles the mode withholds leave the informative set; the rest are placed but still reported.
+    let (withheld, reported): (Vec<usize>, Vec<usize>) = match model {
+        Some(m) if !m.tract.is_empty() => {
+            let rows: Vec<usize> = rb.informative.iter().copied().filter(|&v| m.tract[v].is_some()).collect();
+            (rows.iter().copied().filter(|&v| !m.tract[v].as_ref().unwrap().placed).collect(), rows)
         }
-        _ => Vec::new(),
+        _ => (Vec::new(), Vec::new()),
     };
-    let informative: Vec<usize> = rb.informative.iter().copied().filter(|v| !annotated.contains(v)).collect();
-    let annotated_names: Vec<String> = annotated.iter().map(|&v| binary.variants[v].clone()).collect();
-    if !annotated.is_empty() {
+    let informative: Vec<usize> = rb.informative.iter().copied().filter(|v| !withheld.contains(v)).collect();
+    let annotated_names: Vec<String> = withheld.iter().map(|&v| binary.variants[v].clone()).collect();
+    if !withheld.is_empty() {
         info!(
             "[SCITE] Tract annotation: {} allele(s) reported but kept out of the search (see tract_annotation.tsv): {}",
-            annotated.len(),
+            withheld.len(),
             annotated_names.join(", ")
         );
     }
@@ -2206,8 +2216,8 @@ pub fn run_scite_pipeline(
 
     // Linkage is reported from observed calls over the informative variants, never from the tree-imputed
     // matrix: imputation would turn the tree's own placements into apparent co-occurrence evidence.
-    // Annotate-only tract alleles are listed too: observed linkage is all that is reported for them.
-    let mut cooc_rows: Vec<usize> = informative.iter().chain(annotated.iter()).copied().collect();
+    // Withheld tract alleles are listed too: observed linkage is all that is reported for them.
+    let mut cooc_rows: Vec<usize> = informative.iter().chain(withheld.iter()).copied().collect();
     cooc_rows.sort_unstable();
     write_raw_variant_cooccurrence(
         &rootblock::restrict(full_binary, &cooc_rows),
@@ -2216,9 +2226,9 @@ pub fn run_scite_pipeline(
     if let Some(m) = model {
         write_tract_annotation(
             full_binary,
-            &annotated,
+            &reported,
             &informative,
-            &m.annotate,
+            &m.tract,
             &format!("{output_prefix}.tract_annotation.tsv"),
         )?;
     }
@@ -3391,7 +3401,7 @@ mod tests {
         // Two identical 165/11 rows: only the one given the low fn keeps its excess absences.
         let row = present_then_absent(165, 11);
         let binary = matrix_from_rows(&["m.310T>TC", "m.302A>ACC"], &[&row, &row]);
-        let model = VariantModel { rates: vec![(0.08, 0.118), (0.08, 0.02)], annotate: Vec::new(), sites: Vec::new() };
+        let model = VariantModel { rates: vec![(0.08, 0.118), (0.08, 0.02)], tract: Vec::new(), sites: Vec::new() };
         let prefix = std::env::temp_dir().join("himito_scite_model_index_dropout");
         let prefix = prefix.to_str().unwrap();
         run_scite_pipeline(&binary, 0.005, 0.005, (0.01, 0.04), Some(&model), 200, 1, false, prefix).unwrap();
@@ -3410,7 +3420,7 @@ mod tests {
         let b = format!("{}{}{}1", "1".repeat(40), "0".repeat(40), "0".repeat(40));
         let c = format!("{}{}{}1", "0".repeat(40), "1".repeat(40), "0".repeat(40));
         let binary = matrix_from_rows(&["m.750A>G", "m.1000A>G", "m.2000C>T"], &[&fixed, &b, &c]);
-        let model = VariantModel { rates: vec![(0.001, 0.01), (0.4, 0.01), (0.001, 0.01)], annotate: Vec::new(), sites: Vec::new() };
+        let model = VariantModel { rates: vec![(0.001, 0.01), (0.4, 0.01), (0.001, 0.01)], tract: Vec::new(), sites: Vec::new() };
         let prefix = std::env::temp_dir().join("himito_scite_model_index_search");
         let prefix = prefix.to_str().unwrap();
         let out = run_scite_pipeline(&binary, 0.005, 0.005, (0.01, 0.04), Some(&model), 500, 2, false, prefix).unwrap();
@@ -3426,8 +3436,8 @@ mod tests {
         let fixed = present_then_absent(186, 14);
         let ins = present_then_absent(60, 140);
         let binary = matrix_from_rows(&["m.16183A>C", "m.16183A>AC"], &[&fixed, &ins]);
-        for (annotate, want_block) in [(vec![None, None], false), (vec![None, annotation(12)], true)] {
-            let model = VariantModel { rates: vec![(0.01, 0.05); 2], annotate, sites: Vec::new() };
+        for (tract, want_block) in [(vec![None, None], false), (vec![None, tract_report(12, false)], true)] {
+            let model = VariantModel { rates: vec![(0.01, 0.05); 2], tract, sites: Vec::new() };
             let prefix = std::env::temp_dir().join(format!("himito_scite_span_annot_{want_block}"));
             let prefix = prefix.to_str().unwrap();
             run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 200, 1, false, prefix).unwrap();
@@ -3439,11 +3449,49 @@ mod tests {
     }
 
     #[test]
+    fn placed_tract_alleles_appear_in_the_tree_and_in_tract_annotation() {
+        // Same fixture as `annotated_alleles_are_reported_not_placed`, but with `placed: true`.
+        let a = format!("{}{}", "1".repeat(40), "0".repeat(40));
+        let b = format!("{}{}", "1".repeat(20), "0".repeat(60));
+        let t = format!("{}{}", "1".repeat(30), "0".repeat(50));
+        let binary = matrix_from_rows(&["m.100A>G", "m.200C>T", "m.302A>ACC"], &[&a, &b, &t]);
+        let model = VariantModel {
+            rates: vec![(0.01, 0.05); 3],
+            tract: vec![
+                None,
+                None,
+                Some(TractReport {
+                    run_class: "C/G".into(),
+                    run_length: 9,
+                    placed: true,
+                    reason: "beyond_calibration (run 9 > calibrated 6)".into(),
+                }),
+            ],
+            sites: Vec::new(),
+        };
+        let prefix = std::env::temp_dir().join("himito_scite_placed_tract");
+        let prefix = prefix.to_str().unwrap();
+        let out = run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 200, 1, false, prefix).unwrap();
+        assert!(out.cleaned.variants.iter().any(|v| v == "m.302A>ACC"), "placed: imputed into the cleaned matrix");
+        let tree = read_output(prefix, ".mutation_tree.tsv");
+        assert!(!tree.contains("TRACT_ANNOTATED"), "{tree}");
+        assert!(tree.lines().any(|l| l.split('\t').nth(1) == Some("m.302A>ACC")), "{tree}");
+        let nwk = read_output(prefix, ".read_lineage.nwk");
+        assert!(nwk.contains("mutation=m.302A>ACC"), "{nwk}");
+        assert!(!nwk.contains("tract_annotated=m.302A>ACC"), "{nwk}");
+        let ann = read_output(prefix, ".tract_annotation.tsv");
+        assert!(ann.lines().next().unwrap().contains("\tplaced\t"), "{ann}");
+        let row: Vec<&str> = ann.lines().nth(1).unwrap().split('\t').collect();
+        assert_eq!((row[0], row[3], row[4], row[5]), ("m.302A>ACC", "9", "yes", "m.100A>G"), "{ann}");
+        assert!(ann.lines().count() == 2, "only the tract allele is a row, and never paired with itself:\n{ann}");
+    }
+
+    #[test]
     fn model_rates_drive_the_root_block_dropout() {
         // 165/11 on a D310 allele: excess at its old HP fn 0.04 would need fn <= ~0.03; at the table fn 0.118 it is not.
         let binary = matrix_from_rows(&["m.310T>TC"], &[&present_then_absent(165, 11)]);
         for (fnr, want) in [(0.02, "excess_absences"), (0.118, "high_raw_vaf")] {
-            let model = VariantModel { rates: vec![(0.08, fnr)], annotate: Vec::new(), sites: Vec::new() };
+            let model = VariantModel { rates: vec![(0.08, fnr)], tract: Vec::new(), sites: Vec::new() };
             let prefix = std::env::temp_dir().join(format!("himito_scite_model_dropout_{fnr}"));
             let prefix = prefix.to_str().unwrap();
             run_scite_pipeline(&binary, 0.005, 0.005, (0.01, 0.04), Some(&model), 200, 1, false, prefix).unwrap();
@@ -3452,8 +3500,8 @@ mod tests {
         }
     }
 
-    fn annotation(len: usize) -> Option<TractAnnotation> {
-        Some(TractAnnotation { run_class: "C/G".into(), run_length: len, reason: "test".into() })
+    fn tract_report(len: usize, placed: bool) -> Option<TractReport> {
+        Some(TractReport { run_class: "C/G".into(), run_length: len, placed, reason: "test".into() })
     }
 
     #[test]
@@ -3463,7 +3511,7 @@ mod tests {
         let b = format!("{}{}", "1".repeat(20), "0".repeat(60));
         let t = format!("{}{}", "1".repeat(30), "0".repeat(50));
         let binary = matrix_from_rows(&["m.100A>G", "m.200C>T", "m.302A>ACC"], &[&a, &b, &t]);
-        let model = VariantModel { rates: vec![(0.01, 0.05); 3], annotate: vec![None, None, annotation(9)], sites: Vec::new() };
+        let model = VariantModel { rates: vec![(0.01, 0.05); 3], tract: vec![None, None, tract_report(9, false)], sites: Vec::new() };
         let prefix = std::env::temp_dir().join("himito_scite_annotate");
         let prefix = prefix.to_str().unwrap();
         let out = run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 200, 1, false, prefix).unwrap();
@@ -3478,7 +3526,7 @@ mod tests {
         assert!(cooc.contains("m.100A>G\tm.302A>ACC\t80\t30\t10\t0\t40"), "observed linkage is reported:\n{cooc}");
         let ann = read_output(prefix, ".tract_annotation.tsv");
         let row: Vec<&str> = ann.lines().nth(1).unwrap().split('\t').collect();
-        assert_eq!((row[0], row[2], row[3], row[4], row[10], row[11]), ("m.302A>ACC", "C/G", "9", "m.100A>G", "yes", "test"), "{ann}");
+        assert_eq!((row[0], row[2], row[3], row[4], row[5], row[11], row[12]), ("m.302A>ACC", "C/G", "9", "no", "m.100A>G", "yes", "test"), "{ann}");
     }
 
     // ─── Multi-allelic tract sites ───────────────────────────────────────────
@@ -3788,7 +3836,7 @@ mod tests {
         };
         let model = VariantModel {
             rates: vec![(0.06, 0.07); 3],
-            annotate: Vec::new(),
+            tract: Vec::new(),
             sites: vec![spec(vec![0, 1], vec![9, 10], 7), spec(vec![2], vec![13], 12)],
         };
         let prefix = std::env::temp_dir().join("himito_scite_tract_sites");
@@ -3816,9 +3864,9 @@ mod tests {
         let mut rows: Vec<&str> = others.iter().map(|(_, r)| *r).collect();
         rows.push(t);
         let binary = matrix_from_rows(&names, &rows);
-        let mut annotate = vec![None; others.len()];
-        annotate.push(annotation(9));
-        let model = VariantModel { rates: vec![(0.01, 0.05); names.len()], annotate, sites: Vec::new() };
+        let mut tract = vec![None; others.len()];
+        tract.push(tract_report(9, false));
+        let model = VariantModel { rates: vec![(0.01, 0.05); names.len()], tract, sites: Vec::new() };
         let prefix = std::env::temp_dir().join(format!("himito_scite_partner_{tag}"));
         let prefix = prefix.to_str().unwrap();
         run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 200, 1, false, prefix).unwrap();
@@ -3832,11 +3880,11 @@ mod tests {
         // Negative linkage only (T is never on A's reads): no candidate at all.
         let t_neg = format!("{}{}", "0".repeat(40), "1".repeat(20) + &"0".repeat(20));
         let row = annotation_row("neg", &t_neg, &[("m.100A>G", &a)]);
-        assert_eq!((row[4].as_str(), row[10].as_str()), ("NA", "NA"), "{row:?}");
+        assert_eq!((row[5].as_str(), row[11].as_str()), ("NA", "NA"), "{row:?}");
         // Weak positive linkage (3 of 5 T reads on A): named, but not linked.
         let t_weak = format!("{}{}{}", "1".repeat(3), "0".repeat(40), "11".to_string() + &"0".repeat(35));
         let row = annotation_row("weak", &t_weak, &[("m.100A>G", &a)]);
-        assert_eq!((row[4].as_str(), row[10].as_str()), ("m.100A>G", "no"), "{row:?}");
+        assert_eq!((row[5].as_str(), row[11].as_str()), ("m.100A>G", "no"), "{row:?}");
     }
 
     #[test]
@@ -3848,13 +3896,13 @@ mod tests {
         let b = format!("{}{}{}{}", "1".repeat(6), "0".repeat(4), "1".repeat(6), "0".repeat(64));
         let t = format!("{}{}", "1".repeat(10), "0".repeat(70));
         let row = annotation_row("tie", &t, &[("m.100A>G", &a), ("m.200A>G", &b)]);
-        assert_eq!(row[4], "m.200A>G", "{row:?}");
+        assert_eq!(row[5], "m.200A>G", "{row:?}");
     }
 
     #[test]
     fn annotation_of_every_informative_variant_falls_back_to_root_only() {
         let binary = matrix_from_rows(&["m.302A>ACC"], &["11110000"]);
-        let model = VariantModel { rates: vec![(0.01, 0.05)], annotate: vec![annotation(9)], sites: Vec::new() };
+        let model = VariantModel { rates: vec![(0.01, 0.05)], tract: vec![tract_report(9, false)], sites: Vec::new() };
         let prefix = std::env::temp_dir().join("himito_scite_annotate_all");
         let prefix = prefix.to_str().unwrap();
         run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 200, 1, false, prefix).unwrap();

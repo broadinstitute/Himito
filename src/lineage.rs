@@ -846,8 +846,9 @@ pub fn estimate_snv_dropout(raw: &RawMatrix, max_hf: f64) -> Option<DropoutEstim
 /// What to do with homopolymer-tract alleles (D310, HVS1-C) in the tree search.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TractAlleleMode {
-    /// ONT alleles whose run is longer than the confusion table calibrates are annotate-only; the rest are placed
-    /// as multi-allelic sites (`Site`).
+    /// Tract alleles are placed as multi-allelic sites (`Site`); an allele whose run is longer than the
+    /// confusion table calibrates is placed too, flagged `beyond_calibration` in `tract_annotation.tsv`
+    /// and `mutation_tree.tsv`, so its placement is judged on its margin rather than deleted.
     #[default]
     Auto,
     /// Every tract allele is placed, with the alleles at one tract position scored as one categorical site whose
@@ -1470,7 +1471,7 @@ fn tract_site_specs(
         .collect()
 }
 
-/// Per-variant rates (and annotate-only tract alleles) for `binary`, with their `error_model.tsv` rows.
+/// Per-variant rates (and the report on each tract allele) for `binary`, with their `error_model.tsv` rows.
 /// D310/HVS1-C alleles ([`is_homopolymer_tract_allele`]) take table rates for their implied run (CLI `--hp-*-rate`
 /// wins), other tract alleles the default HP rates, everything else the SNV rates.
 pub fn build_variant_model(
@@ -1482,10 +1483,8 @@ pub fn build_variant_model(
 ) -> (crate::scite::VariantModel, Vec<ErrorModelRow>) {
     let background = majority_names(raw);
     let spans = crate::scite::variant_spans(&binary.variants);
-    let is_ont = opts.data_type.starts_with("ont");
-    let cli_rates = opts.hp_fp_rate.is_some() && opts.hp_fn_rate.is_some();
     let mut rates = Vec::with_capacity(binary.variants.len());
-    let mut annotate = Vec::with_capacity(binary.variants.len());
+    let mut tract = Vec::with_capacity(binary.variants.len());
     let mut rows = Vec::new();
     // (variant, run class, run length) of the placed homopolymer-tract alleles.
     let mut site_candidates: Vec<(usize, RunClass, usize)> = Vec::new();
@@ -1493,9 +1492,9 @@ pub fn build_variant_model(
         let at = implied_run_at(name, rcrs(), &background);
         let run = is_homopolymer_tract_allele(name, span, at.as_ref()).then_some(at).flatten().map(|r| (r.class, r.len));
         let Some((class, len)) = run else {
-            let tract = crate::tracts::overlaps_tract(span);
-            rates.push(if tract { resolved.hp_rates } else { (resolved.fp_rate, resolved.fn_rate) });
-            annotate.push(None);
+            let in_tract = crate::tracts::overlaps_tract(span);
+            rates.push(if in_tract { resolved.hp_rates } else { (resolved.fp_rate, resolved.fn_rate) });
+            tract.push(None);
             continue;
         };
         // Without a table both HP rates come from the command line (the table is not loaded then).
@@ -1523,24 +1522,20 @@ pub fn build_variant_model(
             });
         }
         rates.push((fp, fn_));
-        let reason = match opts.tract_alleles {
-            TractAlleleMode::Search | TractAlleleMode::Site => None,
-            TractAlleleMode::Annotate => Some("--tract-alleles annotate".to_string()),
-            TractAlleleMode::Auto => match tr {
-                Some(t) if is_ont && t.beyond_calibration && !cli_rates => {
-                    Some(format!("beyond_calibration (run {len} > calibrated {})", t.calibrated_max))
+        let (placed, reason) = match opts.tract_alleles {
+            TractAlleleMode::Annotate => (false, "--tract-alleles annotate".to_string()),
+            TractAlleleMode::Auto | TractAlleleMode::Site | TractAlleleMode::Search => match tr {
+                Some(t) if t.beyond_calibration => {
+                    (true, format!("beyond_calibration (run {len} > calibrated {})", t.calibrated_max))
                 }
-                _ => None,
+                Some(t) => (true, format!("calibrated (run {len} <= calibrated {})", t.calibrated_max)),
+                None => (true, "no confusion table".to_string()),
             },
         };
-        if reason.is_none() {
+        if placed {
             site_candidates.push((rates.len() - 1, class, len));
         }
-        annotate.push(reason.map(|reason| crate::scite::TractAnnotation {
-            run_class: class.to_string(),
-            run_length: len,
-            reason,
-        }));
+        tract.push(Some(crate::scite::TractReport { run_class: class.to_string(), run_length: len, placed, reason }));
     }
     // Site kernels come from the table; any explicit `--hp-*-rate` keeps the alleles as binary rows (so it is used).
     let any_cli = opts.hp_fp_rate.is_some() || opts.hp_fn_rate.is_some();
@@ -1577,7 +1572,7 @@ pub fn build_variant_model(
             detail: format!("calibrated run lengths {lo}..{hi} (n >= {HP_TABLE_MIN_N})"),
         });
     }
-    (crate::scite::VariantModel { rates, annotate, sites }, rows)
+    (crate::scite::VariantModel { rates, tract, sites }, rows)
 }
 
 /// Collapse reads with identical binary profiles into unique haplotypes backed by at least `MIN_READS` reads.
@@ -2300,7 +2295,8 @@ mod tests {
         assert!(close(model.rates[0].0, 0.081778) && close(model.rates[0].1, 0.118002), "{:?}", model.rates[0]);
         assert_eq!(model.rates[1], (0.005, 0.02), "an SNV keeps the SNV rates (preset fn: no near-fixed SNVs here)");
         assert_eq!(model.rates[2], (0.01, 0.04), "CA514 keeps twice the preset");
-        assert!(model.annotate.iter().all(|a| a.is_none()));
+        assert!(model.tract.iter().flatten().all(|t| t.placed), "Search places every tract allele");
+        assert!(model.tract[0].is_some() && model.tract[1].is_none(), "D310 is recognised, the SNV is not");
         let detail = &rows.iter().find(|r| r.variant == "m.302A>ACC").unwrap().detail;
         assert_eq!(detail, "run=C/G:9 calibrated_max=6 beyond_calibration=yes");
     }
@@ -2332,13 +2328,13 @@ mod tests {
         assert!(close(m.rates[0].0, 0.081778) && close(m.rates[0].1, 0.118002), "{:?}", m.rates[0]);
         let detail = &rows.iter().find(|r| r.variant == ins).unwrap().detail;
         assert_eq!(detail, "run=C/G:13 calibrated_max=6 beyond_calibration=yes");
-        let a = m.annotate[0].clone().expect("ONT auto: C13 is beyond calibration");
-        assert_eq!((a.run_class.as_str(), a.run_length), ("C/G", 13));
+        let a = m.tract[0].clone().expect("a C13 insertion at HVS1-C is a tract allele");
+        assert_eq!((a.run_class.as_str(), a.run_length, a.placed), ("C/G", 13, true));
 
         // Without that background the insertion is an ordinary indel with the SNV rates.
         let (m, rows, resolved) = model(&raw_with(&[]));
         assert_eq!(m.rates[0], (resolved.fp_rate, resolved.fn_rate));
-        assert!(m.annotate[0].is_none() && rows.iter().all(|r| r.variant != ins));
+        assert!(m.tract[0].is_none() && rows.iter().all(|r| r.variant != ins));
     }
 
     #[test]
@@ -2363,12 +2359,12 @@ mod tests {
         let lens: Vec<i64> = model.sites[0].kernel.iter().map(|k| k.0).collect();
         assert_eq!(lens, [7, 9, 10], "a kernel for every state's length");
         assert!(rows.iter().any(|r| r.scope == "site" && r.variant == "m.302A>ACC,m.302A>ACCC" && r.value == 7.0));
-        // ONT auto annotates the C9/C10 alleles, so only m.310T>TC (C6, within calibration) is a site.
+        // ONT auto places the C9/C10 alleles too: the data-type string no longer decides it.
         let ont = model_for(&names, &opts("ont-r10", TractAlleleMode::Auto)).0;
-        assert_eq!(ont.sites.iter().map(|s| s.members.clone()).collect::<Vec<_>>(), [vec![2]]);
+        assert_eq!(ont.sites.iter().map(|s| s.members.clone()).collect::<Vec<_>>(), [vec![0, 1], vec![2]]);
         let ont_site = model_for(&names, &opts("ont-r10", TractAlleleMode::Site)).0;
         assert_eq!(ont_site.sites.len(), 2);
-        assert!(ont_site.annotate.iter().all(|a| a.is_none()));
+        assert!(ont_site.tract.iter().flatten().all(|t| t.placed));
         // search keeps one binary row per allele.
         assert!(model_for(&names, &opts("pacbio", TractAlleleMode::Search)).0.sites.is_empty());
         assert_eq!("site".parse::<TractAlleleMode>(), Ok(TractAlleleMode::Site));
@@ -2484,22 +2480,43 @@ mod tests {
         let (model, rows) = model_for(&["m.302A>ACC"], &opts);
         assert_eq!(model.rates[0], (0.2, 0.3));
         assert!(rows.iter().filter(|r| r.variant == "m.302A>ACC").all(|r| r.source == "cli"));
-        assert!(model.annotate[0].is_none(), "auto keeps alleles with explicit HP rates in the search");
+        assert!(model.tract[0].as_ref().is_some_and(|t| t.placed), "auto places alleles with explicit HP rates");
     }
 
     #[test]
-    fn auto_annotates_ont_alleles_beyond_calibration_only() {
-        let names = ["m.302A>ACC", "m.310T>TC", "m.3243A>G"];
-        let opts = |dt: &str, mode| RateOptions { data_type: dt.into(), tract_alleles: mode, ..Default::default() };
-        let flags = |o: &RateOptions| model_for(&names, o).0.annotate.iter().map(|a| a.is_some()).collect::<Vec<_>>();
-        assert_eq!(flags(&opts("ont-r10", TractAlleleMode::Auto)), [true, false, false], "C9 beyond, C6 within");
-        assert_eq!(flags(&opts("ont-denoised", TractAlleleMode::Auto)), [true, false, false]);
-        assert_eq!(flags(&opts("pacbio", TractAlleleMode::Auto)), [false, false, false]);
-        assert_eq!(flags(&opts("pacbio", TractAlleleMode::Annotate)), [true, true, false]);
-        assert_eq!(flags(&opts("ont-r10", TractAlleleMode::Search)), [false, false, false]);
-        let reason = model_for(&names, &opts("ont-r10", TractAlleleMode::Auto)).0.annotate[0].clone().unwrap();
-        assert_eq!((reason.run_class.as_str(), reason.run_length), ("C/G", 9));
-        assert_eq!(reason.reason, "beyond_calibration (run 9 > calibrated 6)");
+    fn auto_places_beyond_calibration_alleles_on_every_platform() {
+        let opts = |dt: &str| RateOptions { data_type: dt.into(), tract_alleles: TractAlleleMode::Auto, ..Default::default() };
+        for dt in ["ont-r10", "pacbio"] {
+            let (model, _rows) = model_for(&["m.302A>ACC"], &opts(dt));
+            let t = model.tract[0].as_ref().expect("a D310 length allele is a tract allele");
+            assert!(t.placed, "{dt}: auto must place the allele");
+            assert_eq!(t.reason, "beyond_calibration (run 9 > calibrated 6)", "{dt}");
+        }
+    }
+
+    #[test]
+    fn annotate_mode_still_withholds_tract_alleles_on_every_platform() {
+        let opts = |dt: &str| RateOptions {
+            data_type: dt.into(),
+            tract_alleles: TractAlleleMode::Annotate,
+            ..Default::default()
+        };
+        for dt in ["ont-r10", "pacbio"] {
+            let (model, _rows) = model_for(&["m.302A>ACC"], &opts(dt));
+            let t = model.tract[0].as_ref().expect("a D310 length allele is a tract allele");
+            assert!(!t.placed, "{dt}: annotate must withhold the allele");
+            assert_eq!(t.reason, "--tract-alleles annotate", "{dt}");
+        }
+    }
+
+    #[test]
+    fn a_calibrated_tract_allele_is_placed_and_says_so() {
+        let opts = RateOptions { data_type: "ont-r10".into(), tract_alleles: TractAlleleMode::Auto, ..Default::default() };
+        // m.310T>TC implies a C/G run of 6, which the table calibrates.
+        let (model, _rows) = model_for(&["m.310T>TC"], &opts);
+        let t = model.tract[0].as_ref().expect("D310 allele");
+        assert!(t.placed);
+        assert_eq!(t.reason, "calibrated (run 6 <= calibrated 6)");
     }
 
     #[test]

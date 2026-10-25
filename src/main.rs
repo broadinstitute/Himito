@@ -512,7 +512,10 @@ enum Commands {
         #[clap(long, value_parser, hide_short_help = true)]
         hp_error: Option<String>,
 
-        /// D310/HVS1-C alleles: site = alleles at one tract position are one categorical site whose states may recur on several branches; auto = site, except ONT alleles beyond the table's calibrated run length are annotate-only (any --hp-*-rate: binary rows; both: those ONT alleles are searched too); search = one binary row per allele; annotate
+        /// D310/HVS1-C alleles: auto = alleles at one tract position are one categorical site whose states may
+        /// recur on several branches, with runs beyond the confusion table's calibrated length flagged
+        /// beyond_calibration; site = the same without the flag; search = one binary row per allele;
+        /// annotate = reported in tract_annotation.tsv but never placed
         #[clap(
             long,
             default_value = "auto",

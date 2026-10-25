@@ -88,7 +88,14 @@ fn absence_vs_alt(matrix: &BinaryMatrix, v: usize, u: usize) -> Option<(f64, f64
 
 /// Split the variants into the root block and the informative set.
 /// `dropout_rate` is the expected per-read dropout; 0 disables the dropout correction and the excess-absence rule.
+/// The pipeline uses [`partition_with_rates`]; this one-rate form is kept for tests and single-rate callers.
+#[allow(dead_code)]
 pub fn partition(matrix: &BinaryMatrix, dropout_rate: f64) -> RootBlock {
+    partition_with_rates(matrix, &vec![dropout_rate; matrix.variants.len()])
+}
+
+/// [`partition`] with one dropout rate per variant (e.g. the HP-tract fn for tract alleles).
+pub fn partition_with_rates(matrix: &BinaryMatrix, dropout_rates: &[f64]) -> RootBlock {
     let n = matrix.variants.len();
     let mut block = Vec::new();
     let mut informative = Vec::new();
@@ -101,6 +108,7 @@ pub fn partition(matrix: &BinaryMatrix, dropout_rate: f64) -> RootBlock {
         let covered = present + n_absent;
 
         // Dropout inflates the absent count, which drags observed HF below the gate as depth grows.
+        let dropout_rate = dropout_rates[v];
         let expected_dropout = dropout_rate * covered as f64;
         let corrected_absent = (n_absent as f64 - expected_dropout).max(0.0);
         let denom = present as f64 + corrected_absent;
@@ -120,8 +128,12 @@ pub fn partition(matrix: &BinaryMatrix, dropout_rate: f64) -> RootBlock {
     }
 
     // Excess absences versus dropout, before any partner test.
-    if dropout_rate > 0.0 {
+    {
         pending.retain(|&(v, hf, n_absent, covered)| {
+            let dropout_rate = dropout_rates[v];
+            if dropout_rate <= 0.0 {
+                return true;
+            }
             let p_excess = crate::scite::binomial_upper_tail(covered, n_absent, dropout_rate);
             let excess = p_excess <= MAX_Q && n_absent as f64 >= MIN_OR * dropout_rate * covered as f64;
             if excess {
@@ -443,6 +455,36 @@ mod tests {
         assert!(q1 > 0.05, "q1 was {q1}");
         // Confirms the underlying per-pair p-value really is moderate.
         assert!(q0 < 0.5, "q0 was {q0}, expected a moderate (not saturated) value");
+    }
+
+    #[test]
+    fn partition_with_uniform_rates_matches_partition() {
+        let m = matrix(vec![run(188, 12), run(190, 10), run(80, 120), run(180, 20)]);
+        for rate in [0.0, 0.02, 0.05] {
+            let a = partition(&m, rate);
+            let b = partition_with_rates(&m, &vec![rate; m.variants.len()]);
+            assert_eq!((&a.block, &a.informative), (&b.block, &b.informative), "rate {rate}");
+            let reasons = |rb: &RootBlock| rb.audit.iter().map(|x| (x.variant, x.reason)).collect::<Vec<_>>();
+            assert_eq!(reasons(&a), reasons(&b), "rate {rate}");
+        }
+    }
+
+    #[test]
+    fn a_tract_rate_turns_excess_absences_into_a_partner_test() {
+        // 165 present, 11 absent: HG00097 ONT m.310T>TC. Excess at fn 0.02, not at the HP-tract fn 0.04.
+        let m = matrix(vec![run(165, 11)]);
+        assert_eq!(partition_with_rates(&m, &[0.02]).audit[0].reason, BlockReason::ExcessAbsences);
+        let tract = partition_with_rates(&m, &[0.04]);
+        assert_ne!(tract.audit[0].reason, BlockReason::ExcessAbsences);
+        assert_eq!(tract.block, vec![0]);
+    }
+
+    #[test]
+    fn per_variant_rates_are_applied_to_their_own_rows() {
+        let m = matrix(vec![run(165, 11), run(165, 11)]);
+        let rb = partition_with_rates(&m, &[0.02, 0.04]);
+        assert_eq!(rb.informative, vec![0]);
+        assert_eq!(rb.block, vec![1]);
     }
 
     #[test]

@@ -928,7 +928,96 @@ struct SiteAcc {
     any_best: BTreeSet<usize>,
 }
 
-fn build_geno_sites(refseq: &[u8], variants: &[Variant]) -> Vec<GenoSite> {
+/// Variants above this VCF HF are the sample's background: the matrix genotyper writes them into every haplotype of
+/// an indel site whose window holds them, so reads are scored against the sample's own sequence rather than bare rCRS.
+const GENOTYPE_BACKGROUND_MIN_HF: f64 = 0.5;
+
+/// The background for [`genotype_from_bam`]: variants with HF above [`GENOTYPE_BACKGROUND_MIN_HF`], highest HF first
+/// (ties by position and name), which is the order [`site_background`] resolves overlaps in.
+fn genotype_background(variants: &[Variant], coverage: &HashMap<usize, usize>) -> Vec<Variant> {
+    let mut bg: Vec<(f64, &Variant)> = variants
+        .iter()
+        .map(|v| (site_hf(v, coverage), v))
+        .filter(|(hf, _)| *hf > GENOTYPE_BACKGROUND_MIN_HF)
+        .collect();
+    bg.sort_by(|a, b| {
+        b.0.total_cmp(&a.0)
+            .then(allele_span(a.1).0.cmp(&allele_span(b.1).0))
+            .then_with(|| generate_variant_name(a.1).cmp(&generate_variant_name(b.1)))
+    });
+    bg.into_iter().map(|(_, v)| v.clone()).collect()
+}
+
+/// An edit `(start, REF, ALT)` without the bases REF and ALT share at the front. A VCF indel's anchor base is not
+/// part of what it changes, so the sample may change that base through another allele. An insertion has an empty
+/// REF: it goes in before `start`.
+fn core_edit<'a>(start: usize, r: &'a str, a: &'a str) -> (usize, &'a str, &'a str) {
+    let pre = r.bytes().zip(a.bytes()).take_while(|(x, y)| x == y).count();
+    (start + pre, &r[pre..], &a[pre..])
+}
+
+/// Whether two core edits touch the same reference bases. Spans are half-open REF intervals; an empty span is an
+/// insertion point, which clashes with another insertion at the same point or an edit that strictly contains it.
+fn edits_clash(a: (usize, usize), b: (usize, usize)) -> bool {
+    match (a.0 == a.1, b.0 == b.1) {
+        (false, false) => a.0 < b.1 && b.0 < a.1,
+        (true, true) => a.0 == b.0,
+        (true, false) => b.0 < a.0 && a.0 < b.1,
+        (false, true) => a.0 < b.0 && b.0 < a.1,
+    }
+}
+
+/// Background core edits for one site: those whose REF matches `refseq`, that lie inside `[left, right)` and that
+/// clash neither with a member nor with an already accepted edit. `background` is in priority order.
+fn site_background<'a>(
+    refseq: &[u8],
+    background: &'a [Variant],
+    members: &[(usize, &str, &str)],
+    left: usize,
+    right: usize,
+) -> Vec<(usize, &'a str, &'a str)> {
+    let span = |(s, r, _): (usize, &str, &str)| (s, s + r.len());
+    let mut taken: Vec<(usize, usize)> = members.iter().map(|&m| span(m)).collect();
+    let mut edits = Vec::new();
+    for v in background {
+        let (s, r, a) = allele_span(v);
+        let plain = |x: &str| x.bytes().all(|b| matches!(b, b'A' | b'C' | b'G' | b'T' | b'N'));
+        if !plain(r) || !plain(a) || refseq.get(s..s + r.len()) != Some(r.as_bytes()) {
+            continue;
+        }
+        let e = core_edit(s, r, a);
+        let (es, ee) = span(e);
+        let inside = if es == ee { left < es && es < right } else { left <= es && ee <= right };
+        if !inside || taken.iter().any(|&t| edits_clash(t, (es, ee))) {
+            continue;
+        }
+        taken.push((es, ee));
+        edits.push(e);
+    }
+    edits
+}
+
+/// `refseq[left..right]` with non-clashing core `edits` applied (an insertion before an edit at the same start).
+fn window_haplotype(refseq: &[u8], left: usize, right: usize, edits: &[(usize, &str, &str)]) -> Vec<u8> {
+    let mut sorted = edits.to_vec();
+    sorted.sort_by_key(|e| (e.0, !e.1.is_empty()));
+    let mut h = Vec::with_capacity(right - left + 8);
+    let mut cur = left;
+    for (s, r, a) in sorted {
+        h.extend_from_slice(&refseq[cur..s]);
+        h.extend_from_slice(a.as_bytes());
+        cur = s + r.len();
+    }
+    h.extend_from_slice(&refseq[cur..right]);
+    h
+}
+
+/// One site per group of overlapping alleles. At an indel site, REF and each member's haplotype carry the site's
+/// background, so a read that matches the sample's own sequence pays nothing for it, and a length allele is scored
+/// against the sample's own run. SNP sites keep bare-reference haplotypes: an SNV call does not depend on uniform
+/// background mismatches, while with unit edit costs a background that joins the SNV into a run would make a read
+/// with a 1-bp run-length error tie REF and ALT.
+fn build_geno_sites(refseq: &[u8], variants: &[Variant], background: &[Variant]) -> Vec<GenoSite> {
     let mut sites = Vec::new();
     for members in group_sites(variants) {
         let spans: Vec<(usize, &str, &str)> =
@@ -939,12 +1028,14 @@ fn build_geno_sites(refseq: &[u8], variants: &[Variant]) -> Vec<GenoSite> {
             Some(w) => w,
             None => continue, // crosses the circular origin: left NaN
         };
-        let mut haps = vec![refseq[left..right].to_vec()];
-        for &(s, r, a) in &spans {
-            let mut h = refseq[left..s].to_vec();
-            h.extend_from_slice(a.as_bytes());
-            h.extend_from_slice(&refseq[s + r.len()..right]);
-            haps.push(h);
+        let cores: Vec<(usize, &str, &str)> = spans.iter().map(|&(s, r, a)| core_edit(s, r, a)).collect();
+        let indel_site = spans.iter().any(|&(_, r, a)| r.len() != a.len());
+        let bg = if indel_site { site_background(refseq, background, &cores, left, right) } else { Vec::new() };
+        let mut haps = vec![window_haplotype(refseq, left, right, &bg)];
+        for &member in &cores {
+            let mut edits = bg.clone();
+            edits.push(member);
+            haps.push(window_haplotype(refseq, left, right, &edits));
         }
         sites.push(GenoSite { left, right, members, haps });
     }
@@ -993,16 +1084,18 @@ fn score_record_at_sites(
     out
 }
 
-/// Re-genotype `variants` in every read of `bam` by local realignment against the REF.
+/// Re-genotype `variants` in every read of `bam` by local realignment against haplotypes built on `background`
+/// (see [`build_geno_sites`]; empty = bare reference).
 fn genotype_from_bam(
     bam: &Path,
     refseq: &[u8],
     ref_name: &str,
     variants: &[Variant],
+    background: &[Variant],
     max_ed: u32,
 ) -> (HashMap<String, Vec<serde_json::Value>>, HashMap<String, HashSet<String>>) {
     const BATCH: usize = 4096;
-    let sites = build_geno_sites(refseq, variants);
+    let sites = build_geno_sites(refseq, variants, background);
     let lefts: Vec<usize> = sites.iter().map(|s| s.left).collect();
 
     let mut qname_ids: HashMap<String, u32> = HashMap::new();
@@ -1395,8 +1488,9 @@ fn recount_flagged_indels_from_bam(
     if flagged.is_empty() {
         return variants.to_vec();
     }
-    // Ungated: the matrix noise gate must not move the VCF.
-    let (read_record, cover_record) = genotype_from_bam(bam, refseq, ref_name, &flagged, u32::MAX);
+    // Ungated: the matrix noise gate must not move the VCF. Bare-reference haplotypes, as before the matrix
+    // genotyper gained a background, so this recount (and the VCF) is unchanged.
+    let (read_record, cover_record) = genotype_from_bam(bam, refseq, ref_name, &flagged, &[], u32::MAX);
     println!(
         "Strand-bias BAM recount: {} flagged indel(s) from {} (forward fraction {:.3})",
         flagged.len(),
@@ -1969,11 +2063,21 @@ pub fn start(
         link_calls.as_ref().map(|_| new_links.as_slice()),
         &indel_artifact_exempt,
     );
-    // The VCF and every filter above run on the graph; only the lineage matrix is BAM-genotyped.
+    // The VCF and every filter above run on the graph; only the lineage matrix is BAM-genotyped, on haplotypes
+    // that carry the sample's majority alleles.
+    let background = genotype_background(&permu_filtered_var, &coverage);
+    if bam.is_some() {
+        println!(
+            "Genotyping background: {} variant(s) with HF > {}",
+            background.len(),
+            GENOTYPE_BACKGROUND_MIN_HF
+        );
+    }
     let genotype_src = bam.map(|bam| GenotypeSource {
         bam,
         refseq: ref_seq.as_bytes(),
         ref_name: &ref_header,
+        background: &background,
         max_ed: if is_ont(data_type) { GENOTYPE_MAX_ED_ONT } else { u32::MAX },
     });
     if let Err(e) = write_final_matrix(
@@ -1986,6 +2090,21 @@ pub fn start(
     ) {
         eprintln!("Error writing matrix: {e}");
     }
+    // Homopolymer length confusion of the same reads, beside matrix.csv: `lineage` turns it into tract-allele rates.
+    if let Some(bam) = bam {
+        let path = output_file.with_extension("hp_confusion.tsv");
+        let result = crate::hperror::measure(
+            bam,
+            fasta_reference,
+            crate::hperror::DEFAULT_MIN_LEN,
+            crate::hperror::DEFAULT_SKIP,
+        )
+        .and_then(|rows| crate::hperror::write_confusion(&rows, &path));
+        match result {
+            Ok(()) => println!("Wrote homopolymer length confusion: {}", path.display()),
+            Err(e) => eprintln!("Warning: homopolymer length confusion not written: {e:#}"),
+        }
+    }
 }
 
 /// Where to re-genotype the final variants from.
@@ -1993,6 +2112,8 @@ struct GenotypeSource<'a> {
     bam: &'a Path,
     refseq: &'a [u8],
     ref_name: &'a str,
+    /// Majority alleles written into every genotyping haplotype ([`genotype_background`]).
+    background: &'a [Variant],
     max_ed: u32,
 }
 
@@ -2014,7 +2135,7 @@ fn write_final_matrix(
         Some(src) => {
             let all: Vec<Variant> = variants.iter().chain(rescued).cloned().collect();
             let (read_record, cover_record) =
-                genotype_from_bam(src.bam, src.refseq, src.ref_name, &all, src.max_ed);
+                genotype_from_bam(src.bam, src.refseq, src.ref_name, &all, src.background, src.max_ed);
             let (matrix, var_record, read_set) =
                 construct_matrix(&read_record, &cover_record, &all);
             println!(
@@ -2747,7 +2868,7 @@ mod tests {
         sam: &str,
         variants: &[Variant],
     ) -> (HashMap<String, Vec<serde_json::Value>>, HashMap<String, HashSet<String>>) {
-        genotype_from_bam(&geno_path(sam), GENO_REF.as_bytes(), "chrM", variants, u32::MAX)
+        genotype_from_bam(&geno_path(sam), GENO_REF.as_bytes(), "chrM", variants, &[], u32::MAX)
     }
 
     #[test]
@@ -2820,10 +2941,150 @@ mod tests {
     fn genotype_from_bam_unknown_ref_name_returns_ref_column_only() {
         let name = "m.31A>T";
         let (rr, cr) = genotype_from_bam(
-            &geno_path("reads_second_contig.sam"), GENO_REF.as_bytes(), "not_a_contig", &[geno_snp()], u32::MAX,
+            &geno_path("reads_second_contig.sam"), GENO_REF.as_bytes(), "not_a_contig", &[geno_snp()], &[], u32::MAX,
         );
         assert!(alt_reads(&rr, name).is_empty());
         assert_eq!(sorted(cr[name].clone()), ["not_a_contig"]);
+    }
+
+    /// An HVS1-like stretch: `…ATC AAAA CCCCC T CCCC ATG…` at 30..50 between unique flanks (0-based).
+    /// The sample background is 35A>C, 36A>C and 42T>C, which turn it into `ATCAA` + 12 C + `ATG`.
+    const HVS_REF: &str = "GCTAGACATACATACATACACGTCAGCACGATCAAAACCCCCTCCCCATGCTTAGTGTGATCGCTAGTAGTAGTGTCAGG";
+
+    fn hvs_background() -> Vec<Variant> {
+        vec![var(35, "A", "C", 90), var(36, "A", "C", 90), var(42, "T", "C", 90)]
+    }
+
+    /// One more C in the run, written the way the graph VCF does: `m.35A>AC`, anchored on base 34.
+    fn hvs_ins() -> Variant {
+        ins_at(HVS_REF.as_bytes(), 35, "C", 30)
+    }
+
+    /// Three more Cs: `m.35A>ACCC`, the competing length allele at the same site.
+    fn hvs_ins3() -> Variant {
+        ins_at(HVS_REF.as_bytes(), 35, "CCC", 5)
+    }
+
+    #[test]
+    fn genotype_background_keeps_majority_alleles_highest_hf_first() {
+        let vs = vec![var(10, "A", "C", 30), var(20, "A", "C", 90), var(30, "A", "C", 50), var(40, "A", "C", 60)];
+        let coverage: HashMap<usize, usize> = vs.iter().map(|v| (v.pos, 100)).collect();
+        let names: Vec<String> = genotype_background(&vs, &coverage).iter().map(generate_variant_name).collect();
+        // HF 0.9 and 0.6 are the background; 0.5 is not above the bar and 0.3 is a minority allele.
+        assert_eq!(names, ["m.21A>C", "m.41A>C"]);
+    }
+
+    #[test]
+    fn site_haplotypes_carry_the_sample_background() {
+        let refseq = HVS_REF.as_bytes();
+        let mut background = hvs_background();
+        background.push(var(42, "CT", "C", 80)); // deletes base 42, which 42T>C (higher HF) already changes: skipped
+        background.push(var(25, "T", "A", 90)); // REF is not the reference base (25 is G): skipped
+        background.push(var(75, "T", "A", 90)); // outside the window: ignored
+        let sites = build_geno_sites(refseq, &[hvs_ins()], &background);
+        assert_eq!(sites.len(), 1);
+        let site = &sites[0];
+        assert_eq!((site.left, site.right), (22, 49));
+        let c = |n: usize| "C".repeat(n);
+        assert_eq!(String::from_utf8_lossy(&site.haps[0]), format!("TCAGCACGATCAA{}AT", c(12)));
+        assert_eq!(String::from_utf8_lossy(&site.haps[1]), format!("TCAGCACGATCAA{}AT", c(13)));
+        // Without a background the insertion haplotype is an isolated C between As, not a longer run.
+        let bare = build_geno_sites(refseq, &[hvs_ins()], &[]);
+        assert_eq!(String::from_utf8_lossy(&bare[0].haps[0]), "TCAGCACGATCAAAACCCCCTCCCCAT");
+        assert_eq!(String::from_utf8_lossy(&bare[0].haps[1]), "TCAGCACGATCAACAACCCCCTCCCCAT");
+
+        // An insertion anchored on a base the sample changes (m.43T>TC on 42T>C, like m.16189T>TC on 16189T>C)
+        // keeps the change: the anchor is not part of the edit.
+        let anchored = build_geno_sites(refseq, &[ins_at(refseq, 43, "C", 30)], &hvs_background());
+        assert_eq!(String::from_utf8_lossy(&anchored[0].haps[0]), format!("ATCAA{}ATGCTTAG", c(12)));
+        assert_eq!(String::from_utf8_lossy(&anchored[0].haps[1]), format!("ATCAA{}ATGCTTAG", c(13)));
+        // The same allele as background and member (a majority length allele) is the member, not background.
+        let own = build_geno_sites(refseq, &[hvs_ins()], &[hvs_ins()]);
+        assert_eq!(own[0].haps[0], bare[0].haps[0]);
+
+        // SNP sites keep bare-reference haplotypes.
+        let snp_site = &build_geno_sites(refseq, &[var(36, "A", "C", 90)], &hvs_background())[0];
+        assert_eq!(snp_site.haps[0], refseq[snp_site.left..snp_site.right].to_vec());
+    }
+
+    /// Reads over `HVS_REF` on the sample background with 12 (`r_c12`), 13, 11 and 15 Cs in the run, as a SAM in a
+    /// fresh temp dir (returned with the file).
+    fn write_hvs_sam(tag: &str) -> (PathBuf, PathBuf) {
+        let refseq = HVS_REF.as_bytes();
+        let mut sample = refseq.to_vec();
+        for i in [35, 36, 42] {
+            sample[i] = b'C';
+        }
+        let s = |v: &[u8]| String::from_utf8(v.to_vec()).unwrap();
+        let c13 = [&sample[..35], b"C", &sample[35..]].concat();
+        let c15 = [&sample[..35], b"CCC", &sample[35..]].concat();
+        let c11 = [&sample[..35], &sample[36..]].concat();
+        let sam = |name: &str, cigar: &str, seq: &str| {
+            format!("{name}\t0\tchrM\t1\t60\t{cigar}\t*\t0\t0\t{seq}\t{}\n", "I".repeat(seq.len()))
+        };
+        let dir = std::env::temp_dir().join(format!("himito_geno_bg_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("hvs.sam");
+        let text = format!(
+            "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chrM\tLN:{}\n{}{}{}{}",
+            refseq.len(),
+            sam("r_c12", "80M", &s(&sample)),
+            sam("r_c13", "35M1I45M", &s(&c13)),
+            sam("r_c11", "35M1D44M", &s(&c11)),
+            sam("r_c15", "35M3I45M", &s(&c15)),
+        );
+        std::fs::write(&path, text).unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn genotype_from_bam_calls_hvs1_length_alleles_on_the_sample_background() {
+        let refseq = HVS_REF.as_bytes();
+        let (dir, path) = write_hvs_sam("calls");
+        let (ins, ins3) = (generate_variant_name(&hvs_ins()), generate_variant_name(&hvs_ins3()));
+        let mut variants = hvs_background();
+        variants.extend([hvs_ins(), hvs_ins3()]);
+        let (rr, cr) = genotype_from_bam(&path, refseq, "chrM", &variants, &hvs_background(), u32::MAX);
+        assert_eq!(alt_reads(&rr, &ins), HashSet::from(["r_c13"]));
+        assert_eq!(alt_reads(&rr, &ins3), HashSet::from(["r_c15"]));
+        for name in [&ins, &ins3] {
+            assert_eq!(sorted(cr[name].clone()), ["chrM", "r_c11", "r_c12", "r_c13", "r_c15"], "{name}");
+        }
+        // The SNPs that build the run are called on every read, the one with a 1-bp shorter run included.
+        for snp in ["m.36A>C", "m.37A>C", "m.43T>C"] {
+            for read in ["r_c11", "r_c12", "r_c13", "r_c15"] {
+                assert!(alt_reads(&rr, snp).contains(read), "{snp} {read}");
+            }
+        }
+
+        // Bare reference haplotypes (the old genotyper): every read pays the background on every haplotype. The
+        // 12-C read ties all three, the 13-C carrier ties A>AC with A>ACCC, so A>AC gets no alt read at all.
+        let (rr0, cr0) = genotype_from_bam(&path, refseq, "chrM", &variants, &[], u32::MAX);
+        assert!(alt_reads(&rr0, &ins).is_empty());
+        assert!(!cr0[&ins].contains("r_c13") && !cr0[&ins].contains("r_c12"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn write_final_matrix_genotypes_on_the_source_background() {
+        let (dir, path) = write_hvs_sam("final");
+        let out = dir.join("out.vcf");
+        let variants = vec![hvs_ins()];
+        let graph_matrix = Array2::from_shape_vec((1, 1), vec![f64::NAN]).unwrap();
+        let background = hvs_background();
+        let src = GenotypeSource {
+            bam: &path,
+            refseq: HVS_REF.as_bytes(),
+            ref_name: "chrM",
+            background: &background,
+            max_ed: u32::MAX,
+        };
+        write_final_matrix(&out, &graph_matrix, &variants, &[], &["g1".to_string()], Some(&src)).unwrap();
+        let csv = std::fs::read_to_string(out.with_extension("matrix.csv")).unwrap();
+        // r_c15 is missing: with A>AC the only candidate, the window ends 2 bases past the run, so the 3 extra Cs
+        // cost REF and A>AC the same 2 edits (the flank mismatches instead). A tie is missing, never a call.
+        assert_eq!(csv, "variant,chrM,r_c11,r_c12,r_c13\nm.35A>AC,0,0,0,1\n");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2839,7 +3100,13 @@ mod tests {
         assert_eq!(matrix_csv(), "variant,g1,g2\nm.31A>T,1,\n");
 
         let bam = geno_path("reads.sam");
-        let src = GenotypeSource { bam: &bam, refseq: GENO_REF.as_bytes(), ref_name: "chrM", max_ed: u32::MAX };
+        let src = GenotypeSource {
+            bam: &bam,
+            refseq: GENO_REF.as_bytes(),
+            ref_name: "chrM",
+            background: &[],
+            max_ed: u32::MAX,
+        };
         write_final_matrix(&out, &graph_matrix, &[geno_snp()], &[], &graph_reads, Some(&src)).unwrap();
         // Reads sorted by name, the ref pseudo-read all 0, r_del (tie) and r_short (partial) missing.
         assert_eq!(matrix_csv(), "variant,chrM,r_alt,r_ref,r_split\nm.31A>T,0,1,0,1\n");

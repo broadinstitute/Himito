@@ -132,6 +132,7 @@ impl MutationTree {
 }
 
 /// Fixed sequencing/genotyping error rates used in the SCITE likelihood model.
+#[derive(Debug, Clone)]
 pub struct ErrorRates {
     /// alpha: P(observed = 1 | true = 0) — false positive rate.
     pub fp_rate: f64,
@@ -139,12 +140,90 @@ pub struct ErrorRates {
     pub fn_rate: f64,
     /// Per-variant `(fp, fn)`; columns past its end (root-block genotypes) use the global rates.
     pub per_variant: Vec<(f64, f64)>,
+    /// Homopolymer-tract sites: their member columns are scored as one categorical character each, not with
+    /// the binary `(fp, fn)` above.
+    pub sites: Vec<TractSite>,
+}
+
+/// A homopolymer-tract site: the length alleles at one tract position (and copies of them on other branches), scored
+/// as one categorical character. State 0 is "none of these alleles", the root's state; members are columns of the
+/// scored matrix. Same-locus exclusivity keeps at most one member on any root-to-node path, so a node's state
+/// is that member's state, or 0.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TractSite {
+    pub members: Vec<usize>,
+    /// State of each member (1-based; state 0 is "none of the site's alleles", the root's).
+    pub member_state: Vec<usize>,
+    /// `log_p[o][t]` = log P(the read is called state `o` | its node has state `t`).
+    pub log_p: Vec<Vec<f64>>,
+}
+
+impl TractSite {
+    /// The state a read was called with: the allele of its alt member calls, state 0 when every member call is a
+    /// reference call, else `None` (no call, a tie between alleles, or alt calls for two different alleles).
+    pub fn observed(&self, call: impl Fn(usize) -> Option<u8>) -> Option<usize> {
+        let mut state = None;
+        let mut all_ref = true;
+        for (&m, &s) in self.members.iter().zip(&self.member_state) {
+            match call(m) {
+                Some(1) => {
+                    if state.is_some_and(|x| x != s) {
+                        return None;
+                    }
+                    state = Some(s);
+                }
+                Some(_) => {}
+                None => all_ref = false,
+            }
+        }
+        state.or(if all_ref { Some(0) } else { None })
+    }
+
+    /// The state of a node whose ancestor set (itself included) is `on_path`.
+    fn node_state(&self, on_path: impl Fn(usize) -> bool) -> usize {
+        self.members.iter().zip(&self.member_state).find(|(m, _)| on_path(**m)).map_or(0, |(_, &s)| s)
+    }
+}
+
+/// Floor on the length-confusion kernel, so an unseen length change is unlikely but possible.
+pub const KERNEL_FLOOR: f64 = 1e-4;
+
+/// `log_p[o][t]` for a site whose state 0 is "called none of the site's alleles" (the root state, run length
+/// `lens[0]`) and whose states `1..` are its alleles (run lengths `lens[1..]`). For a node of state `t`:
+/// P(called allele o | t) = K(lens[o] − lens[t] | lens[t]) and P(called none | t) = 1 − Σ over the alleles, each
+/// floored at [`KERNEL_FLOOR`]. No renormalisation: a read called at a length that is not an allele here (an
+/// allele filtered out of the search, or a length with no allele) is a "none" call, and keeps its slip probability.
+pub fn site_log_p(lens: &[i64], kernel: impl Fn(i64, i64) -> f64) -> Vec<Vec<f64>> {
+    let n = lens.len();
+    let mut log_p = vec![vec![0.0; n]; n];
+    for t in 0..n {
+        let alleles: Vec<f64> = (1..n).map(|o| kernel(lens[t], lens[o] - lens[t]).clamp(0.0, 1.0)).collect();
+        let none = (1.0 - alleles.iter().sum::<f64>()).max(KERNEL_FLOOR);
+        log_p[0][t] = none.ln();
+        for o in 1..n {
+            log_p[o][t] = alleles[o - 1].max(KERNEL_FLOOR).ln();
+        }
+    }
+    log_p
 }
 
 /// Error rates are clamped into `[RATE_FLOOR, 1 - RATE_FLOOR]` before any logarithm is taken.
 const RATE_FLOOR: f64 = 1e-12;
 
 impl ErrorRates {
+    /// For each of `n` columns, the `(site, member index)` it belongs to.
+    fn site_columns(&self, n: usize) -> Vec<Option<(usize, usize)>> {
+        let mut of = vec![None; n];
+        for (si, site) in self.sites.iter().enumerate() {
+            for (k, &m) in site.members.iter().enumerate() {
+                if m < n {
+                    of[m] = Some((si, k));
+                }
+            }
+        }
+        of
+    }
+
     /// The clamped `(fp, fn)` for variant `v`.
     fn clamped_for(&self, v: usize) -> (f64, f64) {
         let (fp, fnr) = self.per_variant.get(v).copied().unwrap_or((self.fp_rate, self.fn_rate));
@@ -159,7 +238,16 @@ pub fn attachment_log_likelihood(
     rates: &ErrorRates,
 ) -> f64 {
     let mut ll = 0.0;
+    let site_of = rates.site_columns(profile.len());
+    for site in &rates.sites {
+        if let Some(o) = site.observed(|m| profile.get(m).copied().flatten()) {
+            ll += site.log_p[o][site.node_state(|m| ancestor_mask.get(m))];
+        }
+    }
     for (i, call) in profile.iter().enumerate() {
+        if site_of[i].is_some() {
+            continue;
+        }
         let Some(observed) = call else { continue };
         let (fp, fn_rate) = rates.clamped_for(i);
         let expected_mutated = ancestor_mask.get(i);
@@ -242,8 +330,9 @@ pub struct AttachmentScorer {
     code: Vec<u8>,
     /// Row stride of `code`.
     n_variants: usize,
-    /// `delta[variant][code]` is log P(call | variant mutated) − log P(call | variant not mutated).
-    delta: Vec<[f64; 3]>,
+    /// `delta[variant][code]` is log P(call | variant mutated) − log P(call | variant not mutated). For a site member
+    /// the code is 1 + the read's called state (0 = none), and the "not mutated" state is the site's root state.
+    delta: Vec<Vec<f64>>,
 }
 
 impl AttachmentScorer {
@@ -253,9 +342,31 @@ impl AttachmentScorer {
         let mut base = vec![0.0f64; n_reads];
         let mut code = vec![CODE_UNCOVERED; n_reads * n_variants];
         // delta[_][CODE_UNCOVERED] stays 0: an uncovered cell costs nothing at any node.
-        let mut delta = vec![[0.0f64; 3]; n_variants];
+        let mut delta = vec![vec![0.0f64; 3]; n_variants];
+        let site_of = rates.site_columns(n_variants);
+
+        for site in &rates.sites {
+            let n_states = site.log_p.len();
+            for (&m, &t) in site.members.iter().zip(&site.member_state) {
+                if m < n_variants {
+                    delta[m] = (0..=n_states)
+                        .map(|c| if c == 0 { 0.0 } else { site.log_p[c - 1][t] - site.log_p[c - 1][0] })
+                        .collect();
+                }
+            }
+            for r in 0..n_reads {
+                let Some(o) = site.observed(|m| matrix.data.get(m).and_then(|row| row[r])) else { continue };
+                base[r] += site.log_p[o][0];
+                for &m in site.members.iter().filter(|&&m| m < n_variants) {
+                    code[r * n_variants + m] = (o + 1) as u8;
+                }
+            }
+        }
 
         for m in 0..n_variants {
+            if site_of[m].is_some() {
+                continue;
+            }
             let (fp, fnr) = rates.clamped_for(m);
             let ln_fp = fp.ln();
             let ln_1mfp = (1.0 - fp).ln();
@@ -621,8 +732,9 @@ pub fn run_mcmc(
 ) -> (MutationTree, f64) {
     let n = matrix.variants.len();
     let spans = variant_spans(&matrix.variants);
+    let recurrent = recurrent_nodes(&matrix.variants);
     let mut current = initial_tree.cloned().unwrap_or_else(|| MutationTree::random(n, rng));
-    current = enforce_position_exclusivity(&current, &spans);
+    current = settle_constraints(&current, &matrix.variants, &spans);
     let scorer = AttachmentScorer::new(matrix, rates);
     let mut current_ll = tree_log_likelihood_with(&current, &scorer);
     let mut best = current.clone();
@@ -635,8 +747,9 @@ pub fn run_mcmc(
 
     for _ in 0..n_iterations {
         let (proposal, nbh_correction) = propose_move(&current, rng);
-        // Hard constraint: overlapping (mutually exclusive) alleles never share a root-to-leaf path.
-        if violates_position_exclusivity(&proposal, &spans) {
+        // Hard constraints: overlapping (mutually exclusive) alleles never share a root-to-leaf path, and recurrent
+        // tract states stay leaves.
+        if violates_position_exclusivity(&proposal, &spans) || violates_recurrent_leaves(&proposal, &recurrent) {
             continue;
         }
         let proposal_ll = tree_log_likelihood_with(&proposal, &scorer);
@@ -680,6 +793,285 @@ pub fn run_mcmc_multichain(
         };
     }
     best.expect("n_chains must be >= 1")
+}
+
+// ─── Recurrent tract states ─────────────────────────────────────────────────
+
+/// Most copies of tract alleles one search adds (reaching it is logged).
+const TRACT_COPY_MAX: usize = 32;
+/// Family-wise level of the excess test a copy must pass (Bonferroni over the candidates of a round, or over the
+/// copies when they are re-checked).
+const TRACT_COPY_ALPHA: f64 = 0.05;
+/// The excess test assumes at least this chance of a read being called another length: past the calibrated run
+/// length the kernel's slip rates are lower bounds, so a copy must beat a plausible long-run slip rate too.
+const TRACT_COPY_NULL_FLOOR: f64 = 0.05;
+
+/// The binomial upper-tail p of the reads called `state` at `site` among the reads attached to `nodes` that have a
+/// call there, when their clade has the site state of `clade_node` (so that state is reached only by error, at a
+/// rate of at least [`TRACT_COPY_NULL_FLOOR`]).
+fn copy_excess_p(
+    matrix: &BinaryMatrix,
+    tree: &MutationTree,
+    site: &TractSite,
+    state: usize,
+    attachment: &[usize],
+    nodes: &[usize],
+    clade_node: usize,
+) -> f64 {
+    let path = if clade_node == tree.root() { Mask::new() } else { tree.ancestor_mask(clade_node) };
+    let clade_state = site.node_state(|m| path.get(m));
+    let (mut n, mut k) = (0usize, 0usize);
+    for (r, a) in attachment.iter().enumerate() {
+        if !nodes.contains(a) {
+            continue;
+        }
+        if let Some(o) = site.observed(|m| matrix.data.get(m).and_then(|row| row[r])) {
+            n += 1;
+            k += usize::from(o == state);
+        }
+    }
+    let p0 = if state == clade_state { 1.0 } else { site.log_p[state][clade_state].exp().max(TRACT_COPY_NULL_FLOOR) };
+    binomial_upper_tail(n, k, p0)
+}
+
+/// A copy's name is `<allele>#<k>`; this is the allele.
+pub fn copy_base(name: &str) -> &str {
+    name.split_once('#').map_or(name, |(base, _)| base)
+}
+
+/// Nodes of recurrent tract states: an allele with copies (`<allele>#<k>`) is homoplastic, so none of its nodes may
+/// define a clade; they stay leaves.
+pub fn recurrent_nodes(variants: &[String]) -> Vec<bool> {
+    let recurrent: std::collections::HashSet<&str> =
+        variants.iter().filter(|v| v.contains('#')).map(|v| copy_base(v)).collect();
+    variants.iter().map(|v| recurrent.contains(copy_base(v))).collect()
+}
+
+/// Whether some node hangs under a recurrent tract-state node.
+pub fn violates_recurrent_leaves(tree: &MutationTree, recurrent: &[bool]) -> bool {
+    (0..tree.n_mutations).any(|x| {
+        let p = tree.parent[x];
+        p != tree.root() && recurrent.get(p).copied().unwrap_or(false)
+    })
+}
+
+/// Lift every child of a recurrent tract-state node to that node's nearest non-recurrent ancestor (or the root).
+pub fn enforce_recurrent_leaves(tree: &MutationTree, recurrent: &[bool]) -> MutationTree {
+    let mut result = tree.clone();
+    let is_rec = |x: usize| x != tree.root() && recurrent.get(x).copied().unwrap_or(false);
+    for x in 0..tree.n_mutations {
+        let mut p = result.parent[x];
+        while is_rec(p) {
+            p = result.parent[p];
+        }
+        result.parent[x] = p;
+    }
+    result
+}
+
+/// `matrix`/`rates`/`tree` plus a copy of column `col` as a new leaf under `parent`: the copy's column repeats
+/// the allele's calls and joins its site with the same state, so the site's observations do not change.
+fn with_tract_copy(
+    matrix: &BinaryMatrix,
+    rates: &ErrorRates,
+    tree: &MutationTree,
+    col: usize,
+    parent: usize,
+) -> (BinaryMatrix, ErrorRates, MutationTree) {
+    let base = copy_base(&matrix.variants[col]).to_string();
+    let k = 1 + matrix.variants.iter().filter(|v| copy_base(v) == base).count();
+    let new_col = matrix.variants.len();
+    let mut m = matrix.clone();
+    m.variants.push(format!("{base}#{k}"));
+    m.data.push(matrix.data[col].clone());
+    let mut r = rates.clone();
+    if col < r.per_variant.len() {
+        let rate = r.per_variant[col];
+        r.per_variant.resize(new_col, (r.fp_rate, r.fn_rate));
+        r.per_variant.push(rate);
+    }
+    for site in &mut r.sites {
+        if let Some(i) = site.members.iter().position(|&x| x == col) {
+            let state = site.member_state[i];
+            site.members.push(new_col);
+            site.member_state.push(state);
+        }
+    }
+    let n = tree.n_mutations;
+    let lift = |p: usize| if p == n { n + 1 } else { p };
+    let mut parents: Vec<usize> = tree.parent[..n].iter().map(|&p| lift(p)).collect();
+    parents.push(lift(parent));
+    parents.push(n + 1);
+    let t = enforce_recurrent_leaves(&MutationTree { n_mutations: n + 1, parent: parents }, &recurrent_nodes(&m.variants));
+    (m, r, t)
+}
+
+/// `matrix`/`rates`/`tree` without mutation `node`: its children move to its parent.
+fn without_node(
+    matrix: &BinaryMatrix,
+    rates: &ErrorRates,
+    tree: &MutationTree,
+    node: usize,
+) -> (BinaryMatrix, ErrorRates, MutationTree) {
+    let n = tree.n_mutations;
+    let shift = |x: usize| if x > node { x - 1 } else { x };
+    let mut m = matrix.clone();
+    m.variants.remove(node);
+    m.data.remove(node);
+    let mut r = rates.clone();
+    if node < r.per_variant.len() {
+        r.per_variant.remove(node);
+    }
+    for site in &mut r.sites {
+        let kept: Vec<(usize, usize)> = site
+            .members
+            .iter()
+            .zip(&site.member_state)
+            .filter(|(&x, _)| x != node)
+            .map(|(&x, &st)| (shift(x), st))
+            .collect();
+        site.members = kept.iter().map(|k| k.0).collect();
+        site.member_state = kept.iter().map(|k| k.1).collect();
+    }
+    let up = tree.parent[node];
+    let parents: Vec<usize> = (0..=n)
+        .filter(|&x| x != node)
+        .map(|x| {
+            let p = if tree.parent[x] == node { up } else { tree.parent[x] };
+            shift(p)
+        })
+        .collect();
+    (m, r, MutationTree { n_mutations: n - 1, parent: parents })
+}
+
+/// Both hard constraints: same-locus exclusivity, then recurrent tract states as leaves (lifting a child keeps it
+/// off its old ancestors' paths, so exclusivity still holds).
+fn settle_constraints(tree: &MutationTree, variants: &[String], spans: &[VariantSpan]) -> MutationTree {
+    enforce_recurrent_leaves(&enforce_position_exclusivity(tree, spans), &recurrent_nodes(variants))
+}
+
+/// Recurrent tract states. A copy of a site allele, as a leaf under node `p`, is a candidate when adding it raises the
+/// tree log-likelihood by more than `penalty` nats and, among the reads then attached to the copy or to its parent,
+/// those called that allele are significantly more than the parent's own state explains (binomial upper tail below
+/// `TRACT_COPY_ALPHA` over the round's candidates). The best candidate is added and the search re-run from there; this repeats until none is left.
+/// Copies of one site never share a root-to-node path, and every node of a recurrent allele is a leaf (its first
+/// node's children move up when a copy is added, and the gain is measured after that). Finally each copy is
+/// re-checked against its parent's clade on the final tree and dropped when the excess no longer holds (or it has
+/// no reads). Returns the grown matrix, rates and tree, and one log line per change.
+pub fn add_tract_copies(
+    matrix: &BinaryMatrix,
+    rates: &ErrorRates,
+    tree: &MutationTree,
+    n_iterations: usize,
+    penalty: f64,
+) -> (BinaryMatrix, ErrorRates, MutationTree, Vec<String>) {
+    let (mut m, mut r, mut t) = (matrix.clone(), rates.clone(), tree.clone());
+    let mut ll = tree_log_likelihood(&m, &t, &r);
+    let mut log = Vec::new();
+    let site_of = |r: &ErrorRates, col: usize| -> Option<(usize, usize)> {
+        r.sites.iter().enumerate().find_map(|(si, site)| {
+            site.members.iter().position(|&x| x == col).map(|k| (si, site.member_state[k]))
+        })
+    };
+    let mut added = 0usize;
+    while added < TRACT_COPY_MAX {
+        let spans = variant_spans(&m.variants);
+        let recurrent = recurrent_nodes(&m.variants);
+        let originals: Vec<usize> = r
+            .sites
+            .iter()
+            .flat_map(|site| site.members.iter().copied())
+            .filter(|&c| c < m.variants.len() && !m.variants[c].contains('#'))
+            .collect();
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        for &col in &originals {
+            let base = copy_base(&m.variants[col]);
+            for p in 0..=t.n_mutations {
+                let mut cur = p;
+                let mut clash = false;
+                while cur != t.root() {
+                    clash |= spans[cur].overlaps(&spans[col]);
+                    cur = t.parent[cur];
+                }
+                let sibling = (0..t.n_mutations).any(|x| t.parent[x] == p && copy_base(&m.variants[x]) == base);
+                // A copy under a recurrent node would be lifted to that node's parent anyway: skip the duplicate.
+                let under_recurrent = p != t.root() && recurrent[p];
+                if clash || sibling || under_recurrent {
+                    continue;
+                }
+                candidates.push((col, p));
+            }
+        }
+        // The excess test runs on the reads that move to the copy, against the state of the clade it joins.
+        let alpha = TRACT_COPY_ALPHA / candidates.len().max(1) as f64;
+        let mut best: Option<(f64, usize, usize, f64)> = None;
+        for &(col, p) in &candidates {
+            let (m2, r2, t2) = with_tract_copy(&m, &r, &t, col, p);
+            let gain = tree_log_likelihood(&m2, &t2, &r2) - ll;
+            if gain <= penalty || best.is_some_and(|b| gain <= b.0 + LL_TIE_EPS) {
+                continue;
+            }
+            let copy = m2.variants.len() - 1;
+            let (si, state) = site_of(&r2, copy).expect("a copy joins its allele's site");
+            let attachment = attach_all_reads(&m2, &t2, &r2).attachment;
+            let q = t2.parent[copy];
+            let excess = copy_excess_p(&m2, &t2, &r2.sites[si], state, &attachment, &[q, copy], q);
+            if excess < alpha {
+                best = Some((gain, col, p, excess));
+            }
+        }
+        let Some((gain, col, p, excess)) = best else { break };
+        let parent_name = if p == t.root() { "ROOT".to_string() } else { m.variants[p].clone() };
+        let (m2, r2, t2) = with_tract_copy(&m, &r, &t, col, p);
+        let spans2 = variant_spans(&m2.variants);
+        let (t3, _) = run_mcmc_multichain(&m2, &r2, n_iterations, 1, Some(&t2));
+        let t3 = settle_constraints(&polish_unary_path_order(&t3, &m2, &r2), &m2.variants, &spans2);
+        let ll3 = tree_log_likelihood(&m2, &t3, &r2);
+        log.push(format!(
+            "{} proposed as a leaf under {parent_name} (+{gain:.2} nats, excess p {excess:.2e}); tree {ll:.2} -> \
+             {ll3:.2} after re-search",
+            m2.variants[m2.variants.len() - 1]
+        ));
+        (m, r, t, ll) = (m2, r2, t3, ll3);
+        added += 1;
+    }
+    if added == TRACT_COPY_MAX {
+        warn!("[SCITE] Tract copies: stopped at the cap of {TRACT_COPY_MAX}; more may be supported");
+        log.push(format!("stopped at the cap of {TRACT_COPY_MAX} copies"));
+    }
+    // Re-check every copy on the final tree: its reads against the state of its parent's clade.
+    loop {
+        let attachment = attach_all_reads(&m, &t, &r).attachment;
+        let copies: Vec<usize> = (0..t.n_mutations).filter(|&x| m.variants[x].contains('#')).collect();
+        let alpha = TRACT_COPY_ALPHA / copies.len().max(1) as f64;
+        let failing = copies.iter().copied().find_map(|x| {
+            let (si, state) = site_of(&r, x)?;
+            let q = t.parent[x];
+            let excess = copy_excess_p(&m, &t, &r.sites[si], state, &attachment, &[q, x], q);
+            (excess >= alpha).then_some((x, excess))
+        });
+        let Some((x, excess)) = failing else { break };
+        log.push(format!("{} dropped (excess p {excess:.2e} on the final tree)", m.variants[x]));
+        (m, r, t) = without_node(&m, &r, &t, x);
+    }
+    (m, r, t, log)
+}
+
+/// `cleaned` with each copy's row folded (OR) into its allele's row, so every allele has one row.
+pub fn merge_tract_copies(cleaned: &CleanedMatrix) -> CleanedMatrix {
+    let mut variants = Vec::new();
+    let mut data: Vec<Vec<u8>> = Vec::new();
+    for (name, row) in cleaned.variants.iter().zip(&cleaned.data) {
+        let base = copy_base(name);
+        match variants.iter().position(|v: &String| v == base) {
+            Some(i) => data[i].iter_mut().zip(row).for_each(|(a, b)| *a |= *b),
+            None => {
+                variants.push(base.to_string());
+                data.push(row.clone());
+            }
+        }
+    }
+    CleanedMatrix { variants, reads: cleaned.reads.clone(), data, attachment: cleaned.attachment.clone() }
 }
 
 /// The imputed, denoised genotype matrix from attaching every read to its best node in `tree`.
@@ -856,11 +1248,89 @@ fn write_cooccurrence(
 }
 
 /// Co-occurrence on the SCITE-cleaned matrix over its first `n` (non-block) variants.
+/// Every read is imputed from its tree attachment, so these statistics restate the tree; `--debug` only.
 pub fn write_variant_cooccurrence(matrix: &CleanedMatrix, n: usize, path: &str) -> Result<()> {
     write_cooccurrence(&matrix.variants[..n], matrix.reads.len(), |v, r| Some(matrix.data[v][r]), path)
 }
 
-/// Same statistics on the raw (pre-SCITE) matrix.
+/// One row per annotate-only tract allele: its observed linkage to the informative variants.
+/// `best_partner` is the informative variant with odds ratio > 1 and the smallest BH q (ties: smaller p, then
+/// matrix order); `linked` says whether that q is <= 0.05. The q values are corrected over the annotated x
+/// informative pairs only, so they differ from the same pair's q in `variant_cooccurrence.tsv`.
+fn write_tract_annotation(
+    matrix: &BinaryMatrix,
+    annotated: &[usize],
+    informative: &[usize],
+    annotate: &[Option<TractAnnotation>],
+    path: &str,
+) -> Result<()> {
+    let mut pairs: Vec<(usize, usize, PairCooccurrence)> = Vec::new();
+    for &a in annotated {
+        for &u in informative {
+            let (mut n11, mut n10, mut n01, mut n00) = (0usize, 0usize, 0usize, 0usize);
+            for r in 0..matrix.reads.len() {
+                if let (Some(x), Some(y)) = (matrix.data[a][r], matrix.data[u][r]) {
+                    match (x, y) {
+                        (1, 1) => n11 += 1,
+                        (1, 0) => n10 += 1,
+                        (0, 1) => n01 += 1,
+                        _ => n00 += 1,
+                    }
+                }
+            }
+            pairs.push((a, u, pair_cooccurrence(n11, n10, n01, n00)));
+        }
+    }
+    let qs = if pairs.is_empty() {
+        Vec::new()
+    } else {
+        adjust(&pairs.iter().map(|(_, _, s)| s.fisher_p).collect::<Vec<_>>(), Procedure::BenjaminiHochberg)
+    };
+    let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
+    writeln!(
+        w,
+        "variant\thf\trun_class\trun_length\tbest_partner\tn_co\tn11\todds_ratio\tfisher_p\tfisher_q\tlinked\treason"
+    )?;
+    for &a in annotated {
+        let info = annotate[a].as_ref().expect("annotated variants carry an annotation");
+        let (_, _, hf) = crate::lineage::row_hf(&matrix.data[a]);
+        let best = pairs
+            .iter()
+            .zip(qs.iter())
+            .filter(|((pa, _, s), _)| *pa == a && s.odds_ratio > 1.0)
+            .fold(None::<(&(usize, usize, PairCooccurrence), f64)>, |acc, (p, &q)| match acc {
+                Some((bp, bq)) if bq < q || (bq == q && bp.2.fisher_p <= p.2.fisher_p) => acc,
+                _ => Some((p, q)),
+            });
+        let fields: [String; 7] = match best {
+            Some(((_, u, s), q)) => [
+                matrix.variants[*u].clone(),
+                s.n_co.to_string(),
+                s.n11.to_string(),
+                s.odds_ratio.to_string(),
+                format!("{:.6e}", s.fisher_p),
+                format!("{q:.6e}"),
+                if q <= MAX_PARTNER_Q { "yes" } else { "no" }.to_string(),
+            ],
+            None => std::array::from_fn(|_| "NA".to_string()),
+        };
+        writeln!(
+            w,
+            "{}\t{hf:.6}\t{}\t{}\t{}\t{}",
+            matrix.variants[a],
+            info.run_class,
+            info.run_length,
+            fields.join("\t"),
+            info.reason
+        )?;
+    }
+    Ok(())
+}
+
+/// BH q at or below which an annotated tract allele counts as linked to its best partner.
+const MAX_PARTNER_Q: f64 = 0.05;
+
+/// Same statistics on observed (pre-SCITE) calls: each pair counts only the reads that call both sites.
 pub fn write_raw_variant_cooccurrence(matrix: &BinaryMatrix, path: &str) -> Result<()> {
     write_cooccurrence(&matrix.variants, matrix.reads.len(), |v, r| matrix.data[v][r], path)
 }
@@ -936,14 +1406,21 @@ pub fn edge_evidence(
 ) -> Vec<EdgeEvidence> {
     let scorer = AttachmentScorer::new(matrix, rates);
     let tree_ll = tree_log_likelihood_with(tree, &scorer);
+    let spans = variant_spans(&matrix.variants);
+    let recurrent = recurrent_nodes(&matrix.variants);
 
     (0..tree.n_mutations)
         .map(|node| {
             let parent = tree.parent[node];
-            if parent == tree.root() {
+            // A recurrent tract state's carriers are spread over its copies: its edge has no order to test.
+            if parent == tree.root() || recurrent[node] {
                 return EdgeEvidence { support_ll: None, counts: None };
             }
             let swapped = swap_labels(tree, node, parent);
+            // The swap is no tree the model allows (it would put two alleles of one site on a path): no evidence.
+            if violates_position_exclusivity(&swapped, &spans) || violates_recurrent_leaves(&swapped, &recurrent) {
+                return EdgeEvidence { support_ll: None, counts: None };
+            }
             EdgeEvidence {
                 support_ll: Some(tree_ll - tree_log_likelihood_with(&swapped, &scorer)),
                 counts: Some(orientation_counts(matrix, node, parent)),
@@ -991,6 +1468,7 @@ pub fn write_mutation_tree(
     matrix: &CleanedMatrix,
     evidence: &[EdgeEvidence],
     block_names: &[String],
+    annotated_names: &[String],
     path: &str,
 ) -> Result<()> {
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
@@ -1027,6 +1505,10 @@ pub fn write_mutation_tree(
             block_names.join(","),
             tree.root()
         )?;
+    }
+    // Tract alleles reported but not placed: one row, no read count (they are in no node).
+    if !annotated_names.is_empty() {
+        writeln!(w, "TRACT_ANNOTATED\t{}\t{}\tROOT\tNA\tNA\tNA\tNA", annotated_names.join(","), tree.root())?;
     }
     Ok(())
 }
@@ -1116,6 +1598,7 @@ pub fn write_read_lineage_newick(
     rates: &ErrorRates,
     evidence: &[EdgeEvidence],
     block_names: &[String],
+    annotated_names: &[String],
     path: &str,
 ) -> Result<()> {
     let children = tree.children_of();
@@ -1138,9 +1621,16 @@ pub fn write_read_lineage_newick(
 
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
     write!(w, "{body}")?;
-    // The body ends with the `)ROOT` node, which carries the root block as an NHX field.
+    // The body ends with the `)ROOT` node, which carries the root block and the tract annotation as NHX fields.
+    let mut root_fields = Vec::new();
     if !block_names.is_empty() {
-        write!(w, "[&&NHX:root_block={}]", block_names.join(","))?;
+        root_fields.push(format!("root_block={}", block_names.join(",")));
+    }
+    if !annotated_names.is_empty() {
+        root_fields.push(format!("tract_annotated={}", annotated_names.join(",")));
+    }
+    if !root_fields.is_empty() {
+        write!(w, "[&&NHX:{}]", root_fields.join(":"))?;
     }
     writeln!(w, ";")?;
     Ok(())
@@ -1155,7 +1645,13 @@ pub fn polish_unary_path_order(
 ) -> MutationTree {
     let mut current = tree.clone();
     let scorer = AttachmentScorer::new(matrix, rates);
-    let paths = maximal_unary_paths(&current);
+    // Recurrent tract states are leaves: reordering one into the middle of a path would break that rule.
+    let recurrent = recurrent_nodes(&matrix.variants);
+    let paths: Vec<Vec<usize>> = maximal_unary_paths(&current)
+        .into_iter()
+        .map(|p| p.into_iter().take_while(|&x| !recurrent.get(x).copied().unwrap_or(false)).collect::<Vec<_>>())
+        .filter(|p| p.len() >= 2)
+        .collect();
     info!(
         "[SCITE] Unary-path polish: {} maximal unary path(s) (len≥2) over {} variants",
         paths.len(),
@@ -1379,12 +1875,18 @@ fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usiz
 
 /// Pull every block member whose REF span overlaps any other variant back into the search: imputing
 /// it on every read would put two mutually-exclusive alleles on one molecule.
-/// `variants` is the full variant list `rb` indexes.
-fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> rootblock::RootBlock {
+/// `variants` is the full variant list `rb` indexes. Variants flagged in `not_searched` (annotate-only tract
+/// alleles; empty = none) never enter the search, so overlapping them is no conflict.
+fn resolve_span_conflicts(
+    mut rb: rootblock::RootBlock,
+    variants: &[String],
+    not_searched: &[bool],
+) -> rootblock::RootBlock {
     let spans = variant_spans(variants);
+    let searched = |u: usize| !not_searched.get(u).copied().unwrap_or(false);
 
     let (pulled_back, kept): (Vec<usize>, Vec<usize>) = rb.block.iter().copied().partition(|&v| {
-        (0..variants.len()).any(|u| u != v && spans[v].overlaps(&spans[u]))
+        (0..variants.len()).any(|u| u != v && searched(u) && spans[v].overlaps(&spans[u]))
     });
 
     if !pulled_back.is_empty() {
@@ -1414,7 +1916,77 @@ fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> 
     rb
 }
 
-/// The cleaned matrix (root-block columns appended) and its haplotypes, the tips of `<prefix>.read_lineage.nwk`.
+/// Why a tract allele is reported but kept out of the tree search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TractAnnotation {
+    pub run_class: String,
+    pub run_length: usize,
+    pub reason: String,
+}
+
+/// Per-variant error model for the filtered matrix, aligned with its variants (`lineage` builds it).
+#[derive(Debug, Clone, Default)]
+pub struct VariantModel {
+    /// `(fp, fn)` of every variant: SCITE scoring, and `.1` as its root-block dropout.
+    pub rates: Vec<(f64, f64)>,
+    /// `Some` for tract alleles that are reported but never placed; empty means none.
+    pub annotate: Vec<Option<TractAnnotation>>,
+    /// Homopolymer-tract sites to score as categorical characters, with recurrent states.
+    pub sites: Vec<SiteSpec>,
+}
+
+/// One homopolymer-tract site as `lineage` describes it, before the root block and annotation are known.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SiteSpec {
+    /// The site's length alleles, as indices into the filtered matrix's variants.
+    pub members: Vec<usize>,
+    /// Run length of each member's state.
+    pub member_len: Vec<i64>,
+    /// Run length of the root state: the most common length called at this position among those that are not
+    /// members (REF, or an allele the filters dropped).
+    pub root_len: i64,
+    /// `(L, [(Δ, P(called length − L = Δ | true length L))])` for every length among the states.
+    pub kernel: Vec<(i64, Vec<(i64, f64)>)>,
+}
+
+impl SiteSpec {
+    fn kernel_at(&self, len: i64, delta: i64) -> f64 {
+        self.kernel
+            .iter()
+            .find(|(l, _)| *l == len)
+            .and_then(|(_, k)| k.iter().find(|(d, _)| *d == delta))
+            .map_or(0.0, |(_, p)| *p)
+    }
+}
+
+/// The scored sites over the search matrix: each spec's searched members (their `informative` positions) are the
+/// allele states, state 0 has the spec's root length. A spec with no searched member is no site. (A root-block
+/// member never sits beside a searched one: span conflicts pull it back into the search.)
+pub fn build_sites(specs: &[SiteSpec], informative: &[usize]) -> Vec<TractSite> {
+    specs
+        .iter()
+        .filter_map(|spec| {
+            let searched: Vec<(usize, i64)> = spec
+                .members
+                .iter()
+                .zip(&spec.member_len)
+                .filter_map(|(v, &len)| informative.iter().position(|i| i == v).map(|col| (col, len)))
+                .collect();
+            if searched.is_empty() {
+                return None;
+            }
+            let lens: Vec<i64> = std::iter::once(spec.root_len).chain(searched.iter().map(|s| s.1)).collect();
+            Some(TractSite {
+                members: searched.iter().map(|s| s.0).collect(),
+                member_state: (1..=searched.len()).collect(),
+                log_p: site_log_p(&lens, |l, d| spec.kernel_at(l, d)),
+            })
+        })
+        .collect()
+}
+
+/// The cleaned matrix (root-block columns appended; tract copies folded into their allele's row, while `attachment`
+/// keeps the node ids of the tree with copies) and the haplotypes that are the tips of `<prefix>.read_lineage.nwk`.
 pub struct SciteOutput {
     pub cleaned: CleanedMatrix,
     pub cleaned_haplotypes: HaplotypeMatrix,
@@ -1427,6 +1999,7 @@ pub fn run_scite_pipeline(
     fp_rate: f64,
     fn_rate: f64,
     hp_rates: (f64, f64),
+    model: Option<&VariantModel>,
     n_iterations: usize,
     n_chains: usize,
     debug: bool,
@@ -1438,8 +2011,33 @@ pub fn run_scite_pipeline(
              relax the --min-hf / --max-hf thresholds."
         );
     }
-    // TODO: dropout_rate is still the global fn, not the HP-tract fn.
-    let rb = resolve_span_conflicts(rootblock::partition(binary, fn_rate), &binary.variants);
+    if let Some(m) = model {
+        anyhow::ensure!(
+            m.rates.len() == binary.variants.len()
+                && (m.annotate.is_empty() || m.annotate.len() == binary.variants.len()),
+            "variant model covers {} rates / {} annotations for {} variants",
+            m.rates.len(),
+            m.annotate.len(),
+            binary.variants.len()
+        );
+    }
+    // Root-block dropout uses the same per-variant fn as the SCITE scorer: HP-tract alleles get their HP fn.
+    let dropout_rates: Vec<f64> = match model {
+        Some(m) => m.rates.iter().map(|r| r.1).collect(),
+        None => variant_spans(&binary.variants)
+            .iter()
+            .map(|span| if crate::tracts::overlaps_tract(span) { hp_rates.1 } else { fn_rate })
+            .collect(),
+    };
+    let not_searched: Vec<bool> = match model {
+        Some(m) if !m.annotate.is_empty() => m.annotate.iter().map(|a| a.is_some()).collect(),
+        _ => Vec::new(),
+    };
+    let rb = resolve_span_conflicts(
+        rootblock::partition_with_rates(binary, &dropout_rates),
+        &binary.variants,
+        &not_searched,
+    );
     // The raw co-occurrence and root-block tables report the full matrix; everything else the search matrix.
     let full_binary = binary;
     let block_names: Vec<String> =
@@ -1452,7 +2050,23 @@ pub fn run_scite_pipeline(
             block_names.join(", ")
         );
     }
-    let search_matrix = rootblock::restrict(binary, &rb.informative);
+    // Annotate-only tract alleles leave the informative set: reported with their observed linkage, never placed.
+    let annotated: Vec<usize> = match model {
+        Some(m) if !m.annotate.is_empty() => {
+            rb.informative.iter().copied().filter(|&v| m.annotate[v].is_some()).collect()
+        }
+        _ => Vec::new(),
+    };
+    let informative: Vec<usize> = rb.informative.iter().copied().filter(|v| !annotated.contains(v)).collect();
+    let annotated_names: Vec<String> = annotated.iter().map(|&v| binary.variants[v].clone()).collect();
+    if !annotated.is_empty() {
+        info!(
+            "[SCITE] Tract annotation: {} allele(s) reported but kept out of the search (see tract_annotation.tsv): {}",
+            annotated.len(),
+            annotated_names.join(", ")
+        );
+    }
+    let search_matrix = rootblock::restrict(binary, &informative);
     let binary = &search_matrix;
     // Haplotypes over the search matrix only seed the NJ-derived initial tree.
     let hap_matrix = lineage::deduplicate(binary);
@@ -1469,7 +2083,7 @@ pub fn run_scite_pipeline(
         info!(
             "[SCITE] Only 1 variant ({}) passed filtering: the mutation tree is \
              fixed (root → variant), so the MCMC search and unary-path polish are \
-             skipped and the pairwise co-occurrence tables will be empty.",
+             skipped and the co-occurrence table has no pair among tree variants.",
             binary.variants[0]
         );
     }
@@ -1482,14 +2096,22 @@ pub fn run_scite_pipeline(
     );
 
     let spans = variant_spans(&binary.variants);
-    let per_variant = per_variant_rates(&spans, fp_rate, fn_rate, hp_rates);
-    let n_hp = spans.iter().filter(|span| crate::tracts::overlaps_tract(span)).count();
-    info!(
-        "[SCITE] {n_hp} of {} variant(s) overlap a known HP tract and use fp={}, fn={}",
-        spans.len(),
-        hp_rates.0,
-        hp_rates.1
-    );
+    let per_variant = match model {
+        Some(m) => {
+            info!("[SCITE] Per-variant rates from the error model (see error_model.tsv)");
+            informative.iter().map(|&v| m.rates[v]).collect()
+        }
+        None => {
+            let n_hp = spans.iter().filter(|span| crate::tracts::overlaps_tract(span)).count();
+            info!(
+                "[SCITE] {n_hp} of {} variant(s) overlap a known HP tract and use fp={}, fn={}",
+                spans.len(),
+                hp_rates.0,
+                hp_rates.1
+            );
+            per_variant_rates(&spans, fp_rate, fn_rate, hp_rates)
+        }
+    };
     // Overlap is not transitive, so report the constrained pairs rather than grouping into sites.
     let conflict_pairs: Vec<String> = (0..spans.len())
         .flat_map(|i| (i + 1..spans.len()).map(move |j| (i, j)))
@@ -1515,7 +2137,18 @@ pub fn run_scite_pipeline(
         }
     );
 
-    let rates = ErrorRates { fp_rate, fn_rate, per_variant };
+    // Tract alleles at one position form one categorical site; its states may recur on several branches.
+    let sites = model.map(|m| build_sites(&m.sites, &informative)).unwrap_or_default();
+    for site in &sites {
+        let names: Vec<&str> = site.members.iter().map(|&c| binary.variants[c].as_str()).collect();
+        let stay: Vec<String> = (0..site.log_p.len()).map(|t| format!("{:.3}", site.log_p[t][t].exp())).collect();
+        info!(
+            "[SCITE] Tract site {{{}}}: one categorical character, P(called as itself) by state (none/root first) {}",
+            names.join(", "),
+            stay.join("/")
+        );
+    }
+    let rates = ErrorRates { fp_rate, fn_rate, per_variant, sites };
     let (tree, ll) = if no_informative {
         (MutationTree { n_mutations: 0, parent: vec![0] }, 0.0)
     } else {
@@ -1525,11 +2158,29 @@ pub fn run_scite_pipeline(
 
     let tree = if no_informative { tree } else { polish_unary_path_order(&tree, binary, &rates) };
     let tree = enforce_position_exclusivity(&tree, &spans);
+    // Recurrent tract states: copies of site alleles on other branches, each worth more than ln(n_reads) nats.
+    let (copied_matrix, rates, tree) = if rates.sites.is_empty() || no_informative {
+        (binary.clone(), rates, tree)
+    } else {
+        let penalty = (binary.reads.len().max(2) as f64).ln();
+        let (m, r, t, log) = add_tract_copies(binary, &rates, &tree, n_iterations, penalty);
+        for line in &log {
+            info!("[SCITE] Tract copy: {line}");
+        }
+        if log.is_empty() {
+            info!("[SCITE] Tract copies: none gains more than {penalty:.2} nats");
+        }
+        (m, r, t)
+    };
+    let binary = &copied_matrix;
     let ll_polish = tree_log_likelihood(binary, &tree, &rates);
     info!("[SCITE] After unary-path polish log-likelihood: {ll_polish:.3}");
 
     let mut cleaned = attach_all_reads(binary, &tree, &rates);
     let n_informative = rootblock::append_block_to_cleaned(&mut cleaned, &block_names);
+    // Tree outputs keep each copy as its own node; matrix outputs fold copies into their allele's row.
+    let merged = merge_tract_copies(&cleaned);
+    let n_merged_informative = n_informative - (cleaned.variants.len() - merged.variants.len());
 
     let evidence = edge_evidence(&tree, binary, &rates);
     let unresolved: Vec<String> = (0..tree.n_mutations)
@@ -1553,12 +2204,41 @@ pub fn run_scite_pipeline(
         );
     }
 
-    write_variant_cooccurrence(&cleaned, n_informative, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
+    // Linkage is reported from observed calls over the informative variants, never from the tree-imputed
+    // matrix: imputation would turn the tree's own placements into apparent co-occurrence evidence.
+    // Annotate-only tract alleles are listed too: observed linkage is all that is reported for them.
+    let mut cooc_rows: Vec<usize> = informative.iter().chain(annotated.iter()).copied().collect();
+    cooc_rows.sort_unstable();
+    write_raw_variant_cooccurrence(
+        &rootblock::restrict(full_binary, &cooc_rows),
+        &format!("{output_prefix}.variant_cooccurrence.tsv"),
+    )?;
+    if let Some(m) = model {
+        write_tract_annotation(
+            full_binary,
+            &annotated,
+            &informative,
+            &m.annotate,
+            &format!("{output_prefix}.tract_annotation.tsv"),
+        )?;
+    }
     if debug {
         write_raw_variant_cooccurrence(full_binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
+        write_variant_cooccurrence(
+            &merged,
+            n_merged_informative,
+            &format!("{output_prefix}.cleaned_variant_cooccurrence.tsv"),
+        )?;
     }
-    write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
-    write_mutation_tree(&tree, &cleaned, &evidence, &block_names, &format!("{output_prefix}.mutation_tree.tsv"))?;
+    write_molecule_summary(&merged, &format!("{output_prefix}.molecule_summary.tsv"))?;
+    write_mutation_tree(
+        &tree,
+        &cleaned,
+        &evidence,
+        &block_names,
+        &annotated_names,
+        &format!("{output_prefix}.mutation_tree.tsv"),
+    )?;
     write_root_block_table(&rb.audit, &full_binary.variants, &format!("{output_prefix}.root_block.tsv"))?;
 
     // Deduplicate the SCITE-cleaned reads into haplotypes for the lineage tree.
@@ -1578,13 +2258,12 @@ pub fn run_scite_pipeline(
         &rates,
         &evidence,
         &block_names,
+        &annotated_names,
         &format!("{output_prefix}.read_lineage.nwk"),
     )?;
 
-    Ok(SciteOutput {
-        cleaned,
-        cleaned_haplotypes: cleaned_hap_matrix,
-    })
+    // The haplotype map keeps the Newick's haplotypes, so tip ids match (it lists reads, not variants).
+    Ok(SciteOutput { cleaned: merged, cleaned_haplotypes: cleaned_hap_matrix })
 }
 
 #[cfg(test)]
@@ -1594,7 +2273,7 @@ mod tests {
     impl ErrorRates {
         /// The same rates for every variant.
         fn uniform(fp: f64, fnr: f64) -> Self {
-            ErrorRates { fp_rate: fp, fn_rate: fnr, per_variant: Vec::new() }
+            ErrorRates { fp_rate: fp, fn_rate: fnr, per_variant: Vec::new(), sites: Vec::new() }
         }
     }
 
@@ -1682,7 +2361,7 @@ mod tests {
     /// Run the pipeline into the temp prefix `himito_scite_<name>`; returns its output and that prefix.
     fn run_pipeline(name: &str, binary: &BinaryMatrix, debug: bool) -> (SciteOutput, String) {
         let prefix = std::env::temp_dir().join(format!("himito_scite_{name}")).to_str().unwrap().to_string();
-        let out = run_scite_pipeline(binary, 0.01, 0.05, (0.01, 0.05), 200, 1, debug, &prefix).unwrap();
+        let out = run_scite_pipeline(binary, 0.01, 0.05, (0.01, 0.05), None, 200, 1, debug, &prefix).unwrap();
         (out, prefix)
     }
 
@@ -1747,7 +2426,7 @@ mod tests {
     #[test]
     fn columns_past_per_variant_use_the_global_rate() {
         let profile = vec![Some(1), Some(1)];
-        let rates = ErrorRates { fp_rate: 0.1, fn_rate: 0.2, per_variant: vec![(0.3, 0.4)] };
+        let rates = ErrorRates { fp_rate: 0.1, fn_rate: 0.2, per_variant: vec![(0.3, 0.4)], sites: Vec::new() };
         // Variant 0 uses its own fp (0.3); the extra column falls back to 0.1.
         let expected = 0.3_f64.ln() + 0.1_f64.ln();
         let actual = attachment_log_likelihood(&profile, &Mask::new(), &rates);
@@ -1792,7 +2471,12 @@ mod tests {
         let global = ErrorRates::uniform(0.01, 0.05);
         assert_eq!(best_attachment(&profile, &tree, &global).0, 0, "global fn keeps the absence above B");
 
-        let high = ErrorRates { fp_rate: 0.01, fn_rate: 0.05, per_variant: vec![(0.01, 0.05), (0.01, 0.999)] };
+        let high = ErrorRates {
+            fp_rate: 0.01,
+            fn_rate: 0.05,
+            per_variant: vec![(0.01, 0.05), (0.01, 0.999)],
+            sites: Vec::new(),
+        };
         assert_eq!(best_attachment(&profile, &tree, &high).0, 1, "high fn at B explains the absence as dropout");
         let matrix = matrix_from_rows(&["A", "B"], &["1", "0"]);
         assert_eq!(attach_all_reads(&matrix, &tree, &high).attachment, vec![1]);
@@ -2366,13 +3050,13 @@ mod tests {
                      0\tA\t2\tROOT\t1\tNA\tNA\tNA\n\
                      1\tB\t0\tA\t1\t4.250\t3\t7\n\
                      2\tROOT\t2\tROOT\t0\tNA\tNA\tNA\n";
-        let content = written("himito_test_write_mutation_tree.tsv", |p| write_mutation_tree(&tree, &matrix, &evidence, &[], p));
+        let content = written("himito_test_write_mutation_tree.tsv", |p| write_mutation_tree(&tree, &matrix, &evidence, &[], &[], p));
         assert_eq!(content, nodes);
 
         // The whole root block is one extra row.
         let block = ["m.750A>G".to_string(), "m.16183A>C".to_string()];
         let content =
-            written("himito_test_write_mutation_tree_block.tsv", |p| write_mutation_tree(&tree, &matrix, &evidence, &block, p));
+            written("himito_test_write_mutation_tree_block.tsv", |p| write_mutation_tree(&tree, &matrix, &evidence, &block, &[], p));
         assert_eq!(content, format!("{nodes}ROOT_BLOCK\tm.750A>G,m.16183A>C\t2\tROOT\t0\tNA\tNA\tNA\n"));
     }
 
@@ -2433,7 +3117,7 @@ mod tests {
             EdgeEvidence { support_ll: Some(3.0), counts: Some((1, 4)) },
         ];
         let content = written("himito_test_read_lineage.nwk", |p| {
-            write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, &[], p)
+            write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, &[], &[], p)
         });
 
         // No haplotype has zero mutations, so the root state becomes a synthetic zero-read tip.
@@ -2462,7 +3146,7 @@ mod tests {
         };
         let evidence = vec![EdgeEvidence { support_ll: None, counts: None }];
         let write = |block: &[String], name: &str| {
-            written(name, |p| write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, block, p))
+            written(name, |p| write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, block, &[], p))
         };
 
         let body = "(H0001_n3:1[&&NHX:mutation=mA:order_support=NA:reads=3],H0000_n5:0[&&NHX:reads=5])ROOT";
@@ -2610,7 +3294,7 @@ mod tests {
                     })
                     .collect(),
             };
-            let rb = resolve_span_conflicts(rb, &variants);
+            let rb = resolve_span_conflicts(rb, &variants, &[]);
             assert!(rb.block.is_empty(), "{names:?}: every overlapping block member must be pulled back");
             assert_eq!(rb.informative, (0..n).collect::<Vec<_>>());
             assert!(
@@ -2686,5 +3370,530 @@ mod tests {
         let cooc = read_output(&prefix, ".variant_cooccurrence.tsv");
         assert_eq!(cooc.lines().count(), 2, "expected one informative pair:\n{cooc}");
         assert!(!cooc.contains("m.750A>G"), "the block variant must be omitted entirely:\n{cooc}");
+    }
+
+    #[test]
+    fn tract_alleles_use_the_hp_fn_as_root_block_dropout() {
+        // The same 165/11 row: an SNV keeps its excess absences, a D310 allele is judged at the HP fn.
+        let row = present_then_absent(165, 11);
+        for (name, want) in [("m.3243A>G", "excess_absences"), ("m.310T>TC", "high_raw_vaf")] {
+            let binary = matrix_from_rows(&[name], &[&row]);
+            let prefix = std::env::temp_dir().join(format!("himito_scite_hp_dropout_{}", &name[2..6]));
+            let prefix = prefix.to_str().unwrap();
+            run_scite_pipeline(&binary, 0.005, 0.02, (0.01, 0.04), None, 200, 1, false, prefix).unwrap();
+            let table = read_output(prefix, ".root_block.tsv");
+            assert!(table.lines().nth(1).unwrap().ends_with(want), "{name}: {table}");
+        }
+    }
+
+    #[test]
+    fn model_rates_are_indexed_per_variant_in_the_partition() {
+        // Two identical 165/11 rows: only the one given the low fn keeps its excess absences.
+        let row = present_then_absent(165, 11);
+        let binary = matrix_from_rows(&["m.310T>TC", "m.302A>ACC"], &[&row, &row]);
+        let model = VariantModel { rates: vec![(0.08, 0.118), (0.08, 0.02)], annotate: Vec::new(), sites: Vec::new() };
+        let prefix = std::env::temp_dir().join("himito_scite_model_index_dropout");
+        let prefix = prefix.to_str().unwrap();
+        run_scite_pipeline(&binary, 0.005, 0.005, (0.01, 0.04), Some(&model), 200, 1, false, prefix).unwrap();
+        let table = read_output(prefix, ".root_block.tsv");
+        let reason = |v: &str| table.lines().find(|l| l.starts_with(v)).unwrap().rsplit('\t').next().unwrap().to_string();
+        assert_ne!(reason("m.310T>TC"), "excess_absences", "{table}");
+        assert_eq!(reason("m.302A>ACC"), "excess_absences", "{table}");
+    }
+
+    #[test]
+    fn model_rates_follow_their_variant_into_the_search_matrix() {
+        // v0 is near-fixed (blocked), so v1 and v2 are search columns 0 and 1. B (v1) and C (v2) are siblings;
+        // read r120 carries both. With B's fp high it is cheaper to call B a false positive: r120 attaches to C.
+        // Rates read by search position instead of variant would swap that.
+        let fixed = format!("{}0", "1".repeat(120));
+        let b = format!("{}{}{}1", "1".repeat(40), "0".repeat(40), "0".repeat(40));
+        let c = format!("{}{}{}1", "0".repeat(40), "1".repeat(40), "0".repeat(40));
+        let binary = matrix_from_rows(&["m.750A>G", "m.1000A>G", "m.2000C>T"], &[&fixed, &b, &c]);
+        let model = VariantModel { rates: vec![(0.001, 0.01), (0.4, 0.01), (0.001, 0.01)], annotate: Vec::new(), sites: Vec::new() };
+        let prefix = std::env::temp_dir().join("himito_scite_model_index_search");
+        let prefix = prefix.to_str().unwrap();
+        let out = run_scite_pipeline(&binary, 0.005, 0.005, (0.01, 0.04), Some(&model), 500, 2, false, prefix).unwrap();
+        assert_eq!(&out.cleaned.variants[..2], ["m.1000A>G", "m.2000C>T"]);
+        let r = out.cleaned.reads.iter().position(|x| x == "r120").unwrap();
+        assert_eq!((out.cleaned.data[0][r], out.cleaned.data[1][r]), (0, 1), "r120 should attach to C");
+    }
+
+    #[test]
+    fn annotate_only_alleles_do_not_pull_block_members_back() {
+        // m.16183A>C is near-fixed; m.16183A>AC overlaps it. Searched, the overlap is a span conflict;
+        // annotate-only, it is never placed, so 16183A>C stays in the block.
+        let fixed = present_then_absent(186, 14);
+        let ins = present_then_absent(60, 140);
+        let binary = matrix_from_rows(&["m.16183A>C", "m.16183A>AC"], &[&fixed, &ins]);
+        for (annotate, want_block) in [(vec![None, None], false), (vec![None, annotation(12)], true)] {
+            let model = VariantModel { rates: vec![(0.01, 0.05); 2], annotate, sites: Vec::new() };
+            let prefix = std::env::temp_dir().join(format!("himito_scite_span_annot_{want_block}"));
+            let prefix = prefix.to_str().unwrap();
+            run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 200, 1, false, prefix).unwrap();
+            let rb = read_output(prefix, ".root_block.tsv");
+            let row: Vec<&str> = rb.lines().find(|l| l.starts_with("m.16183A>C\t")).unwrap().split('\t').collect();
+            assert_eq!(row[5] == "true", want_block, "{rb}");
+            assert_eq!(row[6] == "span_conflict", !want_block, "{rb}");
+        }
+    }
+
+    #[test]
+    fn model_rates_drive_the_root_block_dropout() {
+        // 165/11 on a D310 allele: excess at its old HP fn 0.04 would need fn <= ~0.03; at the table fn 0.118 it is not.
+        let binary = matrix_from_rows(&["m.310T>TC"], &[&present_then_absent(165, 11)]);
+        for (fnr, want) in [(0.02, "excess_absences"), (0.118, "high_raw_vaf")] {
+            let model = VariantModel { rates: vec![(0.08, fnr)], annotate: Vec::new(), sites: Vec::new() };
+            let prefix = std::env::temp_dir().join(format!("himito_scite_model_dropout_{fnr}"));
+            let prefix = prefix.to_str().unwrap();
+            run_scite_pipeline(&binary, 0.005, 0.005, (0.01, 0.04), Some(&model), 200, 1, false, prefix).unwrap();
+            let table = read_output(prefix, ".root_block.tsv");
+            assert!(table.lines().nth(1).unwrap().ends_with(want), "fn {fnr}: {table}");
+        }
+    }
+
+    fn annotation(len: usize) -> Option<TractAnnotation> {
+        Some(TractAnnotation { run_class: "C/G".into(), run_length: len, reason: "test".into() })
+    }
+
+    #[test]
+    fn annotated_alleles_are_reported_not_placed() {
+        // B is nested in A; T (a D310 length allele) rides on A's reads.
+        let a = format!("{}{}", "1".repeat(40), "0".repeat(40));
+        let b = format!("{}{}", "1".repeat(20), "0".repeat(60));
+        let t = format!("{}{}", "1".repeat(30), "0".repeat(50));
+        let binary = matrix_from_rows(&["m.100A>G", "m.200C>T", "m.302A>ACC"], &[&a, &b, &t]);
+        let model = VariantModel { rates: vec![(0.01, 0.05); 3], annotate: vec![None, None, annotation(9)], sites: Vec::new() };
+        let prefix = std::env::temp_dir().join("himito_scite_annotate");
+        let prefix = prefix.to_str().unwrap();
+        let out = run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 200, 1, false, prefix).unwrap();
+
+        assert!(!out.cleaned.variants.iter().any(|v| v == "m.302A>ACC"), "not imputed into the cleaned matrix");
+        let tree = read_output(prefix, ".mutation_tree.tsv");
+        assert!(tree.contains("TRACT_ANNOTATED\tm.302A>ACC\t"), "{tree}");
+        assert!(!tree.lines().any(|l| l.split('\t').nth(1) == Some("m.302A>ACC") && !l.starts_with("TRACT")), "{tree}");
+        let nwk = read_output(prefix, ".read_lineage.nwk");
+        assert!(nwk.contains("tract_annotated=m.302A>ACC") && !nwk.contains("mutation=m.302A>ACC"), "{nwk}");
+        let cooc = read_output(prefix, ".variant_cooccurrence.tsv");
+        assert!(cooc.contains("m.100A>G\tm.302A>ACC\t80\t30\t10\t0\t40"), "observed linkage is reported:\n{cooc}");
+        let ann = read_output(prefix, ".tract_annotation.tsv");
+        let row: Vec<&str> = ann.lines().nth(1).unwrap().split('\t').collect();
+        assert_eq!((row[0], row[2], row[3], row[4], row[10], row[11]), ("m.302A>ACC", "C/G", "9", "m.100A>G", "yes", "test"), "{ann}");
+    }
+
+    // ─── Multi-allelic tract sites ───────────────────────────────────────────
+
+    /// A length kernel: P(Δ = 0) 0.93, P(-1) 0.05, P(+1) 0.02 at every length.
+    fn slip_kernel(_len: i64, delta: i64) -> f64 {
+        match delta {
+            0 => 0.93,
+            -1 => 0.05,
+            1 => 0.02,
+            _ => 0.0,
+        }
+    }
+
+    fn site(members: &[usize], lens: &[i64]) -> TractSite {
+        TractSite {
+            members: members.to_vec(),
+            member_state: (1..=members.len()).collect(),
+            log_p: site_log_p(lens, slip_kernel),
+        }
+    }
+
+    #[test]
+    fn tract_site_observation_reads_one_state_or_none() {
+        let s = site(&[0, 1], &[7, 9, 10]);
+        let obs = |calls: [Option<u8>; 2]| s.observed(|m| calls[m]);
+        assert_eq!(obs([Some(1), Some(0)]), Some(1));
+        assert_eq!(obs([Some(0), Some(1)]), Some(2));
+        assert_eq!(obs([Some(0), Some(0)]), Some(0), "every member a reference call: the root state");
+        assert_eq!(obs([Some(0), None]), None, "a tie is no call");
+        assert_eq!(obs([None, None]), None);
+        assert_eq!(obs([Some(1), Some(1)]), None, "alt calls for two alleles");
+        // A copy repeats its allele's calls and state.
+        let copied = TractSite { members: vec![0, 1, 2], member_state: vec![1, 2, 1], log_p: s.log_p.clone() };
+        assert_eq!(copied.observed(|m| [Some(1), Some(0), Some(1)][m]), Some(1));
+    }
+
+    #[test]
+    fn site_log_p_keeps_slips_to_lengths_that_are_no_state() {
+        // Root (none of the alleles) C8, alleles C9 and C10.
+        let log_p = site_log_p(&[8, 9, 10], slip_kernel);
+        let p = |o: usize, t: usize| log_p[o][t].exp();
+        for t in 0..3 {
+            // Each column sums to 1, up to the floor given to impossible calls.
+            assert!(((0..3).map(|o| p(o, t)).sum::<f64>() - 1.0).abs() <= 2.0 * KERNEL_FLOOR, "column {t}");
+        }
+        // A C9 node: called C9 0.93, C10 (+1) 0.02, and "none" (C8 or anything else) the remaining 0.05.
+        assert!((p(1, 1) - 0.93).abs() < 1e-12 && (p(2, 1) - 0.02).abs() < 1e-12 && (p(0, 1) - 0.05).abs() < 1e-12);
+        // The root (C8): a C9 call is its +1 slip; a C10 call (+2) is at the floor.
+        assert!((p(1, 0) - 0.02).abs() < 1e-12 && (p(2, 0) - KERNEL_FLOOR).abs() < 1e-15);
+    }
+
+    #[test]
+    fn a_length_slip_costs_one_categorical_term_not_an_fn_and_an_fp() {
+        // One read called C10 (m.302A>ACCC); it is scored at the C9 node.
+        let binary = matrix_from_rows(&["m.302A>ACC", "m.302A>ACCC"], &["0", "1"]);
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 2, 2] };
+        let s = site(&[0, 1], &[7, 9, 10]);
+        let rates = ErrorRates { sites: vec![s.clone()], ..ErrorRates::uniform(0.06, 0.07) };
+        let profile = [Some(0), Some(1)];
+        let at = |node: usize| attachment_log_likelihood(&profile, &tree.ancestor_mask(node), &rates);
+        assert!((at(0) - s.log_p[2][1]).abs() < 1e-12);
+        assert!((at(1) - s.log_p[2][2]).abs() < 1e-12);
+        assert!((at(2) - s.log_p[2][0]).abs() < 1e-12);
+        // The binary model charges both rows: fn on m.302A>ACC and fp on m.302A>ACCC.
+        let binary_rates = ErrorRates::uniform(0.06, 0.07);
+        let binary_at0 = attachment_log_likelihood(&profile, &tree.ancestor_mask(0), &binary_rates);
+        assert!((binary_at0 - (0.07f64.ln() + 0.06f64.ln())).abs() < 1e-12);
+        // The scorer agrees with the reference.
+        let scorer = AttachmentScorer::new(&binary, &rates);
+        let mut scratch = Vec::new();
+        let (node, ll) = scorer.best_attachment(0, &tree, &TreeLayout::new(&tree), &mut scratch);
+        let (ref_node, ref_ll) = best_attachment(&profile, &tree, &rates);
+        assert!(node == ref_node && (ll - ref_ll).abs() < 1e-12);
+    }
+
+    #[test]
+    fn site_scorer_matches_the_reference_on_random_trees() {
+        let names = ["m.302A>AC", "m.302A>ACC", "m.302A>ACCC", "m.100A>G", "m.16181A>AC", "m.302A>ACCC#2"];
+        let mut rng = StdRng::seed_from_u64(11);
+        for _ in 0..40 {
+            // Copies repeat their allele's calls, so column 5 copies column 2.
+            let mut rows: Vec<String> = (0..5)
+                .map(|_| (0..30).map(|_| ['0', '1', '.'][rng.random_range(0..3)]).collect())
+                .collect();
+            rows.push(rows[2].clone());
+            let row_refs: Vec<&str> = rows.iter().map(|r| r.as_str()).collect();
+            let binary = matrix_from_rows(&names, &row_refs);
+            let mut d310 = site(&[0, 1, 2], &[7, 8, 9, 10]);
+            d310.members.push(5);
+            d310.member_state.push(3);
+            let rates = ErrorRates { sites: vec![d310, site(&[4], &[12, 13])], ..ErrorRates::uniform(0.01, 0.05) };
+            let tree = enforce_position_exclusivity(&MutationTree::random(6, &mut rng), &variant_spans(&binary.variants));
+            let scorer = AttachmentScorer::new(&binary, &rates);
+            let layout = TreeLayout::new(&tree);
+            let mut scratch = Vec::new();
+            for r in 0..binary.reads.len() {
+                let profile: Vec<Option<u8>> = binary.data.iter().map(|row| row[r]).collect();
+                let (rn, rl) = best_attachment(&profile, &tree, &rates);
+                let (sn, sl) = scorer.best_attachment(r, &tree, &layout, &mut scratch);
+                assert!((rl - sl).abs() < 1e-9 && rn == sn, "read {r}: reference {rn} {rl}, scorer {sn} {sl}");
+            }
+        }
+    }
+
+    /// D310 C9 (`m.302A>ACC`) / C10 (`m.302A>ACCC`) reads, `with_b` of each carrying HVS1 C13 (`m.16181A>AC`).
+    fn two_tract_matrix(acc_with_b: usize, acc_without: usize, accc_with_b: usize, accc_without: usize) -> BinaryMatrix {
+        let mut acc = String::new();
+        let mut accc = String::new();
+        let mut b = String::new();
+        for (n, is_acc, has_b) in
+            [(acc_with_b, true, true), (acc_without, true, false), (accc_with_b, false, true), (accc_without, false, false)]
+        {
+            for _ in 0..n {
+                acc.push(if is_acc { '1' } else { '0' });
+                accc.push(if is_acc { '0' } else { '1' });
+                b.push(if has_b { '1' } else { '0' });
+            }
+        }
+        matrix_from_rows(&["m.302A>ACC", "m.302A>ACCC", "m.16181A>AC"], &[&acc, &accc, &b])
+    }
+
+    fn two_tract_rates() -> ErrorRates {
+        ErrorRates { sites: vec![site(&[0, 1], &[7, 9, 10]), site(&[2], &[12, 13])], ..ErrorRates::uniform(0.01, 0.05) }
+    }
+
+    #[test]
+    fn a_length_allele_independent_of_the_other_tract_recurs() {
+        // C13 sits on half the C9 and half the C10 molecules: no single placement fits, two copies do.
+        let binary = two_tract_matrix(30, 30, 30, 30);
+        let rates = two_tract_rates();
+        let tree = MutationTree { n_mutations: 3, parent: vec![3, 3, 0, 3] };
+        let penalty = (binary.reads.len() as f64).ln();
+        let before = tree_log_likelihood(&binary, &tree, &rates);
+        let (m, r, t, log) = add_tract_copies(&binary, &rates, &tree, 200, penalty);
+        assert_eq!(m.variants.iter().filter(|v| copy_base(v) == "m.16181A>AC").count(), 2, "{:?} {log:?}", m.variants);
+        assert!(tree_log_likelihood(&m, &t, &r) > before + penalty);
+        let parent_of = |name: &str| m.variants[t.parent[m.variants.iter().position(|v| v == name).unwrap()]].clone();
+        let mut parents = vec![parent_of("m.16181A>AC"), parent_of("m.16181A>AC#2")];
+        parents.sort();
+        assert_eq!(parents, ["m.302A>ACC", "m.302A>ACCC"], "{log:?}");
+        assert!(!violates_position_exclusivity(&t, &variant_spans(&m.variants)));
+    }
+
+    #[test]
+    fn recurrent_tract_states_never_define_a_clade() {
+        // An SNV on 10 of the C9 + C13 reads, first placed under C13. Once C13 recurs it may not keep children.
+        let base = two_tract_matrix(30, 30, 30, 30);
+        let snv: String = (0..120).map(|r| if r < 10 { '1' } else { '0' }).collect();
+        let mut rows: Vec<String> = base.data.iter().map(|row| row.iter().map(|c| if *c == Some(1) { '1' } else { '0' }).collect()).collect();
+        rows.push(snv);
+        let row_refs: Vec<&str> = rows.iter().map(|r| r.as_str()).collect();
+        let binary = matrix_from_rows(&["m.302A>ACC", "m.302A>ACCC", "m.16181A>AC", "m.100A>G"], &row_refs);
+        let tree = MutationTree { n_mutations: 4, parent: vec![4, 4, 0, 2, 4] };
+        let (m, _, t, log) = add_tract_copies(&binary, &two_tract_rates(), &tree, 300, (120f64).ln());
+        let recurrent = recurrent_nodes(&m.variants);
+        assert!(recurrent.iter().filter(|&&x| x).count() >= 2, "{log:?}");
+        assert!(!violates_recurrent_leaves(&t, &recurrent));
+        let snv_parent = &m.variants[t.parent[m.variants.iter().position(|v| v == "m.100A>G").unwrap()]];
+        assert_eq!(snv_parent, "m.302A>ACC", "{log:?}");
+    }
+
+    #[test]
+    fn mcmc_keeps_recurrent_tract_states_as_leaves() {
+        // Every SNV read carries C13, so without the rule the SNV would sit under a C13 node.
+        let names = ["m.16181A>AC", "m.16181A>AC#2", "m.100A>G"];
+        let b: String = (0..60).map(|r| if r < 40 { '1' } else { '0' }).collect();
+        let snv: String = (0..60).map(|r| if r < 20 { '1' } else { '0' }).collect();
+        let binary = matrix_from_rows(&names, &[&b, &b, &snv]);
+        let rates = ErrorRates {
+            sites: vec![TractSite { members: vec![0, 1], member_state: vec![1, 1], log_p: site_log_p(&[12, 13], slip_kernel) }],
+            ..ErrorRates::uniform(0.01, 0.05)
+        };
+        let recurrent = recurrent_nodes(&binary.variants);
+        for seed in 0..5 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let (tree, _) = run_mcmc(&binary, &rates, 300, None, &mut rng);
+            assert!(!violates_recurrent_leaves(&tree, &recurrent), "seed {seed}: {:?}", tree.parent);
+        }
+    }
+
+    #[test]
+    fn copies_left_without_reads_are_dropped() {
+        // C13#2 hangs under C10, where no C13 read sits; nothing is gained by adding more.
+        let mut binary = two_tract_matrix(30, 30, 0, 60);
+        binary.variants.push("m.16181A>AC#2".into());
+        binary.data.push(binary.data[2].clone());
+        let mut rates = two_tract_rates();
+        rates.sites[1].members.push(3);
+        rates.sites[1].member_state.push(1);
+        let tree = MutationTree { n_mutations: 4, parent: vec![4, 4, 0, 1, 4] };
+        let (m, r, t, log) = add_tract_copies(&binary, &rates, &tree, 50, f64::INFINITY);
+        assert_eq!(m.variants, ["m.302A>ACC", "m.302A>ACCC", "m.16181A>AC"], "{log:?}");
+        assert_eq!(r.sites[1].members, [2]);
+        assert_eq!(t.parent, [3, 3, 0, 3]);
+        assert_eq!(log, ["m.16181A>AC#2 dropped (excess p 1.00e0 on the final tree)"]);
+    }
+
+    #[test]
+    fn build_sites_maps_searched_alleles_to_search_columns() {
+        let spec = SiteSpec {
+            members: vec![1, 3, 4],
+            member_len: vec![9, 10, 11],
+            root_len: 8,
+            kernel: [8, 9, 10, 11].iter().map(|&l| (l, vec![(0, 0.93), (-1, 0.05), (1, 0.02)])).collect(),
+        };
+        // Variant 3 is not searched (root block or annotated); the search matrix holds variants 0, 1 and 4.
+        let sites = build_sites(&[spec.clone()], &[0, 1, 4]);
+        assert_eq!((sites[0].members.clone(), sites[0].member_state.clone()), (vec![1, 2], vec![1, 2]));
+        assert_eq!(sites[0].log_p, site_log_p(&[8, 9, 11], |l, d| spec.kernel_at(l, d)));
+        // A spec with nothing searched is no site.
+        assert!(build_sites(&[spec], &[0, 2]).is_empty());
+    }
+
+    #[test]
+    fn copies_need_an_excess_over_the_slip_rate() {
+        // C13 on 4 of 100 C9 reads and 4 of 100 C10 reads. Moving them to a copy gains ~4 ln(0.93 / 0.02) = 15 nats,
+        // past ln(200), but 4% is within a plausible slip rate (the test assumes at least 5%), so no copy.
+        let binary = two_tract_matrix(4, 96, 4, 96);
+        let tree = MutationTree { n_mutations: 3, parent: vec![3, 3, 0, 3] };
+        let (m, _, _, log) = add_tract_copies(&binary, &two_tract_rates(), &tree, 100, (200f64).ln());
+        assert_eq!(m.variants.len(), 3, "{log:?}");
+        assert!(log.is_empty(), "not even proposed: {log:?}");
+        // The excess p of such a copy: 4 C13 calls among 100 reads at 5% is no excess at all.
+        let s = site(&[0], &[12, 13]);
+        let calls = matrix_from_rows(&["m.16181A>AC"], &[&format!("{}{}", "1".repeat(4), "0".repeat(96))]);
+        let tree1 = MutationTree { n_mutations: 1, parent: vec![1, 1] };
+        let p = copy_excess_p(&calls, &tree1, &s, 1, &vec![1; 100], &[1], 1);
+        assert!((p - binomial_upper_tail(100, 4, TRACT_COPY_NULL_FLOOR)).abs() < 1e-12 && p > 0.5, "{p}");
+    }
+
+    #[test]
+    fn edge_evidence_is_none_for_impossible_swaps_and_recurrent_nodes() {
+        // m.100A>G -> {C9, C10}: swapping the SNV with C9 would put C9 above C10. C13 and C13#2 are recurrent.
+        let names = ["m.100A>G", "m.302A>ACC", "m.302A>ACCC", "m.16181A>AC", "m.16181A>AC#2"];
+        let rows = ["1111110000", "1110000000", "0001110000", "1000000000", "0001000000"];
+        let binary = matrix_from_rows(&names, &rows);
+        let rates = ErrorRates {
+            sites: vec![site(&[1, 2], &[7, 9, 10]), TractSite { members: vec![3, 4], member_state: vec![1, 1], log_p: site_log_p(&[12, 13], slip_kernel) }],
+            ..ErrorRates::uniform(0.01, 0.05)
+        };
+        let tree = MutationTree { n_mutations: 5, parent: vec![5, 0, 0, 1, 2, 5] };
+        let ev = edge_evidence(&tree, &binary, &rates);
+        assert_eq!(ev[1], EdgeEvidence { support_ll: None, counts: None }, "C9 <-> SNV swap is not a valid tree");
+        assert_eq!(ev[3], EdgeEvidence { support_ll: None, counts: None });
+        assert_eq!(ev[4], EdgeEvidence { support_ll: None, counts: None });
+    }
+
+    #[test]
+    fn polish_leaves_recurrent_leaves_at_the_ends_of_paths() {
+        // A unary path SNV -> C13 with C13 recurrent: polish must not move C13 above the SNV.
+        let names = ["m.100A>G", "m.16181A>AC", "m.16181A>AC#2"];
+        let rows = ["1111100000", "1111111111", "1111111111"];
+        let binary = matrix_from_rows(&names, &rows);
+        let rates = ErrorRates {
+            sites: vec![TractSite { members: vec![1, 2], member_state: vec![1, 1], log_p: site_log_p(&[12, 13], slip_kernel) }],
+            ..ErrorRates::uniform(0.01, 0.05)
+        };
+        let tree = MutationTree { n_mutations: 3, parent: vec![3, 0, 3, 3] };
+        let polished = polish_unary_path_order(&tree, &binary, &rates);
+        assert!(!violates_recurrent_leaves(&polished, &recurrent_nodes(&binary.variants)), "{:?}", polished.parent);
+    }
+
+    #[test]
+    fn enforce_recurrent_leaves_lifts_children_to_the_nearest_clade_ancestor() {
+        // 0 -> 1 -> 2 -> root(3), node 1 recurrent: 0 moves to 2.
+        let tree = MutationTree { n_mutations: 3, parent: vec![1, 2, 3, 3] };
+        let recurrent = [false, true, false];
+        assert!(violates_recurrent_leaves(&tree, &recurrent));
+        let fixed = enforce_recurrent_leaves(&tree, &recurrent);
+        assert_eq!(fixed.parent, [2, 2, 3, 3]);
+        assert!(!violates_recurrent_leaves(&fixed, &recurrent));
+        let names: Vec<String> = ["m.1A>G", "m.16181A>AC", "m.16181A>AC#2"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(recurrent_nodes(&names), [false, true, true]);
+    }
+
+    #[test]
+    fn a_length_allele_linked_to_one_lineage_gets_no_copy() {
+        let binary = two_tract_matrix(30, 30, 0, 60);
+        let tree = MutationTree { n_mutations: 3, parent: vec![3, 3, 0, 3] };
+        let penalty = (binary.reads.len() as f64).ln();
+        let (m, _, t, log) = add_tract_copies(&binary, &two_tract_rates(), &tree, 200, penalty);
+        assert_eq!(m.variants.len(), 3, "{log:?}");
+        assert_eq!(t.parent, tree.parent);
+    }
+
+    #[test]
+    fn merge_tract_copies_folds_copies_into_their_allele() {
+        let cleaned = CleanedMatrix {
+            variants: vec!["m.16181A>AC".into(), "m.100A>G".into(), "m.16181A>AC#2".into()],
+            reads: vec!["r0".into(), "r1".into(), "r2".into()],
+            data: vec![vec![1, 0, 0], vec![0, 1, 0], vec![0, 0, 1]],
+            attachment: vec![0, 1, 2],
+        };
+        let merged = merge_tract_copies(&cleaned);
+        assert_eq!(merged.variants, ["m.16181A>AC", "m.100A>G"]);
+        assert_eq!(merged.data, [vec![1, 0, 1], vec![0, 1, 0]]);
+    }
+
+    #[test]
+    fn pipeline_places_recurrent_tract_copies_and_folds_them_in_matrix_outputs() {
+        let binary = two_tract_matrix(30, 30, 30, 30);
+        let spec = |members: Vec<usize>, member_len: Vec<i64>, root_len: i64| {
+            let lens: Vec<i64> = std::iter::once(root_len).chain(member_len.iter().copied()).collect();
+            let kernel = lens.iter().map(|&l| (l, vec![(0, 0.93), (-1, 0.05), (1, 0.02)])).collect();
+            SiteSpec { members, member_len, root_len, kernel }
+        };
+        let model = VariantModel {
+            rates: vec![(0.06, 0.07); 3],
+            annotate: Vec::new(),
+            sites: vec![spec(vec![0, 1], vec![9, 10], 7), spec(vec![2], vec![13], 12)],
+        };
+        let prefix = std::env::temp_dir().join("himito_scite_tract_sites");
+        let prefix = prefix.to_str().unwrap();
+        let out = run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 300, 1, false, prefix).unwrap();
+        let tree = read_output(prefix, ".mutation_tree.tsv");
+        assert!(tree.lines().any(|l| l.split('\t').nth(1) == Some("m.16181A>AC#2")), "{tree}");
+        assert!(read_output(prefix, ".read_lineage.nwk").contains("m.16181A>AC#2"));
+        assert_eq!(out.cleaned.variants, ["m.302A>ACC", "m.302A>ACCC", "m.16181A>AC"], "copies are folded");
+        assert!(!read_output(prefix, ".molecule_summary.tsv").contains('#'));
+        // Every C13 read carries the allele in the folded matrix.
+        let b = &out.cleaned.data[2];
+        assert_eq!(b.iter().filter(|&&x| x == 1).count(), 60);
+        // The haplotype map's ids and read counts are the Newick tips'.
+        let nwk = read_output(prefix, ".read_lineage.nwk");
+        for hap in &out.cleaned_haplotypes.haplotypes {
+            assert!(nwk.contains(&format!("{}_n{}", hap.id, hap.count)), "{} n{} not in {nwk}", hap.id, hap.count);
+        }
+    }
+
+    /// `tract_annotation.tsv` row of a single annotated allele `t` against informative variants `others`.
+    fn annotation_row(tag: &str, t: &str, others: &[(&str, &str)]) -> Vec<String> {
+        let mut names: Vec<&str> = others.iter().map(|(n, _)| *n).collect();
+        names.push("m.302A>ACC");
+        let mut rows: Vec<&str> = others.iter().map(|(_, r)| *r).collect();
+        rows.push(t);
+        let binary = matrix_from_rows(&names, &rows);
+        let mut annotate = vec![None; others.len()];
+        annotate.push(annotation(9));
+        let model = VariantModel { rates: vec![(0.01, 0.05); names.len()], annotate, sites: Vec::new() };
+        let prefix = std::env::temp_dir().join(format!("himito_scite_partner_{tag}"));
+        let prefix = prefix.to_str().unwrap();
+        run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 200, 1, false, prefix).unwrap();
+        let ann = read_output(prefix, ".tract_annotation.tsv");
+        ann.lines().nth(1).unwrap().split('\t').map(String::from).collect()
+    }
+
+    #[test]
+    fn best_partner_needs_positive_linkage_and_reports_weak_links_as_unlinked() {
+        let a = format!("{}{}", "1".repeat(40), "0".repeat(40));
+        // Negative linkage only (T is never on A's reads): no candidate at all.
+        let t_neg = format!("{}{}", "0".repeat(40), "1".repeat(20) + &"0".repeat(20));
+        let row = annotation_row("neg", &t_neg, &[("m.100A>G", &a)]);
+        assert_eq!((row[4].as_str(), row[10].as_str()), ("NA", "NA"), "{row:?}");
+        // Weak positive linkage (3 of 5 T reads on A): named, but not linked.
+        let t_weak = format!("{}{}{}", "1".repeat(3), "0".repeat(40), "11".to_string() + &"0".repeat(35));
+        let row = annotation_row("weak", &t_weak, &[("m.100A>G", &a)]);
+        assert_eq!((row[4].as_str(), row[10].as_str()), ("m.100A>G", "no"), "{row:?}");
+    }
+
+    #[test]
+    fn best_partner_ties_on_q_go_to_the_smaller_p() {
+        // T is on reads 0..10. A covers all of them (+30 others): one-sided p 5.15e-4. B covers 6 of them (+6
+        // others): p 4.82e-4. With two pairs BH gives both q = 5.15e-4, a tie: the smaller p (B) must win even
+        // though A comes first.
+        let a = format!("{}{}", "1".repeat(40), "0".repeat(40));
+        let b = format!("{}{}{}{}", "1".repeat(6), "0".repeat(4), "1".repeat(6), "0".repeat(64));
+        let t = format!("{}{}", "1".repeat(10), "0".repeat(70));
+        let row = annotation_row("tie", &t, &[("m.100A>G", &a), ("m.200A>G", &b)]);
+        assert_eq!(row[4], "m.200A>G", "{row:?}");
+    }
+
+    #[test]
+    fn annotation_of_every_informative_variant_falls_back_to_root_only() {
+        let binary = matrix_from_rows(&["m.302A>ACC"], &["11110000"]);
+        let model = VariantModel { rates: vec![(0.01, 0.05)], annotate: vec![annotation(9)], sites: Vec::new() };
+        let prefix = std::env::temp_dir().join("himito_scite_annotate_all");
+        let prefix = prefix.to_str().unwrap();
+        run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 200, 1, false, prefix).unwrap();
+        let tree = read_output(prefix, ".mutation_tree.tsv");
+        assert!(tree.lines().nth(1).unwrap().starts_with("0\tROOT\t0\tROOT\t"), "{tree}");
+        let ann = read_output(prefix, ".tract_annotation.tsv");
+        assert!(ann.lines().nth(1).unwrap().contains("\tNA\tNA\tNA\tNA\tNA\t"), "no partner to test:\n{ann}");
+    }
+
+    /// One `variant_cooccurrence.tsv` row as (n_co, n11, n10, n01, n00).
+    fn cooc_counts(table: &str, a: &str, b: &str) -> (usize, usize, usize, usize, usize) {
+        let row = table
+            .lines()
+            .find(|l| l.starts_with(&format!("{a}\t{b}\t")))
+            .unwrap_or_else(|| panic!("no {a}/{b} row in:\n{table}"));
+        let f: Vec<usize> = row.split('\t').skip(2).take(5).map(|x| x.parse().unwrap()).collect();
+        (f[0], f[1], f[2], f[3], f[4])
+    }
+
+    #[test]
+    fn variant_cooccurrence_counts_observed_calls_not_tree_imputed_ones() {
+        // B is nested in A. Reads 0..20 carry both; 20..40 carry A with B uncovered; 40..80 carry neither.
+        let a = format!("{}{}", "1".repeat(40), "0".repeat(40));
+        let b = format!("{}{}{}", "1".repeat(20), ".".repeat(20), "0".repeat(40));
+        let binary = matrix_from_rows(&["m.100A>G", "m.200C>T"], &[&a, &b]);
+        let (out, prefix) = run_pipeline("cooc_observed", &binary, true);
+        assert_eq!(out.cleaned.reads.len(), 80, "test premise: every read is attached and imputed");
+
+        // Observed: only the 60 reads calling both sites.
+        let observed = read_output(&prefix, ".variant_cooccurrence.tsv");
+        assert_eq!(cooc_counts(&observed, "m.100A>G", "m.200C>T"), (60, 20, 0, 0, 40));
+        // Imputed (debug only): all 80 reads, the 20 uncovered ones filled in from their attachment.
+        let imputed = read_output(&prefix, ".cleaned_variant_cooccurrence.tsv");
+        assert_eq!(cooc_counts(&imputed, "m.100A>G", "m.200C>T").0, 80);
+
+        let quiet = std::env::temp_dir().join("himito_scite_cooc_observed_nodebug");
+        let quiet = quiet.to_str().unwrap();
+        run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), None, 200, 1, false, quiet).unwrap();
+        assert_eq!(read_output(quiet, ".variant_cooccurrence.tsv"), observed, "debug must not change the default table");
+        assert!(!std::path::Path::new(&format!("{quiet}.cleaned_variant_cooccurrence.tsv")).exists());
     }
 }

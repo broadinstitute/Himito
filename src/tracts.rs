@@ -34,6 +34,26 @@ pub fn overlaps_tract(span: &VariantSpan) -> bool {
     KNOWN_TRACTS.iter().any(|t| tract_span(t).overlaps(span))
 }
 
+/// The single-base homopolymer tracts whose allele lengths `hp_confusion.tsv` measures (CA514 is a dinucleotide repeat).
+pub const HOMOPOLYMER_TRACTS: &[&str] = &["D310", "HVS1-C"];
+
+/// Whether `span` overlaps a [`HOMOPOLYMER_TRACTS`] entry.
+pub fn overlaps_homopolymer_tract(span: &VariantSpan) -> bool {
+    KNOWN_TRACTS
+        .iter()
+        .filter(|t| HOMOPOLYMER_TRACTS.contains(&t.name))
+        .any(|t| tract_span(t).overlaps(span))
+}
+
+/// Whether `span` overlaps the body of a [`HOMOPOLYMER_TRACTS`] entry: the tract without its first base, the A that
+/// anchors its C run (D310 303-315, HVS1-C 16184-16193).
+pub fn overlaps_homopolymer_tract_body(span: &VariantSpan) -> bool {
+    KNOWN_TRACTS
+        .iter()
+        .filter(|t| HOMOPOLYMER_TRACTS.contains(&t.name))
+        .any(|t| VariantSpan { start: t.start + 1, end: t.end + 1 }.overlaps(span))
+}
+
 /// The matrix row name for tract allele `alt`: `m.<start><ref_seq>><alt>`.
 pub fn tract_allele_name(tract: &Tract, alt: &str) -> String {
     format!("m.{}{}>{}", tract.start, tract.ref_seq, alt)

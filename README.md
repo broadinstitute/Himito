@@ -101,6 +101,10 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 `-b/--bam` takes the raw (pre-denoise) BAM of the same reads. It drives the strand-bias
 filter, linkage rescue and `<output>.matrix.csv`. `--input-bam` is accepted as an alias.
 Without `-b`, the matrix comes from the graph and the strand filter and linkage rescue are off.
+At indel sites the matrix genotyper scores each read against haplotypes that carry the sample's
+majority alleles (VCF HF > 0.5) inside the site window, not bare rCRS. This matters where the sample
+rewrites a homopolymer, e.g. HVS1 with 16182C/16183C/16189C, where `m.16181A>AC` lengthens a 12-C run.
+SNP sites keep bare-reference haplotypes.
 The strand-bias action, permutation mode and genotyping gates are set by the data type.
 
 Indels are left-aligned against the reference by default, the way `bcftools norm`
@@ -133,11 +137,26 @@ guarantee rather than a transformation and typically changes nothing.
 
 Himito includes a new function for inferring mitochondrial mutation history from heteroplasmic variants given the Infinite Sites assumption (ISA) that every variant can only mutate once and will exist on the lineage over the lifetime. 
 
-Given a Himito read–variant matrix (`<prefix>.matrix.csv` from `call`) and the corresponding VCF, the `lineage` command filters to informative heteroplasmic sites, deduplicates reads into haplotypes, and runs an MCMC search over mutation trees and identify a ML tree (algorithm adapted from SCITE, Kuipers J et al. Single-cell sequencing data reveals widespread recurrence and loss of mutational hits in the life histories of tumorus. Genome Research 2017; 27:1885-1894.). The initial tree is a Neighbor–Joining tree constructed from reads instead of a random tree though. Sequencing errors are modeled with false-positive and false-negative rates preset by `-d` (pacbio 0.005 / 0.05, ONT 0.005 / 0.02) and set with `--fp-rate` / `--fn-rate`. 
+Given a Himito read–variant matrix (`<prefix>.matrix.csv` from `call`) and the corresponding VCF, the `lineage` command filters to informative heteroplasmic sites, deduplicates reads into haplotypes, and runs an MCMC search over mutation trees and identify a ML tree (algorithm adapted from SCITE, Kuipers J et al. Single-cell sequencing data reveals widespread recurrence and loss of mutational hits in the life histories of tumorus. Genome Research 2017; 27:1885-1894.). The initial tree is a Neighbor–Joining tree constructed from reads instead of a random tree though. Sequencing errors are modeled with false-positive and false-negative rates, measured per sample where the data allow:
 
-Outputs include a mutation tree, read-level lineage Newick tree, the cleaned read–variant matrix `<prefix>.cleaned_matrix_all_variants.csv`, the variant co-occurrence table `variant_cooccurrence.tsv`, and haplotype maps. The raw co-occurrence table and `raw_haplotype_map.tsv` are written only with `--debug`.
+- SNV false negatives: estimated from the sample's near-fixed SNV rows, with a floor of 0.005. If there are too few such rows, the `-d` preset is used (pacbio 0.05, ONT 0.02). The SNV false-positive rate is the `-d` preset (0.005). `--fp-rate` / `--fn-rate` override both.
+- D310 and HVS1-C length alleles (alleles overlapping the tract, and indels whose run on the sample's majority alleles reaches its C run, such as `m.16181A>AC`): rates come from the sample's homopolymer length confusion, `<prefix>.hp_confusion.tsv`. `call --bam` writes this file, and `Himito hp-error` writes it for existing outputs. `lineage` uses `--hp-error`, or the file beside `<prefix>.matrix.csv`, or else an embedded HG00097 table.
+  - chrM has no C run longer than 6 bp outside these tracts, so rates for longer runs are lower bounds.
+  - With `--tract-alleles auto` (the default), ONT alleles in such runs are reported in `tract_annotation.tsv` instead of being placed in the tree. That file gives each allele's best observed partner and whether it is significantly linked to it.
+  - Placed tract alleles form multi-allelic sites. The alleles at one tract position (e.g. `m.302A>ACC`/`m.302A>ACCC`) are one categorical character, scored with the sample's length-change kernel from `hp_confusion.tsv`, so a 1-bp slip costs one error term.
+  - A length allele that occurs in several lineages (e.g. an HVS1 length independent of D310) is placed as recurrent leaf copies, named `<allele>#2`, `#3`, …. Each copy must raise the tree log-likelihood by more than ln(number of reads), and the reads it takes must be called that length significantly more often than the lineage's own length explains, assuming a slip rate of at least 5% (binomial, Bonferroni). A recurrent allele never has children, so it never defines a clade. Matrix outputs fold the copies into the allele's row.
+  - Other `--tract-alleles` values: `site` uses sites for every tract allele (ONT included), `search` gives each allele its own binary row (the earlier model), and `annotate` reports every tract allele without placing it.
+  - Any `--hp-fp-rate` / `--hp-fn-rate` given: no sites (binary rows with that rate). Only with both given does `auto` also keep ONT alleles beyond calibration in the search.
+  - A site needs pure length alleles that agree on the reference run. Its root length is the commonest called length there that is not a site allele; with near-equal counts (e.g. HG00097 PacBio D310: C8 24 vs C11 23 reads) it rests on few reads.
+  - `--hp-fp-rate` / `--hp-fn-rate` override the table.
+- Every rate used, and where it came from, is written to `<prefix>.error_model.tsv`. 
+
+Outputs include a mutation tree, read-level lineage Newick tree, the cleaned read–variant matrix `<prefix>.cleaned_matrix_all_variants.csv`, the variant co-occurrence table `variant_cooccurrence.tsv`, and haplotype maps. `variant_cooccurrence.tsv` counts observed calls only: each pair of informative variants is tabulated over the reads that call both sites, never over the tree-imputed matrix. `--debug` also writes the co-occurrence table over every filtered variant (`raw_variant_cooccurrence.tsv`, root-block variants included), the same table on the tree-imputed matrix (`cleaned_variant_cooccurrence.tsv`, which restates the tree), and `raw_haplotype_map.tsv`.
 
 ```
+# only for outputs made before `call` wrote it:
+./target/release/Himito hp-error -b <reads.bam> -r rCRS.fasta -o <prefix>
+
 ./target/release/Himito lineage -m <prefix>.matrix.csv \
                                  -v <output.vcf> \
                                  -o <output_prefix> \
@@ -145,9 +164,9 @@ Outputs include a mutation tree, read-level lineage Newick tree, the cleaned rea
                                  --max-hf 0.95
 ```
 
-Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix_all_variants.csv`, `<output_prefix>.variant_cooccurrence.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv` and `<output_prefix>.raw_variant_cooccurrence.tsv`.
+Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix_all_variants.csv`, `<output_prefix>.variant_cooccurrence.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`, `<output_prefix>.root_block.tsv`, `<output_prefix>.error_model.tsv`, `<output_prefix>.tract_annotation.tsv`. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv`, `<output_prefix>.raw_variant_cooccurrence.tsv` and `<output_prefix>.cleaned_variant_cooccurrence.tsv`.
 
-`lineage` shows `-m -v -d -o --min-hf --max-hf` in `-h`; the error-rate, MCMC and `--debug`
+`lineage` shows `-m -v -d -o --min-hf --max-hf` in `-h`. The error-rate, `--hp-error`, `--tract-alleles`, MCMC and `--debug`
 options are listed by `--help`.
 
 To Do: 

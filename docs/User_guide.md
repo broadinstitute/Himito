@@ -139,8 +139,12 @@ Required Parameters:
 
 Optional:
 - -b, --bam <FILE>: raw (pre-denoise) BAM of the same reads. It drives the strand-bias filter,
-  linkage rescue and `<output>.matrix.csv`. `--input-bam` is an alias. Without it the matrix
-  comes from the graph and the strand filter and linkage rescue are off.
+  linkage rescue, `<output>.matrix.csv` and `<output>.hp_confusion.tsv` (the sample's homopolymer
+  length confusion, which `lineage` uses for D310/HVS1-C allele rates). `--input-bam` is an alias.
+  Without it the matrix comes from the graph and the strand filter and linkage rescue are off.
+  At indel sites, matrix genotyping scores reads against haplotypes carrying the sample's majority
+  alleles (HF > 0.5) inside the site window, so length alleles in a homopolymer the sample has
+  rewritten (HVS1) are scored on the sample's own sequence. SNP sites use bare-reference haplotypes.
 
 Advanced options are hidden from `-h` and listed by `--help`: `-k`, `-m`, `-v`, `-p`, `-f`,
 `--strand-bias-threshold`, `--indel-false-threshold`, `--permutation-frequency-threshold`,
@@ -351,6 +355,7 @@ Many outputs share the same basename you pass with `-o` / `--output-prefix` (`qu
 | `.vcf` | Variant calls after graph-based calling and permutation filtering (`call` / `quick-start`) |
 | `.bed` | Methylation summary (`methyl` / `quick-start`) |
 | `.raw_matrix.csv`, `.matrix.csv` | Per-read variant support matrices written next to the VCF basename (`call` / `quick-start`) |
+| `.hp_confusion.tsv` | Homopolymer length confusion of the reads (`base ref_len obs_len strand n`), written with `--bam` (`call` / `quick-start`) or by `Himito hp-error`; read by `lineage` |
 
 The **matrix CSV** has header `variant`, then one column per read name. Each row is a variant identifier; cell values are non-negative counts of support in that read (see `call` in the codebase). `.raw_matrix.csv` is produced before permutation-based filtering; `.matrix.csv` matches the variants retained in the final VCF.
 

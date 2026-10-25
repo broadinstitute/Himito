@@ -35,13 +35,22 @@ Options:
           SCITE false-positive rate (preset by data type)
 
       --fn-rate <FN_RATE>
-          SCITE false-negative rate (preset by data type)
+          SCITE false-negative rate for SNVs (default: estimated per sample from near-fixed SNVs, floor 0.005; data-type preset when too few)
 
       --hp-fp-rate <HP_FP_RATE>
-          SCITE false-positive rate in HP tracts (twice --fp-rate, capped at 0.5)
+          SCITE false-positive rate for HP-tract alleles (default: D310/HVS1-C from the hp_confusion.tsv table; CA514 twice --fp-rate or its preset)
 
       --hp-fn-rate <HP_FN_RATE>
-          SCITE false-negative rate in HP tracts (twice --fn-rate, capped at 0.5)
+          SCITE false-negative rate for HP-tract alleles (default: D310/HVS1-C from the hp_confusion.tsv table; CA514 twice --fn-rate or its preset)
+
+      --hp-error <HP_ERROR>
+          hp_confusion.tsv (`Himito hp-error`) for D310/HVS1-C allele rates [default: <X>.hp_confusion.tsv beside <X>.matrix.csv, else the embedded HG00097 table]
+
+      --tract-alleles <TRACT_ALLELES>
+          D310/HVS1-C alleles: site = alleles at one tract position are one categorical site whose states may recur on several branches; auto = site, except ONT alleles beyond the table's calibrated run length are annotate-only (any --hp-*-rate: binary rows; both: those ONT alleles are searched too); search = one binary row per allele; annotate
+          
+          [default: auto]
+          [possible values: auto, site, search, annotate]
 
       --collapse-hp
           merge equivalent spellings inside known rCRS homopolymer tracts
@@ -57,7 +66,7 @@ Options:
           [default: 3]
 
       --debug
-          also write raw_haplotype_map.tsv and raw_variant_cooccurrence.tsv
+          also write raw_haplotype_map.tsv, raw_variant_cooccurrence.tsv and cleaned_variant_cooccurrence.tsv
 
   -h, --help
           Print help (see a summary with '-h')

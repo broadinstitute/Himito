@@ -18,6 +18,7 @@ mod tracts;
 mod scite;
 mod denoise;
 mod denoise_indel;
+mod hperror;
 mod linkage;
 
 pub const DENOISE_KEEP_VAF: f64 = 0.03;
@@ -495,17 +496,30 @@ enum Commands {
         #[clap(long, value_parser, hide_short_help = true)]
         fp_rate: Option<f64>,
 
-        /// SCITE false-negative rate (preset by data type)
+        /// SCITE false-negative rate for SNVs (default: estimated per sample from near-fixed SNVs, floor 0.005; data-type preset when too few)
         #[clap(long, value_parser, hide_short_help = true)]
         fn_rate: Option<f64>,
 
-        /// SCITE false-positive rate in HP tracts (twice --fp-rate, capped at 0.5)
+        /// SCITE false-positive rate for HP-tract alleles (default: D310/HVS1-C from the hp_confusion.tsv table; CA514 twice --fp-rate or its preset)
         #[clap(long, value_parser, hide_short_help = true)]
         hp_fp_rate: Option<f64>,
 
-        /// SCITE false-negative rate in HP tracts (twice --fn-rate, capped at 0.5)
+        /// SCITE false-negative rate for HP-tract alleles (default: D310/HVS1-C from the hp_confusion.tsv table; CA514 twice --fn-rate or its preset)
         #[clap(long, value_parser, hide_short_help = true)]
         hp_fn_rate: Option<f64>,
+
+        /// hp_confusion.tsv (`Himito hp-error`) for D310/HVS1-C allele rates [default: <X>.hp_confusion.tsv beside <X>.matrix.csv, else the embedded HG00097 table]
+        #[clap(long, value_parser, hide_short_help = true)]
+        hp_error: Option<String>,
+
+        /// D310/HVS1-C alleles: site = alleles at one tract position are one categorical site whose states may recur on several branches; auto = site, except ONT alleles beyond the table's calibrated run length are annotate-only (any --hp-*-rate: binary rows; both: those ONT alleles are searched too); search = one binary row per allele; annotate
+        #[clap(
+            long,
+            default_value = "auto",
+            value_parser = clap::builder::PossibleValuesParser::new(["auto", "site", "search", "annotate"]),
+            hide_short_help = true
+        )]
+        tract_alleles: String,
 
         /// merge equivalent spellings inside known rCRS homopolymer tracts
         // Tracts: D310 302-315, HVS1-C 16183-16193, CA514 513-525.
@@ -520,9 +534,33 @@ enum Commands {
         #[clap(long, value_parser = parse_positive, default_value_t = 3, hide_short_help = true)]
         mcmc_chains: usize,
 
-        /// also write raw_haplotype_map.tsv and raw_variant_cooccurrence.tsv
+        /// also write raw_haplotype_map.tsv, raw_variant_cooccurrence.tsv and cleaned_variant_cooccurrence.tsv
         #[clap(long, action, hide_short_help = true)]
         debug: bool,
+    },
+
+    /// Measure homopolymer length confusion of a sample's reads (writes <prefix>.hp_confusion.tsv)
+    #[clap(arg_required_else_help = true)]
+    HpError {
+        /// reads aligned to the reference; primary alignments are scored
+        #[clap(short, long, value_parser, required = true)]
+        bam_file: PathBuf,
+
+        /// reference FASTA (rCRS)
+        #[clap(short, long, value_parser, required = true)]
+        reference: PathBuf,
+
+        /// output prefix; writes <prefix>.hp_confusion.tsv
+        #[clap(short, long, value_parser, required = true)]
+        output_prefix: String,
+
+        /// shortest reference homopolymer run measured
+        #[clap(long, value_parser, default_value_t = hperror::DEFAULT_MIN_LEN)]
+        min_len: u32,
+
+        /// catalogue runs to skip: comma list of ids (D310, HVS1, C573, T455, C960, C5899, A12418, CA514, R8281), "hp_tracts" for all, or "none"
+        #[clap(long, value_parser, default_value = "D310,HVS1,CA514")]
+        tracts: String,
     }
 }
 
@@ -835,6 +873,8 @@ fn main() {
             fn_rate,
             hp_fp_rate,
             hp_fn_rate,
+            hp_error,
+            tract_alleles,
             collapse_hp,
             mcmc_iterations,
             mcmc_chains,
@@ -845,9 +885,9 @@ fn main() {
             let vcf_file = vcf_file
                 .as_deref()
                 .map(|p| p.to_str().expect("vcf-file path is not valid UTF-8"));
-            let (fp_rate, fn_rate) =
-                lineage::resolve_error_rates(&data_type, fp_rate, fn_rate);
-            let hp_rates = lineage::resolve_hp_rates(fp_rate, fn_rate, hp_fp_rate, hp_fn_rate);
+            let tract_alleles: lineage::TractAlleleMode = tract_alleles.parse().expect("clap restricts the values");
+            let rate_options =
+                lineage::RateOptions { data_type, fp_rate, fn_rate, hp_fp_rate, hp_fn_rate, hp_error, tract_alleles };
             // Empty slice: collapse is the identity.
             let tracts = if collapse_hp {
                 crate::tracts::KNOWN_TRACTS
@@ -859,9 +899,7 @@ fn main() {
                 vcf_file,
                 min_hf,
                 max_hf,
-                fp_rate,
-                fn_rate,
-                hp_rates,
+                &rate_options,
                 tracts,
                 mcmc_iterations,
                 mcmc_chains,
@@ -871,6 +909,17 @@ fn main() {
                 eprintln!("Error running lineage analysis: {:#}", e);
                 std::process::exit(1);
             }
+        }
+        Commands::HpError { bam_file, reference, output_prefix, min_len, tracts } => {
+            let path = std::path::PathBuf::from(format!("{output_prefix}.hp_confusion.tsv"));
+            let result = hperror::parse_skip(&tracts)
+                .and_then(|skip| hperror::measure(&bam_file, &reference, min_len, &skip))
+                .and_then(|rows| hperror::write_confusion(&rows, &path));
+            if let Err(e) = result {
+                eprintln!("Error measuring homopolymer errors: {:#}", e);
+                std::process::exit(1);
+            }
+            println!("Wrote {}", path.display());
         }
     }
 

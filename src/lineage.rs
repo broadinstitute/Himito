@@ -542,8 +542,9 @@ pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tr
     BinaryMatrix { variants, reads: raw.reads.clone(), data }
 }
 
-/// Where one candidate variant ended up. One row per VCF whitelist entry and per matrix row, so an
-/// ONT run and a PacBio run can be compared with a single `diff`.
+/// Where one candidate variant ended up. One row per VCF site inside the HF window (the whitelist
+/// `parse_vcf` builds) and per matrix row, so an ONT run and a PacBio run can be compared with a single
+/// `diff`. A PASS site whose VCF HF is outside the window and which has no matrix row gets no row at all.
 ///
 /// `outcome` is one of:
 /// - `informative`: placed in the mutation tree (or, before the search has run, simply not filtered out);
@@ -552,8 +553,8 @@ pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tr
 /// - `dropped_hf_window`: matrix HF outside `[--min-hf, --max-hf)`;
 /// - `dropped_min_presence`: fewer than [`MIN_PRESENCE`] reads carry it;
 /// - `dropped_min_absence`: fewer than [`MIN_ABSENCE`] reads call it absent;
-/// - `dropped_not_whitelisted`: the VCF is a whitelist and does not list it;
-/// - `no_matrix_row`: PASS in the VCF but the matrix has no row for it.
+/// - `dropped_not_whitelisted`: the VCF does not list it as a PASS site inside the HF window (see `detail`);
+/// - `no_matrix_row`: a PASS site inside the HF window that the matrix has no row for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VariantDisposition {
     pub variant: String,

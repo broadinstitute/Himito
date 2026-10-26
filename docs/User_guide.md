@@ -356,6 +356,8 @@ Many outputs share the same basename you pass with `-o` / `--output-prefix` (`qu
 | `.bed` | Methylation summary (`methyl` / `quick-start`) |
 | `.raw_matrix.csv`, `.matrix.csv` | Per-read variant support matrices written next to the VCF basename (`call` / `quick-start`) |
 | `.hp_confusion.tsv` | Homopolymer length confusion of the reads (`base ref_len obs_len strand n`), written with `--bam` (`call` / `quick-start`) or by `Himito hp-error`; read by `lineage` |
+| `.mutation_tree.tsv` | `lineage`: one row per mutation node (`node_id`, `variant`, `parent_id`, `parent_variant`, `n_reads_attached`), with two confidence measures. `order_support_ll` (with `n_child_without_parent` / `n_parent_without_child`) is the log-likelihood (nats) lost by swapping the node with its own parent. `placement_support_ll` is the log-likelihood (nats) lost by re-attaching the node and its whole subtree under the best other valid parent, named in `alt_parent`; it is `NA` when the node has no other valid parent (or above 200 mutations). A margin under 2 nats is logged as a warning: the node's position is unresolved, so read it as a coin flip however large `order_support_ll` is |
+| `.read_lineage.nwk` | `lineage`: read lineage tree in Newick with NHX branch tags. Every mutation branch carries `mutation=`, `order_support=` and `placement_support=` (the same two measures, one comma-joined value per mutation on a collapsed branch) |
 
 The **matrix CSV** has header `variant`, then one column per read name. Each row is a variant identifier; cell values are non-negative counts of support in that read (see `call` in the codebase). `.raw_matrix.csv` is produced before permutation-based filtering; `.matrix.csv` matches the variants retained in the final VCF.
 

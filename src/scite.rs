@@ -1439,6 +1439,68 @@ pub fn edge_evidence(
         .collect()
 }
 
+/// How firmly the data pins a node under its parent rather than under any other valid parent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacementEvidence {
+    /// Best-tree log-likelihood minus the best over every other valid parent (nats); `None` when the
+    /// node has no other valid parent.
+    pub margin_ll: Option<f64>,
+    /// The parent that reached that best alternative.
+    pub alt_parent: Option<usize>,
+}
+
+/// Above this many mutations the all-parents rescan is skipped (it is O(n^2) tree scorings).
+const PLACEMENT_MAX_NODES: usize = 200;
+/// Below this margin (nats) a placement is reported as weak.
+pub const PLACEMENT_MIN_SUPPORT_LL: f64 = 2.0;
+
+/// [`PlacementEvidence`] for every mutation node, indexed by mutation id. Moving a node moves its whole
+/// subtree with it, so the margin answers "is this subtree in the right place", not "is this one edge".
+pub fn placement_evidence(
+    tree: &MutationTree,
+    matrix: &BinaryMatrix,
+    rates: &ErrorRates,
+) -> Vec<PlacementEvidence> {
+    let none = PlacementEvidence { margin_ll: None, alt_parent: None };
+    if tree.n_mutations > PLACEMENT_MAX_NODES {
+        warn!(
+            "[SCITE] {} mutations exceeds the placement-margin limit of {PLACEMENT_MAX_NODES}: \
+             placement_support_ll is reported as NA",
+            tree.n_mutations
+        );
+        return vec![none; tree.n_mutations];
+    }
+    let scorer = AttachmentScorer::new(matrix, rates);
+    let tree_ll = tree_log_likelihood_with(tree, &scorer);
+    let spans = variant_spans(&matrix.variants);
+    let recurrent = recurrent_nodes(&matrix.variants);
+
+    (0..tree.n_mutations)
+        .map(|node| {
+            let descendants = tree.descendant_mask(node);
+            let mut best: Option<(usize, f64)> = None;
+            for p in 0..=tree.n_mutations {
+                // Its own place, itself, and its own descendants are not alternatives.
+                if p == tree.parent[node] || p == node || descendants.get(p) {
+                    continue;
+                }
+                let moved = tree.with_parent(node, p);
+                if violates_position_exclusivity(&moved, &spans) || violates_recurrent_leaves(&moved, &recurrent) {
+                    continue;
+                }
+                let ll = tree_log_likelihood_with(&moved, &scorer);
+                if best.is_none_or(|(_, b)| ll > b + LL_TIE_EPS) {
+                    best = Some((p, ll));
+                }
+            }
+            match best {
+                Some((p, ll)) => PlacementEvidence { margin_ll: Some(tree_ll - ll), alt_parent: Some(p) },
+                None => none.clone(),
+            }
+        })
+        .collect()
+}
+
 fn format_support(support: Option<f64>) -> String {
     match support {
         Some(s) => format!("{s:.3}"),
@@ -1477,6 +1539,7 @@ pub fn write_mutation_tree(
     tree: &MutationTree,
     matrix: &CleanedMatrix,
     evidence: &[EdgeEvidence],
+    placement: &[PlacementEvidence],
     block_names: &[String],
     annotated_names: &[String],
     path: &str,
@@ -1485,7 +1548,8 @@ pub fn write_mutation_tree(
     writeln!(
         w,
         "node_id\tvariant\tparent_id\tparent_variant\tn_reads_attached\t\
-         order_support_ll\tn_child_without_parent\tn_parent_without_child"
+         order_support_ll\tn_child_without_parent\tn_parent_without_child\t\
+         placement_support_ll\talt_parent"
     )?;
     let node_name = |id: usize| -> String {
         if id == tree.root() { "ROOT".to_string() } else { matrix.variants[id].clone() }
@@ -1499,9 +1563,12 @@ pub fn write_mutation_tree(
             Some((c, p)) => (c.to_string(), p.to_string()),
             None => ("NA".to_string(), "NA".to_string()),
         };
+        let pl = placement.get(node);
+        let margin = format_support(pl.and_then(|p| p.margin_ll));
+        let alt = pl.and_then(|p| p.alt_parent).map_or("NA".to_string(), node_name);
         writeln!(
             w,
-            "{node}\t{}\t{parent}\t{}\t{n_reads}\t{support}\t{n_child}\t{n_parent}",
+            "{node}\t{}\t{parent}\t{}\t{n_reads}\t{support}\t{n_child}\t{n_parent}\t{margin}\t{alt}",
             node_name(node),
             node_name(parent)
         )?;
@@ -1511,14 +1578,14 @@ pub fn write_mutation_tree(
         let root_reads = matrix.attachment.iter().filter(|&&a| a == tree.root()).count();
         writeln!(
             w,
-            "ROOT_BLOCK\t{}\t{}\tROOT\t{root_reads}\tNA\tNA\tNA",
+            "ROOT_BLOCK\t{}\t{}\tROOT\t{root_reads}\tNA\tNA\tNA\tNA\tNA",
             block_names.join(","),
             tree.root()
         )?;
     }
     // Tract alleles reported but not placed: one row, no read count (they are in no node).
     if !annotated_names.is_empty() {
-        writeln!(w, "TRACT_ANNOTATED\t{}\t{}\tROOT\tNA\tNA\tNA\tNA", annotated_names.join(","), tree.root())?;
+        writeln!(w, "TRACT_ANNOTATED\t{}\t{}\tROOT\tNA\tNA\tNA\tNA\tNA\tNA", annotated_names.join(","), tree.root())?;
     }
     Ok(())
 }
@@ -1533,6 +1600,7 @@ fn emit_lineage_node(
     haps_by_node: &[Vec<(String, usize)>],
     variants: &[String],
     evidence: &[EdgeEvidence],
+    placement: &[PlacementEvidence],
 ) -> String {
     let is_root = node == tree.root();
     let child_nodes = &children[node];
@@ -1548,6 +1616,13 @@ fn emit_lineage_node(
             .join(",")
     };
 
+    let mut_placement = |muts: &[usize]| -> String {
+        muts.iter()
+            .map(|&m| format_support(placement.get(m).and_then(|p| p.margin_ll)))
+            .collect::<Vec<String>>()
+            .join(",")
+    };
+
     // Collapse: a non-root node with a single effective child is dissolved.
     if !is_root && n_effective == 1 {
         if child_nodes.len() == 1 {
@@ -1555,15 +1630,16 @@ fn emit_lineage_node(
             let c = child_nodes[0];
             let mut muts = edge_muts.to_vec();
             muts.push(c);
-            return emit_lineage_node(c, &muts, tree, children, haps_by_node, variants, evidence);
+            return emit_lineage_node(c, &muts, tree, children, haps_by_node, variants, evidence, placement);
         } else {
             // Single haplotype tip: the mutation(s) ride on that tip's branch.
             let (hid, count) = &haps[0];
             return format!(
-                "{hid}_n{count}:{}[&&NHX:mutation={}:order_support={}:reads={count}]",
+                "{hid}_n{count}:{}[&&NHX:mutation={}:order_support={}:placement_support={}:reads={count}]",
                 edge_muts.len(),
                 mut_names(edge_muts),
-                mut_support(edge_muts)
+                mut_support(edge_muts),
+                mut_placement(edge_muts)
             );
         }
     }
@@ -1571,7 +1647,7 @@ fn emit_lineage_node(
     // Otherwise this node is emitted (branch point, root, or dead-end).
     let mut tokens: Vec<String> = Vec::new();
     for &c in child_nodes {
-        tokens.push(emit_lineage_node(c, &[c], tree, children, haps_by_node, variants, evidence));
+        tokens.push(emit_lineage_node(c, &[c], tree, children, haps_by_node, variants, evidence, placement));
     }
 
     if is_root {
@@ -1590,12 +1666,13 @@ fn emit_lineage_node(
     let blen = edge_muts.len();
     let muts = mut_names(edge_muts);
     let support = mut_support(edge_muts);
+    let place = mut_placement(edge_muts);
     if tokens.is_empty() {
         // Dead-end ancestral node (no descendants, no reads) — keep the mutation.
-        format!("anc{node}:{blen}[&&NHX:mutation={muts}:order_support={support}]")
+        format!("anc{node}:{blen}[&&NHX:mutation={muts}:order_support={support}:placement_support={place}]")
     } else {
         format!(
-            "({})anc{node}:{blen}[&&NHX:mutation={muts}:order_support={support}]",
+            "({})anc{node}:{blen}[&&NHX:mutation={muts}:order_support={support}:placement_support={place}]",
             tokens.join(",")
         )
     }
@@ -1607,6 +1684,7 @@ pub fn write_read_lineage_newick(
     hap_matrix: &HaplotypeMatrix,
     rates: &ErrorRates,
     evidence: &[EdgeEvidence],
+    placement: &[PlacementEvidence],
     block_names: &[String],
     annotated_names: &[String],
     path: &str,
@@ -1627,6 +1705,7 @@ pub fn write_read_lineage_newick(
         &haps_by_node,
         &hap_matrix.variants,
         evidence,
+        placement,
     );
 
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
@@ -2200,6 +2279,18 @@ pub fn run_scite_pipeline(
     let n_merged_informative = n_informative - (cleaned.variants.len() - merged.variants.len());
 
     let evidence = edge_evidence(&tree, binary, &rates);
+    let placement = placement_evidence(&tree, binary, &rates);
+    for (node, p) in placement.iter().enumerate() {
+        if p.margin_ll.is_some_and(|m| m < PLACEMENT_MIN_SUPPORT_LL) {
+            warn!(
+                "[SCITE] {} is placed under {} by only {:.2} nats over {}: treat its position as unresolved",
+                binary.variants[node],
+                if tree.parent[node] == tree.root() { "ROOT" } else { &binary.variants[tree.parent[node]] },
+                p.margin_ll.unwrap(),
+                p.alt_parent.map_or("ROOT", |a| if a == tree.root() { "ROOT" } else { &binary.variants[a] })
+            );
+        }
+    }
     let unresolved: Vec<String> = (0..tree.n_mutations)
         .filter(|&m| evidence[m].order_resolved() == Some(false))
         .map(|m| {
@@ -2252,6 +2343,7 @@ pub fn run_scite_pipeline(
         &tree,
         &cleaned,
         &evidence,
+        &placement,
         &block_names,
         &annotated_names,
         &format!("{output_prefix}.mutation_tree.tsv"),
@@ -2274,6 +2366,7 @@ pub fn run_scite_pipeline(
         &cleaned_hap_matrix,
         &rates,
         &evidence,
+        &placement,
         &block_names,
         &annotated_names,
         &format!("{output_prefix}.read_lineage.nwk"),
@@ -3055,6 +3148,46 @@ mod tests {
     }
 
     #[test]
+    fn placement_evidence_pins_a_node_its_reads_support_and_not_one_they_do_not() {
+        // Three variants. Reads 0-3 carry A and B; reads 4-7 carry A and C. B and C are
+        // sibling children of A, which hangs from the root.
+        let variants = vec!["m.100A>G".to_string(), "m.200A>G".to_string(), "m.300A>G".to_string()];
+        let reads: Vec<String> = (0..8).map(|i| format!("r{i}")).collect();
+        let data = vec![
+            vec![Some(1); 8],
+            (0..8).map(|i| Some(u8::from(i < 4))).collect(),
+            (0..8).map(|i| Some(u8::from(i >= 4))).collect(),
+        ];
+        let matrix = BinaryMatrix { variants, reads, data };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.01, per_variant: vec![(0.01, 0.01); 3], sites: Vec::new() };
+        // parent[0] = ROOT (3), parent[1] = 0, parent[2] = 0
+        let tree = MutationTree { n_mutations: 3, parent: vec![3, 0, 0, 3] };
+
+        let ev = placement_evidence(&tree, &matrix, &rates);
+        assert_eq!(ev.len(), 3);
+        // B's reads all carry A, so moving B off A costs likelihood.
+        assert!(ev[1].margin_ll.unwrap() > 1.0, "{:?}", ev[1]);
+        assert!(ev[1].alt_parent.is_some());
+        // C is just as pinned: its reads all carry A and none carry B.
+        assert!(ev[2].margin_ll.unwrap() > 1.0, "{:?}", ev[2]);
+        // B and C are A's descendants and A hangs from the root, so A has no valid other parent.
+        assert_eq!(ev[0], PlacementEvidence { margin_ll: None, alt_parent: None });
+    }
+
+    #[test]
+    fn placement_evidence_has_no_alternative_for_a_lone_mutation() {
+        let matrix = BinaryMatrix {
+            variants: vec!["m.100A>G".to_string()],
+            reads: vec!["r0".to_string(), "r1".to_string()],
+            data: vec![vec![Some(1), Some(0)]],
+        };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.01, per_variant: vec![(0.01, 0.01)], sites: Vec::new() };
+        let tree = MutationTree { n_mutations: 1, parent: vec![1, 1] };
+        let ev = placement_evidence(&tree, &matrix, &rates);
+        assert_eq!(ev, vec![PlacementEvidence { margin_ll: None, alt_parent: None }]);
+    }
+
+    #[test]
     fn write_mutation_tree_lists_every_node_with_parent_and_attached_read_count() {
         let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
         let matrix = small_cleaned_matrix();
@@ -3062,19 +3195,41 @@ mod tests {
             EdgeEvidence { support_ll: None, counts: None },
             EdgeEvidence { support_ll: Some(4.25), counts: Some((3, 7)) },
         ];
+        // Node A has no alternative parent; B's best alternative is the root, 2.5 nats behind.
+        let placement = vec![
+            PlacementEvidence { margin_ll: None, alt_parent: None },
+            PlacementEvidence { margin_ll: Some(2.5), alt_parent: Some(2) },
+        ];
         let nodes = "node_id\tvariant\tparent_id\tparent_variant\tn_reads_attached\t\
-                     order_support_ll\tn_child_without_parent\tn_parent_without_child\n\
-                     0\tA\t2\tROOT\t1\tNA\tNA\tNA\n\
-                     1\tB\t0\tA\t1\t4.250\t3\t7\n\
-                     2\tROOT\t2\tROOT\t0\tNA\tNA\tNA\n";
-        let content = written("himito_test_write_mutation_tree.tsv", |p| write_mutation_tree(&tree, &matrix, &evidence, &[], &[], p));
+                     order_support_ll\tn_child_without_parent\tn_parent_without_child\t\
+                     placement_support_ll\talt_parent\n\
+                     0\tA\t2\tROOT\t1\tNA\tNA\tNA\tNA\tNA\n\
+                     1\tB\t0\tA\t1\t4.250\t3\t7\t2.500\tROOT\n\
+                     2\tROOT\t2\tROOT\t0\tNA\tNA\tNA\tNA\tNA\n";
+        let content = written("himito_test_write_mutation_tree.tsv", |p| {
+            write_mutation_tree(&tree, &matrix, &evidence, &placement, &[], &[], p)
+        });
         assert_eq!(content, nodes);
+
+        // A short or empty placement slice leaves NA/NA rather than panicking.
+        let content = written("himito_test_write_mutation_tree_noplacement.tsv", |p| {
+            write_mutation_tree(&tree, &matrix, &evidence, &[], &[], &[], p)
+        });
+        assert!(content.contains("\n1\tB\t0\tA\t1\t4.250\t3\t7\tNA\tNA\n"), "{content}");
 
         // The whole root block is one extra row.
         let block = ["m.750A>G".to_string(), "m.16183A>C".to_string()];
-        let content =
-            written("himito_test_write_mutation_tree_block.tsv", |p| write_mutation_tree(&tree, &matrix, &evidence, &block, &[], p));
-        assert_eq!(content, format!("{nodes}ROOT_BLOCK\tm.750A>G,m.16183A>C\t2\tROOT\t0\tNA\tNA\tNA\n"));
+        let content = written("himito_test_write_mutation_tree_block.tsv", |p| {
+            write_mutation_tree(&tree, &matrix, &evidence, &placement, &block, &[], p)
+        });
+        assert_eq!(content, format!("{nodes}ROOT_BLOCK\tm.750A>G,m.16183A>C\t2\tROOT\t0\tNA\tNA\tNA\tNA\tNA\n"));
+
+        // Tract alleles reported but not placed: one row, also NA in the new columns.
+        let tract = ["m.310T>TC".to_string()];
+        let content = written("himito_test_write_mutation_tree_tract.tsv", |p| {
+            write_mutation_tree(&tree, &matrix, &evidence, &placement, &[], &tract, p)
+        });
+        assert_eq!(content, format!("{nodes}TRACT_ANNOTATED\tm.310T>TC\t2\tROOT\tNA\tNA\tNA\tNA\tNA\tNA\n"));
     }
 
     #[test]
@@ -3133,16 +3288,22 @@ mod tests {
             EdgeEvidence { support_ll: Some(0.0), counts: Some((2, 2)) },
             EdgeEvidence { support_ll: Some(3.0), counts: Some((1, 4)) },
         ];
+        let placement = vec![
+            PlacementEvidence { margin_ll: Some(40.0), alt_parent: Some(4) },
+            PlacementEvidence { margin_ll: Some(7.25), alt_parent: Some(0) },
+            PlacementEvidence { margin_ll: None, alt_parent: None },
+            PlacementEvidence { margin_ll: Some(1.5), alt_parent: Some(0) },
+        ];
         let content = written("himito_test_read_lineage.nwk", |p| {
-            write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, &[], &[], p)
+            write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, &placement, &[], &[], p)
         });
 
         // No haplotype has zero mutations, so the root state becomes a synthetic zero-read tip.
         assert_eq!(
             content,
-            "((H0_n9:1[&&NHX:mutation=mC:order_support=0.000:reads=9],\
-             (H1_n7:0[&&NHX:reads=7],H2_n4:0[&&NHX:reads=4])anc3:1[&&NHX:mutation=mD:order_support=3.000],\
-             H3_n2:0[&&NHX:reads=2])anc1:2[&&NHX:mutation=mA,mB:order_support=NA,12.500],\
+            "((H0_n9:1[&&NHX:mutation=mC:order_support=0.000:placement_support=NA:reads=9],\
+             (H1_n7:0[&&NHX:reads=7],H2_n4:0[&&NHX:reads=4])anc3:1[&&NHX:mutation=mD:order_support=3.000:placement_support=1.500],\
+             H3_n2:0[&&NHX:reads=2])anc1:2[&&NHX:mutation=mA,mB:order_support=NA,12.500:placement_support=40.000,7.250],\
              Hroot_n0:0[&&NHX:reads=0])ROOT;\n"
         );
     }
@@ -3163,10 +3324,10 @@ mod tests {
         };
         let evidence = vec![EdgeEvidence { support_ll: None, counts: None }];
         let write = |block: &[String], name: &str| {
-            written(name, |p| write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, block, &[], p))
+            written(name, |p| write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, &[], block, &[], p))
         };
 
-        let body = "(H0001_n3:1[&&NHX:mutation=mA:order_support=NA:reads=3],H0000_n5:0[&&NHX:reads=5])ROOT";
+        let body = "(H0001_n3:1[&&NHX:mutation=mA:order_support=NA:placement_support=NA:reads=3],H0000_n5:0[&&NHX:reads=5])ROOT";
         assert_eq!(write(&[], "himito_test_read_lineage_root_tip.nwk"), format!("{body};\n"));
         // The root block is an NHX field on the ROOT node.
         let block = ["m.750A>G".to_string(), "m.16183A>C".to_string()];

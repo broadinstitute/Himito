@@ -508,6 +508,7 @@ mod tests {
             reads: vec!["r0".to_string(), "r1".to_string()],
             data: vec![vec![1, 0]],
             attachment: vec![0, 1],
+            n_unassigned: 0,
         };
         let n_informative = append_block_to_cleaned(&mut c, &["m.9A>G".to_string()]);
 

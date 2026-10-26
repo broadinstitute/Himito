@@ -151,6 +151,8 @@ Given a Himito read–variant matrix (`<prefix>.matrix.csv` from `call`) and the
   - `--hp-fp-rate` / `--hp-fn-rate` override the table.
 - Every rate used, and where it came from, is written to `<prefix>.error_model.tsv`. 
 
+`<prefix>.variant_disposition.tsv` accounts for every candidate variant: one row per VCF PASS site and per matrix row, with its VCF HF, matrix HF, read counts and an `outcome` of `informative`, `root_block`, `tract_annotated`, `dropped_hf_window`, `dropped_min_presence`, `dropped_min_absence`, `dropped_not_whitelisted` or `no_matrix_row` (PASS in the VCF but absent from `matrix.csv`), plus a `detail`. Diffing two platforms' tables answers why their trees differ. `<prefix>.mutation_tree.tsv` accounts for every read: a trailing `UNASSIGNED` row counts the reads that call nothing at any informative variant. They are attached to no node and left out of the cleaned matrix, haplotype tips and Newick, rather than imputed as a wild-type clone.
+
 Outputs include a mutation tree, read-level lineage Newick tree, the cleaned read–variant matrix `<prefix>.cleaned_matrix_all_variants.csv`, the variant co-occurrence table `variant_cooccurrence.tsv`, and haplotype maps. `variant_cooccurrence.tsv` counts observed calls only: each pair of informative variants is tabulated over the reads that call both sites, never over the tree-imputed matrix. `--debug` also writes the co-occurrence table over every filtered variant (`raw_variant_cooccurrence.tsv`, root-block variants included), the same table on the tree-imputed matrix (`cleaned_variant_cooccurrence.tsv`, which restates the tree), and `raw_haplotype_map.tsv`.
 
 ```
@@ -164,7 +166,7 @@ Outputs include a mutation tree, read-level lineage Newick tree, the cleaned rea
                                  --max-hf 0.95
 ```
 
-Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix_all_variants.csv`, `<output_prefix>.variant_cooccurrence.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`, `<output_prefix>.root_block.tsv`, `<output_prefix>.error_model.tsv`, `<output_prefix>.tract_annotation.tsv`. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv`, `<output_prefix>.raw_variant_cooccurrence.tsv` and `<output_prefix>.cleaned_variant_cooccurrence.tsv`.
+Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix_all_variants.csv`, `<output_prefix>.variant_cooccurrence.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`, `<output_prefix>.root_block.tsv`, `<output_prefix>.error_model.tsv`, `<output_prefix>.tract_annotation.tsv`, `<output_prefix>.variant_disposition.tsv`. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv`, `<output_prefix>.raw_variant_cooccurrence.tsv` and `<output_prefix>.cleaned_variant_cooccurrence.tsv`.
 
 `lineage` shows `-m -v -d -o --min-hf --max-hf` in `-h`. The error-rate, `--hp-error`, `--tract-alleles`, MCMC and `--debug`
 options are listed by `--help`.

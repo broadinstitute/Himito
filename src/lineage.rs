@@ -492,14 +492,47 @@ pub fn read_raw_matrix<R: std::io::Read>(reader: R) -> Result<RawMatrix> {
     Ok(RawMatrix { variants, reads, data })
 }
 
+/// Why the matrix row `vid` is not a candidate for the tree: `(outcome, detail)`, or `None` if it passes every
+/// gate. The one place the gates live, so [`filter_matrix`] and [`variant_dispositions`] cannot disagree.
+fn screen_variant(
+    vid: &str,
+    (n_present, n_absent, matrix_hf): (usize, usize, f64),
+    hf: &HfFilter,
+    tracts: &[crate::tracts::Tract],
+) -> Option<(&'static str, String)> {
+    if n_present < MIN_PRESENCE {
+        return Some(("dropped_min_presence", format!("{n_present} present < {MIN_PRESENCE}")));
+    }
+    // The HF window is judged before absence: a variant with no ref call at all has matrix HF 1.0, and "above the
+    // window" is the useful reason for it (`collect_fixed_homoplasmies` reports those the same way).
+    if !hf.keeps(vid, matrix_hf, tracts) {
+        return Some(match hf {
+            HfFilter::FromVcf { map, min, max }
+                if !map.contains_key(vid) && !crate::tracts::is_tract_allele(vid, tracts) =>
+            {
+                (
+                    "dropped_not_whitelisted",
+                    format!("not in the VCF whitelist (not a PASS site, or its VCF HF is outside [{min}, {max}))"),
+                )
+            }
+            HfFilter::FromVcf { min, max, .. } | HfFilter::FromMatrix { min, max } => {
+                ("dropped_hf_window", format!("matrix HF {matrix_hf:.4} outside [{min}, {max})"))
+            }
+        });
+    }
+    if n_absent < MIN_ABSENCE {
+        return Some(("dropped_min_absence", format!("{n_absent} absent < {MIN_ABSENCE}")));
+    }
+    None
+}
+
 /// Apply the prevalence and heteroplasmy filters to a [`RawMatrix`]; `tracts` names the collapsed tract-allele rows.
 pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tract]) -> BinaryMatrix {
     let mut variants: Vec<String> = Vec::new();
     let mut data: Vec<Vec<Option<u8>>> = Vec::new();
 
     for (vid, row) in raw.variants.iter().zip(raw.data.iter()) {
-        let (present, absent, freq) = row_hf(row);
-        if present < MIN_PRESENCE || absent < MIN_ABSENCE || !hf.keeps(vid, freq, tracts) {
+        if screen_variant(vid, row_hf(row), hf, tracts).is_some() {
             continue;
         }
         variants.push(vid.clone());
@@ -507,6 +540,101 @@ pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tr
     }
 
     BinaryMatrix { variants, reads: raw.reads.clone(), data }
+}
+
+/// Where one candidate variant ended up. One row per VCF whitelist entry and per matrix row, so an
+/// ONT run and a PacBio run can be compared with a single `diff`.
+///
+/// `outcome` is one of:
+/// - `informative`: placed in the mutation tree (or, before the search has run, simply not filtered out);
+/// - `root_block`: near-fixed, removed from the search and reported unordered at the root;
+/// - `tract_annotated`: a homopolymer-tract allele reported in `tract_annotation.tsv` but kept out of the search;
+/// - `dropped_hf_window`: matrix HF outside `[--min-hf, --max-hf)`;
+/// - `dropped_min_presence`: fewer than [`MIN_PRESENCE`] reads carry it;
+/// - `dropped_min_absence`: fewer than [`MIN_ABSENCE`] reads call it absent;
+/// - `dropped_not_whitelisted`: the VCF is a whitelist and does not list it;
+/// - `no_matrix_row`: PASS in the VCF but the matrix has no row for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VariantDisposition {
+    pub variant: String,
+    /// `None` for a matrix row no VCF lists (a collapsed tract allele, or a no-VCF run).
+    pub vcf_hf: Option<f64>,
+    pub matrix_hf: f64,
+    pub n_present: usize,
+    pub n_absent: usize,
+    pub outcome: &'static str,
+    pub detail: String,
+}
+
+/// Classify every candidate by the same gates as [`filter_matrix`]. `blocked` names the variants the root
+/// block took (empty before the search has run, which reports every surviving variant as `informative`).
+pub fn variant_dispositions(
+    raw: &RawMatrix,
+    hf: &HfFilter,
+    tracts: &[crate::tracts::Tract],
+    blocked: &[String],
+) -> Vec<VariantDisposition> {
+    let vcf_hf = |vid: &str| match hf {
+        HfFilter::FromVcf { map, .. } => map.get(vid).copied(),
+        HfFilter::FromMatrix { .. } => None,
+    };
+    let mut rows: Vec<VariantDisposition> = raw
+        .variants
+        .iter()
+        .zip(raw.data.iter())
+        .map(|(vid, row)| {
+            let stats @ (n_present, n_absent, matrix_hf) = row_hf(row);
+            let (outcome, detail) = screen_variant(vid, stats, hf, tracts).unwrap_or_else(|| {
+                if blocked.contains(vid) {
+                    ("root_block", "near-fixed: reported unordered at the root".to_string())
+                } else {
+                    ("informative", String::new())
+                }
+            });
+            VariantDisposition { variant: vid.clone(), vcf_hf: vcf_hf(vid), matrix_hf, n_present, n_absent, outcome, detail }
+        })
+        .collect();
+    // Whitelisted names the matrix never genotyped: silent otherwise, and the reason an ONT/PacBio
+    // comparison can look like a lineage difference when it is a calling difference.
+    if let HfFilter::FromVcf { map, .. } = hf {
+        for (vid, hfv) in map {
+            if !raw.variants.iter().any(|v| v == vid) {
+                rows.push(VariantDisposition {
+                    variant: vid.clone(),
+                    vcf_hf: Some(*hfv),
+                    matrix_hf: 0.0,
+                    n_present: 0,
+                    n_absent: 0,
+                    outcome: "no_matrix_row",
+                    detail: "PASS in the VCF but absent from matrix.csv".to_string(),
+                });
+            }
+        }
+    }
+    rows.sort_by(|a, b| a.variant.cmp(&b.variant));
+    rows
+}
+
+/// Relabel the candidates the search withheld as tract annotations (`annotated` comes from the search itself).
+pub fn mark_tract_annotated(rows: &mut [VariantDisposition], annotated: &[String]) {
+    for r in rows.iter_mut().filter(|r| r.outcome == "informative" && annotated.contains(&r.variant)) {
+        r.outcome = "tract_annotated";
+        r.detail = "reported in tract_annotation.tsv, kept out of the tree search".to_string();
+    }
+}
+
+pub fn write_variant_disposition(rows: &[VariantDisposition], path: &str) -> Result<()> {
+    let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
+    writeln!(w, "variant\tvcf_hf\tmatrix_hf\tn_present\tn_absent\toutcome\tdetail")?;
+    for r in rows {
+        let vcf = r.vcf_hf.map_or("NA".to_string(), |h| format!("{h:.6}"));
+        writeln!(
+            w,
+            "{}\t{vcf}\t{:.6}\t{}\t{}\t{}\t{}",
+            r.variant, r.matrix_hf, r.n_present, r.n_absent, r.outcome, r.detail
+        )?;
+    }
+    Ok(())
 }
 
 /// Collapse every known homopolymer tract in `raw` into sequence-level alleles.
@@ -1771,10 +1899,13 @@ pub fn start(
     }
     let raw = collapse_tracts(raw, tracts);
     let binary = filter_matrix(&raw, &hf, tracts);
+    // Written before anything can fail, then rewritten once the search has named its root block and annotations.
+    let disposition_path = format!("{output_prefix}.variant_disposition.tsv");
+    write_variant_disposition(&variant_dispositions(&raw, &hf, tracts, &[]), &disposition_path)?;
     if binary.variants.is_empty() {
         bail!(
-            "No informative variants remain after filtering. \
-             Try adjusting --min-hf / --max-hf thresholds."
+            "No variant survives filtering. {disposition_path} lists every candidate and why it was \
+             dropped; try relaxing --min-hf / --max-hf."
         );
     }
     let (variant_model, allele_rows) =
@@ -1815,6 +1946,10 @@ pub fn start(
         debug,
         output_prefix,
     )?;
+
+    let mut dispositions = variant_dispositions(&raw, &hf, tracts, &out.block_names);
+    mark_tract_annotated(&mut dispositions, &out.annotated_names);
+    write_variant_disposition(&dispositions, &disposition_path)?;
 
     // Near-fixed homoplasmies were removed by the HF ceiling before the tree was built; report them as all-present rows.
     let fixed_homoplasmies = collect_fixed_homoplasmies(&raw, max_hf, &binary.variants);
@@ -2925,5 +3060,194 @@ mod tests {
         };
         let hf = HfFilter::FromVcf { map: [("m.73A>G".to_string(), 0.5)].into(), min: 0.01, max: 0.95 };
         assert!(filter_matrix(&raw, &hf, KNOWN_TRACTS).variants.is_empty());
+    }
+
+    #[test]
+    fn disposition_names_why_each_candidate_left_the_analysis() {
+        let raw = RawMatrix {
+            variants: vec!["m.100A>G".to_string(), "m.200A>G".to_string(), "m.300A>G".to_string()],
+            reads: (0..10).map(|i| format!("r{i}")).collect(),
+            data: vec![
+                (0..10).map(|i| Some(u8::from(i < 5))).collect(), // HF 0.5, kept
+                vec![Some(1); 10],                                // HF 1.0, above the window
+                (0..10).map(|i| Some(u8::from(i < 1))).collect(), // 1 present, below MIN_PRESENCE
+            ],
+        };
+        let hf = HfFilter::FromVcf {
+            map: [("m.100A>G".to_string(), 0.5), ("m.200A>G".to_string(), 0.9), ("m.300A>G".to_string(), 0.1)].into(),
+            min: 0.01,
+            max: 0.95,
+        };
+        let rows = variant_dispositions(&raw, &hf, KNOWN_TRACTS, &[]);
+        let by = |n: &str| rows.iter().find(|r| r.variant == n).unwrap().outcome;
+        assert_eq!(by("m.100A>G"), "informative");
+        assert_eq!(by("m.200A>G"), "dropped_hf_window");
+        assert_eq!(by("m.300A>G"), "dropped_min_presence");
+    }
+
+    #[test]
+    fn disposition_reports_a_whitelisted_site_with_no_matrix_row() {
+        let raw = RawMatrix { variants: Vec::new(), reads: vec!["r0".to_string()], data: Vec::new() };
+        let hf = HfFilter::FromVcf { map: [("m.16368T>C".to_string(), 0.09)].into(), min: 0.01, max: 0.95 };
+        let rows = variant_dispositions(&raw, &hf, KNOWN_TRACTS, &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outcome, "no_matrix_row");
+        assert_eq!(rows[0].vcf_hf, Some(0.09));
+    }
+
+    /// Ten reads, one row per variant: `n_alt` alt calls, then `n_ref` ref calls, the rest uncovered.
+    fn counted_raw(rows: &[(&str, usize, usize)]) -> RawMatrix {
+        RawMatrix {
+            variants: rows.iter().map(|r| r.0.to_string()).collect(),
+            reads: (0..10).map(|i| format!("r{i}")).collect(),
+            data: rows
+                .iter()
+                .map(|&(_, alt, rf)| {
+                    (0..10).map(|i| if i < alt { Some(1) } else if i < alt + rf { Some(0) } else { None }).collect()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn disposition_covers_every_remaining_outcome() {
+        let raw = counted_raw(&[
+            ("m.100A>G", 5, 5),  // whitelisted, HF 0.5
+            ("m.200A>G", 5, 5),  // same counts, but the root block takes it
+            ("m.300A>G", 5, 5),  // same counts, not in the VCF
+            ("m.400A>G", 10, 0), // whitelisted, no ref call at all (HF 1.0 is inside the window below)
+            ("m.500A>G", 0, 0),  // whitelisted, never covered
+        ]);
+        let map: HfMap = ["m.100A>G", "m.200A>G", "m.400A>G", "m.500A>G"].map(|n| (n.to_string(), 0.5)).into();
+        let hf = HfFilter::FromVcf { map, min: 0.01, max: 1.01 };
+        let rows = variant_dispositions(&raw, &hf, KNOWN_TRACTS, &["m.200A>G".to_string()]);
+        let row = |n: &str| rows.iter().find(|r| r.variant == n).unwrap();
+
+        assert_eq!(row("m.100A>G").outcome, "informative");
+        assert_eq!((row("m.100A>G").n_present, row("m.100A>G").n_absent, row("m.100A>G").matrix_hf), (5, 5, 0.5));
+        assert_eq!(row("m.100A>G").vcf_hf, Some(0.5));
+        assert_eq!(row("m.200A>G").outcome, "root_block");
+        assert_eq!(row("m.300A>G").outcome, "dropped_not_whitelisted");
+        assert_eq!(row("m.300A>G").vcf_hf, None);
+        assert_eq!(row("m.400A>G").outcome, "dropped_min_absence");
+        assert_eq!(row("m.500A>G").outcome, "dropped_min_presence");
+        assert_eq!(rows.len(), 5);
+        assert!(rows.windows(2).all(|w| w[0].variant <= w[1].variant), "sorted by variant");
+    }
+
+    #[test]
+    fn disposition_marks_tract_alleles_the_search_withheld() {
+        let raw = counted_raw(&[("m.100A>G", 5, 5), ("m.16189T>TC", 5, 5)]);
+        let hf = HfFilter::FromMatrix { min: 0.01, max: 0.95 };
+        let mut rows = variant_dispositions(&raw, &hf, &[], &[]);
+        mark_tract_annotated(&mut rows, &["m.16189T>TC".to_string()]);
+        let outcomes: Vec<(&str, &str)> = rows.iter().map(|r| (r.variant.as_str(), r.outcome)).collect();
+        assert_eq!(outcomes, [("m.100A>G", "informative"), ("m.16189T>TC", "tract_annotated")]);
+    }
+
+    #[test]
+    fn disposition_agrees_with_filter_matrix_on_every_boundary() {
+        // Every gate at its edge: presence 1 and 2, absence 0 and 1, HF exactly at min and at max, a tract
+        // allele and an unlisted name, under both HF modes.
+        let raw = counted_raw(&[
+            ("m.100A>G", 1, 9),
+            ("m.101A>G", 2, 8),
+            ("m.102A>G", 9, 0),
+            ("m.103A>G", 9, 1),
+            ("m.104A>G", 5, 5),
+            ("m.105A>G", 2, 0),
+            ("m.106A>G", 0, 10),
+            ("m.16189T>TC", 5, 5),
+        ]);
+        let listed: HfMap = raw.variants.iter().filter(|v| !v.starts_with("m.104")).map(|v| (v.clone(), 0.5)).collect();
+        let filters = [
+            HfFilter::FromVcf { map: listed, min: 0.2, max: 0.9 },
+            HfFilter::FromMatrix { min: 0.5, max: 0.9 },
+            HfFilter::FromMatrix { min: 0.1, max: 0.5 },
+        ];
+        for hf in &filters {
+            for tracts in [KNOWN_TRACTS, &[][..]] {
+                let kept = filter_matrix(&raw, hf, tracts).variants;
+                let rows = variant_dispositions(&raw, hf, tracts, &[]);
+                let informative: Vec<String> =
+                    rows.iter().filter(|r| r.outcome == "informative").map(|r| r.variant.clone()).collect();
+                let mut kept_sorted = kept.clone();
+                kept_sorted.sort();
+                assert_eq!(informative, kept_sorted, "{:?}", rows);
+                assert!(rows.iter().all(|r| r.outcome != "no_matrix_row"));
+            }
+        }
+    }
+
+    #[test]
+    fn write_variant_disposition_writes_one_tab_separated_row_each() {
+        let rows = vec![
+            VariantDisposition {
+                variant: "m.100A>G".to_string(),
+                vcf_hf: Some(0.25),
+                matrix_hf: 0.5,
+                n_present: 5,
+                n_absent: 5,
+                outcome: "informative",
+                detail: String::new(),
+            },
+            VariantDisposition {
+                variant: "m.200A>G".to_string(),
+                vcf_hf: None,
+                matrix_hf: 1.0,
+                n_present: 10,
+                n_absent: 0,
+                outcome: "dropped_min_absence",
+                detail: "0 absent < 1".to_string(),
+            },
+        ];
+        let path = std::env::temp_dir().join("himito_test_variant_disposition.tsv");
+        write_variant_disposition(&rows, path.to_str().unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            content,
+            "variant\tvcf_hf\tmatrix_hf\tn_present\tn_absent\toutcome\tdetail\n\
+             m.100A>G\t0.250000\t0.500000\t5\t5\tinformative\t\n\
+             m.200A>G\tNA\t1.000000\t10\t0\tdropped_min_absence\t0 absent < 1\n"
+        );
+    }
+
+    #[test]
+    fn start_with_no_surviving_variant_still_writes_the_disposition_table() {
+        let dir = std::env::temp_dir().join("himito_test_disposition_empty");
+        std::fs::create_dir_all(&dir).unwrap();
+        let matrix = dir.join("m.matrix.csv");
+        // One variant at HF 1.0: above the window, so nothing survives.
+        std::fs::write(&matrix, csv_with_pseudo_read(20, &[("m.9000A>G", 20, 0)])).unwrap();
+        let prefix = dir.join("out").to_str().unwrap().to_string();
+        let opts = RateOptions { data_type: "pacbio".to_string(), ..Default::default() };
+        let err = start(matrix.to_str().unwrap(), None, 0.01, 0.95, &opts, &[], 20, 1, false, &prefix).unwrap_err();
+        assert!(err.to_string().contains("variant_disposition.tsv"), "{err}");
+        let table = std::fs::read_to_string(format!("{prefix}.variant_disposition.tsv")).unwrap();
+        assert!(table.contains("m.9000A>G\tNA\t"), "{table}");
+        assert!(table.contains("dropped_min_absence") || table.contains("dropped_hf_window"), "{table}");
+    }
+
+    #[test]
+    fn start_writes_a_disposition_table_that_names_the_root_block() {
+        let dir = std::env::temp_dir().join("himito_test_disposition_run");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rows = fixed_rows(198, 2);
+        rows.push(("m.9000A>G", 100, 100));
+        rows.push(("m.9100C>T", 50, 150));
+        let matrix = dir.join("m.matrix.csv");
+        std::fs::write(&matrix, csv_with_pseudo_read(200, &rows)).unwrap();
+        let prefix = dir.join("out").to_str().unwrap().to_string();
+        let opts = RateOptions { data_type: "pacbio".to_string(), ..Default::default() };
+        start(matrix.to_str().unwrap(), None, 0.01, 0.95, &opts, &[], 100, 1, false, &prefix).unwrap();
+        let table = std::fs::read_to_string(format!("{prefix}.variant_disposition.tsv")).unwrap();
+        let outcome = |n: &str| {
+            table.lines().find(|l| l.starts_with(&format!("{n}\t"))).unwrap().split('\t').nth(5).unwrap().to_string()
+        };
+        assert_eq!(outcome("m.9000A>G"), "informative", "{table}");
+        assert_eq!(outcome("m.9100C>T"), "informative", "{table}");
+        // The six fixed SNVs sit at HF 0.99: above the 0.95 ceiling.
+        assert_eq!(outcome("m.1000A>G"), "dropped_hf_window", "{table}");
     }
 }

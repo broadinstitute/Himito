@@ -814,7 +814,7 @@ fn copy_excess_p(
     tree: &MutationTree,
     site: &TractSite,
     state: usize,
-    attachment: &[usize],
+    attachment: &[Option<usize>],
     nodes: &[usize],
     clade_node: usize,
 ) -> f64 {
@@ -822,7 +822,8 @@ fn copy_excess_p(
     let clade_state = site.node_state(|m| path.get(m));
     let (mut n, mut k) = (0usize, 0usize);
     for (r, a) in attachment.iter().enumerate() {
-        if !nodes.contains(a) {
+        // `attachment` is indexed by read, with `None` for a read that calls nothing informative.
+        if !a.is_some_and(|a| nodes.contains(&a)) {
             continue;
         }
         if let Some(o) = site.observed(|m| matrix.data.get(m).and_then(|row| row[r])) {
@@ -1013,7 +1014,7 @@ pub fn add_tract_copies(
             }
             let copy = m2.variants.len() - 1;
             let (si, state) = site_of(&r2, copy).expect("a copy joins its allele's site");
-            let attachment = attach_all_reads(&m2, &t2, &r2).attachment;
+            let attachment = read_attachments(&m2, &t2, &r2);
             let q = t2.parent[copy];
             let excess = copy_excess_p(&m2, &t2, &r2.sites[si], state, &attachment, &[q, copy], q);
             if excess < alpha {
@@ -1041,7 +1042,7 @@ pub fn add_tract_copies(
     }
     // Re-check every copy on the final tree: its reads against the state of its parent's clade.
     loop {
-        let attachment = attach_all_reads(&m, &t, &r).attachment;
+        let attachment = read_attachments(&m, &t, &r);
         let copies: Vec<usize> = (0..t.n_mutations).filter(|&x| m.variants[x].contains('#')).collect();
         let alpha = TRACT_COPY_ALPHA / copies.len().max(1) as f64;
         let failing = copies.iter().copied().find_map(|x| {
@@ -1071,46 +1072,68 @@ pub fn merge_tract_copies(cleaned: &CleanedMatrix) -> CleanedMatrix {
             }
         }
     }
-    CleanedMatrix { variants, reads: cleaned.reads.clone(), data, attachment: cleaned.attachment.clone() }
+    CleanedMatrix {
+        variants,
+        reads: cleaned.reads.clone(),
+        data,
+        attachment: cleaned.attachment.clone(),
+        n_unassigned: cleaned.n_unassigned,
+    }
 }
 
-/// The imputed, denoised genotype matrix from attaching every read to its best node in `tree`.
+/// The imputed, denoised genotype matrix from attaching every read that calls an informative variant to its
+/// best node in `tree`.
 #[derive(Debug, Clone)]
 pub struct CleanedMatrix {
     pub variants: Vec<String>,
+    /// Only the reads that were attached; the `n_unassigned` that were not are absent from `reads`, `data`
+    /// and `attachment` alike.
     pub reads: Vec<String>,
     /// `data[variant_idx][read_idx]`, always `0` or `1` (no missing values).
     pub data: Vec<Vec<u8>>,
     /// `attachment[read_idx]` = the tree node id that read attached to.
     pub attachment: Vec<usize>,
+    /// Reads with no call (ref or alt) at any informative variant. They carry no lineage signal, so they are
+    /// counted here rather than attached: attaching them would impute them all-reference, a wild-type clone
+    /// no read supports.
+    pub n_unassigned: usize,
+}
+
+/// The node each read attaches to, indexed by read; `None` for a read with no call (ref or alt) at any variant.
+/// With no variant at all there is nothing to be uncovered by, so every read belongs to the root.
+fn read_attachments(matrix: &BinaryMatrix, tree: &MutationTree, rates: &ErrorRates) -> Vec<Option<usize>> {
+    let scorer = AttachmentScorer::new(matrix, rates);
+    let layout = TreeLayout::new(tree);
+    let mut scratch = Vec::new();
+    (0..matrix.reads.len())
+        .map(|r| {
+            let covered = matrix.variants.is_empty() || matrix.data.iter().any(|row| row[r].is_some());
+            covered.then(|| scorer.best_attachment(r, tree, &layout, &mut scratch).0)
+        })
+        .collect()
 }
 
 pub fn attach_all_reads(matrix: &BinaryMatrix, tree: &MutationTree, rates: &ErrorRates) -> CleanedMatrix {
     let n_variants = matrix.variants.len();
-    let n_reads = matrix.reads.len();
-    let mut data = vec![vec![0u8; n_reads]; n_variants];
-    let mut attachment = vec![0usize; n_reads];
-
-    let scorer = AttachmentScorer::new(matrix, rates);
-    let layout = TreeLayout::new(tree);
-    let mut scratch = Vec::new();
+    let nodes = read_attachments(matrix, tree, rates);
+    let keep: Vec<(usize, usize)> = nodes.iter().enumerate().filter_map(|(r, n)| n.map(|n| (r, n))).collect();
+    let n_unassigned = matrix.reads.len() - keep.len();
 
     // Per-node genotypes depend only on the tree: build them once, not per read.
     let masks: Vec<Mask> = (0..=tree.n_mutations).map(|n| tree.ancestor_mask(n)).collect();
-
-    for r in 0..n_reads {
-        let (node, _ll) = scorer.best_attachment(r, tree, &layout, &mut scratch);
-        attachment[r] = node;
+    let mut data = vec![vec![0u8; keep.len()]; n_variants];
+    for (i, &(_, node)) in keep.iter().enumerate() {
         for v in 0..n_variants {
-            data[v][r] = u8::from(masks[node].get(v));
+            data[v][i] = u8::from(masks[node].get(v));
         }
     }
 
     CleanedMatrix {
         variants: matrix.variants.clone(),
-        reads: matrix.reads.clone(),
+        reads: keep.iter().map(|&(r, _)| matrix.reads[r].clone()).collect(),
         data,
-        attachment,
+        attachment: keep.iter().map(|&(_, node)| node).collect(),
+        n_unassigned,
     }
 }
 
@@ -1586,6 +1609,10 @@ pub fn write_mutation_tree(
     // Tract alleles reported but not placed: one row, no read count (they are in no node).
     if !annotated_names.is_empty() {
         writeln!(w, "TRACT_ANNOTATED\t{}\t{}\tROOT\tNA\tNA\tNA\tNA\tNA\tNA", annotated_names.join(","), tree.root())?;
+    }
+    // Reads that call nothing informative sit in no node: they are counted, not attached.
+    if matrix.n_unassigned > 0 {
+        writeln!(w, "UNASSIGNED\tNA\tNA\tNA\t{}\tNA\tNA\tNA\tNA\tNA", matrix.n_unassigned)?;
     }
     Ok(())
 }
@@ -2085,6 +2112,10 @@ pub fn build_sites(specs: &[SiteSpec], informative: &[usize]) -> Vec<TractSite> 
 pub struct SciteOutput {
     pub cleaned: CleanedMatrix,
     pub cleaned_haplotypes: HaplotypeMatrix,
+    /// The root block: variants removed from the search and reported unordered at the root.
+    pub block_names: Vec<String>,
+    /// Tract alleles reported (`TRACT_ANNOTATED`) but kept out of the search.
+    pub annotated_names: Vec<String>,
 }
 
 /// Run the MCMC mutation-tree search, attach every read to its best-fitting node, and write the
@@ -2273,6 +2304,13 @@ pub fn run_scite_pipeline(
     info!("[SCITE] After unary-path polish log-likelihood: {ll_polish:.3}");
 
     let mut cleaned = attach_all_reads(binary, &tree, &rates);
+    if cleaned.n_unassigned > 0 {
+        warn!(
+            "[SCITE] {} of {} reads call no informative variant: reported as UNASSIGNED, not attached to any node",
+            cleaned.n_unassigned,
+            binary.reads.len()
+        );
+    }
     let n_informative = rootblock::append_block_to_cleaned(&mut cleaned, &block_names);
     // Tree outputs keep each copy as its own node; matrix outputs fold copies into their allele's row.
     let merged = merge_tract_copies(&cleaned);
@@ -2373,7 +2411,7 @@ pub fn run_scite_pipeline(
     )?;
 
     // The haplotype map keeps the Newick's haplotypes, so tip ids match (it lists reads, not variants).
-    Ok(SciteOutput { cleaned: merged, cleaned_haplotypes: cleaned_hap_matrix })
+    Ok(SciteOutput { cleaned: merged, cleaned_haplotypes: cleaned_hap_matrix, block_names, annotated_names })
 }
 
 #[cfg(test)]
@@ -3076,12 +3114,91 @@ mod tests {
         assert_eq!(cleaned.attachment, vec![1, 0, 1]);
     }
 
+    #[test]
+    fn reads_calling_no_informative_variant_are_unassigned_not_wild_type() {
+        let matrix = BinaryMatrix {
+            variants: vec!["m.100A>G".to_string()],
+            reads: vec!["carrier".to_string(), "refcall".to_string(), "nocall".to_string()],
+            data: vec![vec![Some(1), Some(0), None]],
+        };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.01, per_variant: vec![(0.01, 0.01)], sites: Vec::new() };
+        let tree = MutationTree { n_mutations: 1, parent: vec![1, 1] };
+        let cleaned = attach_all_reads(&matrix, &tree, &rates);
+        assert_eq!(cleaned.reads, vec!["carrier".to_string(), "refcall".to_string()]);
+        assert_eq!(cleaned.n_unassigned, 1);
+    }
+
+    #[test]
+    fn unassigned_reads_leave_reads_data_and_attachment_aligned() {
+        // The uncovered reads sit first and in the middle, so an off-by-one would misalign a survivor.
+        let tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] }; // A ancestor of B
+        let rates = ErrorRates::uniform(0.01, 0.1);
+        let matrix = BinaryMatrix {
+            variants: vec!["A".to_string(), "B".to_string()],
+            reads: ["gap0", "full", "gap1", "refcall", "gap2"].map(String::from).to_vec(),
+            data: vec![
+                vec![None, Some(1), None, Some(0), None],
+                vec![None, Some(1), None, Some(0), None],
+            ],
+        };
+        let cleaned = attach_all_reads(&matrix, &tree, &rates);
+        assert_eq!(cleaned.reads, vec!["full", "refcall"]);
+        assert_eq!(cleaned.n_unassigned, 3);
+        assert_eq!(cleaned.data, vec![vec![1, 0], vec![1, 0]]);
+        assert_eq!(cleaned.attachment, vec![1, 2], "full -> B, refcall -> ROOT");
+    }
+
+    #[test]
+    fn with_no_informative_variant_no_read_is_unassigned() {
+        // Nothing to call means nothing to be uncovered by: the reads all belong to the root.
+        let matrix = BinaryMatrix {
+            variants: Vec::new(),
+            reads: vec!["r0".to_string(), "r1".to_string()],
+            data: Vec::new(),
+        };
+        let tree = MutationTree { n_mutations: 0, parent: vec![0] };
+        let cleaned = attach_all_reads(&matrix, &tree, &ErrorRates::uniform(0.01, 0.1));
+        assert_eq!(cleaned.reads.len(), 2);
+        assert_eq!(cleaned.attachment, vec![0, 0]);
+        assert_eq!(cleaned.n_unassigned, 0);
+    }
+
+    #[test]
+    fn pipeline_reports_unassigned_reads_and_keeps_them_out_of_the_tips() {
+        // 40 carriers, 40 ref calls, 20 reads covering nothing.
+        let row = format!("{}{}{}", "1".repeat(40), "0".repeat(40), ".".repeat(20));
+        let binary = matrix_from_rows(&["m.100A>G", "m.200A>G"], &[&row, &row]);
+        let (out, prefix) = run_pipeline("unassigned", &binary, false);
+        assert_eq!(out.cleaned.reads.len(), 80);
+        assert_eq!(out.cleaned.n_unassigned, 20);
+
+        let tsv = read_output(&prefix, ".mutation_tree.tsv");
+        let last = tsv.lines().last().unwrap();
+        assert_eq!(last, "UNASSIGNED\tNA\tNA\tNA\t20\tNA\tNA\tNA\tNA\tNA", "{tsv}");
+        let attached: usize = tsv
+            .lines()
+            .skip(1)
+            .filter(|l| !l.starts_with("UNASSIGNED") && !l.starts_with("ROOT_BLOCK"))
+            .map(|l| l.split('\t').nth(4).unwrap().parse::<usize>().unwrap())
+            .sum();
+        assert_eq!(attached, 80, "the attached reads exclude the unassigned ones:\n{tsv}");
+
+        let nwk = read_output(&prefix, ".read_lineage.nwk");
+        let tips: usize = nwk
+            .split("reads=")
+            .skip(1)
+            .map(|t| t.split(|c: char| !c.is_ascii_digit()).next().unwrap().parse::<usize>().unwrap())
+            .sum();
+        assert_eq!(tips, 80, "no tip stands for the unassigned reads:\n{nwk}");
+    }
+
     fn small_cleaned_matrix() -> CleanedMatrix {
         CleanedMatrix {
             variants: vec!["A".to_string(), "B".to_string()],
             reads: vec!["r1".to_string(), "r2".to_string()],
             data: vec![vec![1, 0], vec![1, 1]],
             attachment: vec![1, 0],
+            n_unassigned: 0,
         }
     }
 
@@ -3230,6 +3347,18 @@ mod tests {
             write_mutation_tree(&tree, &matrix, &evidence, &placement, &[], &tract, p)
         });
         assert_eq!(content, format!("{nodes}TRACT_ANNOTATED\tm.310T>TC\t2\tROOT\tNA\tNA\tNA\tNA\tNA\tNA\n"));
+
+        // Reads that call nothing informative are one trailing row, and only when there are any.
+        let unassigned = CleanedMatrix { n_unassigned: 395, ..matrix.clone() };
+        let content = written("himito_test_write_mutation_tree_unassigned.tsv", |p| {
+            write_mutation_tree(&tree, &unassigned, &evidence, &placement, &block, &tract, p)
+        });
+        assert!(
+            content.ends_with("TRACT_ANNOTATED\tm.310T>TC\t2\tROOT\tNA\tNA\tNA\tNA\tNA\tNA\n\
+                               UNASSIGNED\tNA\tNA\tNA\t395\tNA\tNA\tNA\tNA\tNA\n"),
+            "{content}"
+        );
+        assert_eq!(content.matches("UNASSIGNED").count(), 1);
     }
 
     #[test]
@@ -3527,6 +3656,7 @@ mod tests {
         let (out, prefix) = run_pipeline("rb_single", &binary, true);
 
         assert_eq!(out.cleaned.variants, vec!["m.302A>ACC", "m.750A>G"], "block variants stay in the cleaned matrix");
+        assert_eq!(out.block_names, vec!["m.750A>G".to_string()], "the output names the root block");
         let tsv = read_output(&prefix, ".mutation_tree.tsv");
         assert!(tsv.contains("ROOT_BLOCK\tm.750A>G\t"), "the germline variant should be blocked:\n{tsv}");
         assert!(tsv.contains("0\tm.302A>ACC\t1\tROOT\t"), "the informative variant stays a tree node:\n{tsv}");
@@ -3922,7 +4052,7 @@ mod tests {
         let s = site(&[0], &[12, 13]);
         let calls = matrix_from_rows(&["m.16181A>AC"], &[&format!("{}{}", "1".repeat(4), "0".repeat(96))]);
         let tree1 = MutationTree { n_mutations: 1, parent: vec![1, 1] };
-        let p = copy_excess_p(&calls, &tree1, &s, 1, &vec![1; 100], &[1], 1);
+        let p = copy_excess_p(&calls, &tree1, &s, 1, &vec![Some(1); 100], &[1], 1);
         assert!((p - binomial_upper_tail(100, 4, TRACT_COPY_NULL_FLOOR)).abs() < 1e-12 && p > 0.5, "{p}");
     }
 
@@ -3988,8 +4118,10 @@ mod tests {
             reads: vec!["r0".into(), "r1".into(), "r2".into()],
             data: vec![vec![1, 0, 0], vec![0, 1, 0], vec![0, 0, 1]],
             attachment: vec![0, 1, 2],
+            n_unassigned: 7,
         };
         let merged = merge_tract_copies(&cleaned);
+        assert_eq!(merged.n_unassigned, 7, "folding copies does not recount reads");
         assert_eq!(merged.variants, ["m.16181A>AC", "m.100A>G"]);
         assert_eq!(merged.data, [vec![1, 0, 1], vec![0, 1, 0]]);
     }

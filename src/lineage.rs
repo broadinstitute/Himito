@@ -362,6 +362,10 @@ pub struct RawMatrix {
 }
 
 /// Parse a Himito VCF file and return a map from variant ID to HF value.
+///
+/// The map is a name whitelist (see [`HfFilter::FromVcf`]). `[min_hf, max_hf)` is applied here to the
+/// VCF HF and then again to the matrix HF in [`filter_matrix`], on purpose: a site the VCF itself calls
+/// fixed is not a lineage candidate, and dropping this window would widen the whitelist.
 pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
     let mut reader = Reader::from_path(vcf_path)
         .with_context(|| format!("Cannot read VCF: {vcf_path}"))?;
@@ -427,8 +431,10 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
 
 /// How a variant's heteroplasmic frequency is judged during matrix filtering.
 pub enum HfFilter {
-    /// Keep the variants in the (already HF-filtered) VCF map; tract-allele rows, which no VCF lists,
-    /// are judged on their matrix frequency against `[min, max)`.
+    /// Keep the variants the VCF names, each still judged on its own matrix frequency against
+    /// `[min, max)`. The VCF is a whitelist only: its HF reflects pileup depth, while everything
+    /// downstream (root block, SCITE, co-occurrence) counts matrix rows, and the two disagree
+    /// badly at homopolymer tracts.
     FromVcf { map: HfMap, min: f64, max: f64 },
     /// Keep variants whose matrix frequency lies in `[min, max)`.
     FromMatrix { min: f64, max: f64 },
@@ -438,11 +444,10 @@ impl HfFilter {
     fn keeps(&self, vid: &str, freq: f64, tracts: &[crate::tracts::Tract]) -> bool {
         match self {
             HfFilter::FromVcf { map, min, max } => {
-                if crate::tracts::is_tract_allele(vid, tracts) {
-                    freq >= *min && freq < *max
-                } else {
-                    map.contains_key(vid)
-                }
+                // Tract-allele rows are collapsed spellings no VCF lists; they are judged on matrix HF alone.
+                (map.contains_key(vid) || crate::tracts::is_tract_allele(vid, tracts))
+                    && freq >= *min
+                    && freq < *max
             }
             HfFilter::FromMatrix { min, max } => freq >= *min && freq < *max,
         }
@@ -2887,8 +2892,38 @@ mod tests {
         let all = vec![hvs1(C10), hvs1(C11), "m.3243A>G".to_string()];
         assert_eq!(kept(vcf(0.95)), all);
         assert_eq!(kept(HfFilter::FromMatrix { min: 0.2, max: 0.95 }), all);
-        // A ceiling below 0.50 drops both tract alleles even on the VCF path.
-        assert_eq!(kept(vcf(0.4)), vec!["m.3243A>G"]);
+        // A ceiling below 0.50 drops both tract alleles and the whitelisted SNV (matrix HF 0.50) on the VCF path.
+        assert!(kept(vcf(0.4)).is_empty());
         assert!(kept(HfFilter::FromMatrix { min: 0.2, max: 0.4 }).is_empty());
+    }
+
+    #[test]
+    fn a_whitelisted_snv_still_has_to_clear_the_matrix_hf_window() {
+        // One row, 99 alt of 100 covered reads: matrix HF 0.99, above max_hf.
+        let mut row: Vec<Option<u8>> = vec![Some(1); 99];
+        row.push(Some(0));
+        let raw = RawMatrix {
+            variants: vec!["m.73A>G".to_string()],
+            reads: (0..100).map(|i| format!("r{i}")).collect(),
+            data: vec![row],
+        };
+        // The VCF lists it (its own VCF HF was 0.948, inside the window) but the matrix says near-fixed.
+        let hf = HfFilter::FromVcf { map: [("m.73A>G".to_string(), 0.948)].into(), min: 0.01, max: 0.95 };
+        assert!(filter_matrix(&raw, &hf, KNOWN_TRACTS).variants.is_empty());
+
+        // The same row inside the window is kept.
+        let hf = HfFilter::FromVcf { map: [("m.73A>G".to_string(), 0.948)].into(), min: 0.01, max: 0.999 };
+        assert_eq!(filter_matrix(&raw, &hf, KNOWN_TRACTS).variants, vec!["m.73A>G".to_string()]);
+    }
+
+    #[test]
+    fn a_variant_outside_the_whitelist_is_dropped_whatever_its_matrix_hf() {
+        let raw = RawMatrix {
+            variants: vec!["m.3243A>G".to_string()],
+            reads: (0..10).map(|i| format!("r{i}")).collect(),
+            data: vec![(0..10).map(|i| Some(u8::from(i < 5))).collect()],
+        };
+        let hf = HfFilter::FromVcf { map: [("m.73A>G".to_string(), 0.5)].into(), min: 0.01, max: 0.95 };
+        assert!(filter_matrix(&raw, &hf, KNOWN_TRACTS).variants.is_empty());
     }
 }

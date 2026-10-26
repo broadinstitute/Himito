@@ -847,8 +847,8 @@ pub fn estimate_snv_dropout(raw: &RawMatrix, max_hf: f64) -> Option<DropoutEstim
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum TractAlleleMode {
     /// Tract alleles are placed as multi-allelic sites (`Site`); an allele whose run is longer than the
-    /// confusion table calibrates is placed too, flagged `beyond_calibration` in `tract_annotation.tsv`
-    /// and `mutation_tree.tsv`, so its placement is judged on its margin rather than deleted.
+    /// confusion table calibrates is placed too, flagged `beyond_calibration` in `tract_annotation.tsv`,
+    /// so its placement is judged on its margin rather than deleted.
     #[default]
     Auto,
     /// Every tract allele is placed, with the alleles at one tract position scored as one categorical site whose

@@ -514,7 +514,8 @@ enum Commands {
 
         /// D310/HVS1-C alleles: auto = alleles at one tract position are one categorical site whose states may
         /// recur on several branches, with runs beyond the confusion table's calibrated length flagged
-        /// beyond_calibration; site = the same without the flag; search = one binary row per allele;
+        /// beyond_calibration; site = a synonym of auto, kept so the behaviour can be named explicitly;
+        /// search = one binary row per allele;
         /// annotate = reported in tract_annotation.tsv but never placed
         #[clap(
             long,

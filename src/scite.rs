@@ -1253,10 +1253,10 @@ pub fn write_variant_cooccurrence(matrix: &CleanedMatrix, n: usize, path: &str) 
     write_cooccurrence(&matrix.variants[..n], matrix.reads.len(), |v, r| Some(matrix.data[v][r]), path)
 }
 
-/// One row per reported tract allele (placed or withheld): its observed linkage to the other informative variants.
+/// One row per reported tract allele (placed, or withheld under `annotate`): its observed linkage to the other informative variants.
 /// `best_partner` is the informative variant with odds ratio > 1 and the smallest BH q (ties: smaller p, then
-/// matrix order); `linked` says whether that q is <= 0.05. The q values are corrected over the annotated x
-/// informative pairs only, so they differ from the same pair's q in `variant_cooccurrence.tsv`.
+/// matrix order); `linked` says whether that q is <= 0.05. The q values are corrected over the reported x
+/// informative pairs only (a pair of two reported alleles counts once), so they differ from the same pair's q in `variant_cooccurrence.tsv`.
 fn write_tract_annotation(
     matrix: &BinaryMatrix,
     reported: &[usize],
@@ -1269,6 +1269,10 @@ fn write_tract_annotation(
         for &u in informative {
             // A placed allele is itself informative; it has no linkage to itself.
             if u == a {
+                continue;
+            }
+            // Two reported alleles are both ends of one unordered pair: build it once, from the smaller index.
+            if u <= a && reported.contains(&u) {
                 continue;
             }
             let (mut n11, mut n10, mut n01, mut n00) = (0usize, 0usize, 0usize, 0usize);
@@ -1301,14 +1305,15 @@ fn write_tract_annotation(
         let best = pairs
             .iter()
             .zip(qs.iter())
-            .filter(|((pa, _, s), _)| *pa == a && s.odds_ratio > 1.0)
+            .filter(|((pa, pu, s), _)| (*pa == a || *pu == a) && s.odds_ratio > 1.0)
             .fold(None::<(&(usize, usize, PairCooccurrence), f64)>, |acc, (p, &q)| match acc {
                 Some((bp, bq)) if bq < q || (bq == q && bp.2.fisher_p <= p.2.fisher_p) => acc,
                 _ => Some((p, q)),
             });
         let fields: [String; 7] = match best {
-            Some(((_, u, s), q)) => [
-                matrix.variants[*u].clone(),
+            Some(((pa, pu, s), q)) => [
+                // The pair may have been built from either end; the partner is the other one.
+                matrix.variants[if *pa == a { *pu } else { *pa }].clone(),
                 s.n_co.to_string(),
                 s.n11.to_string(),
                 s.odds_ratio.to_string(),
@@ -1332,7 +1337,7 @@ fn write_tract_annotation(
     Ok(())
 }
 
-/// BH q at or below which an annotated tract allele counts as linked to its best partner.
+/// BH q at or below which a reported tract allele counts as linked to its best partner.
 const MAX_PARTNER_Q: f64 = 0.05;
 
 /// Same statistics on observed (pre-SCITE) calls: each pair counts only the reads that call both sites.
@@ -1880,8 +1885,8 @@ fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usiz
 
 /// Pull every block member whose REF span overlaps any other variant back into the search: imputing
 /// it on every read would put two mutually-exclusive alleles on one molecule.
-/// `variants` is the full variant list `rb` indexes. Variants flagged in `not_searched` (annotate-only tract
-/// alleles; empty = none) never enter the search, so overlapping them is no conflict.
+/// `variants` is the full variant list `rb` indexes. Variants flagged in `not_searched` (tract alleles withheld
+/// under `--tract-alleles annotate`; empty = none) never enter the search, so overlapping them is no conflict.
 fn resolve_span_conflicts(
     mut rb: rootblock::RootBlock,
     variants: &[String],
@@ -1926,7 +1931,9 @@ fn resolve_span_conflicts(
 pub struct TractReport {
     pub run_class: String,
     pub run_length: usize,
-    /// Placed as a tree node. `false` only under `--tract-alleles annotate`.
+    /// Placed as a tree node. A `TractReport` (hence a `tract_annotation.tsv` row) exists only for an allele that
+    /// reached the search; a tract allele that went into the root block has none (see `error_model.tsv`).
+    /// Among those, `false` only under `--tract-alleles annotate`.
     pub placed: bool,
     /// `calibrated (run L <= calibrated M)`, `beyond_calibration (run L > calibrated M)`,
     /// or `--tract-alleles annotate`.
@@ -3432,7 +3439,7 @@ mod tests {
     #[test]
     fn annotate_only_alleles_do_not_pull_block_members_back() {
         // m.16183A>C is near-fixed; m.16183A>AC overlaps it. Searched, the overlap is a span conflict;
-        // annotate-only, it is never placed, so 16183A>C stays in the block.
+        // withheld under `annotate`, it is never placed, so 16183A>C stays in the block.
         let fixed = present_then_absent(186, 14);
         let ins = present_then_absent(60, 140);
         let binary = matrix_from_rows(&["m.16183A>C", "m.16183A>AC"], &[&fixed, &ins]);
@@ -3897,6 +3904,38 @@ mod tests {
         let t = format!("{}{}", "1".repeat(10), "0".repeat(70));
         let row = annotation_row("tie", &t, &[("m.100A>G", &a), ("m.200A>G", &b)]);
         assert_eq!(row[5], "m.200A>G", "{row:?}");
+    }
+
+    #[test]
+    fn bh_family_counts_a_pair_of_placed_tract_alleles_once() {
+        // A placed tract allele is also informative, so two of them used to build both (a, u) and (u, a).
+        // A holds reads 0..40, T1 0..36 and T2 0..16, all nested. Three unordered pairs (T1/A, T1/T2, T2/A):
+        // T1/A has by far the smallest p, so it is BH rank 1 and q = 3 * p. A double-counted family of 4 gives 4 * p.
+        let a = format!("{}{}", "1".repeat(40), "0".repeat(40));
+        let t1 = format!("{}{}", "1".repeat(36), "0".repeat(44));
+        let t2 = format!("{}{}", "1".repeat(16), "0".repeat(64));
+        let binary = matrix_from_rows(&["m.100A>G", "m.302A>ACC", "m.16181A>AC"], &[&a, &t1, &t2]);
+        let model = VariantModel {
+            rates: vec![(0.01, 0.05); 3],
+            tract: vec![None, tract_report(9, true), tract_report(7, true)],
+            sites: Vec::new(),
+        };
+        let prefix = std::env::temp_dir().join("himito_scite_tract_bh_family");
+        let prefix = prefix.to_str().unwrap();
+        run_scite_pipeline(&binary, 0.01, 0.05, (0.01, 0.05), Some(&model), 200, 1, false, prefix).unwrap();
+        let ann = read_output(prefix, ".tract_annotation.tsv");
+        let row = |name: &str| -> Vec<String> {
+            let line = ann.lines().find(|l| l.starts_with(&format!("{name}\t"))).unwrap_or_else(|| panic!("no {name} row:\n{ann}"));
+            line.split('\t').map(String::from).collect()
+        };
+        let (r1, r2) = (row("m.302A>ACC"), row("m.16181A>AC"));
+        assert_eq!((r1[4].as_str(), r1[5].as_str()), ("yes", "m.100A>G"), "{ann}");
+        let (p, q): (f64, f64) = (r1[9].parse().unwrap(), r1[10].parse().unwrap());
+        assert!((q / p - 3.0).abs() < 1e-3, "BH family must hold 3 unordered pairs, got q/p = {}:\n{ann}", q / p);
+        // T2's best pair, T1/T2, was built from T1's side; the lookup still finds it and names T1 as the partner.
+        assert_eq!(r2[5], "m.302A>ACC", "{ann}");
+        let (p2, q2): (f64, f64) = (r2[9].parse().unwrap(), r2[10].parse().unwrap());
+        assert!((q2 / p2 - 1.5).abs() < 1e-3, "rank 2 of 3: q = 1.5 * p, got {}:\n{ann}", q2 / p2);
     }
 
     #[test]

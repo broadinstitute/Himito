@@ -516,7 +516,7 @@ enum Commands {
         /// recur on several branches, with runs beyond the confusion table's calibrated length flagged
         /// beyond_calibration; site = a synonym of auto, kept so the behaviour can be named explicitly;
         /// search = one binary row per allele;
-        /// annotate = reported in tract_annotation.tsv but never placed
+        /// annotate = each allele that reaches the search is reported in tract_annotation.tsv but never placed
         #[clap(
             long,
             default_value = "auto",

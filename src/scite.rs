@@ -1466,7 +1466,10 @@ pub fn edge_evidence(
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlacementEvidence {
     /// Best-tree log-likelihood minus the best over every other valid parent (nats); `None` when the
-    /// node has no other valid parent.
+    /// node has no other valid parent. Positive when the reported placement beats every alternative (the
+    /// log-likelihood lost by moving the node). Negative when `alt_parent` is a strictly better placement,
+    /// i.e. the tree is not optimal under subtree moves: the MCMC explores those moves, but the tract-copy and
+    /// unary-path steps that run after it do not.
     pub margin_ll: Option<f64>,
     /// The parent that reached that best alternative.
     pub alt_parent: Option<usize>,
@@ -2319,13 +2322,19 @@ pub fn run_scite_pipeline(
     let evidence = edge_evidence(&tree, binary, &rates);
     let placement = placement_evidence(&tree, binary, &rates);
     for (node, p) in placement.iter().enumerate() {
-        if p.margin_ll.is_some_and(|m| m < PLACEMENT_MIN_SUPPORT_LL) {
+        let Some(margin) = p.margin_ll else { continue };
+        let placed_under = if tree.parent[node] == tree.root() { "ROOT" } else { &binary.variants[tree.parent[node]] };
+        let alt = p.alt_parent.map_or("ROOT", |a| if a == tree.root() { "ROOT" } else { &binary.variants[a] });
+        if margin < 0.0 {
+            warn!(
+                "[SCITE] {} is placed under {}, but {} is a strictly better placement by {:.2} nats: \
+                 the reported tree is not optimal under subtree moves",
+                binary.variants[node], placed_under, alt, -margin
+            );
+        } else if margin < PLACEMENT_MIN_SUPPORT_LL {
             warn!(
                 "[SCITE] {} is placed under {} by only {:.2} nats over {}: treat its position as unresolved",
-                binary.variants[node],
-                if tree.parent[node] == tree.root() { "ROOT" } else { &binary.variants[tree.parent[node]] },
-                p.margin_ll.unwrap(),
-                p.alt_parent.map_or("ROOT", |a| if a == tree.root() { "ROOT" } else { &binary.variants[a] })
+                binary.variants[node], placed_under, margin, alt
             );
         }
     }
@@ -3289,6 +3298,28 @@ mod tests {
         assert!(ev[2].margin_ll.unwrap() > 1.0, "{:?}", ev[2]);
         // B and C are A's descendants and A hangs from the root, so A has no valid other parent.
         assert_eq!(ev[0], PlacementEvidence { margin_ll: None, alt_parent: None });
+    }
+
+    #[test]
+    fn placement_evidence_is_negative_for_a_node_placed_under_the_wrong_parent() {
+        // Same data as above: B and C are sibling children of A (reads 0-3 carry A and B, reads 4-7 carry A and C).
+        // Here C is deliberately hung off B, so C's reads (which never carry B) pay for it, and the better
+        // parent is A.
+        let variants = vec!["m.100A>G".to_string(), "m.200A>G".to_string(), "m.300A>G".to_string()];
+        let reads: Vec<String> = (0..8).map(|i| format!("r{i}")).collect();
+        let data = vec![
+            vec![Some(1); 8],
+            (0..8).map(|i| Some(u8::from(i < 4))).collect(),
+            (0..8).map(|i| Some(u8::from(i >= 4))).collect(),
+        ];
+        let matrix = BinaryMatrix { variants, reads, data };
+        let rates = ErrorRates { fp_rate: 0.01, fn_rate: 0.01, per_variant: vec![(0.01, 0.01); 3], sites: Vec::new() };
+        // parent[0] = ROOT (3), parent[1] = 0, parent[2] = 1 (the wrong parent for C)
+        let tree = MutationTree { n_mutations: 3, parent: vec![3, 0, 1, 3] };
+
+        let ev = placement_evidence(&tree, &matrix, &rates);
+        assert!(ev[2].margin_ll.unwrap() < -1.0, "{:?}", ev[2]);
+        assert_eq!(ev[2].alt_parent, Some(0), "{:?}", ev[2]);
     }
 
     #[test]

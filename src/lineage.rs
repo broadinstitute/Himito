@@ -550,7 +550,10 @@ pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tr
 /// window gets no row at all when it has no matrix row.
 ///
 /// `outcome` is one of:
-/// - `informative`: placed in the mutation tree (or, before the search has run, simply not filtered out);
+/// - `informative`: placed in the mutation tree;
+/// - `pending`: written only in the provisional table a failed run leaves behind; the variant survived filtering
+///   but the tree search had not run, so its final outcome is unknown. A table with any `pending` row is from a
+///   failed run and must not be compared against another platform's;
 /// - `root_block`: near-fixed, removed from the search and reported unordered at the root;
 /// - `tract_annotated`: a homopolymer-tract allele reported in `tract_annotation.tsv` but kept out of the search;
 /// - `dropped_hf_window`: matrix HF outside `[--min-hf, --max-hf)`;
@@ -571,7 +574,7 @@ pub struct VariantDisposition {
 }
 
 /// Classify every candidate by the same gates as [`filter_matrix`]. `blocked` names the variants the root
-/// block took (empty before the search has run, which reports every surviving variant as `informative`).
+/// block took; the pre-search pass has no root block yet and uses [`provisional_dispositions`] instead.
 pub fn variant_dispositions(
     raw: &RawMatrix,
     hf: &HfFilter,
@@ -619,6 +622,22 @@ pub fn variant_dispositions(
     rows
 }
 
+/// The table written before the tree search: every variant that survived filtering reads `pending`, so a run that
+/// fails before the final rewrite leaves a file no reader can mistake for a successful run's. Rows a filter already
+/// dropped are final and are left as [`variant_dispositions`] reports them.
+pub fn provisional_dispositions(
+    raw: &RawMatrix,
+    hf: &HfFilter,
+    tracts: &[crate::tracts::Tract],
+) -> Vec<VariantDisposition> {
+    let mut rows = variant_dispositions(raw, hf, tracts, &[]);
+    for r in rows.iter_mut().filter(|r| r.outcome == "informative") {
+        r.outcome = "pending";
+        r.detail = "the tree search had not run".to_string();
+    }
+    rows
+}
+
 /// Relabel the candidates the search withheld as tract annotations (`annotated` comes from the search itself).
 pub fn mark_tract_annotated(rows: &mut [VariantDisposition], annotated: &[String]) {
     for r in rows.iter_mut().filter(|r| r.outcome == "informative" && annotated.contains(&r.variant)) {
@@ -632,10 +651,11 @@ pub fn write_variant_disposition(rows: &[VariantDisposition], path: &str) -> Res
     writeln!(w, "variant\tvcf_hf\tmatrix_hf\tn_present\tn_absent\toutcome\tdetail")?;
     for r in rows {
         let vcf = r.vcf_hf.map_or("NA".to_string(), |h| format!("{h:.6}"));
+        let detail = if r.detail.is_empty() { "NA" } else { r.detail.as_str() };
         writeln!(
             w,
-            "{}\t{vcf}\t{:.6}\t{}\t{}\t{}\t{}",
-            r.variant, r.matrix_hf, r.n_present, r.n_absent, r.outcome, r.detail
+            "{}\t{vcf}\t{:.6}\t{}\t{}\t{}\t{detail}",
+            r.variant, r.matrix_hf, r.n_present, r.n_absent, r.outcome
         )?;
     }
     Ok(())
@@ -1905,7 +1925,7 @@ pub fn start(
     let binary = filter_matrix(&raw, &hf, tracts);
     // Written before anything can fail, then rewritten once the search has named its root block and annotations.
     let disposition_path = format!("{output_prefix}.variant_disposition.tsv");
-    write_variant_disposition(&variant_dispositions(&raw, &hf, tracts, &[]), &disposition_path)?;
+    write_variant_disposition(&provisional_dispositions(&raw, &hf, tracts), &disposition_path)?;
     if binary.variants.is_empty() {
         bail!(
             "No variant survives filtering. {disposition_path} lists every candidate and why it was \
@@ -3212,7 +3232,7 @@ mod tests {
         assert_eq!(
             content,
             "variant\tvcf_hf\tmatrix_hf\tn_present\tn_absent\toutcome\tdetail\n\
-             m.100A>G\t0.250000\t0.500000\t5\t5\tinformative\t\n\
+             m.100A>G\t0.250000\t0.500000\t5\t5\tinformative\tNA\n\
              m.200A>G\tNA\t1.000000\t10\t0\tdropped_min_absence\t0 absent < 1\n"
         );
     }
@@ -3234,6 +3254,33 @@ mod tests {
     }
 
     #[test]
+    fn a_run_that_fails_after_the_provisional_write_leaves_survivors_marked_pending() {
+        let dir = std::env::temp_dir().join("himito_test_disposition_pending");
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut rows = fixed_rows(198, 2);
+        rows.push(("m.9000A>G", 100, 100));
+        let matrix = dir.join("m.matrix.csv");
+        std::fs::write(&matrix, csv_with_pseudo_read(200, &rows)).unwrap();
+        let prefix = dir.join("out").to_str().unwrap().to_string();
+        // A directory where error_model.tsv belongs: the run gets past filtering and the provisional write,
+        // then fails before the tree search.
+        std::fs::create_dir(format!("{prefix}.error_model.tsv")).unwrap();
+        let opts = RateOptions { data_type: "pacbio".to_string(), ..Default::default() };
+        start(matrix.to_str().unwrap(), None, 0.01, 0.95, &opts, &[], 100, 1, false, &prefix).unwrap_err();
+        let table = std::fs::read_to_string(format!("{prefix}.variant_disposition.tsv")).unwrap();
+        let row = |n: &str| -> Vec<String> {
+            table.lines().find(|l| l.starts_with(&format!("{n}\t"))).unwrap().split('\t').map(String::from).collect()
+        };
+        assert_eq!(row("m.9000A>G")[5..], ["pending", "the tree search had not run"], "{table}");
+        assert!(!table.contains("informative"), "{table}");
+        // A row a filter dropped is already final and reads as it does after the search.
+        assert_eq!(row("m.1000A>G")[5], "dropped_hf_window", "{table}");
+        assert_ne!(row("m.1000A>G")[6], "the tree search had not run", "{table}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn start_writes_a_disposition_table_that_names_the_root_block() {
         let dir = std::env::temp_dir().join("himito_test_disposition_run");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3251,6 +3298,7 @@ mod tests {
         };
         assert_eq!(outcome("m.9000A>G"), "informative", "{table}");
         assert_eq!(outcome("m.9100C>T"), "informative", "{table}");
+        assert!(!table.contains("pending"), "{table}");
         // The six fixed SNVs sit at HF 0.99: above the 0.95 ceiling.
         assert_eq!(outcome("m.1000A>G"), "dropped_hf_window", "{table}");
     }

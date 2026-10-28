@@ -504,7 +504,9 @@ fn screen_variant(
         return Some(("dropped_min_presence", format!("{n_present} present < {MIN_PRESENCE}")));
     }
     // The HF window is judged before absence: a variant with no ref call at all has matrix HF 1.0, and "above the
-    // window" is the useful reason for it (`collect_fixed_homoplasmies` reports those the same way).
+    // window" is the useful reason for it. `collect_fixed_homoplasmies` recovers such variants by matrix HF alone,
+    // without consulting the whitelist, so with `-v` a fixed site is usually labelled `dropped_not_whitelisted`
+    // here (its VCF HF is already at or above `--max-hf`) and only a whitelisted site labelled `dropped_hf_window`.
     if !hf.keeps(vid, matrix_hf, tracts) {
         return Some(match hf {
             HfFilter::FromVcf { map, min, max }
@@ -542,9 +544,10 @@ pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tr
     BinaryMatrix { variants, reads: raw.reads.clone(), data }
 }
 
-/// Where one candidate variant ended up. One row per VCF site inside the HF window (the whitelist
+/// Where one candidate variant ended up. One row per in-window PASS site (the whitelist
 /// `parse_vcf` builds) and per matrix row, so an ONT run and a PacBio run can be compared with a single
-/// `diff`. A PASS site whose VCF HF is outside the window and which has no matrix row gets no row at all.
+/// `diff`. A non-PASS site, a PASS site with neither an HF nor an AF value, or a PASS site whose VCF HF is outside the
+/// window gets no row at all when it has no matrix row.
 ///
 /// `outcome` is one of:
 /// - `informative`: placed in the mutation tree (or, before the search has run, simply not filtered out);
@@ -558,7 +561,7 @@ pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tr
 #[derive(Debug, Clone, PartialEq)]
 pub struct VariantDisposition {
     pub variant: String,
-    /// `None` for a matrix row no VCF lists (a collapsed tract allele, or a no-VCF run).
+    /// `None` when the site is not in the in-window whitelist (a collapsed tract allele, or a no-VCF run).
     pub vcf_hf: Option<f64>,
     pub matrix_hf: f64,
     pub n_present: usize,

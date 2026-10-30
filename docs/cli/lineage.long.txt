@@ -44,7 +44,7 @@ Options:
           SCITE false-negative rate for HP-tract alleles (default: D310/HVS1-C from the hp_confusion.tsv table; CA514 twice --fn-rate or its preset)
 
       --hp-error <HP_ERROR>
-          hp_confusion.tsv (`Himito hp-error`) for D310/HVS1-C allele rates [default: <X>.hp_confusion.tsv beside <X>.matrix.csv, else the embedded HG00097 table]
+          hp_confusion.tsv for D310/HVS1-C allele rates [default: <X>.hp_confusion.tsv beside <X>.matrix.csv, else the embedded HG00097 table]
 
       --tract-alleles <TRACT_ALLELES>
           D310/HVS1-C alleles: auto = alleles at one tract position are one categorical site whose states may recur on several branches, with runs beyond the confusion table's calibrated length flagged beyond_calibration; site = a synonym of auto, kept so the behaviour can be named explicitly; search = one binary row per allele; annotate = each allele that reaches the search is reported in tract_annotation.tsv but never placed
@@ -66,7 +66,7 @@ Options:
           [default: 3]
 
       --debug
-          also write raw_haplotype_map.tsv, raw_variant_cooccurrence.tsv and cleaned_variant_cooccurrence.tsv
+          also write raw_haplotype_map.tsv, raw_variant_cooccurrence.tsv, variant_disposition.tsv and tract_annotation.tsv
 
   -h, --help
           Print help (see a summary with '-h')

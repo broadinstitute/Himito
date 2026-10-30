@@ -88,7 +88,7 @@ Options:
       --denoise-keep-vaf <DENOISE_KEEP_VAF>
           keep threshold of the denoise site model (ont-denoised only)
           
-          [default: 0.03]
+          [default: 0.025]
 
       --indel-linked-min-hf <INDEL_LINKED_MIN_HF>
           PacBio: out-of-tract small indels with HF from this up to --indel-false-threshold PASS only if they pass the linkage test; a value at or above --indel-false-threshold turns this off [default: 0.015]

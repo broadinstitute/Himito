@@ -21,7 +21,10 @@ mod denoise_indel;
 mod hperror;
 mod linkage;
 
-pub const DENOISE_KEEP_VAF: f64 = 0.03;
+/// Quality-weighted frequency at which a substitution allele is kept.
+/// HG00097 ONT against PacBio: true m.14033T>C is 0.030, and the strongest
+/// PacBio-absent allele that passes the strand gate is 0.023.
+pub const DENOISE_KEEP_VAF: f64 = 0.025;
 
 /// The data types Himito accepts wherever a `-d/--data-type` is taken.
 pub const DATA_TYPES: [&str; 4] = ["pacbio", "ont-r9", "ont-r10", "ont-denoised"];
@@ -508,7 +511,7 @@ enum Commands {
         #[clap(long, value_parser, hide_short_help = true)]
         hp_fn_rate: Option<f64>,
 
-        /// hp_confusion.tsv (`Himito hp-error`) for D310/HVS1-C allele rates [default: <X>.hp_confusion.tsv beside <X>.matrix.csv, else the embedded HG00097 table]
+        /// hp_confusion.tsv for D310/HVS1-C allele rates [default: <X>.hp_confusion.tsv beside <X>.matrix.csv, else the embedded HG00097 table]
         #[clap(long, value_parser, hide_short_help = true)]
         hp_error: Option<String>,
 
@@ -538,34 +541,10 @@ enum Commands {
         #[clap(long, value_parser = parse_positive, default_value_t = 3, hide_short_help = true)]
         mcmc_chains: usize,
 
-        /// also write raw_haplotype_map.tsv, raw_variant_cooccurrence.tsv and cleaned_variant_cooccurrence.tsv
+        /// also write raw_haplotype_map.tsv, raw_variant_cooccurrence.tsv, variant_disposition.tsv and tract_annotation.tsv
         #[clap(long, action, hide_short_help = true)]
         debug: bool,
     },
-
-    /// Measure homopolymer length confusion of a sample's reads (writes <prefix>.hp_confusion.tsv)
-    #[clap(arg_required_else_help = true)]
-    HpError {
-        /// reads aligned to the reference; primary alignments are scored
-        #[clap(short, long, value_parser, required = true)]
-        bam_file: PathBuf,
-
-        /// reference FASTA (rCRS)
-        #[clap(short, long, value_parser, required = true)]
-        reference: PathBuf,
-
-        /// output prefix; writes <prefix>.hp_confusion.tsv
-        #[clap(short, long, value_parser, required = true)]
-        output_prefix: String,
-
-        /// shortest reference homopolymer run measured
-        #[clap(long, value_parser, default_value_t = hperror::DEFAULT_MIN_LEN)]
-        min_len: u32,
-
-        /// catalogue runs to skip: comma list of ids (D310, HVS1, C573, T455, C960, C5899, A12418, CA514, R8281), "hp_tracts" for all, or "none"
-        #[clap(long, value_parser, default_value = "D310,HVS1,CA514")]
-        tracts: String,
-    }
 }
 
 /// `--indel-protect-vaf` must be in (0, 1]; 0 would protect every allele.
@@ -913,17 +892,6 @@ fn main() {
                 eprintln!("Error running lineage analysis: {:#}", e);
                 std::process::exit(1);
             }
-        }
-        Commands::HpError { bam_file, reference, output_prefix, min_len, tracts } => {
-            let path = std::path::PathBuf::from(format!("{output_prefix}.hp_confusion.tsv"));
-            let result = hperror::parse_skip(&tracts)
-                .and_then(|skip| hperror::measure(&bam_file, &reference, min_len, &skip))
-                .and_then(|rows| hperror::write_confusion(&rows, &path));
-            if let Err(e) = result {
-                eprintln!("Error measuring homopolymer errors: {:#}", e);
-                std::process::exit(1);
-            }
-            println!("Wrote {}", path.display());
         }
     }
 

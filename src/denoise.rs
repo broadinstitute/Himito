@@ -500,6 +500,13 @@ fn compute_corrections(
         stats.columns_processed += 1;
         stats.bases_examined += obs.len() as u64;
 
+        // rCRS 3107 is N. A non-base has no reference allele, so whatever the reads
+        // show becomes a "minor" and then rescues unrelated errors.
+        if ref_idx.is_none() {
+            stats.columns_skipped += 1;
+            continue;
+        }
+
         if counts.non_ref() == 0 {
             stats.columns_skipped += 1;
             continue;
@@ -616,7 +623,9 @@ fn record_sub(
 
 const RESCUE_MIN_DIST: u32 = 20;
 const RESCUE_MIN_SHARED: u32 = 3;
-const RESCUE_ALPHA: f64 = 1e-4;
+/// On HG00097 (~15,000x) 1e-4 let low-quality errors rescue each other. A false allele's
+/// link to a real heteroplasmy is about 1e-10; m.14033T>C with m.16368T>C is about 1e-206.
+const RESCUE_ALPHA: f64 = 1e-12;
 const RESCUE_ROUNDS: usize = 3;
 
 /// Pending alleles (sorted) co-carried with a partner allele more than chance allows.

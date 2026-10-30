@@ -1489,7 +1489,7 @@ pub fn load_hp_table(opts: &RateOptions, matrix_file: &str) -> Result<(HpRateTab
     };
     warn!(
         "No hp_confusion.tsv for this sample: tract-allele rates come from the embedded {name} table (one sample). \
-         Run `Himito hp-error` on this sample's BAM, or `call --bam`, and pass it with --hp-error."
+         `call --bam` writes <X>.hp_confusion.tsv beside the matrix, or pass that file with --hp-error."
     );
     let table = HpRateTable::from_text(text)?.context("embedded HP table has no usable rows")?;
     Ok((table, format!("default:{name}")))
@@ -1923,14 +1923,19 @@ pub fn start(
     }
     let raw = collapse_tracts(raw, tracts);
     let binary = filter_matrix(&raw, &hf, tracts);
-    // Written before anything can fail, then rewritten once the search has named its root block and annotations.
+    // With --debug, written before anything can fail, then rewritten once the search has named its root block
+    // and annotations.
     let disposition_path = format!("{output_prefix}.variant_disposition.tsv");
-    write_variant_disposition(&provisional_dispositions(&raw, &hf, tracts), &disposition_path)?;
+    if debug {
+        write_variant_disposition(&provisional_dispositions(&raw, &hf, tracts), &disposition_path)?;
+    }
     if binary.variants.is_empty() {
-        bail!(
-            "No variant survives filtering. {disposition_path} lists every candidate and why it was \
-             dropped; try relaxing --min-hf / --max-hf."
-        );
+        let where_ = if debug {
+            format!("{disposition_path} lists every candidate and why it was dropped; ")
+        } else {
+            "Re-run with --debug to write variant_disposition.tsv; ".to_string()
+        };
+        bail!("No variant survives filtering. {where_}try relaxing --min-hf / --max-hf.");
     }
     let (variant_model, allele_rows) =
         build_variant_model(&binary, &raw, &resolved, rate_options, hp_table.as_ref().map(|(t, s)| (t, s.as_str())));
@@ -1971,9 +1976,11 @@ pub fn start(
         output_prefix,
     )?;
 
-    let mut dispositions = variant_dispositions(&raw, &hf, tracts, &out.block_names);
-    mark_tract_annotated(&mut dispositions, &out.annotated_names);
-    write_variant_disposition(&dispositions, &disposition_path)?;
+    if debug {
+        let mut dispositions = variant_dispositions(&raw, &hf, tracts, &out.block_names);
+        mark_tract_annotated(&mut dispositions, &out.annotated_names);
+        write_variant_disposition(&dispositions, &disposition_path)?;
+    }
 
     // Near-fixed homoplasmies were removed by the HF ceiling before the tree was built; report them as all-present rows.
     let fixed_homoplasmies = collect_fixed_homoplasmies(&raw, max_hf, &binary.variants);
@@ -2883,9 +2890,15 @@ mod tests {
         let csv = tripled_csv(&[("m.100A>G", "1100"), ("m.200C>T", "1010")]);
         for debug in [false, true] {
             let prefix = run_small_lineage(&format!("himito_lineage_debug_{debug}"), &csv, debug, &[]);
-            for suffix in [".raw_haplotype_map.tsv", ".raw_variant_cooccurrence.tsv"] {
+            for suffix in [
+                ".raw_haplotype_map.tsv",
+                ".raw_variant_cooccurrence.tsv",
+                ".variant_disposition.tsv",
+                ".tract_annotation.tsv",
+            ] {
                 assert_eq!(Path::new(&format!("{prefix}{suffix}")).exists(), debug, "{suffix} with debug={debug}");
             }
+            assert!(Path::new(&format!("{prefix}.cleaned_variant_cooccurrence.tsv")).exists());
             assert!(!Path::new(&format!("{prefix}.cleaned_matrix.csv")).exists());
         }
     }
@@ -3246,7 +3259,7 @@ mod tests {
         std::fs::write(&matrix, csv_with_pseudo_read(20, &[("m.9000A>G", 20, 0)])).unwrap();
         let prefix = dir.join("out").to_str().unwrap().to_string();
         let opts = RateOptions { data_type: "pacbio".to_string(), ..Default::default() };
-        let err = start(matrix.to_str().unwrap(), None, 0.01, 0.95, &opts, &[], 20, 1, false, &prefix).unwrap_err();
+        let err = start(matrix.to_str().unwrap(), None, 0.01, 0.95, &opts, &[], 20, 1, true, &prefix).unwrap_err();
         assert!(err.to_string().contains("variant_disposition.tsv"), "{err}");
         let table = std::fs::read_to_string(format!("{prefix}.variant_disposition.tsv")).unwrap();
         assert!(table.contains("m.9000A>G\tNA\t"), "{table}");
@@ -3267,7 +3280,7 @@ mod tests {
         // then fails before the tree search.
         std::fs::create_dir(format!("{prefix}.error_model.tsv")).unwrap();
         let opts = RateOptions { data_type: "pacbio".to_string(), ..Default::default() };
-        start(matrix.to_str().unwrap(), None, 0.01, 0.95, &opts, &[], 100, 1, false, &prefix).unwrap_err();
+        start(matrix.to_str().unwrap(), None, 0.01, 0.95, &opts, &[], 100, 1, true, &prefix).unwrap_err();
         let table = std::fs::read_to_string(format!("{prefix}.variant_disposition.tsv")).unwrap();
         let row = |n: &str| -> Vec<String> {
             table.lines().find(|l| l.starts_with(&format!("{n}\t"))).unwrap().split('\t').map(String::from).collect()
@@ -3291,7 +3304,7 @@ mod tests {
         std::fs::write(&matrix, csv_with_pseudo_read(200, &rows)).unwrap();
         let prefix = dir.join("out").to_str().unwrap().to_string();
         let opts = RateOptions { data_type: "pacbio".to_string(), ..Default::default() };
-        start(matrix.to_str().unwrap(), None, 0.01, 0.95, &opts, &[], 100, 1, false, &prefix).unwrap();
+        start(matrix.to_str().unwrap(), None, 0.01, 0.95, &opts, &[], 100, 1, true, &prefix).unwrap();
         let table = std::fs::read_to_string(format!("{prefix}.variant_disposition.tsv")).unwrap();
         let outcome = |n: &str| {
             table.lines().find(|l| l.starts_with(&format!("{n}\t"))).unwrap().split('\t').nth(5).unwrap().to_string()

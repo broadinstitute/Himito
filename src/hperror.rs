@@ -69,8 +69,8 @@ pub fn homopolymer_runs(seq: &[u8], min_len: u32, skip: &[(u32, u32)]) -> Vec<Hp
     runs
 }
 
-/// Catalogue ids from a `--tracts` value: a comma list, `hp_tracts` (every id), or `none`/empty.
-pub fn parse_skip(spec: &str) -> Result<Vec<&'static str>> {
+/// Catalogue ids from a comma list, `hp_tracts` (every id), or `none`/empty.
+fn parse_skip(spec: &str) -> Result<Vec<&'static str>> {
     let spec = spec.trim();
     if spec.is_empty() || spec.eq_ignore_ascii_case("none") {
         return Ok(Vec::new());
@@ -197,6 +197,13 @@ pub fn measure(bam_path: &Path, fasta: &Path, min_len: u32, skip_ids: &[&str]) -
 }
 
 const HEADER: &str = "base\tref_len\tobs_len\tstrand\tn";
+
+/// Measure this sample and write `hp_confusion.tsv` at `path`. Runs shorter than [`DEFAULT_MIN_LEN`] and the
+/// tracts in [`DEFAULT_SKIP`] are left out.
+pub fn write_table(bam: &Path, fasta: &Path, path: &Path) -> Result<()> {
+    let rows = measure(bam, fasta, DEFAULT_MIN_LEN, DEFAULT_SKIP)?;
+    write_confusion(&rows, path)
+}
 
 pub fn write_confusion(rows: &[ConfusionRow], path: &Path) -> Result<()> {
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {}", path.display()))?);

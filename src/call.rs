@@ -2093,13 +2093,7 @@ pub fn start(
     // Homopolymer length confusion of the same reads, beside matrix.csv: `lineage` turns it into tract-allele rates.
     if let Some(bam) = bam {
         let path = output_file.with_extension("hp_confusion.tsv");
-        let result = crate::hperror::measure(
-            bam,
-            fasta_reference,
-            crate::hperror::DEFAULT_MIN_LEN,
-            crate::hperror::DEFAULT_SKIP,
-        )
-        .and_then(|rows| crate::hperror::write_confusion(&rows, &path));
+        let result = crate::hperror::write_table(bam, fasta_reference, &path);
         match result {
             Ok(()) => println!("Wrote homopolymer length confusion: {}", path.display()),
             Err(e) => eprintln!("Warning: homopolymer length confusion not written: {e:#}"),

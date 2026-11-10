@@ -12,6 +12,7 @@ workflow Himito_lineage_eval {
         Float min_hf
         Float max_hf
         String chromo
+        String himito_docker
         String? extra_args_quickstart
         String? extra_args_lineage
     }
@@ -36,7 +37,8 @@ workflow Himito_lineage_eval {
             sample_id = sample_id,
             chromo = chromo,
             data_type = "pacbio",
-            extra_args = extra_args_quickstart
+            extra_args = extra_args_quickstart,
+            himito_docker = himito_docker
 
     }
 
@@ -47,7 +49,8 @@ workflow Himito_lineage_eval {
             prefix = prefix,
             min_hf = min_hf,
             max_hf = max_hf,
-            extra_args = extra_args_lineage
+            extra_args = extra_args_lineage,
+            himito_docker = himito_docker
     }
 
     output {
@@ -175,6 +178,7 @@ task Himito_quickstart {
         String data_type
         String chromo = "chrM"
         String extra_args = ""
+        String himito_docker
 
         RuntimeAttr? runtime_attr_override
     }
@@ -210,7 +214,7 @@ task Himito_quickstart {
         boot_disk_gb:       10,
         preemptible_tries:  2,
         max_retries:        1,
-        docker:             "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
+        docker:             himito_docker
     }
     RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])
     runtime {
@@ -290,6 +294,7 @@ task Himito_lineage {
         Float min_hf
         Float max_hf
         String data_type = "pacbio"
+        String himito_docker
         String? extra_args
         Boolean collapse_hp = false
 
@@ -326,7 +331,7 @@ task Himito_lineage {
         boot_disk_gb:       10,
         preemptible_tries:  2,
         max_retries:        1,
-        docker:             "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
+        docker:             himito_docker
     }
 
     RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])

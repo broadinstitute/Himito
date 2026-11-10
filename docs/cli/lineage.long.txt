@@ -1,4 +1,4 @@
-Infer mitochondrial lineage tree from Himito read_var matrix CSV and heteroplasmic variants
+Infer mitochondrial lineage from read haplotypes using heteroplasmic SNVs by default
 
 Usage: Himito lineage [OPTIONS] --matrix-file <MATRIX_FILE> --output-prefix <OUTPUT_PREFIX>
 
@@ -31,6 +31,9 @@ Options:
           
           [default: 0.95]
 
+      --include-non-snvs
+          include heteroplasmic indels and other non-SNV alleles in the tree
+
       --fp-rate <FP_RATE>
           SCITE false-positive rate (preset by data type)
 
@@ -44,7 +47,7 @@ Options:
           SCITE false-negative rate in HP tracts (twice --fn-rate, capped at 0.5)
 
       --collapse-hp
-          merge equivalent spellings inside known rCRS homopolymer tracts
+          merge equivalent HP-tract spellings (requires --include-non-snvs)
 
       --mcmc-iterations <MCMC_ITERATIONS>
           MCMC iterations per chain

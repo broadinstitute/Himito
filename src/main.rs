@@ -13,7 +13,6 @@ mod correct;
 mod minorhap;
 mod callnumts;
 mod lineage;
-mod rootblock;
 mod tracts;
 mod scite;
 mod denoise;
@@ -459,7 +458,7 @@ enum Commands {
         emit_bnd: bool,
     },
 
-    /// Infer mitochondrial lineage tree from Himito read_var matrix CSV and heteroplasmic variants
+    /// Infer mitochondrial lineage from read haplotypes using heteroplasmic SNVs by default
     #[clap(arg_required_else_help = true)]
     Lineage {
         /// Himito matrix CSV (<prefix>.matrix.csv)
@@ -491,6 +490,10 @@ enum Commands {
         #[clap(long, value_parser, default_value_t = 0.95)]
         max_hf: f64,
 
+        /// include heteroplasmic indels and other non-SNV alleles in the tree
+        #[clap(long, action)]
+        include_non_snvs: bool,
+
         /// SCITE false-positive rate (preset by data type)
         #[clap(long, value_parser, hide_short_help = true)]
         fp_rate: Option<f64>,
@@ -507,9 +510,9 @@ enum Commands {
         #[clap(long, value_parser, hide_short_help = true)]
         hp_fn_rate: Option<f64>,
 
-        /// merge equivalent spellings inside known rCRS homopolymer tracts
+        /// merge equivalent HP-tract spellings (requires --include-non-snvs)
         // Tracts: D310 302-315, HVS1-C 16183-16193, CA514 513-525.
-        #[clap(long, action, hide_short_help = true)]
+        #[clap(long, action, hide_short_help = true, requires = "include_non_snvs")]
         collapse_hp: bool,
 
         /// MCMC iterations per chain
@@ -834,6 +837,7 @@ fn main() {
             hp_fp_rate,
             hp_fn_rate,
             collapse_hp,
+            include_non_snvs,
             mcmc_iterations,
             mcmc_chains,
             debug,
@@ -861,6 +865,7 @@ fn main() {
                 fn_rate,
                 hp_rates,
                 tracts,
+                include_non_snvs,
                 mcmc_iterations,
                 mcmc_chains,
                 debug,
@@ -888,6 +893,19 @@ mod tests {
         for (v, ok) in [("0", false), ("1", true), ("-1", false), ("x", false)] {
             assert_eq!(parse_positive(v).is_ok(), ok, "{v}");
         }
+    }
+
+    #[test]
+    fn lineage_defaults_to_snvs_and_requires_explicit_non_snv_collapse() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec!["Himito", "lineage", "-m", "matrix.csv", "-o", "out"];
+            args.extend_from_slice(extra);
+            Cli::try_parse_from(args)
+        };
+        assert!(matches!(parse(&[]).unwrap().command, Commands::Lineage { include_non_snvs: false, .. }));
+        assert!(matches!(parse(&["--include-non-snvs"]).unwrap().command, Commands::Lineage { include_non_snvs: true, .. }));
+        assert!(parse(&["--collapse-hp"]).is_err());
+        assert!(parse(&["--include-non-snvs", "--collapse-hp"]).is_ok());
     }
 
     /// docs/cli/ holds the `-h` and `--help` text of the commands that hide advanced options from `-h`.

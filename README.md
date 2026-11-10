@@ -100,6 +100,7 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 
 `-b/--bam` takes the raw (pre-denoise) BAM of the same reads. It drives the strand-bias
 filter, ONT linkage rescue and `<output>.matrix.csv`. `--input-bam` is accepted as an alias.
+Strand-biased SNVs and indels are rechecked against BAM haplotype genotypes before the flag is finalized. This prevents incomplete graph paths from flagging variants whose original read support is balanced. Calls with too little BAM support or persistent strand bias remain flagged.
 Without `-b`, the matrix comes from the graph and the strand filter and linkage rescue are off.
 The strand-bias action, permutation mode and genotyping gates are set by the data type.
 
@@ -135,6 +136,8 @@ Himito includes a new function for inferring mitochondrial mutation history from
 
 Given a Himito read–variant matrix (`<prefix>.matrix.csv` from `call`) and the corresponding VCF, the `lineage` command filters to informative heteroplasmic sites, deduplicates reads into haplotypes, and runs an MCMC search over mutation trees and identify a ML tree (algorithm adapted from SCITE, Kuipers J et al. Single-cell sequencing data reveals widespread recurrence and loss of mutational hits in the life histories of tumorus. Genome Research 2017; 27:1885-1894.). The initial tree is a Neighbor–Joining tree constructed from reads instead of a random tree though. Sequencing errors are modeled with false-positive and false-negative rates preset by `-d` (pacbio 0.005 / 0.05, ONT 0.005 / 0.02) and set with `--fp-rate` / `--fn-rate`. 
 
+By default, lineage inference uses only heteroplasmic SNVs with HF in `[0.01, 0.95)`. Add `--include-non-snvs` to include indels and other alleles; `--collapse-hp` additionally merges equivalent homopolymer tract spellings and requires `--include-non-snvs`. Every retained variant enters the mutation-tree search directly, with no root-block partition or forced homoplasmic rows. All cleaned read haplotypes, including singletons, appear in the haplotype map and lineage tree. The three-read threshold applies only to raw haplotypes used for the optional NJ seed and raw diagnostics.
+
 Outputs include a mutation tree, read-level lineage Newick tree, the cleaned read–variant matrix `<prefix>.cleaned_matrix_all_variants.csv`, the variant co-occurrence table `variant_cooccurrence.tsv`, and haplotype maps. The raw co-occurrence table and `raw_haplotype_map.tsv` are written only with `--debug`.
 
 ```
@@ -147,7 +150,7 @@ Outputs include a mutation tree, read-level lineage Newick tree, the cleaned rea
 
 Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix_all_variants.csv`, `<output_prefix>.variant_cooccurrence.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv` and `<output_prefix>.raw_variant_cooccurrence.tsv`.
 
-`lineage` shows `-m -v -d -o --min-hf --max-hf` in `-h`; the error-rate, MCMC and `--debug`
+`lineage` shows `-m -v -d -o --min-hf --max-hf --include-non-snvs` in `-h`; the error-rate, MCMC and `--debug`
 options are listed by `--help`.
 
 To Do: 

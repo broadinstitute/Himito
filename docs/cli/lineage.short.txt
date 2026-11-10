@@ -1,4 +1,4 @@
-Infer mitochondrial lineage tree from Himito read_var matrix CSV and heteroplasmic variants
+Infer mitochondrial lineage from read haplotypes using heteroplasmic SNVs by default
 
 Usage: Himito lineage [OPTIONS] --matrix-file <MATRIX_FILE> --output-prefix <OUTPUT_PREFIX>
 
@@ -10,4 +10,5 @@ Options:
   -o, --output-prefix <OUTPUT_PREFIX>  output prefix; writes <prefix>.haplotype_map.tsv and the trees
       --min-hf <MIN_HF>                minimum heteroplasmic frequency (inclusive) of a variant [default: 0.01]
       --max-hf <MAX_HF>                maximum heteroplasmic frequency (exclusive); excludes fixed variants [default: 0.95]
+      --include-non-snvs               include heteroplasmic indels and other non-SNV alleles in the tree
   -h, --help                           Print help (see more with '--help')

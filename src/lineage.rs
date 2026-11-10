@@ -502,6 +502,22 @@ pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tr
     BinaryMatrix { variants, reads: raw.reads.clone(), data }
 }
 
+/// Restrict the default analysis to single-base A/C/G/T substitutions.
+pub fn retain_snvs(mut raw: RawMatrix) -> RawMatrix {
+    let (variants, data) = raw.variants.into_iter().zip(raw.data)
+        .filter(|(name, _)| {
+            parse_variant_name(name).is_some_and(|(_, r, a)| {
+                r.len() == 1 && a.len() == 1
+                    && r.bytes().chain(a.bytes()).all(|b| b"ACGT".contains(&b.to_ascii_uppercase()))
+                    && !r.eq_ignore_ascii_case(a)
+            })
+        })
+        .unzip();
+    raw.variants = variants;
+    raw.data = data;
+    raw
+}
+
 /// Collapse every known homopolymer tract in `raw` into sequence-level alleles.
 pub fn collapse_tracts(raw: RawMatrix, tracts: &[crate::tracts::Tract]) -> RawMatrix {
     let spans = crate::scite::variant_spans(&raw.variants);
@@ -735,25 +751,19 @@ fn apply_tract_ops(ref_seq: &str, ops: &[&TractOp]) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-/// Near-fixed variants (not in `kept`) dropped by the HF ceiling, not for lack of support.
-pub fn collect_fixed_homoplasmies(raw: &RawMatrix, max_hf: f64, kept: &[String]) -> Vec<String> {
-    let kept: std::collections::HashSet<&String> = kept.iter().collect();
-    raw.variants
-        .iter()
-        .zip(raw.data.iter())
-        .filter(|(vid, row)| {
-            let (present, _, freq) = row_hf(row);
-            !kept.contains(vid) && present >= MIN_PRESENCE && freq >= max_hf
-        })
-        .map(|(vid, _)| vid.clone())
-        .collect()
-}
-
-
 /// Collapse reads with identical binary profiles into unique haplotypes backed by at least `MIN_READS` reads.
 /// Haplotypes are sorted by ascending mutation count (number of 1-bits), then lexicographically by
 /// profile, so that the all-zero haplotype (if present) is always `H0000`.
 pub fn deduplicate(matrix: &BinaryMatrix) -> HaplotypeMatrix {
+    deduplicate_with_min_reads(matrix, MIN_READS)
+}
+
+/// Every cleaned read contributes to one haplotype, including singleton profiles.
+pub fn deduplicate_all(matrix: &BinaryMatrix) -> HaplotypeMatrix {
+    deduplicate_with_min_reads(matrix, 1)
+}
+
+fn deduplicate_with_min_reads(matrix: &BinaryMatrix, min_reads: usize) -> HaplotypeMatrix {
     let n_reads    = matrix.reads.len();
     let n_variants = matrix.variants.len();
 
@@ -780,7 +790,7 @@ pub fn deduplicate(matrix: &BinaryMatrix) -> HaplotypeMatrix {
             }
         })
         .collect();
-    haplotypes.retain(|h| h.count >= MIN_READS);
+    haplotypes.retain(|h| h.count >= min_reads);
     // Deterministic ordering: fewest mutations first, then lexicographic profile
     haplotypes.sort_by(|a, b| {
         let ma: usize = a.profile.iter().filter_map(|&x| x).map(usize::from).sum();
@@ -879,15 +889,10 @@ pub fn resolve_hp_rates(
     )
 }
 
-/// Errors when no read profile is backed by at least `MIN_READS` reads (all were dropped).
+/// Errors when there are no cleaned reads to report.
 fn ensure_haplotypes(hap_matrix: &HaplotypeMatrix) -> Result<()> {
     if hap_matrix.haplotypes.is_empty() {
-        bail!(
-            "No haplotypes remain: every distinct read profile is backed by fewer \
-             than {MIN_READS} reads. This usually means the input is too shallow \
-             or too noisy; widening --min-hf / --max-hf admits more variants and \
-             so more distinguishable haplotypes."
-        );
+        bail!("No cleaned read haplotypes remain; check that the input matrix contains reads.");
     }
     Ok(())
 }
@@ -901,6 +906,7 @@ pub fn start(
     fn_rate: f64,
     hp_rates: (f64, f64),
     tracts: &[crate::tracts::Tract],
+    include_non_snvs: bool,
     mcmc_iterations: usize,
     mcmc_chains: usize,
     debug: bool,
@@ -926,9 +932,12 @@ pub fn start(
         File::open(matrix_file)
             .with_context(|| format!("Cannot read matrix CSV: {matrix_file}"))?,
     )?;
+    let raw = if include_non_snvs { raw } else { retain_snvs(raw) };
+    // Tract alleles are non-SNVs; collapse is only applicable when they are included.
+    let tracts = if include_non_snvs { tracts } else { &[] };
     // An empty slice is the identity.
     if tracts.is_empty() {
-        info!("[lineage] HP tract collapse: off (pass --collapse-hp to enable)");
+        info!("[lineage] HP tract collapse: off (use --include-non-snvs --collapse-hp to enable)");
     } else {
         info!("[lineage] HP tract collapse: on ({} tracts)", tracts.len());
     }
@@ -937,7 +946,7 @@ pub fn start(
     if binary.variants.is_empty() {
         bail!(
             "No informative variants remain after filtering. \
-             Try adjusting --min-hf / --max-hf thresholds."
+             Try adjusting --min-hf / --max-hf thresholds, or use --include-non-snvs for non-SNV alleles."
         );
     }
 
@@ -945,7 +954,6 @@ pub fn start(
     info!("[2/4] Deduplicating reads into haplotypes...");
     let hap_matrix = deduplicate(&binary);
     info!("[2/4] Found {} haplotypes across {} variants.", hap_matrix.haplotypes.len(), hap_matrix.variants.len());
-    ensure_haplotypes(&hap_matrix)?;
     // Variant pairs violating the infinite-sites assumption hint at recurrent/back mutation or recombination.
     let violations = four_gamete_test(&hap_matrix);
     if !violations.is_empty() {
@@ -971,22 +979,12 @@ pub fn start(
         output_prefix,
     )?;
 
-    // Near-fixed homoplasmies were removed by the HF ceiling before the tree was built; report them as all-present rows.
-    let fixed_homoplasmies = collect_fixed_homoplasmies(&raw, max_hf, &binary.variants);
-    if !fixed_homoplasmies.is_empty() {
-        info!(
-            "[3/4] Recovered {} near-fixed homoplasmic variant(s) excluded by the HF ceiling.",
-            fixed_homoplasmies.len()
-        );
-    }
-    let mut cleaned = out.cleaned;
-    crate::rootblock::append_block_to_cleaned(&mut cleaned, &fixed_homoplasmies);
-    crate::scite::write_cleaned_matrix(&cleaned, &format!("{output_prefix}.cleaned_matrix_all_variants.csv"))?;
+    crate::scite::write_cleaned_matrix(&out.cleaned, &format!("{output_prefix}.cleaned_matrix_all_variants.csv"))?;
 
     // ── Step 4: write final haplotype map (filtered by SCITE) ─────────────────
     let cleaned_hap_matrix = out.cleaned_haplotypes;
     info!(
-        "[4/4] Cleaned reads deduplicated into {} haplotypes across {} variants.",
+        "[4/4] All cleaned reads deduplicated into {} haplotypes across {} variants.",
         cleaned_hap_matrix.haplotypes.len(),
         cleaned_hap_matrix.variants.len()
     );
@@ -1114,18 +1112,6 @@ mod tests {
     fn a_vcf_matching_no_variants_keeps_nothing() {
         let kept = filter_from_csv("variant,r1,r2,r3\nm.100A>G,1,1,0\n", &from_vcf(&[]));
         assert!(kept.variants.is_empty(), "{:?}", kept.variants);
-    }
-
-    #[test]
-    fn collect_fixed_homoplasmies_finds_supported_near_fixed_sites_not_already_kept() {
-        // m.100: 4/4, recovered. m.200: 3/4, heteroplasmic. m.300: one alt call only. m.400: already kept.
-        let csv = "variant,r1,r2,r3,r4\n\
-                   m.100A>G,1,1,1,1\n\
-                   m.200C>T,1,1,1,0\n\
-                   m.300G>A,1,,,\n\
-                   m.400T>C,1,1,1,1\n";
-        let raw = read_raw_matrix(Cursor::new(csv)).unwrap();
-        assert_eq!(collect_fixed_homoplasmies(&raw, 0.95, &["m.400T>C".to_string()]), vec!["m.100A>G"]);
     }
 
     #[test]
@@ -1292,22 +1278,53 @@ mod tests {
     }
 
     /// Run `start` without a VCF on `csv` in a fresh temp dir `dir`; returns the output prefix.
-    fn run_small_lineage(dir: &str, csv: &str, debug: bool, tracts: &[crate::tracts::Tract]) -> String {
+    fn run_small_lineage(dir: &str, csv: &str, debug: bool, tracts: &[crate::tracts::Tract], include_non_snvs: bool) -> String {
         let dir = std::env::temp_dir().join(dir);
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let matrix = dir.join("matrix.csv");
         std::fs::write(&matrix, csv).unwrap();
         let prefix = dir.join("out").to_str().unwrap().to_string();
-        start(matrix.to_str().unwrap(), None, 0.01, 0.95, 0.01, 0.1, (0.01, 0.1), tracts, 20, 1, debug, &prefix).unwrap();
+        start(matrix.to_str().unwrap(), None, 0.01, 0.95, 0.01, 0.1, (0.01, 0.1), tracts, include_non_snvs, 20, 1, debug, &prefix).unwrap();
         prefix
+    }
+
+    #[test]
+    fn default_tree_uses_only_heteroplasmic_snvs_and_retains_all_reads() {
+        // No raw profile has 3 reads: denoising must still proceed.
+        let csv = "variant,r1,r2,r3,r4\nm.100A>G,1,1,0,0\nm.16189T>C,1,0,1,0\nm.300A>AC,1,1,0,0\nm.400AT>A,1,1,0,0\nm.500AC>GT,1,1,0,0\nm.600A>G,1,1,1,1\n";
+        let prefix = run_small_lineage("himito_direct_snvs", csv, true, &[], false);
+        let matrix = std::fs::read_to_string(format!("{prefix}.cleaned_matrix_all_variants.csv")).unwrap();
+        assert_eq!(matrix.lines().count(), 3);
+        assert!(matrix.contains("m.100A>G"));
+        assert!(matrix.contains("m.16189T>C"));
+        for suffix in [".cleaned_matrix_all_variants.csv", ".molecule_summary.tsv", ".mutation_tree.tsv", ".read_lineage.nwk"] {
+            let text = std::fs::read_to_string(format!("{prefix}{suffix}")).unwrap();
+            for excluded in ["m.300A>AC", "m.400AT>A", "m.500AC>GT", "m.600A>G"] {
+                assert!(!text.contains(excluded), "{excluded} in {suffix}");
+            }
+        }
+        let map = std::fs::read_to_string(format!("{prefix}.cleaned_haplotype_map.tsv")).unwrap();
+        let total: usize = map.lines().skip(1).map(|row| row.split('\t').nth(2).unwrap().parse::<usize>().unwrap()).sum();
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn snv_filter_rejects_indels_mnvs_ambiguous_and_unchanged_alleles_even_with_vcf() {
+        let raw = raw(
+            &["m.100A>G", "m.200C>t", "m.300A>AC", "m.400AC>GT", "m.500N>A", "m.600A>A"],
+            &["1100"; 6],
+        );
+        let vcf = HfFilter::FromVcf { map: raw.variants.iter().map(|v| (v.clone(), 0.5)).collect(), min: 0.01, max: 0.95 };
+        let filtered = filter_matrix(&retain_snvs(raw), &vcf, &[]);
+        assert_eq!(filtered.variants, vec!["m.100A>G", "m.200C>t"]);
     }
 
     #[test]
     fn debug_gates_the_raw_outputs() {
         let csv = tripled_csv(&[("m.100A>G", "1100"), ("m.200C>T", "1010")]);
         for debug in [false, true] {
-            let prefix = run_small_lineage(&format!("himito_lineage_debug_{debug}"), &csv, debug, &[]);
+            let prefix = run_small_lineage(&format!("himito_lineage_debug_{debug}"), &csv, debug, &[], false);
             for suffix in [".raw_haplotype_map.tsv", ".raw_variant_cooccurrence.tsv"] {
                 assert_eq!(Path::new(&format!("{prefix}{suffix}")).exists(), debug, "{suffix} with debug={debug}");
             }
@@ -1320,7 +1337,7 @@ mod tests {
         let csv = tripled_csv(&[("m.16183A>AC", "1000"), ("m.16189T>TC", "0100"), ("m.100A>G", "1100")]);
         let off: &[crate::tracts::Tract] = &[];
         for (tracts, on) in [(off, false), (KNOWN_TRACTS, true)] {
-            let prefix = run_small_lineage(&format!("himito_lineage_collapse_{on}"), &csv, false, tracts);
+            let prefix = run_small_lineage(&format!("himito_lineage_collapse_{on}"), &csv, false, tracts, true);
             let out = std::fs::read_to_string(format!("{prefix}.cleaned_matrix_all_variants.csv")).unwrap();
             assert_eq!(out.contains("m.16183A>AC"), !on, "{out}");
             assert_eq!(out.contains("m.16189T>TC"), !on, "{out}");

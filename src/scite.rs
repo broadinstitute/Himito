@@ -10,7 +10,6 @@ use statrs::function::gamma::ln_gamma;
 use adjustp::{adjust, Procedure};
 
 use crate::lineage::{self, BinaryMatrix, HaplotypeMatrix};
-use crate::rootblock;
 
 /// A growable bitset over mutation/variant ids, backed by `Vec<u64>` words.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -137,7 +136,7 @@ pub struct ErrorRates {
     pub fp_rate: f64,
     /// beta: P(observed = 0 | true = 1) — false negative rate.
     pub fn_rate: f64,
-    /// Per-variant `(fp, fn)`; columns past its end (root-block genotypes) use the global rates.
+    /// Per-variant `(fp, fn)`; columns past its end use the global rates.
     pub per_variant: Vec<(f64, f64)>,
 }
 
@@ -959,38 +958,10 @@ fn format_support(support: Option<f64>) -> String {
     }
 }
 
-/// The root-block decision for every candidate (variant clearing the HF gate), one row each.
-pub fn write_root_block_table(
-    audit: &[rootblock::RootBlockAudit],
-    variants: &[String],
-    path: &str,
-) -> Result<()> {
-    let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
-    writeln!(w, "variant\thf\tn_absent\tmin_q\tpartner_variant\tin_block\treason")?;
-    for a in audit {
-        let min_q = match a.min_q {
-            Some(q) => format!("{q:.6e}"),
-            None => "NA".to_string(),
-        };
-        // At a saturated min_q (1.0) no partner discriminated better than any other.
-        let partner = match (a.partner, a.min_q) {
-            (Some(u), Some(q)) if q < 1.0 => variants[u].clone(),
-            _ => "NA".to_string(),
-        };
-        writeln!(
-            w,
-            "{}\t{:.6}\t{}\t{min_q}\t{partner}\t{}\t{}",
-            variants[a.variant], a.hf, a.n_absent, a.in_block, a.reason.as_str()
-        )?;
-    }
-    Ok(())
-}
-
 pub fn write_mutation_tree(
     tree: &MutationTree,
     matrix: &CleanedMatrix,
     evidence: &[EdgeEvidence],
-    block_names: &[String],
     path: &str,
 ) -> Result<()> {
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
@@ -1016,16 +987,6 @@ pub fn write_mutation_tree(
             "{node}\t{}\t{parent}\t{}\t{n_reads}\t{support}\t{n_child}\t{n_parent}",
             node_name(node),
             node_name(parent)
-        )?;
-    }
-    // The whole root block is one row.
-    if !block_names.is_empty() {
-        let root_reads = matrix.attachment.iter().filter(|&&a| a == tree.root()).count();
-        writeln!(
-            w,
-            "ROOT_BLOCK\t{}\t{}\tROOT\t{root_reads}\tNA\tNA\tNA",
-            block_names.join(","),
-            tree.root()
         )?;
     }
     Ok(())
@@ -1115,13 +1076,11 @@ pub fn write_read_lineage_newick(
     hap_matrix: &HaplotypeMatrix,
     rates: &ErrorRates,
     evidence: &[EdgeEvidence],
-    block_names: &[String],
     path: &str,
 ) -> Result<()> {
     let children = tree.children_of();
     let mut haps_by_node: Vec<Vec<(String, usize)>> = vec![Vec::new(); tree.n_mutations + 1];
     for hap in &hap_matrix.haplotypes {
-        // Profiles also cover the root-block columns past the tree's mutations; those score alike at every node.
         let (node, _ll) = best_attachment(&hap.profile, tree, rates);
         haps_by_node[node].push((hap.id.clone(), hap.count));
     }
@@ -1138,10 +1097,6 @@ pub fn write_read_lineage_newick(
 
     let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
     write!(w, "{body}")?;
-    // The body ends with the `)ROOT` node, which carries the root block as an NHX field.
-    if !block_names.is_empty() {
-        write!(w, "[&&NHX:root_block={}]", block_names.join(","))?;
-    }
     writeln!(w, ";")?;
     Ok(())
 }
@@ -1377,44 +1332,7 @@ fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usiz
     MutationTree { n_mutations: tree.n_mutations, parent }
 }
 
-/// Pull every block member whose REF span overlaps any other variant back into the search: imputing
-/// it on every read would put two mutually-exclusive alleles on one molecule.
-/// `variants` is the full variant list `rb` indexes.
-fn resolve_span_conflicts(mut rb: rootblock::RootBlock, variants: &[String]) -> rootblock::RootBlock {
-    let spans = variant_spans(variants);
-
-    let (pulled_back, kept): (Vec<usize>, Vec<usize>) = rb.block.iter().copied().partition(|&v| {
-        (0..variants.len()).any(|u| u != v && spans[v].overlaps(&spans[u]))
-    });
-
-    if !pulled_back.is_empty() {
-        let mut names: Vec<String> = pulled_back.iter().map(|&v| variants[v].clone()).collect();
-        names.sort();
-        info!(
-            "[SCITE] Root block: pulled {} variant(s) back into the search — their span \
-             overlaps another variant, so imputing them present on every read would assert \
-             two mutually-exclusive alleles on one molecule: {}",
-            pulled_back.len(),
-            names.join(", ")
-        );
-    }
-
-    for a in rb.audit.iter_mut() {
-        if pulled_back.contains(&a.variant) {
-            a.in_block = false;
-            a.reason = rootblock::BlockReason::SpanConflict;
-        }
-    }
-
-    rb.informative.extend(pulled_back);
-    rb.block = kept;
-    rb.block.sort_unstable();
-    rb.informative.sort_unstable();
-    rb.audit.sort_unstable_by_key(|a| a.variant);
-    rb
-}
-
-/// The cleaned matrix (root-block columns appended) and its haplotypes, the tips of `<prefix>.read_lineage.nwk`.
+/// The cleaned matrix and all its haplotypes, the tips of `<prefix>.read_lineage.nwk`.
 pub struct SciteOutput {
     pub cleaned: CleanedMatrix,
     pub cleaned_haplotypes: HaplotypeMatrix,
@@ -1438,32 +1356,8 @@ pub fn run_scite_pipeline(
              relax the --min-hf / --max-hf thresholds."
         );
     }
-    // TODO: dropout_rate is still the global fn, not the HP-tract fn.
-    let rb = resolve_span_conflicts(rootblock::partition(binary, fn_rate), &binary.variants);
-    // The raw co-occurrence and root-block tables report the full matrix; everything else the search matrix.
-    let full_binary = binary;
-    let block_names: Vec<String> =
-        rb.block.iter().map(|&v| binary.variants[v].clone()).collect();
-    if !block_names.is_empty() {
-        info!(
-            "[SCITE] Root block: {} homoplasmic variant(s) removed from the search \
-             and reported unordered at the root: {}",
-            block_names.len(),
-            block_names.join(", ")
-        );
-    }
-    let search_matrix = rootblock::restrict(binary, &rb.informative);
-    let binary = &search_matrix;
-    // Haplotypes over the search matrix only seed the NJ-derived initial tree.
+    // The complete filtered matrix participates in inference. NJ is only an optional seed.
     let hap_matrix = lineage::deduplicate(binary);
-    let no_informative = binary.variants.is_empty();
-    if no_informative {
-        info!(
-            "[SCITE] Every variant is homoplasmic: the tree is ROOT plus a \
-             {}-variant block, so the MCMC search is skipped.",
-            block_names.len()
-        );
-    }
     let single_variant = binary.variants.len() == 1;
     if single_variant {
         info!(
@@ -1516,20 +1410,15 @@ pub fn run_scite_pipeline(
     );
 
     let rates = ErrorRates { fp_rate, fn_rate, per_variant };
-    let (tree, ll) = if no_informative {
-        (MutationTree { n_mutations: 0, parent: vec![0] }, 0.0)
-    } else {
-        run_mcmc_multichain(binary, &rates, n_iterations, n_chains, initial_tree.as_ref())
-    };
+    let (tree, ll) = run_mcmc_multichain(binary, &rates, n_iterations, n_chains, initial_tree.as_ref());
     info!("[SCITE] Best tree log-likelihood: {ll:.3}");
 
-    let tree = if no_informative { tree } else { polish_unary_path_order(&tree, binary, &rates) };
+    let tree = polish_unary_path_order(&tree, binary, &rates);
     let tree = enforce_position_exclusivity(&tree, &spans);
     let ll_polish = tree_log_likelihood(binary, &tree, &rates);
     info!("[SCITE] After unary-path polish log-likelihood: {ll_polish:.3}");
 
-    let mut cleaned = attach_all_reads(binary, &tree, &rates);
-    let n_informative = rootblock::append_block_to_cleaned(&mut cleaned, &block_names);
+    let cleaned = attach_all_reads(binary, &tree, &rates);
 
     let evidence = edge_evidence(&tree, binary, &rates);
     let unresolved: Vec<String> = (0..tree.n_mutations)
@@ -1553,13 +1442,12 @@ pub fn run_scite_pipeline(
         );
     }
 
-    write_variant_cooccurrence(&cleaned, n_informative, &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
+    write_variant_cooccurrence(&cleaned, binary.variants.len(), &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
     if debug {
-        write_raw_variant_cooccurrence(full_binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
+        write_raw_variant_cooccurrence(binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
     }
     write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
-    write_mutation_tree(&tree, &cleaned, &evidence, &block_names, &format!("{output_prefix}.mutation_tree.tsv"))?;
-    write_root_block_table(&rb.audit, &full_binary.variants, &format!("{output_prefix}.root_block.tsv"))?;
+    write_mutation_tree(&tree, &cleaned, &evidence, &format!("{output_prefix}.mutation_tree.tsv"))?;
 
     // Deduplicate the SCITE-cleaned reads into haplotypes for the lineage tree.
     let cleaned_binary = BinaryMatrix {
@@ -1571,13 +1459,12 @@ pub fn run_scite_pipeline(
             .map(|row| row.iter().map(|&b| Some(b)).collect())
             .collect(),
     };
-    let cleaned_hap_matrix = lineage::deduplicate(&cleaned_binary);
+    let cleaned_hap_matrix = lineage::deduplicate_all(&cleaned_binary);
     write_read_lineage_newick(
         &tree,
         &cleaned_hap_matrix,
         &rates,
         &evidence,
-        &block_names,
         &format!("{output_prefix}.read_lineage.nwk"),
     )?;
 
@@ -1743,7 +1630,7 @@ mod tests {
         assert!((actual - expected).abs() < 1e-12);
     }
 
-    /// Columns past `per_variant` — the root-block genotypes appended beyond `n_mutations`.
+    /// Columns past `per_variant` fall back to the global rates.
     #[test]
     fn columns_past_per_variant_use_the_global_rate() {
         let profile = vec![Some(1), Some(1)];
@@ -2366,47 +2253,8 @@ mod tests {
                      0\tA\t2\tROOT\t1\tNA\tNA\tNA\n\
                      1\tB\t0\tA\t1\t4.250\t3\t7\n\
                      2\tROOT\t2\tROOT\t0\tNA\tNA\tNA\n";
-        let content = written("himito_test_write_mutation_tree.tsv", |p| write_mutation_tree(&tree, &matrix, &evidence, &[], p));
+        let content = written("himito_test_write_mutation_tree.tsv", |p| write_mutation_tree(&tree, &matrix, &evidence, p));
         assert_eq!(content, nodes);
-
-        // The whole root block is one extra row.
-        let block = ["m.750A>G".to_string(), "m.16183A>C".to_string()];
-        let content =
-            written("himito_test_write_mutation_tree_block.tsv", |p| write_mutation_tree(&tree, &matrix, &evidence, &block, p));
-        assert_eq!(content, format!("{nodes}ROOT_BLOCK\tm.750A>G,m.16183A>C\t2\tROOT\t0\tNA\tNA\tNA\n"));
-    }
-
-    #[test]
-    fn write_root_block_table_reports_each_candidate() {
-        use rootblock::{BlockReason, RootBlockAudit};
-        let variants = vec!["m.750A>G".to_string(), "m.310T>TC".to_string(), "m.16189T>C".to_string()];
-        let audit = vec![
-            RootBlockAudit {
-                variant: 0, hf: 0.90, n_absent: 12,
-                min_q: Some(0.42), partner: Some(1), in_block: true,
-                reason: BlockReason::UnstructuredAbsences,
-            },
-            // No partner test: NA, not 0.
-            RootBlockAudit {
-                variant: 1, hf: 0.99, n_absent: 3,
-                min_q: None, partner: None, in_block: true,
-                reason: BlockReason::HighRawVaf,
-            },
-            // A saturated min_q blanks the (arbitrary) partner.
-            RootBlockAudit {
-                variant: 2, hf: 0.87, n_absent: 20,
-                min_q: Some(1.0), partner: Some(1), in_block: true,
-                reason: BlockReason::UnstructuredAbsences,
-            },
-        ];
-        let content = written("himito_test_root_block.tsv", |p| write_root_block_table(&audit, &variants, p));
-        assert_eq!(
-            content,
-            "variant\thf\tn_absent\tmin_q\tpartner_variant\tin_block\treason\n\
-             m.750A>G\t0.900000\t12\t4.200000e-1\tm.310T>TC\ttrue\tunstructured_absences\n\
-             m.310T>TC\t0.990000\t3\tNA\tNA\ttrue\thigh_raw_vaf\n\
-             m.16189T>C\t0.870000\t20\t1.000000e0\tNA\ttrue\tunstructured_absences\n"
-        );
     }
 
     #[test]
@@ -2433,7 +2281,7 @@ mod tests {
             EdgeEvidence { support_ll: Some(3.0), counts: Some((1, 4)) },
         ];
         let content = written("himito_test_read_lineage.nwk", |p| {
-            write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, &[], p)
+            write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, p)
         });
 
         // No haplotype has zero mutations, so the root state becomes a synthetic zero-read tip.
@@ -2461,18 +2309,10 @@ mod tests {
             ],
         };
         let evidence = vec![EdgeEvidence { support_ll: None, counts: None }];
-        let write = |block: &[String], name: &str| {
-            written(name, |p| write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, block, p))
-        };
-
-        let body = "(H0001_n3:1[&&NHX:mutation=mA:order_support=NA:reads=3],H0000_n5:0[&&NHX:reads=5])ROOT";
-        assert_eq!(write(&[], "himito_test_read_lineage_root_tip.nwk"), format!("{body};\n"));
-        // The root block is an NHX field on the ROOT node.
-        let block = ["m.750A>G".to_string(), "m.16183A>C".to_string()];
-        assert_eq!(
-            write(&block, "himito_test_read_lineage_root_block.nwk"),
-            format!("{body}[&&NHX:root_block=m.750A>G,m.16183A>C];\n")
-        );
+        let content = written("himito_test_read_lineage_root_tip.nwk", |p| {
+            write_read_lineage_newick(&tree, &hap_matrix, &rates, &evidence, p)
+        });
+        assert_eq!(content, "(H0001_n3:1[&&NHX:mutation=mA:order_support=NA:reads=3],H0000_n5:0[&&NHX:reads=5])ROOT;\n");
     }
 
     #[test]
@@ -2588,41 +2428,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_span_conflicts_pulls_every_overlapping_block_member_back() {
-        // A blocked indel overlapping an informative SNV at 310; a block chain where B overlaps only
-        // A; two block members overlapping only each other.
-        let cases: [(&[&str], &[usize]); 3] = [
-            (&["m.310T>TC", "m.310T>C"], &[0]),
-            (&["m.300A>G", "m.300AT>A", "m.301TG>T"], &[1, 2]),
-            (&["m.500A>G", "m.500A>T"], &[0, 1]),
-        ];
-        for (names, block) in cases {
-            let variants: Vec<String> = names.iter().map(|s| s.to_string()).collect();
-            let n = variants.len();
-            let rb = rootblock::RootBlock {
-                block: block.to_vec(),
-                informative: (0..n).filter(|v| !block.contains(v)).collect(),
-                audit: block
-                    .iter()
-                    .map(|&variant| rootblock::RootBlockAudit {
-                        variant, hf: 0.9, n_absent: 12, min_q: None, partner: None, in_block: true,
-                        reason: rootblock::BlockReason::HighRawVaf,
-                    })
-                    .collect(),
-            };
-            let rb = resolve_span_conflicts(rb, &variants);
-            assert!(rb.block.is_empty(), "{names:?}: every overlapping block member must be pulled back");
-            assert_eq!(rb.informative, (0..n).collect::<Vec<_>>());
-            assert!(
-                rb.audit.iter().all(|a| !a.in_block && a.reason == rootblock::BlockReason::SpanConflict),
-                "{names:?}: the audit must record the span conflict"
-            );
-        }
-    }
-
-    #[test]
     fn run_scite_pipeline_handles_more_than_63_variants() {
-        // 65 variants need a second mask word; all-ref reads past `n_var` keep every HF below the root-block gate.
+        // 65 variants need a second mask word.
         let (n_var, n_reads) = (65, 131);
         let matrix = BinaryMatrix {
             variants: (0..n_var).map(|i| format!("m.{i}")).collect(),
@@ -2652,39 +2459,30 @@ mod tests {
     }
 
     #[test]
-    fn run_scite_pipeline_with_all_variants_homoplasmic_does_not_panic() {
-        let germline = present_then_absent(95, 5);
-        let binary = matrix_from_rows(&["m.750A>G", "m.16183A>C"], &[&germline, &germline]);
-        let (out, _) = run_pipeline("rb_allblock", &binary, false);
-        assert_eq!(out.cleaned.variants.len(), 2);
+    fn cleaned_singleton_haplotypes_appear_in_the_tree_and_map() {
+        let binary = matrix_from_rows(&["m.100A>G"], &["110"]);
+        let (out, prefix) = run_pipeline("direct_singleton", &binary, false);
+        assert_eq!(out.cleaned_haplotypes.haplotypes.len(), 2);
+        assert_eq!(out.cleaned_haplotypes.haplotypes.iter().map(|h| h.count).sum::<usize>(), 3);
+        let newick = read_output(&prefix, ".read_lineage.nwk");
+        assert!(newick.contains("H0000_n1"));
+        assert!(newick.contains("H0001_n2"));
     }
 
     #[test]
-    fn one_informative_variant_after_partition_still_takes_the_single_variant_path() {
-        let binary = matrix_from_rows(&["m.750A>G", "m.302A>ACC"], &[&present_then_absent(95, 5), &"10".repeat(50)]);
-        let (out, prefix) = run_pipeline("rb_single", &binary, true);
-
-        assert_eq!(out.cleaned.variants, vec!["m.302A>ACC", "m.750A>G"], "block variants stay in the cleaned matrix");
-        let tsv = read_output(&prefix, ".mutation_tree.tsv");
-        assert!(tsv.contains("ROOT_BLOCK\tm.750A>G\t"), "the germline variant should be blocked:\n{tsv}");
-        assert!(tsv.contains("0\tm.302A>ACC\t1\tROOT\t"), "the informative variant stays a tree node:\n{tsv}");
-        // The raw data still carries the blocked variant's dropouts.
-        let raw = read_output(&prefix, ".raw_variant_cooccurrence.tsv");
-        assert!(raw.contains("m.750A>G"), "the blocked variant must stay in the raw co-occurrence table:\n{raw}");
-    }
-
-    #[test]
-    fn variant_cooccurrence_omits_block_variants_entirely() {
+    fn high_hf_variants_remain_tree_nodes_and_all_reads_are_reported() {
         let binary = matrix_from_rows(
-            &["m.750A>G", "m.16183A>C", "m.9477G>A"],
-            &[&present_then_absent(95, 5), &"10".repeat(50), &present_then_absent(30, 70)],
+            &["m.750A>G", "m.9477G>A"],
+            &[&present_then_absent(45, 5), &present_then_absent(15, 35)],
         );
-        let rb = rootblock::partition(&binary, 0.05);
-        assert_eq!((rb.block, rb.informative), (vec![0], vec![1, 2]), "test premise: v0 alone blocks");
-
-        let (_, prefix) = run_pipeline("rb_cooc_omit", &binary, false);
-        let cooc = read_output(&prefix, ".variant_cooccurrence.tsv");
-        assert_eq!(cooc.lines().count(), 2, "expected one informative pair:\n{cooc}");
-        assert!(!cooc.contains("m.750A>G"), "the block variant must be omitted entirely:\n{cooc}");
+        let (out, prefix) = run_pipeline("direct_high_hf", &binary, true);
+        assert_eq!(out.cleaned.variants, binary.variants);
+        assert_eq!(out.cleaned_haplotypes.haplotypes.iter().map(|h| h.count).sum::<usize>(), 50);
+        let tree = read_output(&prefix, ".mutation_tree.tsv");
+        assert!(tree.contains("m.750A>G"));
+        assert!(!tree.contains("ROOT_BLOCK"));
+        assert!(read_output(&prefix, ".variant_cooccurrence.tsv").contains("m.750A>G"));
+        assert!(!read_output(&prefix, ".read_lineage.nwk").contains("root_block="));
+        assert!(!std::path::Path::new(&format!("{prefix}.root_block.tsv")).exists());
     }
 }

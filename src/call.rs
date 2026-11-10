@@ -1200,7 +1200,7 @@ pub(crate) fn strand_bias_pvalue(fwd: usize, rev: usize, expected_fwd_frac: f64)
 }
 
 /// Strand skew: the binomial test against `null_frac` is significant AND the forward fraction is at least
-/// `STRAND_BIAS_MIN_EFFECT` away from it. Used by both denoisers; `filter_strand_bias` and the indel
+/// `STRAND_BIAS_MIN_EFFECT` away from it. Used by both denoisers; `filter_strand_bias` and the BAM
 /// recount apply the same test via `StrandEvidence::skew`, whose values they also log.
 pub(crate) fn is_strand_skewed(fwd: usize, rev: usize, null_frac: f64, p_threshold: f64) -> bool {
     strand_bias_pvalue(fwd, rev, null_frac) < p_threshold
@@ -1340,12 +1340,14 @@ fn filter_strand_bias(
     (kept, filtered_matrix)
 }
 
-fn is_strand_flagged_indel(v: &Variant) -> bool {
-    v.variant_type != "SNP" && v.filter.as_deref() == Some("Strand_bias")
+fn is_strand_flagged(v: &Variant) -> bool {
+    v.filter.as_deref() == Some("Strand_bias")
 }
 
-/// Retest `Strand_bias`-flagged indels on BAM-genotyped alt/cover reads; a balanced split clears the flag.
-fn recount_indel_strand_bias(
+/// Retest `Strand_bias`-flagged variants on BAM-genotyped alt/cover reads.
+/// Graph paths can subsample either strand at an SNV or indel; a balanced split in
+/// the original reads clears that flag without changing any other VCF filter.
+fn recount_strand_bias(
     variants: &[Variant],
     bam_read_record: &HashMap<String, Vec<serde_json::Value>>,
     bam_cover_record: &HashMap<String, HashSet<String>>,
@@ -1354,7 +1356,7 @@ fn recount_indel_strand_bias(
     p_threshold: f64,
 ) -> Vec<Variant> {
     let mut out = variants.to_vec();
-    for variant in out.iter_mut().filter(|v| is_strand_flagged_indel(v)) {
+    for variant in out.iter_mut().filter(|v| is_strand_flagged(v)) {
         let name = generate_variant_name(variant);
         let alt = alt_reads(bam_read_record, &name);
         let ev = StrandEvidence::new(&alt, bam_cover_record.get(&name), strand_map, library_frac);
@@ -1379,8 +1381,8 @@ fn recount_indel_strand_bias(
     out
 }
 
-/// Genotype only the `Strand_bias`-flagged indels in `bam` and retest their strand split there.
-fn recount_flagged_indels_from_bam(
+/// Genotype only the `Strand_bias`-flagged variants in `bam` and retest their strand split there.
+fn recount_flagged_variants_from_bam(
     variants: &[Variant],
     bam: &Path,
     strand_map: &HashMap<String, bool>,
@@ -1389,19 +1391,19 @@ fn recount_flagged_indels_from_bam(
     ref_name: &str,
     p_threshold: f64,
 ) -> Vec<Variant> {
-    let flagged: Vec<Variant> = variants.iter().filter(|v| is_strand_flagged_indel(v)).cloned().collect();
+    let flagged: Vec<Variant> = variants.iter().filter(|v| is_strand_flagged(v)).cloned().collect();
     if flagged.is_empty() {
         return variants.to_vec();
     }
     // Ungated: the matrix noise gate must not move the VCF.
     let (read_record, cover_record) = genotype_from_bam(bam, refseq, ref_name, &flagged, u32::MAX);
     println!(
-        "Strand-bias BAM recount: {} flagged indel(s) from {} (forward fraction {:.3})",
+        "Strand-bias BAM recount: {} flagged variant(s) from {} (forward fraction {:.3})",
         flagged.len(),
         bam.display(),
         library_frac
     );
-    recount_indel_strand_bias(variants, &read_record, &cover_record, strand_map, library_frac, p_threshold)
+    recount_strand_bias(variants, &read_record, &cover_record, strand_map, library_frac, p_threshold)
 }
 
 // ---- adaptive permutation ----
@@ -1882,7 +1884,7 @@ pub fn start(
                 permutation_frequency_threshold,
                 action,
             );
-            let sb_var = recount_flagged_indels_from_bam(
+            let sb_var = recount_flagged_variants_from_bam(
                 &sb_var,
                 bam,
                 &strand_map,
@@ -1955,7 +1957,7 @@ pub fn start(
         link_calls.as_ref().map(|_| new_links.as_slice()),
         &indel_artifact_exempt,
     );
-    // The VCF and every filter above run on the graph; only the lineage matrix is BAM-genotyped.
+    // The VCF uses graph calls with BAM strand rechecks; the lineage matrix is BAM-genotyped.
     let genotype_src = bam.map(|bam| GenotypeSource {
         bam,
         refseq: ref_seq.as_bytes(),
@@ -2503,22 +2505,40 @@ mod tests {
     }
 
     #[test]
-    fn bam_recount_retests_only_strand_flagged_indels() {
+    fn bam_recount_retests_strand_flagged_snvs_and_indels() {
         let sb = Some("Strand_bias");
         // (variant, FILTER before, BAM alt fwd/rev at a balanced site, FILTER after)
         let cases = [
             (var(302, "A", "ACC", 20), sb, 9, 11, None), // balanced in the BAM: cleared
             (var(33, "CG", "C", 20), sb, 1, 19, sb),     // still skewed
             (var(302, "A", "ACC", 20), sb, 1, 0, sb),    // too few BAM alt reads to retest
-            (snp(500, "A", 20), sb, 9, 11, sb),          // SNVs are not recounted
+            (snp(500, "A", 20), sb, 9, 11, None),        // balanced SNV in the BAM: cleared
+            (snp(500, "A", 20), sb, 1, 19, sb),          // truly biased SNV: retained
+            (snp(500, "A", 20), sb, 1, 0, sb),           // insufficient evidence: retained
+            (snp(500, "A", 20), None, 1, 19, None),      // PASS calls are not retested
+            (snp(500, "A", 20), Some("Potential_Artifact"), 9, 11, Some("Potential_Artifact")),
             (var(302, "A", "ACC", 20), Some("Potential_Artifact"), 9, 11, Some("Potential_Artifact")),
         ];
         for (v, before, fwd, rev, after) in cases {
             let v = Variant { filter: before.map(String::from), ..v };
             let bam = sb_case(v.clone(), fwd, rev, 50, 50, 1000);
-            let out = recount_indel_strand_bias(&[v], &bam.read_record, &bam.cover_record, &bam.strand_map, 0.5, 0.01);
+            let out = recount_strand_bias(&[v], &bam.read_record, &bam.cover_record, &bam.strand_map, 0.5, 0.01);
             assert_eq!(out[0].filter.as_deref(), after, "{} {fwd}/{rev}", generate_variant_name(&out[0]));
         }
+    }
+
+    #[test]
+    fn strand_flagged_snv_is_rechecked_using_alignment_genotypes() {
+        let variant = Variant { filter: Some("Strand_bias".into()), ..geno_snp() };
+        // Both alt molecules in this fixture carry the same SNP. Their strand
+        // map is balanced; graph-only strand evidence must not keep the flag.
+        let strands = [("r_alt".to_string(), false), ("r_split".to_string(), true)]
+            .into_iter().collect();
+        let out = recount_flagged_variants_from_bam(
+            &[variant], &geno_path("reads.sam"), &strands, 0.5,
+            GENO_REF.as_bytes(), "chrM", 0.01,
+        );
+        assert_eq!(out[0].filter, None);
     }
 
     // ---- left alignment ----

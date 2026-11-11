@@ -15,9 +15,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 
 OUTDIR="" PROFILE="ont-denoised" NMUT=10 DEPTH=1000
 SEEDS="1 2 3 4 5 6 7 8 9 10"
-# `call -f`: the 0.2 data-type default drops every truth SNV on simulated data
-# and leaves an empty VCF. See README "The -f gate silently empties the VCF".
-FREQ_THRESHOLD=0.05
+FREQ_THRESHOLD=""
 REF_ARG="${REF:-$REPO/rCRS.fasta}"
 KEEP_INTERMEDIATE=0
 # Floor on simulated truth frequencies. Empty = run_eval.sh's default (0.05).
@@ -80,7 +78,7 @@ AGG="$OUTDIR/seed_metrics.tsv"
 FAILED=""
 
 n_seeds=$(wc -w <<<"$SEEDS" | tr -d ' ')
-echo "multi-seed: ${n_seeds} seeds, profile=$PROFILE n_mutations=$NMUT depth=$DEPTH -f=$FREQ_THRESHOLD" >&2
+echo "multi-seed: ${n_seeds} seeds, profile=$PROFILE n_mutations=$NMUT depth=$DEPTH -f=${FREQ_THRESHOLD:-platform-default}" >&2
 
 i=0
 for s in $SEEDS; do
@@ -90,7 +88,8 @@ for s in $SEEDS; do
   rm -rf "$D"
   EVAL_ARGS=(--outdir "$D" --profile "$PROFILE"
              --n-mutations "$NMUT" --total-depth "$DEPTH" --seed "$s"
-             --ref "$REF_ARG" --frequency-threshold "$FREQ_THRESHOLD")
+             --ref "$REF_ARG")
+  [[ -n "$FREQ_THRESHOLD" ]] && EVAL_ARGS+=(--frequency-threshold "$FREQ_THRESHOLD")
   [[ -n "$SIM_MIN_HF" ]] && EVAL_ARGS+=(--sim-min-hf "$SIM_MIN_HF")
   [[ -n "$DENOISE_VAF" ]] && EVAL_ARGS+=(--denoise-vaf "$DENOISE_VAF")
   [[ -n "$TOPOLOGY" ]] && EVAL_ARGS+=(--topology "$TOPOLOGY")

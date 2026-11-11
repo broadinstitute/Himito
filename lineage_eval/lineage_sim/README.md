@@ -4,10 +4,8 @@ Simulate a ground-truth mitochondrial clonal mutation tree, generate long reads
 (PacBio HiFi or ONT-R10), reconstruct the tree with `Himito call` + `Himito
 lineage`, and score reconstruction accuracy across replicate seeds.
 
-**Start here:** [The three frequency gates](#the-three-frequency-gates-read-this-first)
-— the defaults silently empty the VCF on simulated data — and
-[Why `ad_recall` is scored against *all* truth pairs](#why-ad_recall-is-scored-against-all-truth-pairs),
-which governs how the tree metrics may be compared across runs.
+Start with [production calling presets](#production-calling-presets) and
+[ancestry recall](#why-ad_recall-is-scored-against-all-truth-pairs).
 
 ## Files
 
@@ -20,6 +18,7 @@ which governs how the tree metrics may be compared across runs.
 | `simulate_tree.py`, `simulate_reads.sh` | Truth tree and clone genomes; pbsim3 reads. |
 | `run_himito.sh` | minimap2 → `Himito denoise` → `build` → `call` → `lineage`. |
 | `score_lineage.py` | `var_*`, `ad_*`, `hap_*` and HP metrics. |
+| `score_lineage_pair.py` | Strict and branch-only ancestry plus raw-supported haplotype concordance. |
 | `plot_simulation_metrics.py` | Grouped box plots from simulation metric TSVs. |
 | `hp_tracts.py` | rCRS tract catalogue and canonical names (used by the simulator and scorer). |
 | `sweep_hp_rates.sh`, `pick_best_hp_rates.py` | `--hp-fp-rate` × `--hp-fn-rate` sweep on fixed matrices. |
@@ -43,10 +42,10 @@ HP sweep pass. `var_*` still counts every PASS call in the VCF, indels included.
 
 ## Platform requirements
 
-**ONT (`--profile ont-denoised`, or `ont-r10`)** runs on any platform (Linux
-x86, macOS ARM64). pbsim3's `QSHMM-ONT-HQ` model needs no extra tools beyond the
-conda env. Prefer `ont-denoised` — `ont-r10` skips the denoise step and yields an
-empty VCF; see [Use `ont-denoised`, not `ont-r10`](#use-ont-denoised-not-ont-r10).
+**ONT (`--profile ont-r10` or `ont-denoised`)** runs on Linux and macOS ARM64.
+Both profiles simulate the same read type. The denoised profile corrects the
+BAM used to construct the graph. Calling uses the original BAM for read
+evidence in both profiles.
 
 **HiFi (`--profile hifi`)** requires `ccs` (PacBio `pbccs`). Historically `ccs`
 had no macOS-ARM64 build and this profile was Linux-x86-only; as of the current
@@ -69,6 +68,41 @@ conda activate himito-eval
 that `pbsim`, `ccs`, `minimap2`, `samtools`, and Python (`numpy`, `dendropy`)
 all resolve inside the env.
 
+## Score supported haplotypes and branch ancestry
+
+Simulation scoring uses the pre-imputation matrix (`--input-matrix`) to count
+reads that directly support each reconstructed haplotype. A supporting read
+must agree at every observed tree site and cover enough distinguishing sites to
+rule out the root and all competing tree genotypes. Missing calls provide no
+direct evidence. The `supported_hap_*` metrics keep all simulated truth clones
+in the recall denominator. Per-clone evidence is included in `--frequency-out`
+and can also be written separately with `--support-out`.
+
+For two completed paired lineage runs, use the original and cleaned matrices
+from each platform with its mutation tree. The reference label determines the
+orientation of precision and recall.
+
+```bash
+python score_lineage_pair.py \
+  --reference sample.pb.mutation_tree.tsv sample.pb.raw.csv sample.pb.cleaned_matrix_all_variants.csv \
+  --query sample.ont.mutation_tree.tsv sample.ont.raw.csv sample.ont.cleaned_matrix_all_variants.csv \
+  --metrics-out pair_haplotype_metrics.tsv --support-out pair_haplotype_support.json
+```
+
+`run_eval.sh --pair` writes these outputs in addition to its existing pair
+metrics. Both scorers use a provisional reporting threshold of three direct
+reads and ten eligible reads for intermediate clones. Set `--min-clone-support`
+and `--min-clone-eligible` to change the thresholds, or pass
+`--clone-support-scope all` to evaluate the effect of filtering terminal clones
+too. Supported paired F1 includes clones callable in both technologies and
+reports unresolved counts separately. The support score leaves the cleaned
+matrix and strict haplotype F1 intact. Filtered read mass stays unassigned in
+the support-qualified frequency comparison.
+
+Branch-only ancestry ignores directions within comparable unary segments. It
+reports retained and skipped pair counts, and yields `NA` when no informative
+branch relationships remain. Strict ancestry still scores mutation order.
+
 ## Plot simulation metrics
 
 Run `plot_simulation_metrics.py` with a Python environment that has Matplotlib.
@@ -88,107 +122,33 @@ coverages. Repeat `--input LABEL TSV` to add a group. Use `--metrics vcf_vaf_mae
 matrix_vaf_mae` to plot specific columns from newer scoring outputs, or use a
 `.pdf` output path for a vector figure.
 
-## Detection ceiling and tuning guidance
+## Production calling presets
 
-**Read this before interpreting metrics.**
+The simulation wrapper uses the same platform thresholds as Himito
+`quick-start` by default. The aligned BAM supplies read evidence to the
+caller even when the graph was built from denoised reads. The wrapper omits
+the general-purpose NUMT, assembly, and methylation steps for simulated reads.
 
-### The three frequency gates (read this first)
+| Setting | PacBio HiFi | ONT R10 and ONT denoised |
+|---------|------------|-------------------------|
+| Caller minimum VAF (`-v`) | 0.002 | 0.01 |
+| Permutation eligibility ceiling (`-f`) | 0.20 | 0.20 |
+| Permutation BH q-value cutoff | 0.01 | 0.01 |
+| Matrix frequency ceiling for permutation | 0.70 | 0.70 |
+| Small-indel artifact threshold | 0.10 | 0.015 |
+| Denoiser keep VAF | — | 0.03 for `ont-denoised` |
 
-The pipeline applies **three independent frequency floors**, and a truth variant
-is destroyed by whichever is highest. A truth variant's HF is the summed
-frequency of every clone carrying it — at `--n-mutations 10 --sim-min-hf 0.05`
-that is roughly 0.06–0.23, and it falls as `--n-mutations` rises.
+`-f` is the maximum graph allele frequency eligible for permutation testing.
+Lowering it exempts more candidates, and zero bypasses the test for
+positive-frequency alleles. The single-run harness, seed sweep, and simulation
+WDL keep the production ceiling unless a frequency override is supplied.
+Use `--frequency-threshold`, `--vaf`, and `--denoise-vaf` for explicitly labeled
+sensitivity analyses. `--min-hf` applies to lineage reconstruction.
 
-| gate | default | set with | stage |
-|------|---------|----------|-------|
-| `denoise --vaf` | follows `--vaf` (0.01) unless set | `--denoise-vaf` | before the graph |
-| `call -v` | tracks `--min-hf` (0.01) | `--min-hf` / `--vaf` | caller |
-| `call -f` | **0.2** (`call::resolve_thresholds`) | `--frequency-threshold` | permutation test |
-
-> **INVARIANT: every one of these must sit strictly below `--sim-min-hf`.**
-> Any gate above it silently truncates the truth set and caps `var_recall`
-> **regardless of depth** — these are frequency floors, not coverage floors, so
-> adding reads cannot compensate.
-
-Both defaults were tuned for `--n-mutations 10`, where min truth HF is ~0.05, and
-both break silently outside that.
-
-**`call -f` = 0.2.** Measured on `--n-mutations 10 --total-depth 1000 --seed 1`,
-`ont-denoised`:
-
-| `call -f` | VCF records | PASS SNVs | truth SNVs recovered |
-|-----------|-------------|-----------|----------------------|
-| **0.2 (default)** | 0 | 0 | **0 / 10** |
-| 0.1  | 3   | 3  | 3 / 10 |
-| **0.05** | 306 | 10 | **10 / 10** |
-| 0.02 | 593 | 10 | 10 / 10 |
-
-Here all 10 truth SNVs *are* in `<prefix>.raw_matrix.csv` at every setting — the
-graph finds them and the permutation gate throws them away. The symptom is an
-empty VCF, then `Himito lineage` aborting with:
-
-```
-Error running lineage analysis: No informative variants remain after filtering.
-```
-
-**`denoise --vaf`.** This used to be hardcoded to 0.03 in `run_himito.sh` — the
-sweep optimum over the n=10 depth>=300 cells, valid only where the truth has
-headroom above it. It is now unset by default and follows `--vaf`, and the
-resolved value is echoed to stderr at run time so it is never silent. The
-measurement that motivated the change, with the old 0.03 in force: Measured at `--n-mutations 15 --sim-min-hf 0.03` (min truth HF 0.0330),
-one seed, `-f 0.02` so the permutation gate is not the constraint:
-
-| `--denoise-vaf` | truth recovered | var_recall |
-|-----------------|-----------------|------------|
-| **0.03 (default)** | 8 / 15 | **0.533** |
-| 0.01 | 13 / 15 | 0.867 |
-| 0.005 | 14 / 15 | 0.933 |
-
-Unlike the `-f` case these variants are **absent from `raw_matrix.csv` entirely**
-— denoise removes them before the graph is built, so nothing downstream can
-recover them. Raising `--total-depth` from 1000 to 3000 did not move
-`var_recall` at all.
-
-**Working settings.** `--n-mutations 10` at `--sim-min-hf 0.05` clears both
-defaults except `-f`, so it needs only `--frequency-threshold 0.05`. Anything
-rarer needs both:
-
-```bash
-# n=15, min truth HF 0.033 -> every gate must be below it
---sim-min-hf 0.03 --denoise-vaf 0.01 --frequency-threshold 0.02
-```
-
-### Use `ont-denoised`, not `ont-r10`
-
-`run_himito.sh` runs `Himito denoise` only when the profile is `ont-denoised`;
-`ont-r10` skips it. Without indel denoising the graph is swamped (94,694 edges
-vs 25,503 on the same reads) and the VCF comes back empty regardless of `-f`.
-`simulate_reads.sh` simulates both profiles identically, so `ont-denoised`
-changes only the Himito path, not the data. The committed benchmarks were
-produced under `ont-denoised`.
-
-### Low `var_recall` is usually a gate, not the graph
-
-Earlier revisions of this file attributed missing low-frequency variants to GFA
-edges failing to form. That is not what the measurements show on the
-`ont-denoised` path: the losses tracked `denoise --vaf` exactly, and lowering it
-recovered them (8/15 → 14/15 above) with depth held constant. Suspect the gates
-first.
-
-Still true, and independent of the gates: clone frequency falls as
-`--n-mutations` rises, because total clone mass is conserved. At
-`--n-mutations 12 --total-depth 300` a smoke run produced `var_recall ≈ 0.33`,
-`n_shared = 3`, and a degenerate tree.
-
-- Check `var_recall` and `n_shared` **first**. If `n_shared` is well under
-  `n_truth_vars`, fix that first: `ad_recall` is scored against all truth pairs,
-  so undetected variants cap it directly.
-- Verify each gate sits below `--sim-min-hf` before blaming depth.
-- Raise `--total-depth` for genuine coverage limits — but note it cannot fix a
-  frequency gate.
-- To make the *tree* harder without hurting detection, use `--topology` and
-  `--internal-keep` rather than `--n-mutations`. See
-  [Difficulty knobs](#difficulty-knobs).
+Use the production settings to benchmark default precision and recall. When
+investigating lost variants, check whether truth sites survived the denoised
+BAM and appear in the pre-permutation matrix, then check their final VCF
+status. The older frozen benchmarks below pass their own overrides.
 
 ### Difficulty knobs
 
@@ -246,16 +206,13 @@ feasible `--n-mutations` rather than retrying 100 seeds.
 ## Run one evaluation
 
 ```bash
-# ONT (works everywhere). --frequency-threshold is NOT optional here: without
-# it `call -f` defaults to 0.2 and the VCF comes back empty.
+# ONT
 ./run_eval.sh --outdir /tmp/eval_ont --profile ont-denoised \
-  --n-mutations 10 --total-depth 1000 --seed 1 \
-  --frequency-threshold 0.05
+  --n-mutations 10 --total-depth 1000 --seed 1
 
-# HiFi (Linux/x86 only)
+# HiFi
 ./run_eval.sh --outdir /tmp/eval_hifi --profile hifi \
-  --n-mutations 10 --total-depth 1000 --seed 1 \
-  --frequency-threshold 0.05
+  --n-mutations 10 --total-depth 1000 --seed 1
 ```
 
 `run_eval.sh` defaults `REF` to `$REPO/rCRS.fasta`; pass `--ref` if your
@@ -265,12 +222,13 @@ reference lives elsewhere (e.g. `--ref ../../test_data/rCRS.fasta`).
 
 | flag | default | what it does |
 |------|---------|--------------|
-| `--profile` | `ont-r10` | use `ont-denoised`; `ont-r10` skips denoise and empties the VCF |
+| `--profile` | `ont-r10` | `ont-r10` builds from raw alignments and `ont-denoised` builds from corrected alignments |
 | `--n-mutations` / `--total-depth` / `--seed` | 12 / 300 / 1 | simulation size. Not a difficulty knob — see [Difficulty knobs](#difficulty-knobs) |
-| `--frequency-threshold F` | unset (Himito 0.2) | `call -f`. **Must be below `--sim-min-hf`** |
-| `--denoise-vaf F` | unset (follows `--vaf`) | denoise keep threshold. **Must be below `--sim-min-hf`**; see [denoise `--vaf` measurements](#denoise---vaf-measurements) |
+| `--frequency-threshold F` | unset (Himito 0.2) | Override the permutation eligibility ceiling |
+| `--vaf F` | unset (platform preset) | Override the caller VAF floor |
+| `--denoise-vaf F` | unset (Himito 0.03) | Override the denoiser keep threshold |
 | `--sim-min-hf F` / `--sim-max-hf F` | 0.05 / 0.99 | band for *simulated truth* frequencies (distinct from `--min-hf`) |
-| `--min-hf F` / `--max-hf F` | 0.01 / 0.95 | band for `call -v` and `lineage`; **not** the truth band |
+| `--min-hf F` / `--max-hf F` | 0.01 / 0.95 | heteroplasmy band for lineage reconstruction |
 | `--topology random\|chain\|star` | `random` | tree shape; `chain` for ordering difficulty |
 | `--internal-keep F` | 0.20 | terminal mass per internal node; lower = harder ordering |
 | `--fp F` / `--fn F` | unset | SCITE error rates. Unset uses `lineage::resolve_error_rates` (`hifi` 0.005/0.05, every ONT profile 0.005/0.02); `metrics.tsv` records the resolved values |
@@ -280,22 +238,6 @@ reference lives elsewhere (e.g. `--ref ../../test_data/rCRS.fasta`).
 
 `--sim-min-hf` and `--min-hf` are easy to confuse: the first constrains what is
 *simulated*, the second filters what was *called*.
-
-### Call-tuning defaults in `run_himito.sh`
-
-The wrapper passes sim-appropriate `Himito call` flags by default:
-
-| Flag | Default | Why |
-|------|---------|-----|
-| `--minimal-ac` | 2 | Same as Himito `call` / quick-start. |
-| `--vaf` | lineage `--min-hf` (0.01) | Call floor tracks the lineage HF band unless `--vaf` is set. |
-| `--frequency-threshold` | unset (Himito 0.2) | Permutation-test heteroplasmy gate (`call -f`). **Leaving this unset empties the VCF on simulated data** — see [The `-f` gate](#the-three-frequency-gates-read-this-first). Pass `0.05`. `--p-value-threshold` is never set, so `call::resolve_thresholds` supplies the data-type p-value (0.01). |
-
-These can be overridden when calling `run_himito.sh` directly:
-```bash
-./run_himito.sh --outdir /tmp/eval_ont --profile ont-denoised \
-  --frequency-threshold 0.05
-```
 
 ## The standard benchmark (`bench_standard.sh`)
 
@@ -629,7 +571,7 @@ Two things that did **not** work, so you can skip them:
 - **Three frequency gates must all sit below `--sim-min-hf`.** `call -f` (0.2),
   `denoise --vaf` (0.03) and `call -v`. The first two defaults were tuned for
   `--n-mutations 10` and break silently otherwise; no amount of depth
-  compensates. See [The three frequency gates](#the-three-frequency-gates-read-this-first).
+  compensates. See [production calling presets](#production-calling-presets).
 - **`ad_*` changed definition.** `ad_recall` is now scored against all truth
   pairs, so numbers from before that change are inflated and not comparable; see
   [Why `ad_recall` is scored against *all* truth pairs](#why-ad_recall-is-scored-against-all-truth-pairs).

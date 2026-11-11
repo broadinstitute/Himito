@@ -9,52 +9,14 @@ REF="${REF:-$REPO/rCRS.fasta}"
 OUTDIR="" PROFILE="" SAMPLE="SIM" FP="" FN="" KMER=21
 HIMITO_THREADS="${HIMITO_THREADS:-4}"
 
-# Call/build-tuning defaults: match `Himito quick-start`'s own defaults, NOT
-# tuned-for-simulated-data overrides, so this harness measures the pipeline
-# users actually run. Values below are quick-start's CLI defaults (main.rs
-# QuickStart: minimal_ac=2, vaf_threshold=0.01, strand_bias_threshold=0.05,
-# indel_false_threshold=0.1, build's min_edge_reads hardcoded to 2) or, where
-# quick-start leaves a threshold as Option<None>, the same
-# call::resolve_thresholds(data_type, None, None, None) fallback (p=0.01,
-# f=0.2, perm=0.7 for every profile this script supports). `--p-value-threshold`
-# is deliberately omitted so that data-type default runs; pass
-# --frequency-threshold to override `-f` without touching `-p`.
-
-# Call -v tracks lineage --min-hf unless --vaf is passed explicitly, so the
-# VCF that score_lineage.py reads is already cut at the same floor lineage uses.
-# Empty here; filled with MIN_HF after argv parsing.
-MINIMAL_AC=2 VAF="" FREQ_THRESHOLD="" PERM_FREQ_THRESHOLD=0.7
-STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=0.1
-# denoise's keep threshold, decoupled from the caller's -v. quick-start ties the two
-# together, but they answer different questions: -v is a raw HF cut on a called
-# variant, while this one is compared against the site model's EM estimate, which
-# discounts alt observations explainable as quality-weighted error. That makes it a
-# sharper filter on noise sites whose raw HF overlaps real low-frequency
-# heteroplasmies.
-#
-# NOT hardcoded any more. This used to default to 0.03 -- the sweep optimum over
-# the n=10 depth>=300 cells (variant precision 0.837 -> 0.967 at recall 1.000).
-# That number is only valid where the simulated truth has headroom above it, and
-# it is a *frequency* floor applied before the graph is built, so when it does not
-# it silently deletes truth variants and no amount of depth recovers them: at
-# --n-mutations 15 --sim-min-hf 0.03 (min truth HF 0.0330) the 0.03 default cut
-# var_recall to 0.533, and 0.01 restored it to 0.867 on the same reads.
-#
-# Unset now follows --vaf, which is what `Himito quick-start` does (main.rs passes
-# the same vaf_threshold to both). The resolved value is echoed below so it is
-# never silent. Pass --denoise-vaf explicitly to override, and keep it below the
-# lowest heteroplasmy you expect to recover.
+# Reuse the caller and denoiser presets unless the benchmark explicitly overrides
+# them. The standalone caller has a different strand-bias default from quick-start.
+MINIMAL_AC=2 VAF="" FREQ_THRESHOLD="" PERM_FREQ_THRESHOLD=""
+STRAND_BIAS_THRESHOLD=0.05 INDEL_FALSE_THRESHOLD=""
 DENOISE_VAF=""
-# MIN_EDGE_READS deliberately diverges from quick-start's hardcoded 2: the gate is
-# now inclusive (>= N reads), and 1 CIGARs every read-supported edge. At 2, ~98% of
-# edges on this ONT graph go un-CIGARed and the reads reaching a bubble through them
-# are recorded as missing rather than ref, which is what starved the lineage matrix.
 MIN_EDGE_READS=2
 
-# HF band for `Himito lineage` and, unless --vaf is set, for `Himito call -v`.
-# score_lineage.py still counts every PASS/. call (no second HF band): with call
-# already cut at this floor, that is evaluation at the same min-hf.
-# Empty --fp/--fn: Himito lineage uses the -d preset (pacbio 0.005/0.05, ONT 0.005/0.02).
+# The lineage HF band is independent of the caller and denoiser floors.
 MIN_HF=0.01 MAX_HF=0.95
 # Himito lineage is SNV-only by default. --include-non-snvs admits indels (needed
 # for the HP benchmark); --collapse-hp requires it and turns it on.
@@ -112,9 +74,6 @@ case "$PROFILE" in
   *) echo "profile must be hifi or ont-r10 or ont-denoised" >&2; exit 1;;
 esac
 
-# After profile/min-hf are known: call -v follows --min-hf unless --vaf was set.
-VAF="${VAF:-$MIN_HF}"
-
 HDIR="$OUTDIR/himito"; mkdir -p "$HDIR"
 FQ="$OUTDIR/reads/reads.fastq.gz"
 BAM="$HDIR/aln.sorted.bam"
@@ -131,45 +90,18 @@ minimap2 -ax "$MMPRESET" -t "$HIMITO_THREADS" "$REF" "$FQ" \
   | samtools sort -o "$BAM" -
 samtools index "$BAM"
 
-# Denoise ONT reads before graph construction (no-op for hifi/pacbio).
-# quick-start ties denoise's --vaf to the SAME vaf_threshold used for calling
-# (main.rs: `vaf_threshold as f64`). The strand gates are no longer flags at all:
-# min-strand (2) and the strand-bias p (0.01) are the DENOISE_MIN_STRAND /
-# DENOISE_STRAND_BIAS_P constants in main.rs, identical on both paths. The
-# near-homoplasmic exemption does NOT match: quick-start uses 0.7, the standalone
-# denoise subcommand uses 0.95 (DENOISE_HOMOPLASMIC_VAF). This script runs
-# `denoise` directly, so it benchmarks at 0.95.
-#
-# Indel denoising is ON by default. It used to be documented as off with a
-# DENOISE_INDELS=1 opt-in, but `--indels` was ALSO appended unconditionally to the
-# command below, so the switch was dead and indel denoising ran every time -- which
-# is the configuration every committed benchmark here was produced under. Turning it
-# genuinely off costs almost everything: on seed1_mut10_depth300 the VCF goes from 19
-# PASS SNVs / 1 indel to 1 PASS SNV / 10 indels, because uncorrected indel artifacts
-# crowd the graph and matrix. Set DENOISE_INDELS=0 to run the off-vs-on comparison.
+# Denoising changes the graph input. quick-start still passes the original
+# BAM to call for strand evidence, linkage rescue, and genotyping.
 DENOISE_INDELS="${DENOISE_INDELS:-1}"
-
 BUILD_BAM="$BAM"
-CALL_DATATYPE="$DTYPE"
 if [[ "$DTYPE" == ont-denoised ]]; then
   DENOISED="$HDIR/aln.denoised.bam"
-  # Announce the resolved threshold and where it came from. This gate silently
-  # deletes truth variants below it, so a run must never have to guess which
-  # value was in effect.
-  if [[ -n "$DENOISE_VAF" ]]; then
-    RESOLVED_DENOISE_VAF="$DENOISE_VAF"; DENOISE_VAF_SRC="--denoise-vaf"
-  else
-    RESOLVED_DENOISE_VAF="$VAF"; DENOISE_VAF_SRC="follows --vaf"
-  fi
-  echo "denoise --vaf ${RESOLVED_DENOISE_VAF} (${DENOISE_VAF_SRC}); truth variants below this are removed before the graph" >&2
-  DENOISE_ARGS=(--vaf "$RESOLVED_DENOISE_VAF" --stats "$HDIR/denoise_stats.json")
-  if [[ "$DENOISE_INDELS" == "1" ]]; then
-    DENOISE_ARGS+=(--indels)
-  fi
+  DENOISE_ARGS=(--stats "$HDIR/denoise_stats.json")
+  [[ -n "$DENOISE_VAF" ]] && DENOISE_ARGS+=(--vaf "$DENOISE_VAF")
+  [[ "$DENOISE_INDELS" == 1 ]] && DENOISE_ARGS+=(--indels)
   "$HIMITO" denoise -i "$BAM" -o "$DENOISED" -r "$REF" -d "$DTYPE" "${DENOISE_ARGS[@]}"
   samtools index "$DENOISED"
   BUILD_BAM="$DENOISED"
-  CALL_DATATYPE="ont-denoised"
 fi
 
 # Build anchor graph (input can be a BAM). --min-edge-reads matches
@@ -178,20 +110,16 @@ fi
 "$HIMITO" build -i "$BUILD_BAM" -r "$REF" -k "$KMER" -o "$HDIR/sim.gfa" -l 3000 \
   --min-edge-reads "$MIN_EDGE_READS"
 
-# Call variants: -o is the VCF; matrix.csv is derived as <o>.matrix.csv.
-# `-p` / `--p-value-threshold` is omitted so call::resolve_thresholds applies
-# the data-type default (0.01 for every profile this script supports). `-f` is
-# only forwarded when --frequency-threshold was set; otherwise that default
-# (0.2 here) applies too.
+# Leave platform-specific VAF, indel and permutation thresholds to Himito.
 CALL_ARGS=(
-  -g "$HDIR/sim.gfa" -r "$REF" -s "$SAMPLE" -d "$CALL_DATATYPE"
-  -o "$HDIR/sim.vcf" -k "$KMER" --input-bam "$BUILD_BAM"
-  -m "$MINIMAL_AC" -v "$VAF"
-  --permutation-frequency-threshold "$PERM_FREQ_THRESHOLD"
-  --strand-bias-threshold "$STRAND_BIAS_THRESHOLD"
-  --indel-false-threshold "$INDEL_FALSE_THRESHOLD"
+  -g "$HDIR/sim.gfa" -r "$REF" -s "$SAMPLE" -d "$DTYPE"
+  -o "$HDIR/sim.vcf" -k "$KMER" --input-bam "$BAM"
+  -m "$MINIMAL_AC" --strand-bias-threshold "$STRAND_BIAS_THRESHOLD"
 )
+[[ -n "$VAF" ]] && CALL_ARGS+=(-v "$VAF")
 [[ -n "$FREQ_THRESHOLD" ]] && CALL_ARGS+=(-f "$FREQ_THRESHOLD")
+[[ -n "$PERM_FREQ_THRESHOLD" ]] && CALL_ARGS+=(--permutation-frequency-threshold "$PERM_FREQ_THRESHOLD")
+[[ -n "$INDEL_FALSE_THRESHOLD" ]] && CALL_ARGS+=(--indel-false-threshold "$INDEL_FALSE_THRESHOLD")
 "$HIMITO" call "${CALL_ARGS[@]}"
 
 # The HP-rate sweep re-runs lineage itself. Leave the matrix, VCF, reads, and truth in place.

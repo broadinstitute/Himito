@@ -333,6 +333,170 @@ def _f1(p: float, r: float) -> float:
     return 0.0 if (p + r) == 0 else 2 * p * r / (p + r)
 
 
+def branch_ancestry(reference, reconstruction):
+    """Compare directed relationships after setting aside within-segment order."""
+    def segments(tree):
+        child_count = Counter(p for v, p in tree.items() if v != "ROOT")
+        result = {}
+        for variant in tree.keys() - {"ROOT"}:
+            start = variant
+            for _ in tree:
+                parent = tree.get(start, "ROOT")
+                if parent == "ROOT" or child_count[parent] != 1:
+                    break
+                start = parent
+            else:
+                raise ValueError(f"Cycle in tree at {variant}")
+            result[variant] = start
+        return result
+
+    shared = (reference.keys() & reconstruction.keys()) - {"ROOT"}
+    ref_pairs = _anc_pairs(ancestor_sets(reference), shared)
+    recon_pairs = _anc_pairs(ancestor_sets(reconstruction), shared)
+    ref_segments, recon_segments = segments(reference), segments(reconstruction)
+    both_comparable = {frozenset(p) for p in ref_pairs} & {frozenset(p) for p in recon_pairs}
+    skipped = {frozenset((a, b)) for a, b in both_comparable
+               if ref_segments[a] == ref_segments[b] or recon_segments[a] == recon_segments[b]}
+    ref_pairs = {p for p in ref_pairs if frozenset(p) not in skipped}
+    recon_pairs = {p for p in recon_pairs if frozenset(p) not in skipped}
+    matches = len(ref_pairs & recon_pairs)
+    informative = bool(ref_pairs or recon_pairs)
+    precision = matches / len(recon_pairs) if recon_pairs else 0.0
+    recall = matches / len(ref_pairs) if ref_pairs else 0.0
+    return dict(branch_ad_precision=precision if informative else None,
+                branch_ad_recall=recall if informative else None,
+                branch_ad_f1=_f1(precision, recall) if informative else None,
+                branch_ad_n_ref_pairs=len(ref_pairs), branch_ad_n_query_pairs=len(recon_pairs),
+                branch_ad_n_matching_pairs=matches, branch_ad_n_skipped_pairs=len(skipped),
+                branch_ad_n_unshared_sites=len((reference.keys() ^ reconstruction.keys()) - {"ROOT"}),
+                branch_ad_status="evaluated" if informative else "no_informative_pairs")
+
+
+def tree_haplotypes(tree):
+    return {frozenset(anc | {variant}) for variant, anc in ancestor_sets(tree).items()}
+
+
+def matrix_haplotype_counts(path, sites, background):
+    reads, rows = _frequency_matrix_rows(path, sites, background)
+    if set(rows) != sites:
+        raise ValueError(f"Tree variants missing from {path}: {sorted(sites - rows.keys())}")
+    counts = Counter()
+    for i, read in enumerate(reads):
+        if read != "chrM":
+            calls = {v: _allele_call(copies, i) for v, copies in rows.items()}
+            if None not in calls.values():
+                counts[frozenset(v for v, call in calls.items() if call == 1)] += 1
+    physical_reads = [read for read in reads if read != "chrM"]
+    if len(set(physical_reads)) != len(physical_reads):
+        raise ValueError(f"Duplicate read IDs in {path}")
+    return counts, set(physical_reads)
+
+
+def haplotype_support(path, candidates, alternatives, background, min_support, min_eligible, *,
+                      required_reads=()):
+    """Raw evidence per candidate, using unique compatible observations only."""
+    genotypes = candidates | alternatives | {frozenset()}
+    panel = sorted(set().union(*genotypes))
+    bits = {v: 1 << i for i, v in enumerate(panel)}
+    masks = {h: sum(bits[v] for v in h) for h in genotypes}
+    reads, rows = _frequency_matrix_rows(path, set(panel), background)
+    indices = [i for i, read in enumerate(reads) if read != "chrM"]
+    raw_ids = {reads[i] for i in indices}
+    if len(raw_ids) != len(indices):
+        raise ValueError(f"Duplicate read IDs in {path}")
+    if not raw_ids.issuperset(required_reads):
+        raise ValueError(f"{path} must include every cleaned read ID")
+    patterns = Counter()
+    for i in indices:
+        observed = alternate = 0
+        for v, copies in rows.items():
+            call = _allele_call(copies, i)
+            if call is not None:
+                observed |= bits[v]
+                if call:
+                    alternate |= bits[v]
+        patterns[observed, alternate] += 1
+
+    evidence = {}
+    for hap in candidates:
+        expected = masks[hap]
+        differences = [expected ^ mask for other, mask in masks.items() if other != hap]
+        eligible = support = ambiguous = conflicts = 0
+        for (observed, alternate), n in patterns.items():
+            distinguishable = bool(observed) and all(observed & d for d in differences)
+            eligible += n if distinguishable else 0
+            if (observed & expected) != alternate:
+                conflicts += n
+            elif distinguishable:
+                support += n
+            else:
+                ambiguous += n
+        status = "supported"
+        if eligible < min_eligible:
+            status = "insufficient_coverage"
+        elif support < min_support:
+            status = "insufficient_support"
+        evidence[hap] = dict(eligible=eligible, direct_support=support, ambiguous=ambiguous,
+                             conflicting=conflicts, status=status)
+    return evidence, len(indices)
+
+
+def supported_calls(counts, own_tree_haps, evidence, scope="intermediate"):
+    calls = counts.keys() - {frozenset()}
+    intermediates = {h for h in own_tree_haps if any(h < other for other in own_tree_haps)}
+    retained = {h for h in calls if evidence[h]["status"] == "supported"
+                or (scope == "intermediate" and h not in intermediates)}
+    return retained, intermediates
+
+
+def support_detail(evidence, counts, retained, intermediates):
+    return [dict(variants=sorted(hap), **evidence[hap], imputed_reads=counts[hap],
+                 candidate_class=("not_reconstructed" if hap not in counts else
+                                  "intermediate" if hap in intermediates else "terminal"),
+                 reconstructed=hap in counts, retained=hap in retained)
+            for hap in sorted(evidence, key=lambda h: sorted(h))]
+
+
+BRANCH_FIELDS = list(branch_ancestry({}, {}))
+SUPPORT_FIELDS = ["supported_hap_precision", "supported_hap_recall", "supported_hap_f1",
+                  "supported_hap_tp", "supported_hap_fp", "supported_hap_fn",
+                  "supported_hap_n_filtered", "supported_hap_filtered_read_fraction",
+                  "supported_hap_freq_unassigned", "supported_hap_freq_tv"]
+
+
+def supported_haplotype_metrics(reference, query):
+    scores = score_haplotypes(reference, query)
+    return dict(supported_hap_precision=scores["hap_precision"],
+                supported_hap_recall=scores["hap_recall"], supported_hap_f1=scores["hap_f1"],
+                supported_hap_tp=len(reference & query), supported_hap_fp=len(query - reference),
+                supported_hap_fn=len(reference - query))
+
+
+def retained_haplotype_frequencies(counts, retained, n_reads):
+    if not n_reads:
+        return {}, None
+    frequencies = {h: count / n_reads for h, count in counts.items() if not h or h in retained}
+    return frequencies, (n_reads - sum(counts[h] for h in frequencies)) / n_reads
+
+
+def haplotype_frequency_tv(reference, query, ref_unassigned, query_unassigned):
+    if ref_unassigned is None or query_unassigned is None:
+        return None
+    distance = math.fsum(abs(reference.get(h, 0.0) - query.get(h, 0.0))
+                         for h in reference.keys() | query.keys())
+    return (distance + abs(ref_unassigned - query_unassigned)) / 2
+
+
+def add_support_args(parser):
+    parser.add_argument("--min-clone-support", type=int, default=3,
+                        help="minimum direct reads to retain an intermediate clone (default: 3)")
+    parser.add_argument("--min-clone-eligible", type=int, default=10,
+                        help="minimum eligible raw reads to evaluate a clone (default: 10)")
+    parser.add_argument("--clone-support-scope", choices=("intermediate", "all"), default="intermediate",
+                        help="which reconstructed clones must pass the support rule")
+    parser.add_argument("--support-out", help="JSON with per-clone raw support and imputed counts")
+
+
 def score(truth_parent, recon_parent, truth_vars, detected_vars,
           truth_haps=None, recon_haps=None, background=None) -> dict:
     # Plan 2026-09-27 T6. None leaves names as written. A list, including an
@@ -445,7 +609,7 @@ HP_FIELDS = ["n_hp_unstable_truth", "n_hp_unstable_called",
 FIELDS = ["profile", "fp", "fn", "n_truth_vars", "n_detected_vars", "n_shared",
           "n_truth_pairs",
           "var_precision", "var_recall", "var_f1",
-          "ad_precision", "ad_recall", "ad_f1"] + HAP_FIELDS + ["n_background_calls"] + HP_FIELDS + FREQUENCY_FIELDS
+          "ad_precision", "ad_recall", "ad_f1"] + HAP_FIELDS + ["n_background_calls"] + HP_FIELDS + FREQUENCY_FIELDS + BRANCH_FIELDS + SUPPORT_FIELDS
 
 _SNV_NAME = re.compile(r"^m\.\d+([ACGT])>([ACGT])$")
 
@@ -639,6 +803,7 @@ def main() -> None:
     ap.add_argument("--metrics-out", default="")
     ap.add_argument("--input-matrix", default="", help="Pre-lineage BAM genotype matrix; counts omitted reads as unassigned")
     ap.add_argument("--frequency-out", default="", help="JSON detail for truth/called VAF and haplotype read fractions")
+    add_support_args(ap)
     ap.add_argument(
         "--truth-background",
         default="",
@@ -666,6 +831,10 @@ def main() -> None:
         "(plan 2026-09-27 T6)",
     )
     args = ap.parse_args()
+    if min(args.min_clone_support, args.min_clone_eligible) < 1:
+        ap.error("clone thresholds must be positive")
+    if args.support_out and not args.input_matrix:
+        ap.error("--support-out requires --input-matrix")
     try:
         background_tokens = parse_background(args.background)
     except ValueError as exc:
@@ -730,6 +899,8 @@ def main() -> None:
            "hp_len_l1": hp_length_l1(tract_rows, args.recon_matrix, background_tokens),
            "root_fraction": root_fraction(args.recon_tree)}
 
+    row.update(branch_ancestry(truth_pm, recon_pm))
+    row.update(dict.fromkeys(SUPPORT_FIELDS))
     row.update(dict.fromkeys(FREQUENCY_FIELDS))
     if args.input_matrix or args.frequency_out:
         if not args.recon_matrix:
@@ -744,6 +915,45 @@ def main() -> None:
         except (ValueError, KeyError) as exc:
             ap.error(str(exc))
         row.update(summary)
+        if args.input_matrix:
+            counts, _ = matrix_haplotype_counts(args.recon_matrix, keep, background_tokens)
+            candidates = counts.keys() - {frozenset()}
+            tree_haps = tree_haplotypes(recon_pm)
+            evidence, n_reads = haplotype_support(args.input_matrix, candidates, tree_haps,
+                                                  background_tokens, args.min_clone_support,
+                                                  args.min_clone_eligible)
+            retained, intermediates = supported_calls(counts, tree_haps, evidence, args.clone_support_scope)
+            expected = set(truth_freq) - {frozenset()}
+            removed = candidates - retained
+            frequencies, unassigned = retained_haplotype_frequencies(counts, retained, n_reads)
+            row.update(supported_haplotype_metrics(expected, retained),
+                       supported_hap_n_filtered=len(removed),
+                       supported_hap_filtered_read_fraction=sum(counts[h] for h in removed) / n_reads if n_reads else None,
+                       supported_hap_freq_unassigned=unassigned,
+                       supported_hap_freq_tv=haplotype_frequency_tv(truth_freq, frequencies, 0.0, unassigned))
+            hap_details = support_detail(evidence, counts, retained, intermediates)
+            for record in hap_details:
+                hap = frozenset(record["variants"])
+                record["in_truth"] = hap in expected
+                record["truth_frequency"] = truth_freq.get(hap, 0.0)
+            details["haplotype_support"] = hap_details
+            details["supported_hap_missing_truth"] = [
+                dict(variants=sorted(hap), truth_frequency=truth_freq[hap],
+                     reason=evidence[hap]["status"] if hap in candidates else "not_reconstructed")
+                for hap in sorted(expected - retained, key=lambda h: sorted(h))
+            ]
+            truth_tree_haps = tree_haplotypes(truth_pm)
+            truth_intermediates = {h for h in expected if any(h < other for other in truth_tree_haps)}
+            intermediate_calls = (candidates & truth_intermediates) | ((candidates - expected) & intermediates)
+            details["haplotype_support_by_clone_class"] = {
+                "intermediate": supported_haplotype_metrics(truth_intermediates, retained & intermediate_calls),
+                "terminal": supported_haplotype_metrics(expected - truth_intermediates, retained - intermediate_calls),
+            }
+            details["summary"].update({field: row[field] for field in SUPPORT_FIELDS})
+            if args.support_out:
+                with open(args.support_out, "w") as fh:
+                    json.dump(hap_details, fh, indent=2)
+                    fh.write("\n")
         if args.frequency_out:
             with open(args.frequency_out, "w") as fh:
                 json.dump(details, fh, indent=2, allow_nan=False)

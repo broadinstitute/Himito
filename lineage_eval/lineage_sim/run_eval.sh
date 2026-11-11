@@ -10,24 +10,9 @@ export REF="${REF:-$REPO/rCRS.fasta}"
 export HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 
 OUTDIR="" PROFILE="ont-r10" NMUT=12 DEPTH=300 SEED=1 FP="" FN=""
-# Himito call -f override forwarded to run_himito.sh. Empty = omit `-f` so
-# call::resolve_thresholds applies the data-type default (0.2 here). `-p` is
-# never forwarded: run_himito.sh lets the same resolver pick the p-value.
-FREQ_THRESHOLD=""
-# denoise's keep threshold, forwarded to run_himito.sh (which defaults it to 0.03).
-# That default was swept on n=10 cells whose rarest truth variant sits at HF ~0.05.
-# It is a *frequency* floor, not a coverage floor, so depth cannot compensate: at
-# --n-mutations 15 --sim-min-hf 0.03 the six variants at HF 0.033-0.045 never reach
-# raw_matrix.csv and var_recall caps at 0.53 even at --total-depth 3000. Lowering it
-# to 0.01 restores them (0.53 -> 0.87). Keep this below --sim-min-hf.
-DENOISE_VAF=""
-# Shared HF floor for `Himito call -v` and `Himito lineage --min-hf` (forwarded
-# via run_himito.sh). score_lineage.py does not re-band: it counts every PASS/.
-# call, which is evaluation at this floor once the caller already cut there.
-# 0.01 matches the committed benchmarks, whose truth SNVs are *observed* at
-# HF 0.06-0.21 and would be mostly filtered away by a 0.1 floor.
-# max-hf 0.95 matches the Himito lineage CLI (excludes near-fixed sites).
-# Empty --fp/--fn: lineage uses the -d preset (see resolve_scite_rates below).
+# Optional caller and denoiser overrides. Empty values use the platform presets.
+FREQ_THRESHOLD="" DENOISE_VAF="" VAF=""
+# Heteroplasmy band for lineage reconstruction.
 MIN_HF=0.01 MAX_HF=0.95
 # Band for simulate_tree.py's *truth* frequencies. This is a different constraint
 # from the lineage filter above -- one is what we simulate, the other is how we
@@ -76,6 +61,7 @@ while [[ $# -gt 0 ]]; do
     --fp) FP="$2"; shift 2;;
     --fn) FN="$2"; shift 2;;
     --frequency-threshold) FREQ_THRESHOLD="$2"; shift 2;;
+    --vaf) VAF="$2"; shift 2;;
     --denoise-vaf) DENOISE_VAF="$2"; shift 2;;
     --min-hf) MIN_HF="$2"; shift 2;;
     --max-hf) MAX_HF="$2"; shift 2;;
@@ -101,7 +87,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--include-non-snvs] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC] [--pair] [--stop-after call]" >&2
+  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--vaf F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--include-non-snvs] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC] [--pair] [--stop-after call]" >&2
   exit 1
 }
 # Fail before any simulation. An ONT-only run is not a pair.
@@ -157,11 +143,12 @@ run_one_profile() {
   # Not `local -a`: macOS bash 3.2 rejects compound assignment on local.
   HIMITO_ARGS=(
     --outdir "$OUTDIR" --profile "$profile" --sample SIM
-    --vaf "$MIN_HF" --min-hf "$MIN_HF" --max-hf "$MAX_HF"
+    --min-hf "$MIN_HF" --max-hf "$MAX_HF"
   )
   [[ -n "$FP" ]] && HIMITO_ARGS+=(--fp "$FP")
   [[ -n "$FN" ]] && HIMITO_ARGS+=(--fn "$FN")
   [[ -n "$FREQ_THRESHOLD" ]] && HIMITO_ARGS+=(--frequency-threshold "$FREQ_THRESHOLD")
+  [[ -n "$VAF" ]] && HIMITO_ARGS+=(--vaf "$VAF")
   [[ -n "$DENOISE_VAF" ]] && HIMITO_ARGS+=(--denoise-vaf "$DENOISE_VAF")
   [[ "$INCLUDE_NON_SNVS" == 1 ]] && HIMITO_ARGS+=(--include-non-snvs)
   [[ "$COLLAPSE_HP" == 1 ]] && HIMITO_ARGS+=(--collapse-hp)
@@ -239,6 +226,11 @@ with open(out_f, "w") as fh:
     fh.write(f"{pair['ad_f1']}\t{delta}\n")
 PY
   rm -f "$pair_score"
+  python "$HERE/score_lineage_pair.py" \
+    --reference "$OUTDIR/himito_pb/sim_lineage.mutation_tree.tsv" "$OUTDIR/himito_pb/sim.matrix.csv" "$OUTDIR/himito_pb/sim_lineage.cleaned_matrix_all_variants.csv" \
+    --query "$OUTDIR/himito_ont/sim_lineage.mutation_tree.tsv" "$OUTDIR/himito_ont/sim.matrix.csv" "$OUTDIR/himito_ont/sim_lineage.cleaned_matrix_all_variants.csv" \
+    --metrics-out "$OUTDIR/pair_haplotype_metrics.tsv" \
+    --support-out "$OUTDIR/pair_haplotype_support.json"
 }
 
 # sim.matrix.csv and sim.vcf are enough for sweep_hp_rates.sh.

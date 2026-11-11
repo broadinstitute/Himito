@@ -13,7 +13,7 @@ workflow HimitoLineageSim {
         File reference_fa
 
         String profile = "ont-r10"          # hifi | ont-r10 | ont-denoised (hifi needs ccs -> linux/amd64)
-        Float? frequency_threshold = 0.05   # null uses Himito call's platform preset
+        Float? frequency_threshold          # omitted uses Himito call's platform preset
 
         Float? fp
         Float? fn
@@ -99,7 +99,7 @@ task RunEvalCell {
         fp_arg:        "optional '--fp <rate>' override; empty uses the profile's Himito default"
         fn_arg:        "optional '--fn <rate>' override; empty uses the profile's Himito default"
         frequency_threshold_arg: "optional '--frequency-threshold <F>' override; empty uses Himito call's data-type default"
-        min_hf:        "shared HF floor for Himito call -v and lineage --min-hf"
+        min_hf:        "minimum heteroplasmy for lineage reconstruction"
         reference_fa:  "mitochondrial reference FASTA (required)"
     }
 

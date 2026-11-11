@@ -90,6 +90,10 @@ done
   echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--vaf F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--include-non-snvs] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC] [--pair] [--stop-after call]" >&2
   exit 1
 }
+CLEANED_MATRIX=cleaned_matrix_all_variants.csv
+if [[ "$INCLUDE_NON_SNVS" == 1 || "$COLLAPSE_HP" == 1 ]]; then
+  CLEANED_MATRIX=cleaned_matrix_including_non_snvs.csv
+fi
 # Fail before any simulation. An ONT-only run is not a pair.
 if [[ "$PAIR" == 1 ]]; then
   command -v ccs >/dev/null 2>&1 || {
@@ -173,7 +177,7 @@ score_reconstruction() {
     --recon-tree "$OUTDIR/$hdir/sim_lineage.mutation_tree.tsv" \
     --truth-variants "$OUTDIR/truth/truth_variants.txt" \
     --vcf "$OUTDIR/$hdir/sim.vcf" \
-    --recon-matrix "$OUTDIR/$hdir/sim_lineage.cleaned_matrix_all_variants.csv" \
+    --recon-matrix "$OUTDIR/$hdir/sim_lineage.$CLEANED_MATRIX" \
     --truth-clones "$OUTDIR/truth/clones.tsv" \
     --input-matrix "$OUTDIR/$hdir/sim.matrix.csv" \
     --frequency-out "${metrics%.tsv}.frequencies.json" \
@@ -227,8 +231,8 @@ with open(out_f, "w") as fh:
 PY
   rm -f "$pair_score"
   python "$HERE/score_lineage_pair.py" \
-    --reference "$OUTDIR/himito_pb/sim_lineage.mutation_tree.tsv" "$OUTDIR/himito_pb/sim.matrix.csv" "$OUTDIR/himito_pb/sim_lineage.cleaned_matrix_all_variants.csv" \
-    --query "$OUTDIR/himito_ont/sim_lineage.mutation_tree.tsv" "$OUTDIR/himito_ont/sim.matrix.csv" "$OUTDIR/himito_ont/sim_lineage.cleaned_matrix_all_variants.csv" \
+    --reference "$OUTDIR/himito_pb/sim_lineage.mutation_tree.tsv" "$OUTDIR/himito_pb/sim.matrix.csv" "$OUTDIR/himito_pb/sim_lineage.$CLEANED_MATRIX" \
+    --query "$OUTDIR/himito_ont/sim_lineage.mutation_tree.tsv" "$OUTDIR/himito_ont/sim.matrix.csv" "$OUTDIR/himito_ont/sim_lineage.$CLEANED_MATRIX" \
     --metrics-out "$OUTDIR/pair_haplotype_metrics.tsv" \
     --support-out "$OUTDIR/pair_haplotype_support.json"
 }

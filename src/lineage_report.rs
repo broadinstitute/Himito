@@ -82,6 +82,7 @@ pub fn write_imputation_summary(
         .map(|(name, row)| (name.as_str(), row.as_slice())).collect();
     let search_rows: HashMap<_, _> = search.variants.iter().enumerate()
         .map(|(i, name)| (name.as_str(), i)).collect();
+    let search_observed = search.data.iter().flatten().filter(|call| call.is_some()).count();
     let exported: BTreeSet<_> = cleaned.variants.iter().map(String::as_str).collect();
     let mut total = Changes::default();
     let mut modeled = Changes::default();
@@ -126,8 +127,9 @@ pub fn write_imputation_summary(
             "global_fp": rates.fp_rate,
             "global_fn": rates.fn_rate,
             "final_log_likelihood": log_likelihood,
-            "log_likelihood_per_observed_call": (modeled.observed() > 0)
-                .then(|| log_likelihood / modeled.observed() as f64),
+            "n_observed_calls": search_observed,
+            "log_likelihood_per_observed_call": (search_observed > 0)
+                .then(|| log_likelihood / search_observed as f64),
         },
         "total_changes": total.json(),
         "scite_changes": modeled.json(),

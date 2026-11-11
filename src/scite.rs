@@ -1487,9 +1487,7 @@ pub fn run_scite_pipeline(
     }
 
     write_variant_cooccurrence(&cleaned, binary.variants.len(), &format!("{output_prefix}.variant_cooccurrence.tsv"))?;
-    if debug {
-        write_raw_variant_cooccurrence(binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
-    }
+    write_raw_variant_cooccurrence(binary, &format!("{output_prefix}.raw_variant_cooccurrence.tsv"))?;
     write_molecule_summary(&cleaned, &format!("{output_prefix}.molecule_summary.tsv"))?;
     write_mutation_tree(&tree, &cleaned, &evidence, &format!("{output_prefix}.mutation_tree.tsv"))?;
 

@@ -215,7 +215,9 @@ def _frequency_matrix_rows(path, keep, background):
         reads = next(reader)[1:]
         rows = {}
         for row in reader:
-            name = _canonical_variant(row[0], background)
+            name = row[0]
+            if background is not None or name not in keep:
+                name = _canonical_variant(name, background)
             if name in keep:
                 if len(row) != len(reads) + 1:
                     raise ValueError(f"Wrong row length for {name} in {path}")

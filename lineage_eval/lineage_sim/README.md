@@ -34,11 +34,11 @@ mtDNA circularity is handled by simulating reads from two rotations of each
 clone genome (offset 0 and offset 8284) and pooling them, so the rCRS origin is
 covered by full-length reads.
 
-`Himito lineage` builds the tree from heteroplasmic SNVs with HF in
-`[--min-hf, --max-hf)` only. Every such SNV enters the tree search directly; there
-is no root block and no near-fixed rows are appended. Indels reach the tree only
-with `--include-non-snvs` (implied by `--collapse-hp`), which the HP benchmark and
-HP sweep pass. `var_*` still counts every PASS call in the VCF, indels included.
+`Himito lineage` builds the default tree from heteroplasmic SNVs with HF in
+`[--min-hf, --max-hf)`. Fixed SNVs are recorded in the standard imputed matrix
+as all-ALT rows. The HP benchmark and sweep use `--include-non-snvs` and score
+the tree with `<prefix>.cleaned_matrix_including_non_snvs.csv`.
+`var_*` counts every PASS call in the VCF, including indels.
 
 ## Platform requirements
 

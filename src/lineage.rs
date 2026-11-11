@@ -434,6 +434,13 @@ pub enum HfFilter {
 }
 
 impl HfFilter {
+    fn admits_export(&self, name: &str) -> bool {
+        match self {
+            Self::FromVcf { map, .. } => map.contains_key(name),
+            Self::FromMatrix { .. } => parse_variant_name(name).is_some(),
+        }
+    }
+
     fn keeps(&self, vid: &str, freq: f64, tracts: &[crate::tracts::Tract]) -> bool {
         match self {
             HfFilter::FromVcf { map, min, max } => {
@@ -969,21 +976,32 @@ pub fn start(
     let mut cleaned = out.cleaned;
     let mut included: BTreeSet<_> = cleaned.variants.iter().cloned().collect();
     if binary.variants.is_empty() {
-        // Retain input rows as zero placeholders when no mutation can be inferred.
+        // Retain eligible input rows as zero placeholders when no mutation can be inferred.
         for name in &raw.variants {
-            if !homoplasmic.contains(name) && included.insert(name.clone()) {
+            if hf.admits_export(name) && (include_non_snvs || is_snv(name))
+                && !homoplasmic.contains(name) && included.insert(name.clone())
+            {
                 cleaned.variants.push(name.clone());
                 cleaned.data.push(vec![0; cleaned.reads.len()]);
             }
         }
     }
     for name in &homoplasmic {
-        if included.insert(name.clone()) {
+        if (include_non_snvs || is_snv(name)) && included.insert(name.clone()) {
             cleaned.variants.push(name.clone());
             cleaned.data.push(vec![1; cleaned.reads.len()]);
         }
     }
 
+    if include_non_snvs {
+        crate::scite::write_cleaned_matrix(
+            &cleaned,
+            &format!("{output_prefix}.cleaned_matrix_including_non_snvs.csv"),
+        )?;
+        (cleaned.variants, cleaned.data) = cleaned.variants.into_iter().zip(cleaned.data)
+            .filter(|(name, _)| is_snv(name) && hf.admits_export(name))
+            .unzip();
+    }
     crate::scite::write_cleaned_matrix(&cleaned, &format!("{output_prefix}.cleaned_matrix_all_variants.csv"))?;
     crate::lineage_report::write_imputation_summary(
         &raw, &binary, &cleaned, &homoplasmic, &out.rates, out.log_likelihood,
@@ -1324,13 +1342,13 @@ mod tests {
     }
 
     #[test]
-    fn debug_gates_the_raw_outputs() {
+    fn raw_cooccurrence_is_written_with_or_without_debug() {
         let csv = tripled_csv(&[("m.100A>G", "1100"), ("m.200C>T", "1010")]);
         for debug in [false, true] {
             let prefix = run_small_lineage(&format!("himito_lineage_debug_{debug}"), &csv, debug, &[], false);
-            for suffix in [".raw_haplotype_map.tsv", ".raw_variant_cooccurrence.tsv"] {
-                assert_eq!(Path::new(&format!("{prefix}{suffix}")).exists(), debug, "{suffix} with debug={debug}");
-            }
+            assert_eq!(Path::new(&format!("{prefix}.raw_haplotype_map.tsv")).exists(), debug);
+            let raw_cooccurrence = std::fs::read_to_string(format!("{prefix}.raw_variant_cooccurrence.tsv")).unwrap();
+            assert!(raw_cooccurrence.lines().nth(1).unwrap().starts_with("m.100A>G\tm.200C>T\t12\t3\t3\t3\t3\t"));
             assert!(!Path::new(&format!("{prefix}.cleaned_matrix.csv")).exists());
             let violations = std::fs::read_to_string(format!("{prefix}.four_gamete_violations.tsv")).unwrap();
             assert_eq!(violations, "variant_a\tvariant_b\nm.100A>G\tm.200C>T\n");
@@ -1341,7 +1359,7 @@ mod tests {
 
     #[test]
     fn no_informative_variants_preserves_reads_and_writes_zero_placeholders() {
-        let csv = "variant,r1,r2,r3,r4\nm.100A>G,1,0,0,0\nm.200C>T,1,1,1,\n";
+        let csv = "variant,r1,r2,r3,r4\nm.100A>G,1,0,0,0\nm.200C>T,1,1,1,\nm.300C>CT,1,1,1,1\nm.400T>TA,1,0,0,0\n";
         let prefix = run_small_lineage("himito_no_informative", csv, true, &[], false);
         let output = |suffix: &str| std::fs::read_to_string(format!("{prefix}.{suffix}")).unwrap();
         assert_eq!(output("cleaned_matrix_all_variants.csv"),
@@ -1352,6 +1370,7 @@ mod tests {
         assert_eq!(output("read_lineage.nwk"), "(H0000_n4:0[&&NHX:reads=4])ROOT;\n");
         assert!(output("cleaned_haplotype_map.tsv").contains("H0000\t0\t4\tr1,r2,r3,r4"));
         assert_eq!(output("four_gamete_violations.tsv"), "variant_a\tvariant_b\n");
+        assert_eq!(output("raw_variant_cooccurrence.tsv").lines().count(), 1);
         assert!(output("tree_comparison.tsv").contains("no_informative_variants\t0\tNA\tNA\tNA\t0.000000\tNA"));
         let report: serde_json::Value = serde_json::from_str(&output("imputation_summary.json")).unwrap();
         assert_eq!(report["scite_changes"]["variant_rows"], 0);
@@ -1364,17 +1383,18 @@ mod tests {
     fn vcf_fixed_alleles_are_appended_once_and_excluded_from_the_model() {
         let vcf = write_vcf(
             "himito_fixed_output.vcf",
-            "##FILTER=<ID=LowQual,Description=\"Low quality\">\n",
+            "##FILTER=<ID=Potential_Artifact,Description=\"Potential artifact\">\n",
             "chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.95\n\
              chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.99\n\
              chrM\t200\t.\tC\tT\t.\tPASS\t.\tHF\t1.0\n\
-             chrM\t300\t.\tA\tG\t.\tLowQual\t.\tHF\t1.0\n\
+             chrM\t300\t.\tA\tG\t.\tPotential_Artifact\t.\tHF\t1.0\n\
+             chrM\t400\t.\tA\tAC\t.\tPASS\t.\tHF\t1.0\n\
              chrM\t500\t.\tC\tT\t.\tPASS\t.\tHF\t0.5\n",
         );
         let dir = std::env::temp_dir().join("himito_fixed_vcf_output");
         std::fs::create_dir_all(&dir).unwrap();
         let matrix = dir.join("in.csv");
-        std::fs::write(&matrix, "variant,r1,r2,r3,r4\nm.100A>G,1,1,0,\nm.500C>T,1,1,0,\n").unwrap();
+        std::fs::write(&matrix, "variant,r1,r2,r3,r4\nm.100A>G,1,1,0,\nm.500C>T,1,1,0,\nm.300A>G,1,1,1,1\n").unwrap();
         let prefix = dir.join("out");
         let prefix = prefix.to_str().unwrap();
         // A permissive max HF still leaves the fixed alleles out of the tree.
@@ -1395,6 +1415,12 @@ mod tests {
         assert_eq!(report["homoplasmic_changes"]["added_cells_without_input_row"], 4);
         assert_eq!(report["variants"][0]["model_error_rates"]["fp"], 0.01);
         assert!(report["variants"][1]["model_error_rates"].is_null());
+
+        // Even in the root-only fallback, the VCF excludes the flagged SNV and the export skips the fixed indel.
+        start(matrix.to_str().unwrap(), vcf.to_str(), 0.6, 1.0, 0.01, 0.1, (0.01, 0.1),
+            &[], false, 20, 1, false, prefix).unwrap();
+        assert_eq!(read("cleaned_matrix_all_variants.csv"),
+            "variant,r1,r2,r3,r4\nm.500C>T,0,0,0,0\nm.100A>G,1,1,1,1\nm.200C>T,1,1,1,1\n");
         std::fs::remove_file(vcf).ok();
     }
 
@@ -1404,7 +1430,10 @@ mod tests {
         let off: &[crate::tracts::Tract] = &[];
         for (tracts, on) in [(off, false), (KNOWN_TRACTS, true)] {
             let prefix = run_small_lineage(&format!("himito_lineage_collapse_{on}"), &csv, false, tracts, true);
-            let out = std::fs::read_to_string(format!("{prefix}.cleaned_matrix_all_variants.csv")).unwrap();
+            let snvs = std::fs::read_to_string(format!("{prefix}.cleaned_matrix_all_variants.csv")).unwrap();
+            assert_eq!(snvs.lines().count(), 2, "{snvs}");
+            assert!(snvs.lines().nth(1).unwrap().starts_with("m.100A>G,"));
+            let out = std::fs::read_to_string(format!("{prefix}.cleaned_matrix_including_non_snvs.csv")).unwrap();
             assert_eq!(out.contains("m.16183A>AC"), !on, "{out}");
             assert_eq!(out.contains("m.16189T>TC"), !on, "{out}");
             assert_eq!(out.contains("m.16183ACCCCCTCCCC>"), on, "{out}");

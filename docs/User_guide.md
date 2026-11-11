@@ -349,11 +349,11 @@ Many outputs share the same basename you pass with `-o` / `--output-prefix` (`qu
 | `.mt.bam`, `.numts.bam` | Mitochondrial and NUMT-partitioned reads (`filter` / `quick-start`) |
 | `.gfa` | Sequence graph (`build` / `quick-start`; methylation step may update annotated graph) |
 | `.fasta` | Major-haplotype assembly (`asm` / `quick-start`) |
-| `.vcf` | Variant calls after graph-based calling and permutation filtering (`call` / `quick-start`) |
+| `.vcf` | Variant calls from graph-discovered candidates after genotyping and permutation filtering (`call` / `quick-start`) |
 | `.bed` | Methylation summary (`methyl` / `quick-start`) |
 | `.raw_matrix.csv`, `.matrix.csv` | Per-read variant support matrices written next to the VCF basename (`call` / `quick-start`) |
 
-The **matrix CSV** has header `variant`, then one column per read name. Each row is a variant identifier. A cell contains `1` for ALT, `0` for a callable non-ALT genotype, or is empty for a missing genotype. `.raw_matrix.csv` is produced before permutation-based filtering. `.matrix.csv` matches the variants retained in the final VCF. For ONT with a BAM, both files reuse the same physical read genotypes.
+The **matrix CSV** has header `variant`, then one column per read name. Each row is a variant identifier. A cell contains `1` for ALT, `0` for a callable non-ALT genotype, or is empty for a missing genotype. `.raw_matrix.csv` is produced before permutation-based filtering. `.matrix.csv` matches the variants retained in the final VCF. With a BAM, ONT uses the same BAM-derived genotypes for calling, permutation and both matrices. PacBio uses graph genotypes for calling, permutation and `.raw_matrix.csv`, and re-genotypes the retained variants from the BAM for `.matrix.csv`.
 
 ### Graph Files (.gfa)
 - Contains the mitochondrial genome graph structure

@@ -297,7 +297,7 @@ enum Commands {
         #[clap(short, long, value_parser, required = true)]
         output_file: PathBuf,
 
-        /// raw pre-denoise BAM: strand filter, linkage rescue, matrix.csv
+        /// raw pre-denoise BAM for calling, filtering and read genotyping
         #[clap(short = 'b', long = "bam", alias = "input-bam", value_parser)]
         bam: Option<PathBuf>,
 
@@ -524,7 +524,7 @@ enum Commands {
         #[clap(long, value_parser = parse_positive, default_value_t = 3, hide_short_help = true)]
         mcmc_chains: usize,
 
-        /// also write raw_haplotype_map.tsv and raw_variant_cooccurrence.tsv
+        /// also write raw_haplotype_map.tsv
         #[clap(long, action, hide_short_help = true)]
         debug: bool,
     }

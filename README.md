@@ -102,8 +102,10 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 For ONT with a BAM, the graph supplies candidate alleles. BAM re-genotyping supplies the ALT
 count, callable read depth, strand and permutation evidence, and both the pre-permutation
 `<output>.raw_matrix.csv` and final `<output>.matrix.csv`. Ambiguous genotypes are missing.
-PacBio uses graph evidence for calling, rechecks strand flags against the BAM, and re-genotypes
-the final matrix. Without a BAM, both matrices come from the graph and BAM-based filters and
+PacBio uses graph ALT counts, depth, and read genotypes for calling and permutation.
+With a BAM, PacBio rechecks strand flags and re-genotypes the retained variants for the final
+`<output>.matrix.csv`.
+Without a BAM, both matrices come from the graph and BAM-based filters and
 linkage rescue are unavailable.
 The strand-bias action, permutation mode and genotyping gates are set by the data type.
 
@@ -143,7 +145,7 @@ By default, lineage inference uses heteroplasmic SNVs with HF in `[0.01, 0.95)`.
 
 The exported cleaned matrix also includes homoplasmic alleles (HF ≥ 0.95) as all-`1` rows. With a VCF, these are PASS alleles from the VCF, including alleles absent from the input matrix. Without a VCF, they are inferred from covered matrix calls with at least two ALT calls. The homoplasmy cutoff is independent of `--max-hf`. These rows annotate the sample and do not enter the mutation tree, haplotype map or co-occurrence calculations. When no informative variants remain, the command still writes a root-only mutation tree and keeps all input reads. Non-homoplasmic input rows are exported as all-`0` placeholders in that case; the zeros indicate that no genotype was inferred.
 
-Outputs include a mutation tree, read-level lineage Newick tree, the cleaned read–variant matrix `<prefix>.cleaned_matrix_all_variants.csv`, the variant co-occurrence table `variant_cooccurrence.tsv`, and haplotype maps. The raw co-occurrence table and `raw_haplotype_map.tsv` are written only with `--debug`.
+The imputed read–variant matrix `<prefix>.cleaned_matrix_all_variants.csv` contains only SNVs and uses PASS records when a VCF is supplied. With `--include-non-snvs`, `<prefix>.cleaned_matrix_including_non_snvs.csv` also records the alleles used for the experimental tree.
 
 ```
 ./target/release/Himito lineage -m <prefix>.matrix.csv \
@@ -153,7 +155,7 @@ Outputs include a mutation tree, read-level lineage Newick tree, the cleaned rea
                                  --max-hf 0.95
 ```
 
-Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix_all_variants.csv`, `<output_prefix>.variant_cooccurrence.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv` and `<output_prefix>.raw_variant_cooccurrence.tsv`.
+Outputs include the mutation tree, the read-level Newick tree, and the cleaned haplotype map. `<output_prefix>.raw_variant_cooccurrence.tsv` uses pre-imputation genotypes for reads callable at both sites. `<output_prefix>.variant_cooccurrence.tsv` uses imputed genotypes for the same variant pairs. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv`.
 
 Three diagnostic files are always written:
 

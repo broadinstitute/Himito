@@ -295,8 +295,8 @@ task LineageScoreCell {
             SCORE_ARGS+=(--background "~{background}")
         fi
         HAP_ARGS=()
-        if [[ -s sim_lineage.cleaned_matrix_all_variants.csv && -s unpacked/truth/clones.tsv ]]; then
-            HAP_ARGS=(--recon-matrix sim_lineage.cleaned_matrix_all_variants.csv
+        if [[ -s sim_lineage.cleaned_matrix_including_non_snvs.csv && -s unpacked/truth/clones.tsv ]]; then
+            HAP_ARGS=(--recon-matrix sim_lineage.cleaned_matrix_including_non_snvs.csv
                       --truth-clones unpacked/truth/clones.tsv)
         fi
         python3 /opt/lineage_sim/score_lineage.py \

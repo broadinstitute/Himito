@@ -60,7 +60,7 @@ Options:
           [default: 3]
 
       --debug
-          also write raw_haplotype_map.tsv and raw_variant_cooccurrence.tsv
+          also write raw_haplotype_map.tsv
 
   -h, --help
           Print help (see a summary with '-h')

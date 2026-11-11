@@ -16,6 +16,6 @@ Options:
   -o, --output-file <OUTPUT_FILE>
           output VCF path
   -b, --bam <BAM>
-          raw pre-denoise BAM: strand filter, linkage rescue, matrix.csv
+          raw pre-denoise BAM for calling, filtering and read genotyping
   -h, --help
           Print help (see more with '--help')

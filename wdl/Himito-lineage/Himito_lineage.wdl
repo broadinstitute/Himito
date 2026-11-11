@@ -63,6 +63,8 @@ workflow Himito_lineage_eval {
         File pb_mutation_tree = HimitoLineage.pb_mutation_tree
         File pb_read_lineage = HimitoLineage.pb_read_lineage
         File pb_var_cooccurrence = HimitoLineage.pb_var_cooccurrence
+        File pb_raw_var_cooccurrence = HimitoLineage.pb_raw_var_cooccurrence
+        File? pb_analysis_matrix = HimitoLineage.pb_analysis_matrix
         File pb_read_var_mat = HimitoLineage.pb_read_var_mat
         File pb_haplotype_map = HimitoLineage.pb_haplotype_map
         File pb_molecule_summary = HimitoLineage.pb_molecule_summary
@@ -316,7 +318,8 @@ task Himito_lineage {
         File pb_read_var_mat = "~{prefix}.pb.cleaned_matrix_all_variants.csv"
         File pb_haplotype_map = "~{prefix}.pb.cleaned_haplotype_map.tsv" 
         File pb_molecule_summary = "~{prefix}.pb.molecule_summary.tsv" 
-        File? pb_raw_var_cooccurrence = "~{prefix}.pb.raw_variant_cooccurrence.tsv"
+        File pb_raw_var_cooccurrence = "~{prefix}.pb.raw_variant_cooccurrence.tsv"
+        File? pb_analysis_matrix = "~{prefix}.pb.cleaned_matrix_including_non_snvs.csv"
     }
 
     #########################

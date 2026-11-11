@@ -152,8 +152,8 @@ workflow Himito_lineage_eval {
                 ont_tree = HimitoLineage.ont_mutation_tree,
                 pb_raw_matrix = PacbioCall.read_var_mat,
                 ont_raw_matrix = OntCall.read_var_mat,
-                pb_cleaned_matrix = HimitoLineage.pb_read_var_mat,
-                ont_cleaned_matrix = HimitoLineage.ont_read_var_mat,
+                pb_cleaned_matrix = select_first([HimitoLineage.pb_analysis_matrix, HimitoLineage.pb_read_var_mat]),
+                ont_cleaned_matrix = select_first([HimitoLineage.ont_analysis_matrix, HimitoLineage.ont_read_var_mat]),
                 docker = himito_docker
         }
     }
@@ -183,6 +183,7 @@ workflow Himito_lineage_eval {
         Array[File] pb_mutation_tree = HimitoLineage.pb_mutation_tree
         Array[File] pb_read_lineage = HimitoLineage.pb_read_lineage
         Array[File] pb_var_cooccurrence = HimitoLineage.pb_var_cooccurrence
+        Array[File] pb_raw_var_cooccurrence = HimitoLineage.pb_raw_var_cooccurrence
         Array[File] pb_read_var_mat = HimitoLineage.pb_read_var_mat
         Array[File] pb_haplotype_map = HimitoLineage.pb_haplotype_map
         Array[File] pb_molecule_summary = HimitoLineage.pb_molecule_summary
@@ -192,6 +193,7 @@ workflow Himito_lineage_eval {
         Array[File] ont_mutation_tree = HimitoLineage.ont_mutation_tree
         Array[File] ont_read_lineage = HimitoLineage.ont_read_lineage
         Array[File] ont_var_cooccurrence = HimitoLineage.ont_var_cooccurrence
+        Array[File] ont_raw_var_cooccurrence = HimitoLineage.ont_raw_var_cooccurrence
         Array[File] ont_read_var_mat = HimitoLineage.ont_read_var_mat
         Array[File] ont_haplotype_map = HimitoLineage.ont_haplotype_map
         Array[File] ont_molecule_summary = HimitoLineage.ont_molecule_summary
@@ -449,6 +451,8 @@ task Himito_lineage {
         File pb_read_lineage = "~{prefix}.pb.read_lineage.nwk"
         File pb_var_cooccurrence = "~{prefix}.pb.variant_cooccurrence.tsv"
         File pb_read_var_mat = "~{prefix}.pb.cleaned_matrix_all_variants.csv"
+        File? pb_analysis_matrix = "~{prefix}.pb.cleaned_matrix_including_non_snvs.csv"
+        File pb_raw_var_cooccurrence = "~{prefix}.pb.raw_variant_cooccurrence.tsv"
         File pb_haplotype_map = "~{prefix}.pb.cleaned_haplotype_map.tsv" 
         File pb_molecule_summary = "~{prefix}.pb.molecule_summary.tsv" 
 
@@ -456,6 +460,8 @@ task Himito_lineage {
         File ont_read_lineage = "~{prefix}.ont.read_lineage.nwk"
         File ont_var_cooccurrence = "~{prefix}.ont.variant_cooccurrence.tsv"
         File ont_read_var_mat = "~{prefix}.ont.cleaned_matrix_all_variants.csv"
+        File? ont_analysis_matrix = "~{prefix}.ont.cleaned_matrix_including_non_snvs.csv"
+        File ont_raw_var_cooccurrence = "~{prefix}.ont.raw_variant_cooccurrence.tsv"
         File ont_haplotype_map = "~{prefix}.ont.cleaned_haplotype_map.tsv" 
         File ont_molecule_summary = "~{prefix}.ont.molecule_summary.tsv" 
     }

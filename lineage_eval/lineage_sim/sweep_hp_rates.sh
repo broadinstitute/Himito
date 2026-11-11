@@ -168,8 +168,8 @@ for entry in "${CELLS[@]}"; do
         continue
       fi
       HAP_ARGS=()
-      if [[ -s "${pfx}.cleaned_matrix_all_variants.csv" && -s "$cell/truth/clones.tsv" ]]; then
-        HAP_ARGS=(--recon-matrix "${pfx}.cleaned_matrix_all_variants.csv"
+      if [[ -s "${pfx}.cleaned_matrix_including_non_snvs.csv" && -s "$cell/truth/clones.tsv" ]]; then
+        HAP_ARGS=(--recon-matrix "${pfx}.cleaned_matrix_including_non_snvs.csv"
                   --truth-clones "$cell/truth/clones.tsv"
                   --input-matrix "$MATRIX"
                   --frequency-out "${pfx}.frequencies.json")

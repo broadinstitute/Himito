@@ -25,7 +25,7 @@ Options:
           output VCF path
 
   -b, --bam <BAM>
-          raw pre-denoise BAM: strand filter, linkage rescue, matrix.csv
+          raw pre-denoise BAM for calling, filtering and read genotyping
 
   -k, --k <K>
           k-mer size of the anchor graph

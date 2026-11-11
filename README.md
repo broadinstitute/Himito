@@ -136,7 +136,9 @@ Himito includes a new function for inferring mitochondrial mutation history from
 
 Given a Himito read–variant matrix (`<prefix>.matrix.csv` from `call`) and the corresponding VCF, the `lineage` command filters to informative heteroplasmic sites, deduplicates reads into haplotypes, and runs an MCMC search over mutation trees and identify a ML tree (algorithm adapted from SCITE, Kuipers J et al. Single-cell sequencing data reveals widespread recurrence and loss of mutational hits in the life histories of tumorus. Genome Research 2017; 27:1885-1894.). The initial tree is a Neighbor–Joining tree constructed from reads instead of a random tree though. Sequencing errors are modeled with false-positive and false-negative rates preset by `-d` (pacbio 0.005 / 0.05, ONT 0.005 / 0.02) and set with `--fp-rate` / `--fn-rate`. 
 
-By default, lineage inference uses only heteroplasmic SNVs with HF in `[0.01, 0.95)`. Add `--include-non-snvs` to include indels and other alleles; `--collapse-hp` additionally merges equivalent homopolymer tract spellings and requires `--include-non-snvs`. Every retained variant enters the mutation-tree search directly, with no root-block partition or forced homoplasmic rows. All cleaned read haplotypes, including singletons, appear in the haplotype map and lineage tree. The three-read threshold applies only to raw haplotypes used for the optional NJ seed and raw diagnostics.
+By default, lineage inference uses heteroplasmic SNVs with HF in `[0.01, 0.95)`. Add `--include-non-snvs` to search over indels and other alleles; `--collapse-hp` additionally merges equivalent homopolymer tract spellings and requires `--include-non-snvs`. All cleaned read haplotypes, including singletons, appear in the haplotype map and lineage tree. The three-read threshold applies only to raw haplotypes used for the optional NJ seed and its diagnostics.
+
+The exported cleaned matrix also includes homoplasmic alleles (HF ≥ 0.95) as all-`1` rows. With a VCF, these are PASS alleles from the VCF, including alleles absent from the input matrix. Without a VCF, they are inferred from covered matrix calls with at least two ALT calls. The homoplasmy cutoff is independent of `--max-hf`. These rows annotate the sample and do not enter the mutation tree, haplotype map or co-occurrence calculations. When no informative variants remain, the command still writes a root-only mutation tree and keeps all input reads. Non-homoplasmic input rows are exported as all-`0` placeholders in that case; the zeros indicate that no genotype was inferred.
 
 Outputs include a mutation tree, read-level lineage Newick tree, the cleaned read–variant matrix `<prefix>.cleaned_matrix_all_variants.csv`, the variant co-occurrence table `variant_cooccurrence.tsv`, and haplotype maps. The raw co-occurrence table and `raw_haplotype_map.tsv` are written only with `--debug`.
 
@@ -150,9 +152,13 @@ Outputs include a mutation tree, read-level lineage Newick tree, the cleaned rea
 
 Key outputs: `<output_prefix>.mutation_tree.tsv`, `<output_prefix>.read_lineage.nwk`, `<output_prefix>.cleaned_matrix_all_variants.csv`, `<output_prefix>.variant_cooccurrence.tsv`, `<output_prefix>.cleaned_haplotype_map.tsv`. `--debug` also writes `<output_prefix>.raw_haplotype_map.tsv` and `<output_prefix>.raw_variant_cooccurrence.tsv`.
 
+Three diagnostic files are always written:
+
+- `<output_prefix>.imputation_summary.json`: final log likelihood, configured global and effective per-variant error rates, and counts of observed REF/ALT changes and missing-call fills. Changes are reported separately for SCITE, homoplasmic annotations, and zero placeholders. VCF-only rows are counted separately from missing cells in existing rows. SCITE rows are compared to the pre-search matrix (after tract collapse when enabled); annotation rows use the original matrix when available. These are comparisons to observed calls, not accuracy estimates.
+- `<output_prefix>.four_gamete_violations.tsv`: pairs with all four gametes among the raw haplotypes eligible for NJ. Missing calls are ignored.
+- `<output_prefix>.tree_comparison.tsv`: the number and fraction of mutations whose parent changed between the NJ-derived mutation seed and the final tree, plus their log likelihoods and gain. When NJ is unavailable, the distance and seed likelihood are `NA`.
+
 `lineage` shows `-m -v -d -o --min-hf --max-hf --include-non-snvs` in `-h`; the error-rate, MCMC and `--debug`
 options are listed by `--help`.
 
-To Do: 
-1. add four gamete test
-2. Add posteriors, convergence and confidence metrics
+To Do: add posteriors, convergence and confidence metrics.

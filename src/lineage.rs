@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use anyhow::{bail,Context, Result};
 use rust_htslib::bcf::{Read, Reader}; // Read trait must be in scope for .records()
 use std::io::{BufWriter, Write};
@@ -7,6 +7,8 @@ use log::{info, warn};
 
 /// Minimal reads a variant must be present in / absent from to be informative.
 const MIN_PRESENCE: usize = 2;
+/// Alleles at or above this frequency are sample-wide annotations, not tree mutations.
+const HOMOPLASMY_HF: f64 = 0.95;
 const MIN_ABSENCE: usize = 1;
 /// Minimal reads backing a reported haplotype.
 const MIN_READS: usize = 3;
@@ -359,8 +361,8 @@ pub struct RawMatrix {
     pub data: Vec<Vec<Option<u8>>>,
 }
 
-/// Parse a Himito VCF file and return a map from variant ID to HF value.
-pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
+/// Read the first valid HF for each PASS allele, including fixed alleles.
+pub fn parse_vcf(vcf_path: &str) -> Result<HfMap> {
     let mut reader = Reader::from_path(vcf_path)
         .with_context(|| format!("Cannot read VCF: {vcf_path}"))?;
     // `call` writes this only when indels were left-aligned.
@@ -413,7 +415,7 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
                 .and_then(|d| d.get(0).and_then(|s| s.get(alt_idx).or_else(|| s.first())));
             let Some(&hf_val) = hf_val else { continue };
             let hf = hf_val as f64;
-            if hf >= min_hf && hf < max_hf {
+            if (0.0..=1.0).contains(&hf) {
                 let vid = format!("m.{pos}{ref_allele}>{alt_allele}");
                 // The first record wins on a duplicated variant id.
                 map.entry(vid).or_insert(hf);
@@ -425,8 +427,7 @@ pub fn parse_vcf(vcf_path: &str, min_hf: f64, max_hf: f64) -> Result<HfMap> {
 
 /// How a variant's heteroplasmic frequency is judged during matrix filtering.
 pub enum HfFilter {
-    /// Keep the variants in the (already HF-filtered) VCF map; tract-allele rows, which no VCF lists,
-    /// are judged on their matrix frequency against `[min, max)`.
+    /// Use PASS VCF frequencies, except for collapsed tract alleles, which use their matrix frequency.
     FromVcf { map: HfMap, min: f64, max: f64 },
     /// Keep variants whose matrix frequency lies in `[min, max)`.
     FromMatrix { min: f64, max: f64 },
@@ -436,15 +437,37 @@ impl HfFilter {
     fn keeps(&self, vid: &str, freq: f64, tracts: &[crate::tracts::Tract]) -> bool {
         match self {
             HfFilter::FromVcf { map, min, max } => {
+                if map.get(vid).is_some_and(|&h| h >= f64::from(HOMOPLASMY_HF as f32)) {
+                    return false;
+                }
                 if crate::tracts::is_tract_allele(vid, tracts) {
-                    freq >= *min && freq < *max
+                    freq >= *min && freq < max.min(HOMOPLASMY_HF)
                 } else {
-                    map.contains_key(vid)
+                    // VCF HF is stored as f32: compare at that precision so 0.95
+                    // is consistently excluded from search and included in the fixed set.
+                    map.get(vid).is_some_and(|&h| {
+                        let h = h as f32;
+                        h >= *min as f32 && h < max.min(HOMOPLASMY_HF) as f32
+                    })
                 }
             }
-            HfFilter::FromMatrix { min, max } => freq >= *min && freq < *max,
+            HfFilter::FromMatrix { min, max } => freq >= *min && freq < max.min(HOMOPLASMY_HF),
         }
     }
+    fn homoplasmic_variants(&self, raw: &RawMatrix) -> BTreeSet<String> {
+        match self {
+            Self::FromVcf { map, .. } => map.iter()
+                .filter(|(name, hf)| **hf >= f64::from(HOMOPLASMY_HF as f32) && parse_variant_name(name).is_some())
+                .map(|(name, _)| name.clone()).collect(),
+            Self::FromMatrix { .. } => raw.variants.iter().zip(&raw.data)
+                .filter(|(_, row)| {
+                    let (present, _, hf) = row_hf(row);
+                    present >= MIN_PRESENCE && hf >= HOMOPLASMY_HF
+                })
+                .map(|(name, _)| name.clone()).collect(),
+        }
+    }
+
 }
 
 /// Alt and ref call counts of one matrix row, and the alt fraction over *covered* reads (0 if none).
@@ -486,11 +509,14 @@ pub fn read_raw_matrix<R: std::io::Read>(reader: R) -> Result<RawMatrix> {
 }
 
 /// Apply the prevalence and heteroplasmy filters to a [`RawMatrix`]; `tracts` names the collapsed tract-allele rows.
-pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tract]) -> BinaryMatrix {
+pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tract], include_non_snvs: bool) -> BinaryMatrix {
     let mut variants: Vec<String> = Vec::new();
     let mut data: Vec<Vec<Option<u8>>> = Vec::new();
 
     for (vid, row) in raw.variants.iter().zip(raw.data.iter()) {
+        if !include_non_snvs && !is_snv(vid) {
+            continue;
+        }
         let (present, absent, freq) = row_hf(row);
         if present < MIN_PRESENCE || absent < MIN_ABSENCE || !hf.keeps(vid, freq, tracts) {
             continue;
@@ -502,20 +528,13 @@ pub fn filter_matrix(raw: &RawMatrix, hf: &HfFilter, tracts: &[crate::tracts::Tr
     BinaryMatrix { variants, reads: raw.reads.clone(), data }
 }
 
-/// Restrict the default analysis to single-base A/C/G/T substitutions.
-pub fn retain_snvs(mut raw: RawMatrix) -> RawMatrix {
-    let (variants, data) = raw.variants.into_iter().zip(raw.data)
-        .filter(|(name, _)| {
-            parse_variant_name(name).is_some_and(|(_, r, a)| {
-                r.len() == 1 && a.len() == 1
-                    && r.bytes().chain(a.bytes()).all(|b| b"ACGT".contains(&b.to_ascii_uppercase()))
-                    && !r.eq_ignore_ascii_case(a)
-            })
-        })
-        .unzip();
-    raw.variants = variants;
-    raw.data = data;
-    raw
+/// Whether this variant is a single-base A/C/G/T substitution.
+fn is_snv(name: &str) -> bool {
+    parse_variant_name(name).is_some_and(|(_, r, a)| {
+        r.len() == 1 && a.len() == 1
+            && r.bytes().chain(a.bytes()).all(|b| b"ACGT".contains(&b.to_ascii_uppercase()))
+            && !r.eq_ignore_ascii_case(a)
+    })
 }
 
 /// Collapse every known homopolymer tract in `raw` into sequence-level alleles.
@@ -889,14 +908,6 @@ pub fn resolve_hp_rates(
     )
 }
 
-/// Errors when there are no cleaned reads to report.
-fn ensure_haplotypes(hap_matrix: &HaplotypeMatrix) -> Result<()> {
-    if hap_matrix.haplotypes.is_empty() {
-        bail!("No cleaned read haplotypes remain; check that the input matrix contains reads.");
-    }
-    Ok(())
-}
-
 pub fn start(
     matrix_file: &str,
     vcf_file: Option<&str>,
@@ -919,7 +930,7 @@ pub fn start(
     let hf = match vcf_file {
         Some(path) => {
             info!("[1/4] Parsing VCF: {}", path);
-            HfFilter::FromVcf { map: parse_vcf(path, min_hf, max_hf)?, min: min_hf, max: max_hf }
+            HfFilter::FromVcf { map: parse_vcf(path)?, min: min_hf, max: max_hf }
         }
         None => {
             info!("[1/4] No VCF provided; HF recomputed from the matrix itself.");
@@ -932,42 +943,18 @@ pub fn start(
         File::open(matrix_file)
             .with_context(|| format!("Cannot read matrix CSV: {matrix_file}"))?,
     )?;
-    let raw = if include_non_snvs { raw } else { retain_snvs(raw) };
-    // Tract alleles are non-SNVs; collapse is only applicable when they are included.
-    let tracts = if include_non_snvs { tracts } else { &[] };
-    // An empty slice is the identity.
-    if tracts.is_empty() {
-        info!("[lineage] HP tract collapse: off (use --include-non-snvs --collapse-hp to enable)");
+    let homoplasmic = hf.homoplasmic_variants(&raw);
+    // Only copy the full matrix when constructing collapsed tract alleles.
+    let collapsed;
+    let analysis_raw = if include_non_snvs && !tracts.is_empty() {
+        collapsed = collapse_tracts(raw.clone(), tracts);
+        &collapsed
     } else {
-        info!("[lineage] HP tract collapse: on ({} tracts)", tracts.len());
-    }
-    let raw = collapse_tracts(raw, tracts);
-    let binary = filter_matrix(&raw, &hf, tracts);
-    if binary.variants.is_empty() {
-        bail!(
-            "No informative variants remain after filtering. \
-             Try adjusting --min-hf / --max-hf thresholds, or use --include-non-snvs for non-SNV alleles."
-        );
-    }
+        &raw
+    };
+    let binary = filter_matrix(analysis_raw, &hf, tracts, include_non_snvs);
+    info!("[lineage] {} informative and {} homoplasmic variant(s)", binary.variants.len(), homoplasmic.len());
 
-    // ── Step 2: deduplicate reads into haplotypes ───────────────────────────────
-    info!("[2/4] Deduplicating reads into haplotypes...");
-    let hap_matrix = deduplicate(&binary);
-    info!("[2/4] Found {} haplotypes across {} variants.", hap_matrix.haplotypes.len(), hap_matrix.variants.len());
-    // Variant pairs violating the infinite-sites assumption hint at recurrent/back mutation or recombination.
-    let violations = four_gamete_test(&hap_matrix);
-    if !violations.is_empty() {
-        info!(
-            "[2/4] Four-gamete test: {} variant pair(s) violate the infinite-sites assumption.",
-            violations.len()
-        );
-    }
-    if debug {
-        write_haplotype_map(&hap_matrix, &format!("{output_prefix}.raw_haplotype_map.tsv"))?;
-    }
-
-    // ── Step 3: SCITE mutation-tree search (NJ-informed MCMC) ─────────────────
-    info!("[3/4] Running SCITE mutation-tree search...");
     let out = crate::scite::run_scite_pipeline(
         &binary,
         fp_rate,
@@ -979,17 +966,30 @@ pub fn start(
         output_prefix,
     )?;
 
-    crate::scite::write_cleaned_matrix(&out.cleaned, &format!("{output_prefix}.cleaned_matrix_all_variants.csv"))?;
+    let mut cleaned = out.cleaned;
+    let mut included: BTreeSet<_> = cleaned.variants.iter().cloned().collect();
+    if binary.variants.is_empty() {
+        // Retain input rows as zero placeholders when no mutation can be inferred.
+        for name in &raw.variants {
+            if !homoplasmic.contains(name) && included.insert(name.clone()) {
+                cleaned.variants.push(name.clone());
+                cleaned.data.push(vec![0; cleaned.reads.len()]);
+            }
+        }
+    }
+    for name in &homoplasmic {
+        if included.insert(name.clone()) {
+            cleaned.variants.push(name.clone());
+            cleaned.data.push(vec![1; cleaned.reads.len()]);
+        }
+    }
 
-    // ── Step 4: write final haplotype map (filtered by SCITE) ─────────────────
-    let cleaned_hap_matrix = out.cleaned_haplotypes;
-    info!(
-        "[4/4] All cleaned reads deduplicated into {} haplotypes across {} variants.",
-        cleaned_hap_matrix.haplotypes.len(),
-        cleaned_hap_matrix.variants.len()
-    );
-    ensure_haplotypes(&cleaned_hap_matrix)?;
-    write_haplotype_map(&cleaned_hap_matrix, &format!("{output_prefix}.cleaned_haplotype_map.tsv"))
+    crate::scite::write_cleaned_matrix(&cleaned, &format!("{output_prefix}.cleaned_matrix_all_variants.csv"))?;
+    crate::lineage_report::write_imputation_summary(
+        &raw, &binary, &cleaned, &homoplasmic, &out.rates, out.log_likelihood,
+        &format!("{output_prefix}.imputation_summary.json"),
+    )?;
+    write_haplotype_map(&out.cleaned_haplotypes, &format!("{output_prefix}.cleaned_haplotype_map.tsv"))
 }
 
 #[cfg(test)]
@@ -1028,7 +1028,7 @@ mod tests {
 
     /// Parse `csv` and filter it without tract collapse.
     fn filter_from_csv(csv: &str, hf: &HfFilter) -> BinaryMatrix {
-        filter_matrix(&read_raw_matrix(Cursor::new(csv)).unwrap(), hf, &[])
+        filter_matrix(&read_raw_matrix(Cursor::new(csv)).unwrap(), hf, &[], true)
     }
 
     /// Write a one-sample chrM VCF with HF in FORMAT to the temp dir.
@@ -1209,7 +1209,7 @@ mod tests {
              chrM\t200\t.\tC\tT\t.\tPASS\t.\tHF\t0.9\n\
              chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.99\n",
         );
-        let map = parse_vcf(path.to_str().unwrap(), 0.0, 1.0).unwrap();
+        let map = parse_vcf(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
 
         assert_eq!(map.get("m.100A>G").copied(), Some(0.3_f32 as f64));
@@ -1245,7 +1245,7 @@ mod tests {
         log::set_max_level(log::LevelFilter::Warn);
         let path = write_vcf("himito_test_parse_vcf_norm.vcf", extra_header, "chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.3\n");
         let (me, start) = (std::thread::current().id(), WARNINGS.lock().unwrap().len());
-        parse_vcf(path.to_str().unwrap(), 0.0, 1.0).unwrap();
+        parse_vcf(path.to_str().unwrap()).unwrap();
         std::fs::remove_file(&path).ok();
         WARNINGS.lock().unwrap()[start..]
             .iter()
@@ -1295,15 +1295,18 @@ mod tests {
         let csv = "variant,r1,r2,r3,r4\nm.100A>G,1,1,0,0\nm.16189T>C,1,0,1,0\nm.300A>AC,1,1,0,0\nm.400AT>A,1,1,0,0\nm.500AC>GT,1,1,0,0\nm.600A>G,1,1,1,1\n";
         let prefix = run_small_lineage("himito_direct_snvs", csv, true, &[], false);
         let matrix = std::fs::read_to_string(format!("{prefix}.cleaned_matrix_all_variants.csv")).unwrap();
-        assert_eq!(matrix.lines().count(), 3);
+        assert_eq!(matrix.lines().count(), 4);
+        assert!(matrix.contains("m.600A>G,1,1,1,1"));
         assert!(matrix.contains("m.100A>G"));
         assert!(matrix.contains("m.16189T>C"));
         for suffix in [".cleaned_matrix_all_variants.csv", ".molecule_summary.tsv", ".mutation_tree.tsv", ".read_lineage.nwk"] {
             let text = std::fs::read_to_string(format!("{prefix}{suffix}")).unwrap();
-            for excluded in ["m.300A>AC", "m.400AT>A", "m.500AC>GT", "m.600A>G"] {
+            for excluded in ["m.300A>AC", "m.400AT>A", "m.500AC>GT"] {
                 assert!(!text.contains(excluded), "{excluded} in {suffix}");
             }
         }
+        let tree = std::fs::read_to_string(format!("{prefix}.mutation_tree.tsv")).unwrap();
+        assert!(!tree.contains("m.600A>G"));
         let map = std::fs::read_to_string(format!("{prefix}.cleaned_haplotype_map.tsv")).unwrap();
         let total: usize = map.lines().skip(1).map(|row| row.split('\t').nth(2).unwrap().parse::<usize>().unwrap()).sum();
         assert_eq!(total, 4);
@@ -1316,7 +1319,7 @@ mod tests {
             &["1100"; 6],
         );
         let vcf = HfFilter::FromVcf { map: raw.variants.iter().map(|v| (v.clone(), 0.5)).collect(), min: 0.01, max: 0.95 };
-        let filtered = filter_matrix(&retain_snvs(raw), &vcf, &[]);
+        let filtered = filter_matrix(&raw, &vcf, &[], false);
         assert_eq!(filtered.variants, vec!["m.100A>G", "m.200C>t"]);
     }
 
@@ -1329,7 +1332,70 @@ mod tests {
                 assert_eq!(Path::new(&format!("{prefix}{suffix}")).exists(), debug, "{suffix} with debug={debug}");
             }
             assert!(!Path::new(&format!("{prefix}.cleaned_matrix.csv")).exists());
+            let violations = std::fs::read_to_string(format!("{prefix}.four_gamete_violations.tsv")).unwrap();
+            assert_eq!(violations, "variant_a\tvariant_b\nm.100A>G\tm.200C>T\n");
+            let comparison = std::fs::read_to_string(format!("{prefix}.tree_comparison.tsv")).unwrap();
+            assert!(comparison.lines().nth(1).unwrap().starts_with("compared\t2\t"));
         }
+    }
+
+    #[test]
+    fn no_informative_variants_preserves_reads_and_writes_zero_placeholders() {
+        let csv = "variant,r1,r2,r3,r4\nm.100A>G,1,0,0,0\nm.200C>T,1,1,1,\n";
+        let prefix = run_small_lineage("himito_no_informative", csv, true, &[], false);
+        let output = |suffix: &str| std::fs::read_to_string(format!("{prefix}.{suffix}")).unwrap();
+        assert_eq!(output("cleaned_matrix_all_variants.csv"),
+            "variant,r1,r2,r3,r4\nm.100A>G,0,0,0,0\nm.200C>T,1,1,1,1\n");
+        assert_eq!(output("mutation_tree.tsv").lines().nth(1).unwrap(),
+            "0\tROOT\t0\tROOT\t4\tNA\tNA\tNA");
+        assert_eq!(output("mutation_tree.tsv").lines().count(), 2);
+        assert_eq!(output("read_lineage.nwk"), "(H0000_n4:0[&&NHX:reads=4])ROOT;\n");
+        assert!(output("cleaned_haplotype_map.tsv").contains("H0000\t0\t4\tr1,r2,r3,r4"));
+        assert_eq!(output("four_gamete_violations.tsv"), "variant_a\tvariant_b\n");
+        assert!(output("tree_comparison.tsv").contains("no_informative_variants\t0\tNA\tNA\tNA\t0.000000\tNA"));
+        let report: serde_json::Value = serde_json::from_str(&output("imputation_summary.json")).unwrap();
+        assert_eq!(report["scite_changes"]["variant_rows"], 0);
+        assert_eq!(report["zero_fallback_changes"]["observed_alt_to_ref"], 1);
+        assert_eq!(report["homoplasmic_changes"]["missing_to_alt"], 1);
+        assert!(report["model"]["log_likelihood_per_observed_call"].is_null());
+    }
+
+    #[test]
+    fn vcf_fixed_alleles_are_appended_once_and_excluded_from_the_model() {
+        let vcf = write_vcf(
+            "himito_fixed_output.vcf",
+            "##FILTER=<ID=LowQual,Description=\"Low quality\">\n",
+            "chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.95\n\
+             chrM\t100\t.\tA\tG\t.\tPASS\t.\tHF\t0.99\n\
+             chrM\t200\t.\tC\tT\t.\tPASS\t.\tHF\t1.0\n\
+             chrM\t300\t.\tA\tG\t.\tLowQual\t.\tHF\t1.0\n\
+             chrM\t500\t.\tC\tT\t.\tPASS\t.\tHF\t0.5\n",
+        );
+        let dir = std::env::temp_dir().join("himito_fixed_vcf_output");
+        std::fs::create_dir_all(&dir).unwrap();
+        let matrix = dir.join("in.csv");
+        std::fs::write(&matrix, "variant,r1,r2,r3,r4\nm.100A>G,1,1,0,\nm.500C>T,1,1,0,\n").unwrap();
+        let prefix = dir.join("out");
+        let prefix = prefix.to_str().unwrap();
+        // A permissive max HF still leaves the fixed alleles out of the tree.
+        start(matrix.to_str().unwrap(), vcf.to_str(), 0.01, 1.0, 0.01, 0.1, (0.01, 0.1),
+            &[], false, 20, 1, false, prefix).unwrap();
+        let read = |suffix: &str| std::fs::read_to_string(format!("{prefix}.{suffix}")).unwrap();
+        assert_eq!(read("cleaned_matrix_all_variants.csv"),
+            "variant,r1,r2,r3,r4\nm.500C>T,1,1,0,0\nm.100A>G,1,1,1,1\nm.200C>T,1,1,1,1\n");
+        let tree = read("mutation_tree.tsv");
+        assert!(tree.contains("m.500C>T"));
+        assert!(!tree.contains("m.100A>G") && !tree.contains("m.200C>T"));
+        let report: serde_json::Value = serde_json::from_str(&read("imputation_summary.json")).unwrap();
+        assert_eq!(report["model"]["status"], "fitted");
+        assert_eq!(report["scite_changes"]["observed_calls"], 3);
+        assert_eq!(report["scite_changes"]["missing_to_ref"], 1);
+        assert_eq!(report["homoplasmic_changes"]["variant_rows"], 2);
+        assert_eq!(report["homoplasmic_changes"]["observed_ref_to_alt"], 1);
+        assert_eq!(report["homoplasmic_changes"]["added_cells_without_input_row"], 4);
+        assert_eq!(report["variants"][0]["model_error_rates"]["fp"], 0.01);
+        assert!(report["variants"][1]["model_error_rates"].is_null());
+        std::fs::remove_file(vcf).ok();
     }
 
     #[test]
@@ -1462,8 +1528,8 @@ mod tests {
                    m.16189T>C,1,1,1,1\n\
                    m.3243A>G,1,1,0,0\n";
         let raw = collapse_tracts(read_raw_matrix(Cursor::new(csv)).unwrap(), KNOWN_TRACTS);
-        let kept = |hf: HfFilter| filter_matrix(&raw, &hf, KNOWN_TRACTS).variants;
-        let vcf = |max| HfFilter::FromVcf { map: [("m.3243A>G".to_string(), 0.5)].into(), min: 0.2, max };
+        let kept = |hf: HfFilter| filter_matrix(&raw, &hf, KNOWN_TRACTS, true).variants;
+        let vcf = |max| HfFilter::FromVcf { map: [("m.3243A>G".to_string(), 0.3)].into(), min: 0.2, max };
         let all = vec![hvs1(C10), hvs1(C11), "m.3243A>G".to_string()];
         assert_eq!(kept(vcf(0.95)), all);
         assert_eq!(kept(HfFilter::FromMatrix { min: 0.2, max: 0.95 }), all);

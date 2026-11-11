@@ -145,7 +145,7 @@ const RATE_FLOOR: f64 = 1e-12;
 
 impl ErrorRates {
     /// The clamped `(fp, fn)` for variant `v`.
-    fn clamped_for(&self, v: usize) -> (f64, f64) {
+    pub(crate) fn clamped_for(&self, v: usize) -> (f64, f64) {
         let (fp, fnr) = self.per_variant.get(v).copied().unwrap_or((self.fp_rate, self.fn_rate));
         (fp.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR), fnr.clamp(RATE_FLOOR, 1.0 - RATE_FLOOR))
     }
@@ -1336,6 +1336,33 @@ fn apply_path_reorder(tree: &MutationTree, old_path: &[usize], new_order: &[usiz
 pub struct SciteOutput {
     pub cleaned: CleanedMatrix,
     pub cleaned_haplotypes: HaplotypeMatrix,
+    pub rates: ErrorRates,
+    pub log_likelihood: f64,
+}
+
+/// Compare parent assignments after projecting the NJ haplotype tree onto mutation nodes.
+fn write_tree_comparison(
+    initial: Option<&MutationTree>,
+    final_tree: &MutationTree,
+    matrix: &BinaryMatrix,
+    rates: &ErrorRates,
+    final_ll: f64,
+    path: &str,
+) -> Result<()> {
+    let mut w = BufWriter::new(File::create(path).with_context(|| format!("Cannot create {path}"))?);
+    writeln!(w, "status\tn_mutations\tparent_changes\tparent_change_fraction\tnj_seed_log_likelihood\tfinal_log_likelihood\tlog_likelihood_gain")?;
+    let n = final_tree.n_mutations;
+    if let Some(seed) = initial {
+        let changes = (0..n).filter(|&m| seed.parent[m] != final_tree.parent[m]).count();
+        let seed_ll = tree_log_likelihood(matrix, seed, rates);
+        writeln!(w, "compared\t{n}\t{changes}\t{:.6}\t{seed_ll:.6}\t{final_ll:.6}\t{:.6}",
+            changes as f64 / n as f64, final_ll - seed_ll)?;
+    } else {
+        let status = if n == 0 { "no_informative_variants" } else { "nj_unavailable" };
+        writeln!(w, "{status}\t{n}\tNA\tNA\tNA\t{final_ll:.6}\tNA")?;
+    }
+    w.flush()?;
+    Ok(())
 }
 
 /// Run the MCMC mutation-tree search, attach every read to its best-fitting node, and write the
@@ -1350,14 +1377,21 @@ pub fn run_scite_pipeline(
     debug: bool,
     output_prefix: &str,
 ) -> Result<SciteOutput> {
-    if binary.variants.is_empty() {
-        anyhow::bail!(
-            "SCITE requires at least 1 variant (got 0); \
-             relax the --min-hf / --max-hf thresholds."
-        );
-    }
     // The complete filtered matrix participates in inference. NJ is only an optional seed.
     let hap_matrix = lineage::deduplicate(binary);
+    let violations = lineage::four_gamete_test(&hap_matrix);
+    let path = format!("{output_prefix}.four_gamete_violations.tsv");
+    let mut w = BufWriter::new(File::create(&path).with_context(|| format!("Cannot create {path}"))?);
+    writeln!(w, "variant_a\tvariant_b")?;
+    for (a, b) in &violations {
+        writeln!(w, "{a}\t{b}")?;
+    }
+    w.flush()?;
+    info!("[SCITE] Four-gamete violations in NJ input: {}", violations.len());
+    if debug {
+        lineage::write_haplotype_map(&hap_matrix, &format!("{output_prefix}.raw_haplotype_map.tsv"))?;
+    }
+    let empty = binary.variants.is_empty();
     let single_variant = binary.variants.len() == 1;
     if single_variant {
         info!(
@@ -1372,7 +1406,9 @@ pub fn run_scite_pipeline(
         .map(|nj_tree| from_nj_tree(&hap_matrix, &nj_tree));
     info!(
         "[SCITE] Initial tree: {}",
-        if initial_tree.is_some() { "derived from Neighbor-Joining haplotype tree" } else { "random (NJ tree unavailable)" }
+        if empty { "root only (no informative variants)" }
+        else if initial_tree.is_some() { "derived from Neighbor-Joining haplotype tree" }
+        else { "random (NJ tree unavailable)" }
     );
 
     let spans = variant_spans(&binary.variants);
@@ -1402,7 +1438,7 @@ pub fn run_scite_pipeline(
         "[SCITE] {} variants, {} reads. {}",
         binary.variants.len(),
         binary.reads.len(),
-        if single_variant {
+        if empty || single_variant {
             "Only one tree is possible; skipping MCMC.".to_string()
         } else {
             format!("Running MCMC: {n_chains} chains x {n_iterations} iterations")
@@ -1410,13 +1446,21 @@ pub fn run_scite_pipeline(
     );
 
     let rates = ErrorRates { fp_rate, fn_rate, per_variant };
-    let (tree, ll) = run_mcmc_multichain(binary, &rates, n_iterations, n_chains, initial_tree.as_ref());
+    let (tree, ll) = if empty {
+        (MutationTree { n_mutations: 0, parent: vec![0] }, 0.0)
+    } else {
+        run_mcmc_multichain(binary, &rates, n_iterations, n_chains, initial_tree.as_ref())
+    };
     info!("[SCITE] Best tree log-likelihood: {ll:.3}");
 
     let tree = polish_unary_path_order(&tree, binary, &rates);
     let tree = enforce_position_exclusivity(&tree, &spans);
     let ll_polish = tree_log_likelihood(binary, &tree, &rates);
     info!("[SCITE] After unary-path polish log-likelihood: {ll_polish:.3}");
+    write_tree_comparison(
+        initial_tree.as_ref(), &tree, binary, &rates, ll_polish,
+        &format!("{output_prefix}.tree_comparison.tsv"),
+    )?;
 
     let cleaned = attach_all_reads(binary, &tree, &rates);
 
@@ -1471,6 +1515,8 @@ pub fn run_scite_pipeline(
     Ok(SciteOutput {
         cleaned,
         cleaned_haplotypes: cleaned_hap_matrix,
+        rates,
+        log_likelihood: ll_polish,
     })
 }
 
@@ -2456,6 +2502,21 @@ mod tests {
         assert_eq!(cooc.lines().count(), 1, "expected header only in .variant_cooccurrence.tsv");
         let nwk = read_output(&prefix, ".read_lineage.nwk");
         assert!(nwk.contains("mutation=m.100A>G"), "got newick: {nwk}");
+    }
+
+    #[test]
+    fn nj_seed_distance_counts_changed_mutation_parents() {
+        let matrix = matrix_from_rows(&["A", "B"], &["111100", "110000"]);
+        let initial = MutationTree { n_mutations: 2, parent: vec![1, 2, 2] };
+        let final_tree = MutationTree { n_mutations: 2, parent: vec![2, 0, 2] };
+        let rates = ErrorRates::uniform(0.01, 0.05);
+        let final_ll = tree_log_likelihood(&matrix, &final_tree, &rates);
+        let tsv = written("himito_nj_distance.tsv", |p| {
+            write_tree_comparison(Some(&initial), &final_tree, &matrix, &rates, final_ll, p)
+        });
+        let row: Vec<_> = tsv.lines().nth(1).unwrap().split('\t').collect();
+        assert_eq!(&row[..4], &["compared", "2", "2", "1.000000"]);
+        assert!(row[6].parse::<f64>().unwrap() > 0.0);
     }
 
     #[test]

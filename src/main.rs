@@ -13,6 +13,7 @@ mod correct;
 mod minorhap;
 mod callnumts;
 mod lineage;
+mod lineage_report;
 mod tracts;
 mod scite;
 mod denoise;

@@ -25,6 +25,8 @@ workflow Himito_lineage_eval {
         Float min_hf = 0.01
         Float max_hf = 0.95
         String chromo = "chrM"
+        String pacbio_datatype = "pacbio"
+        String ont_datatype = "ont-denoised"
         Array[Int]+ desired_coverages = [100, 300, 500, 700, 1000, 2000]
         Int downsample_seed = 7
         String? call_extra_args
@@ -91,7 +93,7 @@ workflow Himito_lineage_eval {
                 kmer_size = kmer_size,
                 sample_id = sample_id,
                 chromo = chromo,
-                data_type = "pacbio",
+                data_type = pacbio_datatype,
                 extra_args = call_extra_args,
                 himito_docker = himito_docker
         }
@@ -105,7 +107,7 @@ workflow Himito_lineage_eval {
                 kmer_size = kmer_size,
                 sample_id = sample_id,
                 chromo = chromo,
-                data_type = "ont-denoised",
+                data_type = ont_datatype,
                 extra_args = call_extra_args,
                 himito_docker = himito_docker
         }

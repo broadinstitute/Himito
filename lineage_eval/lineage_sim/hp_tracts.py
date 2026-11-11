@@ -129,7 +129,7 @@ _HIMITO_WINDOW = {
 
 _VARIANT_NAME = re.compile(r"^m\.(\d+)([ACGT]+)>([ACGT]+)$")
 _RCRS_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "rCRS.fasta")
+    os.environ.get("REF", os.path.join(os.path.dirname(__file__), "..", "..", "rCRS.fasta"))
 )
 _RCRS: str | None = None
 _BG_SEQ: dict[tuple[str, ...], str] = {}

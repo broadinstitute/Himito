@@ -1,52 +1,39 @@
-# Docker image for the Himito lineage simulation sweep (Himito_lineage_sim.wdl).
-#
-# Bakes in everything run_eval.sh -> {simulate_tree.py, simulate_reads.sh,
-# run_himito.sh, score_lineage.py} needs:
-#   - the Himito release binary
-#   - the read-simulation toolchain (pbsim3, pbccs, minimap2, samtools)
-#   - Python + numpy/dendropy/pysam
-#   - the pbsim3 error models
-#   - the lineage_sim scripts and rCRS.fasta
-#
-# Himito_lineage_hp_sweep.wdl also needs run_eval.sh --stop-after call and
-# pick_best_hp_rates.py from this image. The Himito binary must support
-# `lineage --include-non-snvs`; rebuild after updating HIMITO_IMAGE.
-#
-# pbccs is linux/amd64-only, so the runtime is always amd64. Do NOT compile
-# Rust under QEMU on Apple Silicon: `rustc -vV` SIGSEGVs there. Default is to
-# copy a prebuilt linux/amd64 Himito binary. Compile from source only on a
-# real amd64 host (--build-arg HIMITO_SOURCE=from-source).
-#
-# Build context is this directory (lineage_sim/). Must be linux/amd64 (pbccs)
-# and a single-platform image (no buildx attestation index): Docker Desktop
-# otherwise publishes linux/arm64+unknown, which Terra cannot pull.
+# Linux amd64 image for Himito_lineage_sim.wdl, including HiFi/ccs.
+# Build from the repository root using the current checkout:
 #   docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
-#     --build-arg HIMITO_IMAGE=us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev \
-#     -t us.gcr.io/broad-dsp-lrma/hangsuunc/himito-lineage-sim:dev \
-#     -f Dockerfile . --push
-#
-# ARGs consumed by FROM must be declared before the first FROM. An ARG sitting
-# between stages is scoped to the preceding stage, so FROM ${HIMITO_IMAGE}
-# used to expand to a blank name:
-#   ERROR: failed to solve: base name (${HIMITO_IMAGE}) should not be blank
-ARG HIMITO_IMAGE=docker.io/hangsuunc/himito:dev
-ARG HIMITO_SOURCE=prebuilt
+#     --load -t himito-lineage-sim:linux-amd64 \
+#     -f lineage_eval/lineage_sim/Dockerfile .
+# Default HIMITO_SOURCE=workspace compiles Cargo.lock and src from this checkout.
+# Optional modes: --build-arg HIMITO_SOURCE=prebuilt --build-arg HIMITO_IMAGE=...
+# or --build-arg HIMITO_SOURCE=from-source --build-arg HIMITO_REF=...
 
-# ---- optional: compile Himito (linux/amd64 host only; skipped by default) ----
-FROM rust:1.84.0 AS himito-from-source
-ARG DEBIAN_FRONTEND=noninteractive
-ARG HIMITO_REPO=https://github.com/broadinstitute/Himito.git
-ARG HIMITO_REF=hs_lineage_
+ARG HIMITO_IMAGE=us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev
+ARG HIMITO_SOURCE=workspace
+
+# ---- default: compile the current workspace with a locked dependency set ----
+FROM rust:1.90.0-bookworm AS himito-workspace
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        git ssh build-essential make cmake zlib1g-dev libclang-dev wget util-linux bsdextrautils \
+        build-essential cmake pkg-config zlib1g-dev libbz2-dev liblzma-dev libclang-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
-RUN git config --global http.sslverify false \
-    && git clone --depth 1 --branch "${HIMITO_REF}" "${HIMITO_REPO}" /Himito \
-    && cd /Himito \
-    && cargo build --release
+WORKDIR /Himito
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo build --release --locked
+COPY test_data/rCRS.fasta ./test_data/rCRS.fasta
 
-# ---- default: reuse a published linux/amd64 Himito (no rustc, QEMU-safe) -----
+# Optional remote-source and prebuilt modes remain available explicitly.
+FROM rust:1.90.0-bookworm AS himito-from-source
+ARG HIMITO_REPO=https://github.com/broadinstitute/mitograph.git
+ARG HIMITO_REF=lineage_bench
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git build-essential cmake pkg-config zlib1g-dev libbz2-dev liblzma-dev libclang-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN git clone --depth 1 --branch "${HIMITO_REF}" "${HIMITO_REPO}" /Himito \
+    && cd /Himito && cargo build --release --locked
+
+# ---- optional: reuse a published linux/amd64 Himito -----
 FROM --platform=linux/amd64 ${HIMITO_IMAGE} AS himito-prebuilt
 
 FROM himito-${HIMITO_SOURCE} AS himito-build
@@ -57,7 +44,10 @@ USER root
 ENV MAMBA_ROOT_PREFIX=/opt/conda
 
 # Simulation/reconstruction toolchain (pbsim3, pbccs, minimap2, samtools, python, pysam).
-COPY environment.yml /tmp/environment.yml
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bsdextrautils ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY lineage_eval/lineage_sim/environment.yml /tmp/environment.yml
 RUN micromamba install -y -n base -f /tmp/environment.yml \
     && micromamba clean --all --yes
 ENV PATH=/opt/conda/bin:$PATH
@@ -69,15 +59,12 @@ RUN git clone --depth 1 https://github.com/yukiteruono/pbsim3.git /tmp/pbsim3_sr
     && cp /tmp/pbsim3_src/data/*.model /opt/lineage_sim/pbsim3_models/ \
     && rm -rf /tmp/pbsim3_src
 
-# Himito binary + rCRS.fasta from the Himito image (not the build context:
-# lineage_sim/ has no rCRS.fasta; it lives in test_data/).
+# Binary and reference from the selected workspace/remote/prebuilt stage.
 COPY --from=himito-build /Himito/target/release/Himito /Himito/target/release/Himito
 COPY --from=himito-build /Himito/test_data/rCRS.fasta /opt/lineage_sim/rCRS.fasta
 
-# The lineage_sim scripts (build context = this directory).
-COPY run_eval.sh run_himito.sh simulate_reads.sh simulate_tree.py score_lineage.py \
-     hp_tracts.py measure_hp_errors.py pick_best_hp_rates.py \
-     /opt/lineage_sim/
+# The lineage_sim scripts (build context = repository root).
+COPY lineage_eval/lineage_sim/*.sh lineage_eval/lineage_sim/*.py /opt/lineage_sim/
 RUN chmod +x /opt/lineage_sim/*.sh
 
 ENV HIMITO=/Himito/target/release/Himito \

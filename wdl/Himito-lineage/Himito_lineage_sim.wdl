@@ -13,15 +13,15 @@ workflow HimitoLineageSim {
         File reference_fa
 
         String profile = "ont-r10"          # hifi | ont-r10 | ont-denoised (hifi needs ccs -> linux/amd64)
-        Float frequency_threshold = 0.1           # Himito call -f; unset = data-type default (0.2)
+        Float? frequency_threshold = 0.05   # null uses Himito call's platform preset
 
         Float? fp
         Float? fn
 
-        Float min_hf = 0.1
+        Float min_hf = 0.01
         Float max_hf = 0.95
-        Float sim_min_hf = 0.1
-        Float sim_max_hf = 0.95
+        Float sim_min_hf = 0.05
+        Float sim_max_hf = 0.99
         Float internal_keep = 0.20
         
 
@@ -127,6 +127,10 @@ task RunEvalCell {
     String cell = "seed~{seed}_mut~{n_mutations}_depth~{total_depth}"
     command <<<
         set -euxo pipefail
+        case "~{profile}" in hifi|ont-r10|ont-denoised) ;; *) echo "Invalid profile" >&2; exit 1;; esac
+        (( ~{n_mutations} > 0 && ~{total_depth} > 0 )) || { echo "Mutation count and depth must be positive" >&2; exit 1; }
+        export HIMITO_THREADS=~{select_first([runtime_attr.cpu_cores, default_attr.cpu_cores])}
+        export RAYON_NUM_THREADS="$HIMITO_THREADS"
 
         # Tools + scripts + models + Himito binary are baked into the image;
         # export the paths the shell scripts look for so they run standalone.
@@ -167,7 +171,7 @@ task RunEvalCell {
     }
 
     RuntimeAttr default_attr = object {
-        cpu_cores:          1,
+        cpu_cores:          4,
         mem_gb:             4,
         disk_gb:            50,
         boot_disk_gb:       10,
@@ -200,17 +204,29 @@ task CombineMetrics {
 
     command <<<
         set -euxo pipefail
-        first=1
-        : > metrics.tsv
-        for f in ~{sep=' ' cell_metrics}; do
-            [[ -s "$f" ]] || continue
-            if [[ $first -eq 1 ]]; then
-                cat "$f" >> metrics.tsv
-                first=0
-            else
-                tail -n +2 "$f" >> metrics.tsv
-            fi
-        done
+        python - "~{write_lines(cell_metrics)}" <<'PYTHON'
+        import csv
+        import sys
+        from pathlib import Path
+
+        paths = Path(sys.argv[1]).read_text().splitlines()
+        if not paths:
+            raise SystemExit("No grid cells were supplied")
+        expected = None
+        with open("metrics.tsv", "w", newline="") as out:
+            writer = csv.writer(out, delimiter="\t", lineterminator="\n")
+            for path in paths:
+                with open(path, newline="") as source:
+                    rows = list(csv.reader(source, delimiter="\t"))
+                if len(rows) != 2 or len(rows[1]) != len(rows[0]):
+                    raise SystemExit(f"Expected one complete metrics row: {path}")
+                if expected is None:
+                    expected = rows[0]
+                    writer.writerow(expected)
+                if rows[0] != expected:
+                    raise SystemExit(f"Incompatible metrics header: {path}")
+                writer.writerow(rows[1])
+        PYTHON
         column -t metrics.tsv || true
     >>>
 

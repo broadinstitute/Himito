@@ -7,6 +7,10 @@ Both the truth and the reconstruction use Himito's mutation_tree.tsv schema
 """
 import argparse
 import csv
+import gzip
+import json
+import math
+from collections import Counter
 import os
 import re
 import sys
@@ -19,7 +23,8 @@ def parse_mutation_tree(path: str) -> dict[str, str]:
     """variant -> parent_variant. ROOT maps to ROOT."""
     with open(path) as fh:
         return {row["variant"]: row["parent_variant"]
-                for row in csv.DictReader(fh, delimiter="\t")}
+                for row in csv.DictReader(fh, delimiter="\t")
+                if row.get("node_id") not in {"ROOT_BLOCK", "UNASSIGNED", "TRACT_ANNOTATED"}}
 
 
 def ancestor_sets(parent_map: dict[str, str]) -> dict[str, set[str]]:
@@ -57,44 +62,36 @@ def _anc_pairs(anc: dict[str, set[str]], keep: set[str]) -> set[tuple[str, str]]
 
 
 def detected_variants_with_hf_from_vcf(path: str) -> dict[str, float | None]:
-    """PASS/. calls from a Himito VCF → {m.<pos><ref>><alt>: HF}.
+    """Return PASS/. alleles and the first sample's per-ALT HF (or AF).
 
-    The FILTER column is the only gate: every record marked PASS or "." counts as a
-    detected variant. HF is read from the first sample's FORMAT/HF field (first allele
-    if multi-valued) and is reporting-only -- it never excludes a record, and a
-    missing/unparseable HF yields None rather than dropping the call.
-
-    No HF band and no SNV-only gate are applied here on purpose. Both used to shrink
-    the ``var_precision`` denominator to the slice ``Himito lineage`` consumes, which
-    made precision read 1.0 on runs whose VCF was in fact full of false positives:
-    error-driven calls sat below the band's floor and near-homoplasmic artifacts above
-    its ceiling, so neither reached the metric. Indels are likewise counted now.
-    ``simulate_tree.py`` emits substitutions only, so every indel call is a false
-    positive by construction -- expect ONT ``var_precision`` to read low whenever
-    the permutation test lets indel artifacts through. ``run_himito.sh`` leaves
-    ``call -p`` at the data-type default (does not pass ``-p 1``). That is a
-    property of the caller output, not of lineage reconstruction; read
-    ``ad_*`` for tree accuracy.
+    Missing or invalid estimates do not remove alleles from detection scoring.
     """
     out: dict[str, float | None] = {}
-    with open(path) as fh:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt") as fh:
         for line in fh:
             if line.startswith("#"):
                 continue
             f = line.rstrip("\n").split("\t")
-            if len(f) < 7:
+            if len(f) < 7 or f[6] not in ("PASS", "."):
                 continue
-            pos, ref, alt, filt = f[1], f[3], f[4], f[6]
-            if filt not in ("PASS", "."):
-                continue
-            hf: float | None = None
-            if len(f) >= 10:
-                keys = f[8].split(":")
-                vals = f[9].split(":")
-                sample = dict(zip(keys, vals))
-                if "HF" in sample and sample["HF"] not in (".", ""):
-                    hf = float(sample["HF"].split(",")[0])
-            out[f"m.{pos}{ref}>{alt}"] = hf
+            pos, ref = f[1], f[3]
+            sample = dict(zip(f[8].split(":"), f[9].split(":"))) if len(f) >= 10 else {}
+            for i, alt in enumerate(f[4].split(",")):
+                if alt in ("", "."):
+                    continue
+                hf = None
+                for field in ("HF", "AF"):
+                    values = sample.get(field, "").split(",")
+                    if i < len(values):
+                        try:
+                            value = float(values[i])
+                        except ValueError:
+                            continue
+                        if math.isfinite(value) and 0.0 <= value <= 1.0:
+                            hf = value
+                            break
+                out[f"m.{pos}{ref}>{alt}"] = hf
     return out
 
 
@@ -102,8 +99,7 @@ def parse_clone_haplotypes(path: str) -> set[frozenset[str]]:
     """Truth clones from simulate_tree.py's clones.tsv, as variant sets.
 
     The mutation-free `ref` clone becomes the empty set; `score_haplotypes`
-    drops it. Frequencies are deliberately ignored -- see `score_haplotypes`
-    for why read fractions are not a usable abundance estimate here.
+    drops it. Frequencies are scored separately by `score_frequencies`.
     """
     haps = set()
     with open(path) as fh:
@@ -175,10 +171,8 @@ def score_haplotypes(
     reference -- the other 636 come from mutant clones. Scoring it as a recovered
     reference clone would add a free true positive to every run.
 
-    Haplotypes are counted, not read-weighted, and no abundance metric is reported:
-    a haplotype's read count is not proportional to its clone frequency, so read
-    fractions cannot be compared against the truth frequencies in clones.tsv.
-    Per-site heteroplasmy is available from the VCF's HF field instead.
+    This exact-match metric is unweighted. Frequency agreement is reported
+    separately, using read assignments as an estimate rather than known abundance.
     """
     truth = {h for h in truth_haps if h}
     recon = {h for h in recon_haps if h}
@@ -193,6 +187,145 @@ def score_haplotypes(
         "hap_precision": precision,
         "hap_recall": recall,
         "hap_f1": _f1(precision, recall),
+    }
+
+
+def truth_haplotype_frequencies(path, background):
+    """Terminal clone mass aggregated by canonical lineage genotype."""
+    masses = Counter()
+    with open(path) as fh:
+        for row in csv.DictReader(fh, delimiter="\t"):
+            mass = float(row["frequency"])
+            if not math.isfinite(mass) or mass < 0:
+                raise ValueError(f"Invalid clone frequency in {path}: {mass}")
+            hap = frozenset(_canonical_variant(v, background)
+                            for v in row["variant_path"].split(",") if v)
+            if mass:
+                masses[hap] += mass
+    total = math.fsum(masses.values())
+    if total <= 0:
+        raise ValueError(f"No positive clone frequencies in {path}")
+    # Simulator TSVs round each clone mass independently.
+    return {h: m / total for h, m in masses.items()}
+
+
+def _frequency_matrix_rows(path, keep, background):
+    with open(path) as fh:
+        reader = csv.reader(fh)
+        reads = next(reader)[1:]
+        rows = {}
+        for row in reader:
+            name = _canonical_variant(row[0], background)
+            if name in keep:
+                if len(row) != len(reads) + 1:
+                    raise ValueError(f"Wrong row length for {name} in {path}")
+                rows.setdefault(name, []).append(row[1:])
+    return reads, rows
+
+
+def _allele_call(copies, i):
+    """Combine canonical duplicates without counting a molecule twice."""
+    values = [row[i] for row in copies]
+    if any(v.isascii() and v.isdigit() and int(v) > 0 for v in values):
+        return 1
+    return 0 if all(v == "0" for v in values) else None
+
+
+def _frequency_errors(prefix, errors):
+    n = len(errors)
+    return {
+        f"{prefix}_n_compared": n,
+        f"{prefix}_mae": math.fsum(map(abs, errors)) / n if n else None,
+        f"{prefix}_rmse": math.sqrt(math.fsum(e * e for e in errors) / n) if n else None,
+        f"{prefix}_bias": math.fsum(errors) / n if n else None,
+    }
+
+
+def score_frequencies(truth_freq, truth_vars, detected, detected_hf, cleaned_path,
+                      keep, background, input_path=""):
+    """Caller and matrix VAF, and attachment-frequency agreement."""
+    truth_vaf = Counter()
+    for hap, freq in truth_freq.items():
+        for variant in hap:
+            truth_vaf[variant] += freq
+    reads, rows = _frequency_matrix_rows(cleaned_path, keep, background)
+    if set(rows) != keep:
+        raise ValueError(f"Tree variants missing from {cleaned_path}: {sorted(keep - rows.keys())}")
+
+    clean_ids = {r for r in reads if r != "chrM"}
+    if len(clean_ids) != sum(r != "chrM" for r in reads):
+        raise ValueError(f"Duplicate read IDs in {cleaned_path}")
+    denominator = clean_ids
+    matrix_vaf = {}
+    if input_path:
+        raw_reads, raw_rows = _frequency_matrix_rows(input_path, truth_vars | detected, background)
+        physical_indices = [i for i, r in enumerate(raw_reads) if r != "chrM"]
+        input_reads = [raw_reads[i] for i in physical_indices]
+        denominator = set(input_reads)
+        if len(denominator) != len(input_reads) or not clean_ids <= denominator:
+            raise ValueError("Input-matrix read IDs must be unique and include every cleaned read")
+        for variant, copies in raw_rows.items():
+            support = Counter(_allele_call(copies, i) for i in physical_indices)
+            n_called = support[0] + support[1]
+            matrix_vaf[variant] = (support[1] / n_called if n_called else None, n_called)
+
+    variant_rows = []
+    vcf_errors = []
+    matrix_errors = []
+    for variant in sorted(truth_vars | detected):
+        expected = truth_vaf[variant]
+        estimate = detected_hf.get(variant)
+        matrix_estimate, n_called = matrix_vaf.get(variant, (None, 0))
+        error = None if estimate is None else estimate - expected
+        matrix_error = None if matrix_estimate is None else matrix_estimate - expected
+        if variant in truth_vars:
+            if error is not None:
+                vcf_errors.append(error)
+            if matrix_error is not None:
+                matrix_errors.append(matrix_error)
+        variant_rows.append({
+            "variant": variant, "in_truth": variant in truth_vars,
+            "called": variant in detected, "truth_vaf": expected,
+            "vcf_vaf": estimate, "error": error,
+            "matrix_vaf": matrix_estimate, "matrix_n_called": n_called,
+            "matrix_error": matrix_error,
+        })
+
+    counts = Counter()
+    for i, read in enumerate(reads):
+        if read == "chrM":
+            continue
+        calls = {v: _allele_call(copies, i) for v, copies in rows.items()}
+        if None not in calls.values():
+            counts[frozenset(v for v, call in calls.items() if call == 1)] += 1
+    n_reads = len(denominator)
+    n_unassigned = n_reads - sum(counts.values())
+    hap_rows = []
+    for hap in sorted(set(truth_freq) | set(counts), key=lambda h: (len(h), sorted(h))):
+        expected = truth_freq.get(hap, 0.0)
+        estimate = counts[hap] / n_reads if n_reads else None
+        hap_rows.append({
+            "variants": sorted(hap), "truth_frequency": expected,
+            "estimated_read_fraction": estimate, "n_reads": counts[hap],
+            "error": None if estimate is None else estimate - expected,
+        })
+    unassigned = n_unassigned / n_reads if n_reads else None
+    summary = {
+        "vcf_vaf_n_truth": len(truth_vars),
+        **_frequency_errors("vcf_vaf", vcf_errors),
+        **(_frequency_errors("matrix_vaf", matrix_errors) if input_path else
+           dict.fromkeys(_frequency_errors("matrix_vaf", []))),
+        "hap_freq_n_reads": n_reads,
+        "hap_freq_basis": "input_matrix" if input_path else "cleaned_matrix",
+        "hap_freq_unassigned": unassigned,
+        "hap_freq_mae": math.fsum(abs(row["error"]) for row in hap_rows) / len(hap_rows)
+                        if n_reads and hap_rows else None,
+        "hap_freq_tv": (math.fsum(abs(row["error"]) for row in hap_rows) + unassigned) / 2
+                       if n_reads else None,
+    }
+    return summary, {
+        "summary": summary, "variant_vaf": variant_rows, "haplotype_frequency": hap_rows,
+        "n_unassigned_reads": n_unassigned,
     }
 
 
@@ -295,6 +428,12 @@ def score(truth_parent, recon_parent, truth_vars, detected_vars,
 HAP_FIELDS = ["n_truth_clones", "n_recon_haps",
               "hap_precision", "hap_recall", "hap_f1"]
 
+FREQUENCY_FIELDS = [
+    "vcf_vaf_n_truth", "vcf_vaf_n_compared", "vcf_vaf_mae", "vcf_vaf_rmse", "vcf_vaf_bias",
+    "matrix_vaf_n_compared", "matrix_vaf_mae", "matrix_vaf_rmse", "matrix_vaf_bias",
+    "hap_freq_n_reads", "hap_freq_basis", "hap_freq_unassigned", "hap_freq_mae", "hap_freq_tv",
+]
+
 # Three metric families, each with its own n_* denominators: variant detection,
 # ancestor-descendant tree accuracy, and clone (haplotype) recovery. Consumers
 # look columns up by header name, not by position.
@@ -306,7 +445,7 @@ HP_FIELDS = ["n_hp_unstable_truth", "n_hp_unstable_called",
 FIELDS = ["profile", "fp", "fn", "n_truth_vars", "n_detected_vars", "n_shared",
           "n_truth_pairs",
           "var_precision", "var_recall", "var_f1",
-          "ad_precision", "ad_recall", "ad_f1"] + HAP_FIELDS + ["n_background_calls"] + HP_FIELDS
+          "ad_precision", "ad_recall", "ad_f1"] + HAP_FIELDS + ["n_background_calls"] + HP_FIELDS + FREQUENCY_FIELDS
 
 _SNV_NAME = re.compile(r"^m\.\d+([ACGT])>([ACGT])$")
 
@@ -498,6 +637,8 @@ def main() -> None:
     ap.add_argument("--fp", default="NA")
     ap.add_argument("--fn", default="NA")
     ap.add_argument("--metrics-out", default="")
+    ap.add_argument("--input-matrix", default="", help="Pre-lineage BAM genotype matrix; counts omitted reads as unassigned")
+    ap.add_argument("--frequency-out", default="", help="JSON detail for truth/called VAF and haplotype read fractions")
     ap.add_argument(
         "--truth-background",
         default="",
@@ -589,12 +730,35 @@ def main() -> None:
            "hp_len_l1": hp_length_l1(tract_rows, args.recon_matrix, background_tokens),
            "root_fraction": root_fraction(args.recon_tree)}
 
+    row.update(dict.fromkeys(FREQUENCY_FIELDS))
+    if args.input_matrix or args.frequency_out:
+        if not args.recon_matrix:
+            ap.error("--input-matrix and --frequency-out require --recon-matrix and --truth-clones")
+    if args.truth_clones:
+        try:
+            truth_freq = truth_haplotype_frequencies(args.truth_clones, background_tokens)
+            summary, details = score_frequencies(
+                truth_freq, truth_vars, detected, detected_hf, args.recon_matrix,
+                keep, background_tokens, args.input_matrix,
+            )
+        except (ValueError, KeyError) as exc:
+            ap.error(str(exc))
+        row.update(summary)
+        if args.frequency_out:
+            with open(args.frequency_out, "w") as fh:
+                json.dump(details, fh, indent=2, allow_nan=False)
+                fh.write("\n")
+
     def fmt(x):
-        return f"{x:.4f}" if isinstance(x, float) else str(x)
+        return "NA" if x is None else f"{x:.4f}" if isinstance(x, float) else str(x)
 
     line = "\t".join(fmt(row[f]) for f in FIELDS)
     if args.metrics_out:
         new = not os.path.exists(args.metrics_out) or os.path.getsize(args.metrics_out) == 0
+        if not new:
+            with open(args.metrics_out) as existing:
+                if existing.readline().rstrip("\r\n").split("\t") != FIELDS:
+                    ap.error("--metrics-out has a different schema; choose a new output file")
         with open(args.metrics_out, "a") as fh:
             if new:
                 fh.write("\t".join(FIELDS) + "\n")

@@ -188,6 +188,8 @@ score_reconstruction() {
     --vcf "$OUTDIR/$hdir/sim.vcf" \
     --recon-matrix "$OUTDIR/$hdir/sim_lineage.cleaned_matrix_all_variants.csv" \
     --truth-clones "$OUTDIR/truth/clones.tsv" \
+    --input-matrix "$OUTDIR/$hdir/sim.matrix.csv" \
+    --frequency-out "${metrics%.tsv}.frequencies.json" \
     --profile "$profile" --fp "$fp_rec" --fn "$fn_rec" \
     "${SCORE_ARGS[@]+"${SCORE_ARGS[@]}"}" \
     --metrics-out "$metrics"

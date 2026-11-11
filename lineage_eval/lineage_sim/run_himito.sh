@@ -7,6 +7,7 @@ REPO="$(cd "$HERE/../.." && pwd)"
 HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 REF="${REF:-$REPO/rCRS.fasta}"
 OUTDIR="" PROFILE="" SAMPLE="SIM" FP="" FN="" KMER=21
+HIMITO_THREADS="${HIMITO_THREADS:-4}"
 
 # Call/build-tuning defaults: match `Himito quick-start`'s own defaults, NOT
 # tuned-for-simulated-data overrides, so this harness measures the pipeline
@@ -126,7 +127,7 @@ command -v samtools >/dev/null || { echo "samtools not in PATH" >&2; exit 1; }
 
 # Do not swallow minimap2 stderr — a missing REF/broken install otherwise
 # looks like "samtools sort: failed to read header from '-'".
-minimap2 -ax "$MMPRESET" -t 4 "$REF" "$FQ" \
+minimap2 -ax "$MMPRESET" -t "$HIMITO_THREADS" "$REF" "$FQ" \
   | samtools sort -o "$BAM" -
 samtools index "$BAM"
 

@@ -170,7 +170,9 @@ for entry in "${CELLS[@]}"; do
       HAP_ARGS=()
       if [[ -s "${pfx}.cleaned_matrix_all_variants.csv" && -s "$cell/truth/clones.tsv" ]]; then
         HAP_ARGS=(--recon-matrix "${pfx}.cleaned_matrix_all_variants.csv"
-                  --truth-clones "$cell/truth/clones.tsv")
+                  --truth-clones "$cell/truth/clones.tsv"
+                  --input-matrix "$MATRIX"
+                  --frequency-out "${pfx}.frequencies.json")
       fi
       SCORE_ARGS=()
       [[ -f "$cell/truth/background.txt" ]] && SCORE_ARGS+=(--truth-background "$cell/truth/background.txt")

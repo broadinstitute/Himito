@@ -20,6 +20,7 @@ which governs how the tree metrics may be compared across runs.
 | `simulate_tree.py`, `simulate_reads.sh` | Truth tree and clone genomes; pbsim3 reads. |
 | `run_himito.sh` | minimap2 → `Himito denoise` → `build` → `call` → `lineage`. |
 | `score_lineage.py` | `var_*`, `ad_*`, `hap_*` and HP metrics. |
+| `plot_simulation_metrics.py` | Grouped box plots from simulation metric TSVs. |
 | `hp_tracts.py` | rCRS tract catalogue and canonical names (used by the simulator and scorer). |
 | `sweep_hp_rates.sh`, `pick_best_hp_rates.py` | `--hp-fp-rate` × `--hp-fn-rate` sweep on fixed matrices. |
 | `measure_hp_errors.py` | Standalone HP length-confusion table from a BAM. |
@@ -67,6 +68,25 @@ conda activate himito-eval
 `setup_env.sh` clones pbsim3 just for its `data/*.model` files and verifies
 that `pbsim`, `ccs`, `minimap2`, `samtools`, and Python (`numpy`, `dendropy`)
 all resolve inside the env.
+
+## Plot simulation metrics
+
+Run `plot_simulation_metrics.py` with a Python environment that has Matplotlib.
+Each input TSV contributes one observation per row to each metric. The default
+figure compares precision, recall, and F1 for variants, ancestor–descendant
+pairs, and haplotypes. Empty and `NA` values are omitted and zeroes are retained.
+
+```bash
+python plot_simulation_metrics.py \
+  --input 'PacBio HiFi' pb_metric_sim.tsv \
+  --input 'ONT R10' ont_metric_sim.tsv \
+  --by-coverage --output simulation_metrics_by_coverage.png
+```
+
+`--by-coverage` makes one subplot per `total_depth`. Without it, the figure pools
+coverages. Repeat `--input LABEL TSV` to add a group. Use `--metrics vcf_vaf_mae
+matrix_vaf_mae` to plot specific columns from newer scoring outputs, or use a
+`.pdf` output path for a vector figure.
 
 ## Detection ceiling and tuning guidance
 
@@ -627,3 +647,58 @@ Two things that did **not** work, so you can skip them:
   practical ceiling is `--n-mutations 12`; n=15 needs ≤0.03 and n=20 needs ≤0.02.
   Under `--topology chain` frequencies are deterministic, so reseeding cannot
   help — that path fails immediately and reports the feasible `--n-mutations`.
+
+## Linux image for the simulation WDL
+
+Build from the **repository root**. The default image now compiles the current
+workspace with Cargo.lock, so it includes local lineage fixes rather than silently
+copying an older published binary. HiFi requires linux/amd64 for ccs.
+
+```bash
+docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+  --load -t himito-lineage-sim:linux-amd64 \
+  -f lineage_eval/lineage_sim/Dockerfile .
+```
+
+The Dockerfile-specific ignore file excludes local read datasets, target/ and
+benchmark results. Explicit alternative sources remain available through
+`--build-arg HIMITO_SOURCE=prebuilt --build-arg HIMITO_IMAGE=...` or
+`--build-arg HIMITO_SOURCE=from-source --build-arg HIMITO_REF=...`.
+
+`Himito_lineage_sim.wdl` defaults to caller HF 0.01, simulation HF [0.05, 0.99),
+and call frequency threshold 0.05. The earlier simulation floor 0.1 failed the
+12-mutation, seed-1 random-tree case. Arbitrary requested grids may still be
+infeasible under the clone-frequency constraints. The task defaults to four CPUs
+and passes that allocation to minimap2 and Rayon. It rejects malformed metric
+files rather than silently omitting failed grid cells during aggregation.
+
+The built image is local until explicitly tagged and pushed to the registry named
+by the workflow's docker input; building alone does not publish it to Terra.
+
+## Frequency accuracy against simulation truth
+
+The scorer retains detection, ancestry and exact haplotype F1, and appends
+frequency errors when `--truth-clones` and `--recon-matrix` are supplied.
+Truth variant VAF is the sum of terminal clone frequencies carrying the allele.
+Duplicate clone genotypes are pooled, and rounded clone masses are normalized.
+
+- `vcf_vaf_*` compares PASS caller FORMAT/HF (or AF) with truth. MAE, RMSE
+  and signed bias (estimate minus truth) use only truth alleles with a valid
+  estimate. Compare `n_compared` with `n_truth` and recall: missed alleles are
+  not treated as observed VAF zero.
+- With `--input-matrix`, `matrix_vaf_*` independently compares pre-lineage
+  ALT / (ALT + REF) on observed reads. Missing calls and the synthetic
+  `chrM` column are excluded. Its comparable-site count can differ from the VCF.
+- `hap_freq_*` compares **inferred read fractions** with terminal clone
+  frequencies. The comparison includes the reference genotype and the union of
+  truth and inferred genotypes. Reads omitted from the cleaned matrix or with
+  incomplete modeled calls are unassigned; total variation distance includes
+  their mass. With `--input-matrix` the denominator includes all physical input
+  reads, otherwise it includes physical reads in the cleaned matrix. TV of 0
+  means identical distributions. This measures agreement of read fractions
+  with truth, which can reflect sampling and coverage as well as assignment error.
+
+`run_eval.sh` and the HP sweep supply the input matrix automatically.
+Use `--frequency-out results.frequencies.json` with the scorer for individual
+allele and haplotype estimates, counts and errors; simulation cells save this
+sidecar automatically. Use a new metrics TSV when switching scorer versions.

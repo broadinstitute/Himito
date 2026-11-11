@@ -9,6 +9,22 @@ lineage`, and score reconstruction accuracy across replicate seeds.
 [Why `ad_recall` is scored against *all* truth pairs](#why-ad_recall-is-scored-against-all-truth-pairs),
 which governs how the tree metrics may be compared across runs.
 
+## Files
+
+| file | role |
+|------|------|
+| `bench_standard.sh` | Frozen SNV benchmark against `baseline_standard.tsv`. Start here. |
+| `bench_hp.sh` | Frozen homopolymer-length benchmark against `baseline_hp.tsv` (runs lineage with `--include-non-snvs`). |
+| `sweep_seeds.sh` | One `run_eval.sh` per seed into `seed_metrics.tsv`; used by both benchmarks and for off-config exploration. |
+| `run_eval.sh` | One simulate → reconstruct → score cycle (`--pair` for an in-silico PacBio/ONT pair). |
+| `simulate_tree.py`, `simulate_reads.sh` | Truth tree and clone genomes; pbsim3 reads. |
+| `run_himito.sh` | minimap2 → `Himito denoise` → `build` → `call` → `lineage`. |
+| `score_lineage.py` | `var_*`, `ad_*`, `hap_*` and HP metrics. |
+| `hp_tracts.py` | rCRS tract catalogue and canonical names (used by the simulator and scorer). |
+| `sweep_hp_rates.sh`, `pick_best_hp_rates.py` | `--hp-fp-rate` × `--hp-fn-rate` sweep on fixed matrices. |
+| `measure_hp_errors.py` | Standalone HP length-confusion table from a BAM. |
+| `setup_env.sh`, `environment.yml`, `Dockerfile` | Local conda env and the WDL image. |
+
 ## Truth model
 
 The truth is a **clonal mutation tree** (SCITE-style), matching what `Himito
@@ -17,6 +33,12 @@ node has a cumulative heteroplasmy frequency that sets its simulated read depth.
 mtDNA circularity is handled by simulating reads from two rotations of each
 clone genome (offset 0 and offset 8284) and pooling them, so the rCRS origin is
 covered by full-length reads.
+
+`Himito lineage` builds the tree from heteroplasmic SNVs with HF in
+`[--min-hf, --max-hf)` only. Every such SNV enters the tree search directly; there
+is no root block and no near-fixed rows are appended. Indels reach the tree only
+with `--include-non-snvs` (implied by `--collapse-hp`), which the HP benchmark and
+HP sweep pass. `var_*` still counts every PASS call in the VCF, indels included.
 
 ## Platform requirements
 
@@ -226,12 +248,14 @@ reference lives elsewhere (e.g. `--ref ../../test_data/rCRS.fasta`).
 | `--profile` | `ont-r10` | use `ont-denoised`; `ont-r10` skips denoise and empties the VCF |
 | `--n-mutations` / `--total-depth` / `--seed` | 12 / 300 / 1 | simulation size. Not a difficulty knob — see [Difficulty knobs](#difficulty-knobs) |
 | `--frequency-threshold F` | unset (Himito 0.2) | `call -f`. **Must be below `--sim-min-hf`** |
-| `--denoise-vaf F` | unset (follows `--vaf`) | denoise keep threshold. **Must be below `--sim-min-hf`**; sweep it with `sweep_denoise_vaf.sh` |
+| `--denoise-vaf F` | unset (follows `--vaf`) | denoise keep threshold. **Must be below `--sim-min-hf`**; see [denoise `--vaf` measurements](#denoise---vaf-measurements) |
 | `--sim-min-hf F` / `--sim-max-hf F` | 0.05 / 0.99 | band for *simulated truth* frequencies (distinct from `--min-hf`) |
 | `--min-hf F` / `--max-hf F` | 0.01 / 0.95 | band for `call -v` and `lineage`; **not** the truth band |
 | `--topology random\|chain\|star` | `random` | tree shape; `chain` for ordering difficulty |
 | `--internal-keep F` | 0.20 | terminal mass per internal node; lower = harder ordering |
-| `--fp F` / `--fn F` | unset | SCITE error rates. Unset uses `lineage::resolve_error_rates` (`ont-r10` 0.001/0.05, `ont-denoised` 0.0001/0.01, `hifi` 0.005/0.05); `metrics.tsv` records the resolved values |
+| `--fp F` / `--fn F` | unset | SCITE error rates. Unset uses `lineage::resolve_error_rates` (`hifi` 0.005/0.05, every ONT profile 0.005/0.02); `metrics.tsv` records the resolved values |
+| `--include-non-snvs` | off | let indels and other non-SNV alleles into the lineage tree |
+| `--collapse-hp` | off | merge equivalent HP-tract spellings in lineage; implies `--include-non-snvs` |
 | `--ref FASTA` | `$REPO/rCRS.fasta` | reference |
 
 `--sim-min-hf` and `--min-hf` are easy to confuse: the first constrains what is
@@ -285,6 +309,11 @@ Changing any of these makes the result incomparable to the baseline — that is
 the point of freezing them. For exploration, call `sweep_seeds.sh` directly.
 
 ### Committed baseline
+
+> **Stale.** The numbers below were produced before `Himito lineage` dropped the
+> root block, went SNV-only by default and started reporting singleton
+> haplotypes. `baseline_standard.tsv` is not in the repo. Regenerate it with
+> `./bench_standard.sh --outdir DIR --update-baseline` before reading any verdict.
 
 `baseline_standard.tsv`, 30/30 seeds, no failures. Mean `n_truth_pairs` = 45.0,
 mean `n_shared` = 9.8 of 10.
@@ -356,7 +385,7 @@ Appended after `n_background_calls`. Read them by header name. `bench_hp.sh` ave
 | `hp_intrusion` | Among truth SNVs that also appear in the reconstructed tree, the fraction whose reconstructed ancestors include an unstable length allele. |
 | `hp_backbone_nodes` | Count of unstable names that are the parent of at least one reconstructed node. |
 | `hp_len_l1` | Mean over tracts of Σ \|truth frequency − reconstructed frequency\| across length alleles. `NA` when there is no non-zero δ row or no matrix. |
-| `root_fraction` | ROOT `n_reads_attached` divided by the sum of that column. A `ROOT_BLOCK` row is an annotation and is left out of the sum. `NA` when the column is absent. |
+| `root_fraction` | ROOT `n_reads_attached` divided by the sum of that column. `NA` when the column is absent. |
 
 ### Frozen HP benchmark (`bench_hp.sh`)
 
@@ -373,6 +402,7 @@ Frozen on the standard call/tree settings (`ont-denoised`, 10 mutations, depth 1
 | `--background` | `hvs1-polyC` |
 | `--hp-lineage-indels` | 2 |
 | `--hp-unstable` | `common` |
+| `--include-non-snvs` | on (otherwise the length alleles never reach the tree) |
 
 ### In-silico PacBio/ONT pair (`run_eval.sh --pair`)
 
@@ -387,7 +417,7 @@ This is the in-silico twin of the real sample pairs. `--pair` needs `ccs` (HiFi)
 
 ### Sweep HP rates (`sweep_hp_rates.sh`)
 
-Call and the read simulation do not depend on `--hp-fp-rate` or `--hp-fn-rate`. `run_eval.sh --stop-after call` (or `sweep_seeds.sh --keep-intermediate`) writes `himito/sim.matrix.csv`, `himito/sim.vcf`, and `truth/` once per seed. `sweep_hp_rates.sh` re-runs only `Himito lineage` and `score_lineage.py` on that matrix. The global `--fp-rate` / `--fn-rate` stay at the profile default unless `--fp` / `--fn` are set. The default grid is `{1,2,4,8,16}×fp` and `{1,2,4,8,16,32}×fn`, each product capped at 0.5. For `ont-denoised` that is fp `0.0001…0.0016` and fn `0.01…0.32`.
+Call and the read simulation do not depend on `--hp-fp-rate` or `--hp-fn-rate`. `run_eval.sh --stop-after call` (or `sweep_seeds.sh --keep-intermediate`) writes `himito/sim.matrix.csv`, `himito/sim.vcf`, and `truth/` once per seed. `sweep_hp_rates.sh` re-runs only `Himito lineage --include-non-snvs` and `score_lineage.py` on that matrix. The global `--fp-rate` / `--fn-rate` stay at the profile default unless `--fp` / `--fn` are set. The default grid is `{1,2,4,8,16}×fp` and `{1,2,4,8,16,32}×fn`, each product capped at 0.5. For `ont-denoised` that is fp `0.0001…0.0016` and fn `0.01…0.32`.
 
 ```bash
 ./sweep_hp_rates.sh --outdir /tmp/hp_sweep --profile ont-denoised \
@@ -407,9 +437,9 @@ The report also gives `root_fraction` at the chosen cell and at the global-rate 
 
 ### Workflows
 
-`wdl/Himito-lineage/Himito_lineage_sim.wdl` is the full simulate → call → lineage → score grid (seeds × n_mutations × depth), including the HP modes. `wdl/Himito-lineage/Himito_lineage_hp_sweep.wdl` imports that file's `ValidateConfig` and `CombineMetrics`. It runs `SimulateCell` once per seed (`--stop-after call`), then `LineageScoreCell` for every `hp_fp_grid` × `hp_fn_grid` pair, then the picker above. `n_mutations` and `depth` are scalars. `ValidateConfig` fails the sweep unless `hp_lineage_indels > 0` or `hp_unstable` is set: otherwise the rates have nothing to act on and the sweep is guaranteed flat.
+`wdl/Himito-lineage/Himito_lineage_sim.wdl` is the SNV simulate → call → lineage → score grid (seeds × n_mutations × depth). `wdl/Himito-lineage/Himito_lineage_hp_sweep.wdl` is self-contained. It runs `SimulateCell` once per seed (`--stop-after call`), then `LineageScoreCell` for every `hp_fp_grid` × `hp_fn_grid` pair, then the picker above. `n_mutations` and `depth` are scalars. `SimulateCell` fails unless `hp_lineage_indels > 0` or `hp_unstable` is set: otherwise the rates have nothing to act on and the sweep is guaranteed flat.
 
-`lineage_eval/lineage_sim/Himito_lineage_hp_sweep.inputs.json` is the `bench_hp.sh` configuration with `collapse_hp` true and the ont-denoised default grid. It uses seeds 1–10. Thirty seeds times that 30-cell grid is too expensive for a first pass. MCMC in the sweep is 2 chains × 2000 iterations, the `sweep_fpfn.sh` budget. The image must be rebuilt after this plan so `/opt/lineage_sim` contains `pick_best_hp_rates.py` and `run_eval.sh --stop-after call`.
+`lineage_eval/lineage_sim/Himito_lineage_hp_sweep.inputs.json` is the `bench_hp.sh` configuration with `collapse_hp` true and the ont-denoised default grid. It uses seeds 1–10. Thirty seeds times that 30-cell grid is too expensive for a first pass. MCMC in the sweep is 2 chains × 2000 iterations.
 
 ## Multi-seed baselines (`sweep_seeds.sh`)
 
@@ -444,15 +474,10 @@ Outputs land under `<outdir>/`: `truth/`, `reads/`, `himito/`, and
 `metrics.tsv`.
 
 
-## Sweep denoise --vaf
+## denoise `--vaf` measurements
 
-```bash
-./sweep_denoise_vaf.sh --outdir /tmp/dv --ref ../../test_data/rCRS.fasta \
-  --vafs "0.005 0.01 0.03 0.05" --seeds "1 2 3 4 5 6 7 8 9 10"
-```
-
-Defaults to the standard config and forwards `--topology` / `--internal-keep` /
-`--sim-min-hf`, so a cell differs from the frozen benchmark only in `--vaf`.
+To re-measure, run `sweep_seeds.sh` once per value with the `bench_standard.sh`
+settings and a different `--denoise-vaf`.
 
 Measured on the standard config (10 seeds/cell, min truth HF **0.296**, so a
 ~10x margin over the gate):
@@ -476,28 +501,7 @@ HF 0.033, ~1.1x margin) it cut `var_recall` to 0.533, and 0.01 restored it to
 tool — sweep the regime you are actually in, and check `var_recall` before
 reading any precision gain.
 
-## Sweep fp/fn
-
-After `run_eval.sh` completes (matrix and VCF are fixed), sweep SCITE error
-rates by re-running only `Himito lineage` per grid cell:
-
-```bash
-./sweep_fpfn.sh --outdir /tmp/eval_ont --profile ont-denoised \
-  --fp-grid "0.0005 0.001 0.005 0.01" --fn-grid "0.02 0.05 0.1 0.2"
-```
-
-Writes `sweep_metrics.tsv` and prints the best cell by `ad_f1` (tie-break:
-`var_f1`).
-
-**Check the spread before trusting that line.** When detection is clean the
-matrix is unambiguous and the SCITE error priors have nothing to do: on
-`n=10 / depth 1000 / seed 1 / ont-denoised` all 16 cells returned identical
-scores (`var_f1` 1.000, `ad_f1` 0.875, `hap_f1` 0.900), so the reported "best
-cell" was just the first row of a 16-way tie, not an optimum. To rank fp/fn you
-need instances hard enough to separate the cells — lower `--total-depth`, more
-mutations, and several seeds averaged.
-
-## Metrics (in `metrics.tsv` / `sweep_metrics.tsv`)
+## Metrics (in `metrics.tsv` / `seed_metrics.tsv`)
 
 Three metric families, each with its own denominators. Precision = "of what we
 called, how much is right"; recall/sensitivity = "of the truth, how much we
@@ -585,13 +589,13 @@ poor detection moves a lot (n=10 depth 300, `var_recall` 0.750: 0.848 → 0.615)
 
 Two things that did **not** work, so you can skip them:
 
-- **`sweep_fpfn.sh` does not move `ad_*`.** Across a 16-cell grid plus six
-  hand-picked rates — including the empirically measured fp/fn — every cell
-  returned identical scores. Error-rate priors are not the lever on
+- **Sweeping the global `--fp` / `--fn` does not move `ad_*`.** Across a 16-cell
+  grid plus six hand-picked rates — including the empirically measured fp/fn —
+  every cell returned identical scores. Error-rate priors are not the lever on
   clean-detection instances. (The empirical rates, measured against
-  truth-labelled reads, are fp ≈ 0.009 and fn ≈ 0.21, versus the `ont-denoised`
-  priors of 0.0001/0.01 — mis-specified by 90× and 21×, but correcting them
-  changed nothing.)
+  truth-labelled reads, are fp ≈ 0.009 and fn ≈ 0.21, versus the then
+  `ont-denoised` priors of 0.0001/0.01 — mis-specified by 90× and 21×, but
+  correcting them changed nothing.)
 - **Raising `--n-mutations` does not make the tree harder.** See
   [Difficulty knobs](#difficulty-knobs).
 

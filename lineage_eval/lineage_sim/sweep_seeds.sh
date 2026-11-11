@@ -38,12 +38,12 @@ TOPOLOGY=""
 # Lowering it passes more mass downward, so it raises ordering difficulty without
 # costing detection. Empty = simulator default (0.20).
 INTERNAL_KEEP=""
-# Plan 2026-09-27 T3. Empty = omit the flag on run_eval.sh.
+# Lineage is SNV-only unless set. The HP benchmark needs indels in the tree.
+INCLUDE_NON_SNVS=0
+# HP simulator modes. Empty = omit the flag on run_eval.sh.
 HP_LINEAGE_INDELS=""
-# Plan 2026-09-27 T4. Empty = omit the flag on run_eval.sh.
 HP_UNSTABLE=""
 HP_MIN_SUBCLONE_FREQ=""
-# Plan 2026-09-27 T5. Empty = omit the flag on run_eval.sh.
 BACKGROUND=""
 
 while [[ $# -gt 0 ]]; do
@@ -60,6 +60,7 @@ while [[ $# -gt 0 ]]; do
     --internal-keep) INTERNAL_KEEP="$2"; shift 2;;
     --ref) REF_ARG="$2"; shift 2;;
     --keep-intermediate) KEEP_INTERMEDIATE=1; shift;;
+    --include-non-snvs) INCLUDE_NON_SNVS=1; shift;;
     --hp-lineage-indels) HP_LINEAGE_INDELS="$2"; shift 2;;
     --hp-unstable) HP_UNSTABLE="$2"; shift 2;;
     --hp-min-subclone-freq) HP_MIN_SUBCLONE_FREQ="$2"; shift 2;;
@@ -68,7 +69,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile P] [--n-mutations N] [--total-depth N] [--seeds \"1 2 3\"] [--frequency-threshold F] [--sim-min-hf F] [--denoise-vaf F] [--topology random|chain|star] [--internal-keep F] [--ref FASTA] [--keep-intermediate] [--hp-lineage-indels K] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC]" >&2
+  echo "usage: --outdir DIR [--profile P] [--n-mutations N] [--total-depth N] [--seeds \"1 2 3\"] [--frequency-threshold F] [--sim-min-hf F] [--denoise-vaf F] [--topology random|chain|star] [--internal-keep F] [--ref FASTA] [--keep-intermediate] [--include-non-snvs] [--hp-lineage-indels K] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC]" >&2
   exit 1
 }
 [[ -f "$REF_ARG" ]] || { echo "missing reference FASTA: $REF_ARG (pass --ref)" >&2; exit 1; }
@@ -94,12 +95,10 @@ for s in $SEEDS; do
   [[ -n "$DENOISE_VAF" ]] && EVAL_ARGS+=(--denoise-vaf "$DENOISE_VAF")
   [[ -n "$TOPOLOGY" ]] && EVAL_ARGS+=(--topology "$TOPOLOGY")
   [[ -n "$INTERNAL_KEEP" ]] && EVAL_ARGS+=(--internal-keep "$INTERNAL_KEEP")
-  # Plan 2026-09-27 T3. Empty omits the flag.
+  [[ "$INCLUDE_NON_SNVS" == 1 ]] && EVAL_ARGS+=(--include-non-snvs)
   [[ -n "$HP_LINEAGE_INDELS" ]] && EVAL_ARGS+=(--hp-lineage-indels "$HP_LINEAGE_INDELS")
-  # Plan 2026-09-27 T4. Empty omits the flag.
   [[ -n "$HP_UNSTABLE" ]] && EVAL_ARGS+=(--hp-unstable "$HP_UNSTABLE")
   [[ -n "$HP_MIN_SUBCLONE_FREQ" ]] && EVAL_ARGS+=(--hp-min-subclone-freq "$HP_MIN_SUBCLONE_FREQ")
-  # Plan 2026-09-27 T5. Empty omits the flag.
   [[ -n "$BACKGROUND" ]] && EVAL_ARGS+=(--background "$BACKGROUND")
   if ! "$HERE/run_eval.sh" "${EVAL_ARGS[@]}" >"$OUTDIR/seed$s.log" 2>&1; then
     echo "  FAILED (see $OUTDIR/seed$s.log)" >&2

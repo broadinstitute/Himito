@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
 # Sweep Himito lineage --hp-fp-rate x --hp-fn-rate on a fixed matrix.
-# Plan 2026-09-27 T11. Same shape as sweep_fpfn.sh: simulation, alignment,
-# denoise, build, and call run once per seed; only lineage and score_lineage.py
-# re-run per grid cell.
+# Simulation, alignment, denoise, build, and call run once per seed; only lineage
+# and score_lineage.py re-run per grid cell.
 #
 # Defaults are multiples of the profile's preset global fp/fn (pacbio 0.005/0.05,
 # ONT 0.005/0.02): {1,2,4,8,16} x fp and {1,2,4,8,16,32} x fn, each capped at 0.5.
 # The grid changed on 2026-10-20 when these presets were corrected (ont-denoised was
-# 0.0001/0.01 here), so earlier sweeps are not comparable. Unless --fp/--fn are given,
-# lineage uses the fp preset and estimates the SNV fn per sample; the metrics record
-# the rates each run used (its error_model.tsv). Tract alleles are always searched. Pass --seeds to loop seed*/ cells from sweep_seeds.sh
-# --keep-intermediate (or from run_eval.sh --stop-after call, one directory
-# per seed). Without --seeds, --outdir itself is the one cell.
+# 0.0001/0.01 here), so earlier sweeps are not comparable. Lineage always runs with
+# --include-non-snvs: the HP rates mostly act on tract indels. Pass --seeds to loop
+# seed*/ cells from sweep_seeds.sh --keep-intermediate (or from run_eval.sh
+# --stop-after call, one directory per seed). Without --seeds, --outdir itself is the one cell.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 HIMITO="${HIMITO:-$REPO/target/release/Himito}"
 
-# Plan 2026-09-27 T6. truth/background.txt stores Himito SNV names. The scorer
+# truth/background.txt stores Himito SNV names. The scorer
 # wants the <REF><pos><ALT> tokens those names came from.
 background_spec_from_truth() {
   local file="$1"
@@ -32,21 +30,12 @@ background_spec_from_truth() {
   (IFS=,; echo "${tokens[*]}")
 }
 
-# Data-type presets of lineage::resolve_error_rates (src/lineage.rs): pacbio 0.005/0.05,
-# every ONT type 0.005/0.02. Himito lineage now estimates the SNV fn per sample unless
-# --fn-rate is given, so the rates a run actually used come from its
-# <prefix>.error_model.tsv (snv_rates_used); these presets are only the fallback.
+# Data-type presets of lineage::resolve_error_rates (src/lineage.rs).
 resolve_scite_rates() {
   case "$1" in
     hifi) echo "0.005 0.05";;
     *) echo "0.005 0.02";;  # ont-r10, ont-denoised, ont-r9
   esac
-}
-
-# "fp fn" from the snv rows of a lineage <prefix>.error_model.tsv; nothing if the file is missing.
-snv_rates_used() {
-  [[ -f "$1" ]] || return 0
-  awk -F'\t' '$1=="snv" && $3=="fp"{fp=$4} $1=="snv" && $3=="fn"{fn=$4} END{if (fp!="" && fn!="") print fp, fn}' "$1"
 }
 
 profile_dtype() {
@@ -164,8 +153,7 @@ for entry in "${CELLS[@]}"; do
       LINEAGE_ARGS=(
         -m "$MATRIX" -v "$VCF"
         --hp-fp-rate "$hp_fp" --hp-fn-rate "$hp_fn"
-        # Sweeping HP rates presupposes the tract alleles are placed in the tree.
-        --tract-alleles search
+        --include-non-snvs
         --min-hf "$MIN_HF" --max-hf "$MAX_HF"
         --mcmc-iterations "$MCMC_ITERS" --mcmc-chains "$MCMC_CHAINS"
         -d "$DTYPE"
@@ -191,17 +179,13 @@ for entry in "${CELLS[@]}"; do
       if [[ -n "$cell_background" && "$cell_background" != "none" ]]; then
         SCORE_ARGS+=(--background "$cell_background")
       fi
-      # Record the global rates this lineage run actually used (the fn is estimated per sample).
-      cell_fp="$SCORE_FP"; cell_fn="$SCORE_FN"
-      used="$(snv_rates_used "${pfx}.error_model.tsv")"
-      [[ -n "$used" ]] && read -r cell_fp cell_fn <<<"$used"
       tmp="$cell/himito/.hp_score_${hp_fp}_${hp_fn}.tsv"
       rm -f "$tmp"
       python "$HERE/score_lineage.py" \
         --truth-tree "$cell/truth/truth_mutation_tree.tsv" \
         --recon-tree "${pfx}.mutation_tree.tsv" \
         --truth-variants "$cell/truth/truth_variants.txt" \
-        --vcf "$VCF" --profile "$PROFILE" --fp "$cell_fp" --fn "$cell_fn" \
+        --vcf "$VCF" --profile "$PROFILE" --fp "$SCORE_FP" --fn "$SCORE_FN" \
         "${HAP_ARGS[@]+"${HAP_ARGS[@]}"}" \
         "${SCORE_ARGS[@]+"${SCORE_ARGS[@]}"}" \
         --metrics-out "$tmp" >/dev/null

@@ -2,8 +2,8 @@
 # THE frozen homopolymer-length benchmark. Run this to get a number that is
 # comparable to baseline_hp.tsv and to other people's HP runs.
 #
-# Plan 2026-09-27 T8. bench_standard.sh is a different experiment (SNV-only)
-# and is left unchanged. Do not score an HP run against baseline_standard.tsv.
+# bench_standard.sh is a different experiment (SNV-only). Do not score an HP
+# run against baseline_standard.tsv.
 #
 # ---------------------------------------------------------------------------
 # FROZEN PARAMETERS — do not edit without regenerating the baseline.
@@ -44,6 +44,8 @@
 #   --hp-lineage-indels 2     Two of the ten edges are inherited length changes.
 #   --hp-unstable common      D310 / HVS1 / C573 length states that are not tree
 #                             edges (lineage-independent heteroplasmy).
+#   --include-non-snvs        Himito lineage is SNV-only by default; without this
+#                             the length alleles never reach the tree.
 #   seeds 1..30               10 seeds cannot separate a real effect from one
 #                             coin-flip edge.
 #
@@ -62,7 +64,6 @@ TOPOLOGY=chain
 INTERNAL_KEEP=0.10
 FREQ_THRESHOLD=0.05
 DENOISE_VAF=0.03
-# Plan 2026-09-27 T8.
 BACKGROUND=hvs1-polyC
 HP_LINEAGE_INDELS=2
 HP_UNSTABLE=common
@@ -96,7 +97,7 @@ FOCUS = ["var_precision","var_recall","var_f1",
          "hap_precision","hap_recall","hap_f1",
          "hp_intrusion","hp_backbone_nodes","hp_len_l1",
          "root_fraction","hp_var_f1"]
-# Plan 2026-09-27 T8. These are error counts: a smaller mean is the improvement.
+# These are error counts: a smaller mean is the improvement.
 # var_*, ad_*, hap_*, and hp_var_f1 still treat a larger mean as IMPROVED.
 LOWER_IS_BETTER = {"hp_intrusion", "hp_backbone_nodes", "hp_len_l1", "root_fraction"}
 
@@ -178,13 +179,12 @@ echo "profile=$PROFILE n_mutations=$NMUT depth=$DEPTH topology=$TOPOLOGY" >&2
 echo "internal_keep=$INTERNAL_KEEP -f=$FREQ_THRESHOLD denoise_vaf=$DENOISE_VAF seeds=$(wc -w <<<"$SEEDS" | tr -d ' ')" >&2
 echo "background=$BACKGROUND hp_lineage_indels=$HP_LINEAGE_INDELS hp_unstable=$HP_UNSTABLE" >&2
 
-# Plan 2026-09-27 T8. sweep_seeds.sh already accepts these flags.
 "$HERE/sweep_seeds.sh" --outdir "$OUTDIR" --profile "$PROFILE" \
   --n-mutations "$NMUT" --total-depth "$DEPTH" --seeds "$SEEDS" \
   --topology "$TOPOLOGY" --internal-keep "$INTERNAL_KEEP" \
   --frequency-threshold "$FREQ_THRESHOLD" --denoise-vaf "$DENOISE_VAF" \
   --background "$BACKGROUND" --hp-lineage-indels "$HP_LINEAGE_INDELS" \
-  --hp-unstable "$HP_UNSTABLE" \
+  --hp-unstable "$HP_UNSTABLE" --include-non-snvs \
   --ref "$REF_ARG" || true
 
 RESULT="$OUTDIR/seed_metrics.tsv"

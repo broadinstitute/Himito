@@ -1,7 +1,7 @@
 version 1.0
 
-# WDL port of run_simulation.sh: a Cartesian sweep of the simulate -> reconstruct
-# -> score cycle (run_eval.sh) over seeds x n-mutations x depths. Each grid cell
+# A Cartesian sweep of the simulate -> reconstruct -> score cycle
+# (run_eval.sh) over seeds x n-mutations x depths. Each grid cell
 # runs one full RunEvalCell task; CombineMetrics concatenates the per-cell metrics
 # (with identifying seed/n_mutations/total_depth columns) into a single metrics.tsv.
 
@@ -150,7 +150,7 @@ task RunEvalCell {
             ~{fn_arg} \
             ~{frequency_threshold_arg}
 
-        # Prepend the identifying columns run_simulation.sh adds to the combined table.
+        # Prepend the identifying grid columns to the combined table.
         metrics="~{cell}/metrics.tsv"
         header=$(head -n 1 "$metrics")
         row=$(tail -n 1 "$metrics")

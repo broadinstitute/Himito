@@ -53,19 +53,16 @@ MIN_EDGE_READS=2
 # HF band for `Himito lineage` and, unless --vaf is set, for `Himito call -v`.
 # score_lineage.py still counts every PASS/. call (no second HF band): with call
 # already cut at this floor, that is evaluation at the same min-hf.
-# Empty --fp/--fn: Himito lineage uses the -d fp preset and estimates the SNV fn per sample
-# (written to sim_lineage.error_model.tsv).
-
+# Empty --fp/--fn: Himito lineage uses the -d preset (pacbio 0.005/0.05, ONT 0.005/0.02).
 MIN_HF=0.01 MAX_HF=0.95
-# Plan 2026-09-26 T9. Off unless passed; forwarded only to `Himito lineage`.
+# Himito lineage is SNV-only by default. --include-non-snvs admits indels (needed
+# for the HP benchmark); --collapse-hp requires it and turns it on.
+INCLUDE_NON_SNVS=0
 COLLAPSE_HP=0
-# Plan 2026-09-27 T3. Forwarded only to `Himito lineage`, not `Himito call`.
+# Forwarded only to `Himito lineage`, not `Himito call`.
 HP_FP_RATE=""
 HP_FN_RATE=""
-# Plan 2026-10-20 T10. Empty = Himito lineage default (auto: ONT tract alleles beyond the
-# calibrated run length are annotate-only). Forwarded only to `Himito lineage`.
-TRACT_ALLELES=""
-# Plan 2026-09-27 T11. "call" skips Himito lineage after sim.matrix.csv and sim.vcf exist.
+# "call" skips Himito lineage after sim.matrix.csv and sim.vcf exist.
 STOP_AFTER=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -87,10 +84,10 @@ while [[ $# -gt 0 ]]; do
     --kmer) KMER="$2"; shift 2;;
     --min-hf) MIN_HF="$2"; shift 2;;
     --max-hf) MAX_HF="$2"; shift 2;;
-    --collapse-hp) COLLAPSE_HP=1; shift;;
+    --include-non-snvs) INCLUDE_NON_SNVS=1; shift;;
+    --collapse-hp) COLLAPSE_HP=1; INCLUDE_NON_SNVS=1; shift;;
     --hp-fp-rate) HP_FP_RATE="$2"; shift 2;;
     --hp-fn-rate) HP_FN_RATE="$2"; shift 2;;
-    --tract-alleles) TRACT_ALLELES="$2"; shift 2;;
     --stop-after)
       STOP_AFTER="$2"; shift 2
       [[ "$STOP_AFTER" == "call" ]] || { echo "--stop-after must be call (got $STOP_AFTER)" >&2; exit 1; }
@@ -99,11 +96,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$OUTDIR" && -n "$PROFILE" ]] || {
-  echo "usage: --outdir DIR --profile {hifi,ont-r10} [--sample S] [--fp F] [--fn F]" >&2
+  echo "usage: --outdir DIR --profile {hifi,ont-r10,ont-denoised} [--sample S] [--fp F] [--fn F]" >&2
   echo "  [--minimal-ac N] [--vaf V] [--denoise-vaf V] [--frequency-threshold F]" >&2
   echo "  [--permutation-frequency-threshold F] [--strand-bias-threshold F]" >&2
   echo "  [--indel-false-threshold F] [--min-edge-reads N] [--min-hf F] [--max-hf F]" >&2
-  echo "  [--collapse-hp] [--hp-fp-rate F] [--hp-fn-rate F] [--tract-alleles auto|search|annotate] [--stop-after call]" >&2
+  echo "  [--include-non-snvs] [--collapse-hp] [--hp-fp-rate F] [--hp-fn-rate F] [--stop-after call]" >&2
   exit 1
 }
 
@@ -196,8 +193,7 @@ CALL_ARGS=(
 [[ -n "$FREQ_THRESHOLD" ]] && CALL_ARGS+=(-f "$FREQ_THRESHOLD")
 "$HIMITO" call "${CALL_ARGS[@]}"
 
-# Plan 2026-09-27 T11. The HP-rate sweep re-runs lineage itself. Leave the
-# matrix, VCF, reads, and truth in place.
+# The HP-rate sweep re-runs lineage itself. Leave the matrix, VCF, reads, and truth in place.
 if [[ "$STOP_AFTER" == "call" ]]; then
   echo "stop-after call: skipped Himito lineage ($HDIR/sim.matrix.csv, $HDIR/sim.vcf)" >&2
   exit 0
@@ -209,11 +205,9 @@ fi
 # produce artifacts (fasta, methylation bed) this harness doesn't score, so
 # they're intentionally not reproduced here.
 
-# Lineage: SCITE mutation-tree reconstruction. Unless --fp/--fn are passed, the SNV fp
-# is the -d preset (0.005), the SNV fn is estimated per sample (floor 0.005; preset
-# pacbio 0.05 / ONT 0.02 when too few near-fixed SNVs), and D310/HVS1-C allele rates
-# come from sim.hp_confusion.tsv, which `call --bam` writes beside sim.matrix.csv.
-# sim_lineage.error_model.tsv records every rate used.
+# Lineage: SCITE mutation-tree reconstruction over heteroplasmic SNVs in
+# [--min-hf, --max-hf). Unless --fp/--fn are passed, the rates are the -d preset;
+# variants overlapping D310/HVS1-C/CA514 use twice those unless --hp-fp/fn-rate are set.
 LINEAGE_ARGS=(
   -m "$HDIR/sim.matrix.csv" -v "$HDIR/sim.vcf"
   --min-hf "$MIN_HF" --max-hf "$MAX_HF"
@@ -222,12 +216,10 @@ LINEAGE_ARGS=(
 )
 [[ -n "$FP" ]] && LINEAGE_ARGS+=(--fp-rate "$FP")
 [[ -n "$FN" ]] && LINEAGE_ARGS+=(--fn-rate "$FN")
-# Plan 2026-09-26 T9. Not forwarded to `Himito call`.
+[[ "$INCLUDE_NON_SNVS" == 1 ]] && LINEAGE_ARGS+=(--include-non-snvs)
 [[ "$COLLAPSE_HP" == 1 ]] && LINEAGE_ARGS+=(--collapse-hp)
-# Plan 2026-09-27 T3. Not forwarded to `Himito call`.
 [[ -n "$HP_FP_RATE" ]] && LINEAGE_ARGS+=(--hp-fp-rate "$HP_FP_RATE")
 [[ -n "$HP_FN_RATE" ]] && LINEAGE_ARGS+=(--hp-fn-rate "$HP_FN_RATE")
-[[ -n "$TRACT_ALLELES" ]] && LINEAGE_ARGS+=(--tract-alleles "$TRACT_ALLELES")
 "$HIMITO" lineage "${LINEAGE_ARGS[@]}"
 
 echo "himito done: $HDIR/sim_lineage.mutation_tree.tsv"

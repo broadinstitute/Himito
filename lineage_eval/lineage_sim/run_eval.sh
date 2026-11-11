@@ -27,8 +27,7 @@ DENOISE_VAF=""
 # 0.01 matches the committed benchmarks, whose truth SNVs are *observed* at
 # HF 0.06-0.21 and would be mostly filtered away by a 0.1 floor.
 # max-hf 0.95 matches the Himito lineage CLI (excludes near-fixed sites).
-# Empty --fp/--fn: lineage uses the -d fp preset and estimates the SNV fn per sample;
-# the rates actually used are read back from sim_lineage.error_model.tsv for metrics.tsv.
+# Empty --fp/--fn: lineage uses the -d preset (see resolve_scite_rates below).
 MIN_HF=0.01 MAX_HF=0.95
 # Band for simulate_tree.py's *truth* frequencies. This is a different constraint
 # from the lineage filter above -- one is what we simulate, the other is how we
@@ -49,24 +48,22 @@ INTERNAL_KEEP=""
 # splits mass between siblings, so the minimum clone frequency is higher than a
 # random tree of the same --n-mutations. Empty = simulator default (random).
 TOPOLOGY=""
-# Plan 2026-09-26 T9. Off unless passed; forwarded to run_himito.sh's lineage step.
+# Lineage is SNV-only unless --include-non-snvs (or --collapse-hp, which implies it)
+# is passed. Both are forwarded to run_himito.sh's lineage step only.
+INCLUDE_NON_SNVS=0
 COLLAPSE_HP=0
-# Plan 2026-09-27 T3. Empty = omit the flag (simulate_tree.py default is 0).
+# HP simulator modes (simulate_tree.py). Empty = omit the flag.
 HP_LINEAGE_INDELS=""
-# Plan 2026-09-27 T3. Forwarded only to Himito lineage, via run_himito.sh.
-HP_FP_RATE=""
-HP_FN_RATE=""
-# Plan 2026-10-20 T10. Empty = Himito lineage default (auto). Forwarded via run_himito.sh.
-TRACT_ALLELES=""
-# Plan 2026-09-27 T4. Empty = omit --hp-unstable. Depth is forwarded only with it.
 HP_UNSTABLE=""
 HP_MIN_SUBCLONE_FREQ=""
-# Plan 2026-09-27 T5. Empty = omit; simulate_tree.py defaults to none.
 BACKGROUND=""
-# Plan 2026-09-27 T8. One truth, then hifi and ont-denoised. Linux-only: hifi
-# needs ccs. Off unless passed; --profile is ignored while this is set.
+# Forwarded only to Himito lineage, via run_himito.sh.
+HP_FP_RATE=""
+HP_FN_RATE=""
+# One truth, then hifi and ont-denoised. Linux-only: hifi needs ccs.
+# Off unless passed; --profile is ignored while this is set.
 PAIR=0
-# Plan 2026-09-27 T11. "call" stops once sim.matrix.csv and sim.vcf exist.
+# "call" stops once sim.matrix.csv and sim.vcf exist.
 # Lineage and score_lineage.py are a later sweep step. Reads and truth stay.
 STOP_AFTER=""
 while [[ $# -gt 0 ]]; do
@@ -87,11 +84,11 @@ while [[ $# -gt 0 ]]; do
     --internal-keep) INTERNAL_KEEP="$2"; shift 2;;
     --topology) TOPOLOGY="$2"; shift 2;;
     --ref) export REF="$2"; shift 2;;
+    --include-non-snvs) INCLUDE_NON_SNVS=1; shift;;
     --collapse-hp) COLLAPSE_HP=1; shift;;
     --hp-lineage-indels) HP_LINEAGE_INDELS="$2"; shift 2;;
     --hp-fp-rate) HP_FP_RATE="$2"; shift 2;;
     --hp-fn-rate) HP_FN_RATE="$2"; shift 2;;
-    --tract-alleles) TRACT_ALLELES="$2"; shift 2;;
     --hp-unstable) HP_UNSTABLE="$2"; shift 2;;
     --hp-min-subclone-freq) HP_MIN_SUBCLONE_FREQ="$2"; shift 2;;
     --background) BACKGROUND="$2"; shift 2;;
@@ -104,10 +101,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$OUTDIR" ]] || {
-  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--tract-alleles auto|search|annotate] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC] [--pair] [--stop-after call]" >&2
+  echo "usage: --outdir DIR [--profile ...] [--n-mutations N] [--total-depth N] [--seed N] [--fp F] [--fn F] [--frequency-threshold F] [--denoise-vaf F] [--min-hf F] [--max-hf F] [--sim-min-hf F] [--sim-max-hf F] [--internal-keep F] [--topology random|chain|star] [--ref FASTA] [--include-non-snvs] [--collapse-hp] [--hp-lineage-indels K] [--hp-fp-rate F] [--hp-fn-rate F] [--hp-unstable SPEC] [--hp-min-subclone-freq F] [--background SPEC] [--pair] [--stop-after call]" >&2
   exit 1
 }
-# Plan 2026-09-27 T8. Fail before any simulation. An ONT-only run is not a pair.
+# Fail before any simulation. An ONT-only run is not a pair.
 if [[ "$PAIR" == 1 ]]; then
   command -v ccs >/dev/null 2>&1 || {
     echo "--pair needs HiFi/ccs and is Linux-only for now" >&2
@@ -120,10 +117,8 @@ if [[ -z "${PBSIM_MODEL_DIR:-}" || ! -d "${PBSIM_MODEL_DIR:-}" ]]; then
 fi
 [[ -f "$REF" ]] || { echo "missing reference FASTA: $REF" >&2; exit 1; }
 
-# Data-type presets of lineage::resolve_error_rates (src/lineage.rs): pacbio 0.005/0.05,
-# every ONT type 0.005/0.02. Himito lineage now estimates the SNV fn per sample unless
-# --fn-rate is given, so the rates a run actually used come from its
-# <prefix>.error_model.tsv (snv_rates_used); these presets are only the fallback.
+# Data-type presets of lineage::resolve_error_rates (src/lineage.rs), recorded in
+# metrics.tsv when --fp/--fn are not given.
 resolve_scite_rates() {
   case "$1" in
     hifi) echo "0.005 0.05";;
@@ -131,29 +126,20 @@ resolve_scite_rates() {
   esac
 }
 
-# "fp fn" from the snv rows of a lineage <prefix>.error_model.tsv; nothing if the file is missing.
-snv_rates_used() {
-  [[ -f "$1" ]] || return 0
-  awk -F'\t' '$1=="snv" && $3=="fp"{fp=$4} $1=="snv" && $3=="fn"{fn=$4} END{if (fp!="" && fn!="") print fp, fn}' "$1"
-}
-
 mkdir -p "$OUTDIR"
 echo "$OUTDIR"
 SIM_TREE_ARGS=()
 [[ -n "$INTERNAL_KEEP" ]] && SIM_TREE_ARGS+=(--internal-keep "$INTERNAL_KEEP")
 [[ -n "$TOPOLOGY" ]] && SIM_TREE_ARGS+=(--topology "$TOPOLOGY")
-# Plan 2026-09-27 T3. Empty omits the flag.
 [[ -n "$HP_LINEAGE_INDELS" ]] && SIM_TREE_ARGS+=(--hp-lineage-indels "$HP_LINEAGE_INDELS")
-# Plan 2026-09-27 T4. Empty SPEC omits --hp-unstable. --total-depth reaches
-# simulate_tree.py only together with that flag.
+# --total-depth reaches simulate_tree.py only together with --hp-unstable.
 [[ -n "$HP_UNSTABLE" ]] && SIM_TREE_ARGS+=(--hp-unstable "$HP_UNSTABLE")
 [[ -n "$HP_MIN_SUBCLONE_FREQ" ]] && SIM_TREE_ARGS+=(--hp-min-subclone-freq "$HP_MIN_SUBCLONE_FREQ")
 [[ -n "$HP_UNSTABLE" ]] && SIM_TREE_ARGS+=(--total-depth "$DEPTH")
-# Plan 2026-09-27 T5. Empty omits the flag.
 [[ -n "$BACKGROUND" ]] && SIM_TREE_ARGS+=(--background "$BACKGROUND")
 python "$HERE/simulate_tree.py" --reference "$REF" --n-mutations "$NMUT" --seed "$SEED" --outdir "$OUTDIR" --min-hf "$SIM_MIN_HF" --max-hf "$SIM_MAX_HF" "${SIM_TREE_ARGS[@]+"${SIM_TREE_ARGS[@]}"}"
-# Plan 2026-09-27 T6. Pass truth files when this run wrote them, and the
-# simulator background when it is not `none`, so scoring uses the same tracts.
+# Pass truth files when this run wrote them, and the simulator background when
+# it is not `none`, so scoring uses the same tracts.
 SCORE_ARGS=()
 [[ -f "$OUTDIR/truth/background.txt" ]] && SCORE_ARGS+=(--truth-background "$OUTDIR/truth/background.txt")
 [[ -f "$OUTDIR/truth/hp_tracts.tsv" ]] && SCORE_ARGS+=(--truth-hp-tracts "$OUTDIR/truth/hp_tracts.tsv")
@@ -164,7 +150,7 @@ fi
 
 # $1 profile, $2 reconstruction directory name under OUTDIR.
 # "himito" is where run_himito.sh writes. Any other name is a rename so a
-# second platform (Plan 2026-09-27 T8) cannot clobber the first.
+# second platform (--pair) cannot clobber the first.
 run_one_profile() {
   local profile="$1" dest="$2"
   "$HERE/simulate_reads.sh" --outdir "$OUTDIR" --profile "$profile" --total-depth "$DEPTH" --seed "$SEED"
@@ -177,12 +163,10 @@ run_one_profile() {
   [[ -n "$FN" ]] && HIMITO_ARGS+=(--fn "$FN")
   [[ -n "$FREQ_THRESHOLD" ]] && HIMITO_ARGS+=(--frequency-threshold "$FREQ_THRESHOLD")
   [[ -n "$DENOISE_VAF" ]] && HIMITO_ARGS+=(--denoise-vaf "$DENOISE_VAF")
+  [[ "$INCLUDE_NON_SNVS" == 1 ]] && HIMITO_ARGS+=(--include-non-snvs)
   [[ "$COLLAPSE_HP" == 1 ]] && HIMITO_ARGS+=(--collapse-hp)
-  # Plan 2026-09-27 T3. run_himito.sh forwards these to Himito lineage only.
   [[ -n "$HP_FP_RATE" ]] && HIMITO_ARGS+=(--hp-fp-rate "$HP_FP_RATE")
   [[ -n "$HP_FN_RATE" ]] && HIMITO_ARGS+=(--hp-fn-rate "$HP_FN_RATE")
-  [[ -n "$TRACT_ALLELES" ]] && HIMITO_ARGS+=(--tract-alleles "$TRACT_ALLELES")
-  # Plan 2026-09-27 T11. run_himito.sh exits after Himito call.
   [[ -n "$STOP_AFTER" ]] && HIMITO_ARGS+=(--stop-after "$STOP_AFTER")
   "$HERE/run_himito.sh" "${HIMITO_ARGS[@]}"
   if [[ "$dest" != "himito" ]]; then
@@ -194,11 +178,9 @@ run_one_profile() {
 # $1 profile, $2 reconstruction directory, $3 metrics TSV path.
 score_reconstruction() {
   local profile="$1" hdir="$2" metrics="$3"
-  local default_fp default_fn fp_rec fn_rec used
+  local default_fp default_fn fp_rec fn_rec
   read -r default_fp default_fn < <(resolve_scite_rates "$profile")
   fp_rec="${FP:-$default_fp}"; fn_rec="${FN:-$default_fn}"
-  used="$(snv_rates_used "$OUTDIR/$hdir/sim_lineage.error_model.tsv")"
-  [[ -n "$used" ]] && read -r fp_rec fn_rec <<<"$used"
   python "$HERE/score_lineage.py" \
     --truth-tree "$OUTDIR/truth/truth_mutation_tree.tsv" \
     --recon-tree "$OUTDIR/$hdir/sim_lineage.mutation_tree.tsv" \
@@ -211,7 +193,7 @@ score_reconstruction() {
     --metrics-out "$metrics"
 }
 
-# Plan 2026-09-27 T8. ONT tree scored with the PacBio tree as truth.
+# ONT tree scored with the PacBio tree as truth.
 # pair_ad_f1 is that run's ad_f1. pair_root_fraction_delta is ONT minus PacBio.
 write_pair_metrics() {
   local pb_vars="$OUTDIR/himito_pb/called_variants.txt"
@@ -257,7 +239,7 @@ PY
   rm -f "$pair_score"
 }
 
-# Plan 2026-09-27 T11. sim.matrix.csv and sim.vcf are enough for sweep_hp_rates.sh.
+# sim.matrix.csv and sim.vcf are enough for sweep_hp_rates.sh.
 # Do not score: sim_lineage.* does not exist, and truth/ is left in place.
 stop_after_call() {
   echo "stop-after call: skipped lineage and scoring (truth/ and himito/sim.vcf kept)" >&2

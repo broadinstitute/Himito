@@ -8,12 +8,9 @@
 #   - the pbsim3 error models
 #   - the lineage_sim scripts and rCRS.fasta
 #
-# Plan 2026-09-27 T10. Rebuild this image after the HP plan. It bakes
-# /opt/lineage_sim/*.py; hp_tracts.py, measure_hp_errors.py, and pysam
-# from T7 are new. ValidateConfig imports hp_tracts from that path, so an
-# image built before this plan cannot run Himito_lineage_sim.wdl.
-# Plan 2026-09-27 T11. Rebuild again so run_eval.sh --stop-after call and
-# pick_best_hp_rates.py are in the image. Himito_lineage_hp_sweep.wdl calls both.
+# Himito_lineage_hp_sweep.wdl also needs run_eval.sh --stop-after call and
+# pick_best_hp_rates.py from this image. The Himito binary must support
+# `lineage --include-non-snvs`; rebuild after updating HIMITO_IMAGE.
 #
 # pbccs is linux/amd64-only, so the runtime is always amd64. Do NOT compile
 # Rust under QEMU on Apple Silicon: `rustc -vV` SIGSEGVs there. Default is to
@@ -59,9 +56,7 @@ FROM --platform=linux/amd64 mambaorg/micromamba:1.5.8 AS runtime
 USER root
 ENV MAMBA_ROOT_PREFIX=/opt/conda
 
-# Simulation/reconstruction toolchain (pbsim3, pbccs, minimap2, samtools, python).
-# Plan 2026-09-27 T10. pysam (T7, measure_hp_errors.py) is installed by this
-# conda env: environment.yml lists `- pysam`.
+# Simulation/reconstruction toolchain (pbsim3, pbccs, minimap2, samtools, python, pysam).
 COPY environment.yml /tmp/environment.yml
 RUN micromamba install -y -n base -f /tmp/environment.yml \
     && micromamba clean --all --yes

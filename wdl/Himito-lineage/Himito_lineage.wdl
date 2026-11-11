@@ -304,7 +304,7 @@ task Himito_lineage {
                                               --max-hf ~{max_hf} \
                                               -d ~{data_type} \
                                               -o ~{prefix}.pb \
-                                              ~{true="--collapse-hp" false="" collapse_hp} \
+                                              ~{true="--include-non-snvs --collapse-hp" false="" collapse_hp} \
                                               ~{extra_args}
 
     >>>  

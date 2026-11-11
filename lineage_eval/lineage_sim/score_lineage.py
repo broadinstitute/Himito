@@ -16,35 +16,10 @@ from simulate_tree import parse_background
 
 
 def parse_mutation_tree(path: str) -> dict[str, str]:
-    """variant -> parent_variant. ROOT maps to ROOT.
-
-    A recurrent tract state (`--tract-alleles site`/`auto`) has one leaf node per lineage it occurs in, the extra
-    ones named `<allele>#<k>`. It is scored as one node under the lowest common ancestor of those leaves' parents:
-    the smallest clade that holds every carrier.
-    """
-    rows = []
+    """variant -> parent_variant. ROOT maps to ROOT."""
     with open(path) as fh:
-        rdr = csv.DictReader(fh, delimiter="\t")
-        for row in rdr:
-            # Annotate-only tract alleles are reported, not placed: they are no tree node.
-            if row.get("node_id") == "TRACT_ANNOTATED":
-                continue
-            rows.append((row["variant"], row["parent_variant"]))
-    base = lambda v: v.split("#")[0]
-    recurrent = {base(v) for v, _ in rows if "#" in v}
-    parent = {v: p for v, p in rows if base(v) not in recurrent}
-
-    def path(v: str) -> list[str]:
-        out = [v]
-        while out[-1] != "ROOT" and out[-1] in parent and parent[out[-1]] != out[-1]:
-            out.append(parent[out[-1]])
-        return out
-
-    for allele in sorted(recurrent):
-        paths = [path(p) for v, p in rows if base(v) == allele]
-        common = set(paths[0]).intersection(*map(set, paths[1:]))
-        parent[allele] = next(x for x in paths[0] if x in common)
-    return parent
+        return {row["variant"]: row["parent_variant"]
+                for row in csv.DictReader(fh, delimiter="\t")}
 
 
 def ancestor_sets(parent_map: dict[str, str]) -> dict[str, set[str]]:
@@ -138,13 +113,7 @@ def parse_clone_haplotypes(path: str) -> set[frozenset[str]]:
 
 
 def _canonical_variant(name: str, background: list[str]) -> str:
-    """Canonicalise one name, or each member of a comma-joined ROOT_BLOCK."""
-    if "," not in name:
-        return canonical_name(name, background)
-    return ",".join(
-        canonical_name(part, background) if part else part
-        for part in name.split(",")
-    )
+    return canonical_name(name, background)
 
 
 def _canonical_parent_map(parent: dict[str, str], background: list[str]) -> dict[str, str]:
@@ -164,10 +133,7 @@ def parse_matrix_haplotypes(path: str, keep: set[str] | None = None,
     matrix writes an empty cell for "read does not span this site", and reading
     that as a mutation would invent haplotypes.
 
-    Plan 2026-09-26 T3. ``keep``, when given, ignores rows whose variant is not
-    in the set. ``cleaned_matrix_all_variants.csv`` appends near-fixed
-    homoplasmies that were not rows of the old ``cleaned_matrix.csv``; passing
-    the mutation-tree variant names leaves haplotype scores unchanged.
+    ``keep``, when given, ignores rows whose variant is not in the set.
     """
     with open(path) as fh:
         rows = list(csv.reader(fh))
@@ -331,7 +297,7 @@ HAP_FIELDS = ["n_truth_clones", "n_recon_haps",
 
 # Three metric families, each with its own n_* denominators: variant detection,
 # ancestor-descendant tree accuracy, and clone (haplotype) recovery. Consumers
-# look columns up by header name, not by position -- see sweep_fpfn.sh.
+# look columns up by header name, not by position.
 # Plan 2026-09-27 T6. Appended after n_background_calls. Do not reorder earlier columns.
 HP_FIELDS = ["n_hp_unstable_truth", "n_hp_unstable_called",
              "hp_var_precision", "hp_var_recall", "hp_var_f1",
@@ -441,12 +407,7 @@ def hp_backbone_nodes(recon_parent: dict[str, str], unstable: set[str]) -> int:
 
 
 def root_fraction(path: str):
-    """ROOT ``n_reads_attached`` over the per-node sum, or ``NA``.
-
-    Plan 2026-09-27 T6. ``write_mutation_tree`` repeats the root count on a
-    ``ROOT_BLOCK`` row. That row is an annotation, not another node, so it
-    is left out of the denominator. The numerator is still the ROOT row.
-    """
+    """ROOT ``n_reads_attached`` over the per-node sum, or ``NA``."""
     with open(path) as fh:
         reader = csv.DictReader(fh, delimiter="\t")
         if not reader.fieldnames or "n_reads_attached" not in reader.fieldnames:
@@ -454,8 +415,6 @@ def root_fraction(path: str):
         total = 0
         root = None
         for row in reader:
-            if row.get("node_id") == "ROOT_BLOCK":
-                continue
             raw = (row.get("n_reads_attached") or "").strip()
             if raw in ("", "NA"):
                 continue
@@ -532,7 +491,7 @@ def main() -> None:
     ap.add_argument("--recon-matrix", default="",
                     help="Himito <prefix>.cleaned_matrix_all_variants.csv "
                          "(reconstructed haplotypes; rows outside the mutation "
-                         "tree, including appended near-fixed homoplasmies, are ignored)")
+                         "tree are ignored)")
     ap.add_argument("--truth-clones", default="",
                     help="simulate_tree.py truth/clones.tsv (truth clone genomes)")
     ap.add_argument("--profile", default="NA")
@@ -612,17 +571,7 @@ def main() -> None:
     truth_haps = recon_haps = None
     if args.recon_matrix:
         truth_haps = parse_clone_haplotypes(args.truth_clones)
-        # Plan 2026-09-26 T3. These names are the rows of the old
-        # cleaned_matrix.csv: every mutation-tree key except ROOT, with a
-        # comma-joined ROOT_BLOCK key split into its member variants.
-        keep: set[str] = set()
-        for key in recon_pm:
-            if key == "ROOT":
-                continue
-            if "," in key:
-                keep.update(part for part in key.split(",") if part)
-            else:
-                keep.add(key)
+        keep = set(recon_pm) - {"ROOT"}
         recon_haps = parse_matrix_haplotypes(
             args.recon_matrix, keep=keep, background=background_tokens,
         )

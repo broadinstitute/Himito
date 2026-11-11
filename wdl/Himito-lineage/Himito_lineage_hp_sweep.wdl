@@ -1,6 +1,7 @@
 version 1.0
 
-import "https://raw.githubusercontent.com/broadinstitute/Himito/hs_lineage_posterio/wdl/Himito-lineage/Himito_lineage_sim.wdl" as sim
+# Lineage runs with --include-non-snvs: Himito lineage is SNV-only by default, and
+# the HP rates mostly act on tract length alleles.
 
 workflow HimitoLineageHpSweep {
     input {
@@ -48,29 +49,6 @@ workflow HimitoLineageHpSweep {
     String hp_unstable_arg = if hp_unstable != "" then "--hp-unstable \"" + hp_unstable + "\"" else ""
     String hp_min_subclone_arg = if hp_unstable != "" then "--hp-min-subclone-freq " + hp_min_subclone_freq else ""
 
-    # One n_mutations value: ValidateConfig still wants the array the sim workflow uses.
-    Array[Int] n_mutations_for_config = [n_mutations]
-
-    call sim.ValidateConfig {
-        input:
-            profile = profile,
-            frequency_threshold = frequency_threshold,
-            denoise_vaf = denoise_vaf,
-            min_hf = min_hf,
-            sim_min_hf = sim_min_hf,
-            topology = topology,
-            internal_keep = internal_keep,
-            n_mutations = n_mutations_for_config,
-            background = background,
-            hp_unstable = hp_unstable,
-            hp_lineage_indels = hp_lineage_indels,
-            collapse_hp = collapse_hp,
-            hp_fp_set = true,
-            hp_fn_set = true,
-            require_hp_mode = true,
-            docker = docker
-    }
-
     # WDL 1.0 has no zip over seeds x rates. Index SimulateCell outputs with
     # range(length(seeds)) from the nested rate scatter.
     scatter (seed_i in range(length(seeds))) {
@@ -97,7 +75,6 @@ workflow HimitoLineageHpSweep {
                 hp_unstable_arg = hp_unstable_arg,
                 hp_min_subclone_arg = hp_min_subclone_arg,
                 reference_fa = reference_fa,
-                validated = ValidateConfig.ok,
                 docker = docker
         }
     }
@@ -131,7 +108,7 @@ workflow HimitoLineageHpSweep {
     # Three nested scatters; two flattens, same as HimitoLineageSim.
     Array[File] cell_metrics = flatten(flatten(LineageScoreCell.cell_metrics))
 
-    call sim.CombineMetrics {
+    call CombineMetrics {
         input:
             cell_metrics = cell_metrics,
             docker = docker
@@ -182,7 +159,6 @@ task SimulateCell {
         String hp_lineage_arg
         String hp_unstable_arg
         String hp_min_subclone_arg
-        String validated
         String docker
     }
 
@@ -190,7 +166,10 @@ task SimulateCell {
 
     command <<<
         set -euxo pipefail
-        echo "config ~{validated}" >&2
+        if [[ ~{hp_lineage_indels} -le 0 && -z "~{hp_unstable}" ]]; then
+            echo "set hp_lineage_indels > 0 or hp_unstable: otherwise the HP rates have nothing to act on" >&2
+            exit 1
+        fi
 
         export HIMITO="/Himito/target/release/Himito"
         export PBSIM_MODEL_DIR="/opt/lineage_sim/pbsim3_models"
@@ -294,6 +273,7 @@ task LineageScoreCell {
           -m "~{matrix}" -v "~{vcf}"
           --hp-fp-rate ~{hp_fp_rate}
           --hp-fn-rate ~{hp_fn_rate}
+          --include-non-snvs
           --min-hf ~{min_hf} --max-hf ~{max_hf}
           --mcmc-iterations ~{mcmc_iterations}
           --mcmc-chains ~{mcmc_chains}
@@ -346,6 +326,44 @@ task LineageScoreCell {
         disks:       "local-disk 10 HDD"
         preemptible: 3
         docker:      docker
+    }
+}
+
+task CombineMetrics {
+
+    meta {
+        description: "Concatenate per-cell metrics.tsv files into one table, keeping a single header."
+    }
+
+    input {
+        Array[File] cell_metrics
+        String docker
+    }
+
+    command <<<
+        set -euxo pipefail
+        first=1
+        : > metrics.tsv
+        for f in ~{sep=' ' cell_metrics}; do
+            [[ -s "$f" ]] || continue
+            if [[ $first -eq 1 ]]; then
+                cat "$f" >> metrics.tsv
+                first=0
+            else
+                tail -n +2 "$f" >> metrics.tsv
+            fi
+        done
+    >>>
+
+    output {
+        File combined = "metrics.tsv"
+    }
+
+    runtime {
+        cpu:    1
+        memory: "2 GiB"
+        disks:  "local-disk 10 HDD"
+        docker: docker
     }
 }
 

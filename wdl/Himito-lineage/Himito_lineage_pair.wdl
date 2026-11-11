@@ -9,6 +9,7 @@ workflow Himito_lineage_eval {
         File reference_fa
         String prefix
         String sample_id
+        String himito_docker
         String? billing_project
         Int kmer_size
         Float min_hf
@@ -18,6 +19,7 @@ workflow Himito_lineage_eval {
         String? lineage_extra_args
         String? merge_extra_args
         Boolean snv_only = false
+        
     }
 
     call CalculateCoverage as CalculateCoveragePacBio {
@@ -27,6 +29,7 @@ workflow Himito_lineage_eval {
             billing_project = billing_project,
             locus = chromo,
             prefix = sample_id
+            
     }
 
     call CalculateCoverage as CalculateCoverageONT {
@@ -48,7 +51,8 @@ workflow Himito_lineage_eval {
             sample_id = sample_id,
             chromo = chromo,
             data_type = "pacbio",
-            extra_args = call_extra_args
+            extra_args = call_extra_args,
+            himito_docker = himito_docker
 
     }
 
@@ -62,7 +66,8 @@ workflow Himito_lineage_eval {
             sample_id = sample_id,
             chromo = chromo,
             data_type = "ont-denoised",
-            extra_args = call_extra_args
+            extra_args = call_extra_args,
+            himito_docker = himito_docker
 
     }
 
@@ -85,7 +90,8 @@ workflow Himito_lineage_eval {
             prefix = prefix,
             min_hf = min_hf,
             max_hf = max_hf,
-            extra_args = lineage_extra_args
+            extra_args = lineage_extra_args,
+            himito_docker = himito_docker
     }
 
     output {
@@ -210,6 +216,7 @@ task Himito_quickstart {
         String sample_id
         String data_type
         String chromo = "chrM"
+        String himito_docker
         String? extra_args
 
         RuntimeAttr? runtime_attr_override
@@ -246,7 +253,7 @@ task Himito_quickstart {
         boot_disk_gb:       10,
         preemptible_tries:  2,
         max_retries:        1,
-        docker:             "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
+        docker:             himito_docker
     }
     RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])
     runtime {
@@ -329,6 +336,7 @@ task Himito_lineage {
         String prefix
         Float min_hf
         Float max_hf
+        String himito_docker
         String? extra_args
         Boolean collapse_hp = false
 
@@ -343,7 +351,7 @@ task Himito_lineage {
                                               --max-hf ~{max_hf} \
                                               -d "pacbio" \
                                               -o ~{prefix}.pb \
-                                              ~{true="--collapse-hp" false="" collapse_hp} \
+                                              ~{true="--include-non-snvs --collapse-hp" false="" collapse_hp} \
                                               ~{extra_args}
 
         /Himito/target/release/Himito lineage -m ~{ont_matrix} \
@@ -352,7 +360,7 @@ task Himito_lineage {
                                         --max-hf ~{max_hf} \
                                         -d "ont-denoised" \
                                         -o ~{prefix}.ont \
-                                        ~{true="--collapse-hp" false="" collapse_hp} \
+                                        ~{true="--include-non-snvs --collapse-hp" false="" collapse_hp} \
                                         ~{extra_args}
 
     >>>  
@@ -381,7 +389,7 @@ task Himito_lineage {
         boot_disk_gb:       10,
         preemptible_tries:  2,
         max_retries:        1,
-        docker:             "us.gcr.io/broad-dsp-lrma/hangsuunc/himito:dev"
+        docker:             himito_docker
     }
 
     RuntimeAttr runtime_attr = select_first([runtime_attr_override, default_attr])

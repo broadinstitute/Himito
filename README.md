@@ -98,10 +98,13 @@ msbwt2-build -o sr_msbwt.npy <srWGS.chrM.fasta.gz>
 ./target/release/Himito call -g <output.gfa> -r <NC_012920.1.fasta> -s <sampleid> -d <data_type> -o <output.vcf> -b <raw_mt.bam>
 ```
 
-`-b/--bam` takes the raw (pre-denoise) BAM of the same reads. It drives the strand-bias
-filter, ONT linkage rescue and `<output>.matrix.csv`. `--input-bam` is accepted as an alias.
-Strand-biased SNVs and indels are rechecked against BAM haplotype genotypes before the flag is finalized. This prevents incomplete graph paths from flagging variants whose original read support is balanced. Calls with too little BAM support or persistent strand bias remain flagged.
-Without `-b`, the matrix comes from the graph and the strand filter and linkage rescue are off.
+`-b/--bam` takes the raw (pre-denoise) BAM of the same reads. `--input-bam` is accepted as an alias.
+For ONT with a BAM, the graph supplies candidate alleles. BAM re-genotyping supplies the ALT
+count, callable read depth, strand and permutation evidence, and both the pre-permutation
+`<output>.raw_matrix.csv` and final `<output>.matrix.csv`. Ambiguous genotypes are missing.
+PacBio uses graph evidence for calling, rechecks strand flags against the BAM, and re-genotypes
+the final matrix. Without a BAM, both matrices come from the graph and BAM-based filters and
+linkage rescue are unavailable.
 The strand-bias action, permutation mode and genotyping gates are set by the data type.
 
 Indels are left-aligned against the reference by default, the way `bcftools norm`

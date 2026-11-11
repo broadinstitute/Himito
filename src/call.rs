@@ -472,18 +472,37 @@ fn collapse_identical_records(variants: Vec<Variant>, ref_length: usize) -> Vec<
         .collect()
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AlleleCounts {
+    alt: usize,
+    depth: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum VariantCoverage<'a> {
+    Graph(&'a HashMap<usize, usize>),
+    Bam(&'a HashMap<String, AlleleCounts>),
+}
+
+impl VariantCoverage<'_> {
+    fn depth(self, variant: &Variant) -> usize {
+        match self {
+            Self::Graph(depths) => depths.get(&variant.pos).copied().unwrap_or(0),
+            Self::Bam(counts) => counts.get(&generate_variant_name(variant)).map_or(0, |c| c.depth),
+        }
+    }
+}
+
 fn format_vcf_record(
     variant: &Variant,
-    coverage: HashMap<usize, usize>,
+    read_depth: usize,
     indel_false_threshold: f64,
     skip_indel_artifact: bool,
 ) -> String {
-    // Add AC (allele count) to INFO field
-    let read_depth = coverage.get(&variant.pos).unwrap_or(&0);
-    let allele_frequency = if *read_depth == 0 {
+    let allele_frequency = if read_depth == 0 {
         0.0
     } else {
-        variant.allele_count as f32 / *read_depth as f32
+        variant.allele_count as f32 / read_depth as f32
     };
 
     let info = format!("DP={}", read_depth);
@@ -534,7 +553,7 @@ fn format_vcf_record(
 
 fn filter_vcf_record(
     variants: &[Variant],
-    coverage: &HashMap<usize, usize>,
+    coverage: VariantCoverage<'_>,
     minimal_ac: usize,
     hf_threshold: f32,
 ) -> Vec<Variant> {
@@ -544,11 +563,11 @@ fn filter_vcf_record(
         if allele_count < minimal_ac + 1 {
             continue;
         }
-        let read_depth = coverage.get(&variant.pos).unwrap_or(&0);
-        let hf = if *read_depth == 0 {
+        let read_depth = coverage.depth(variant);
+        let hf = if read_depth == 0 {
             0.0
         } else {
-            variant.allele_count as f32 / *read_depth as f32
+            variant.allele_count as f32 / read_depth as f32
         };
         if hf < hf_threshold as f32 {
             continue;
@@ -613,25 +632,29 @@ fn link_variant(l: &LinkCall) -> Variant {
     }
 }
 
-/// A rescued SNV record; DP/AD/HF are pileup counts.
-fn format_link_record(l: &LinkCall) -> String {
-    let hf = if l.dp == 0 { 0.0 } else { l.ac as f32 / l.dp as f32 };
+/// Linkage statistics come from rescue; report genotyped allele depth when available.
+fn format_link_record(l: &LinkCall, coverage: VariantCoverage<'_>) -> String {
+    let counts = match coverage {
+        VariantCoverage::Graph(_) => AlleleCounts { alt: l.ac as usize, depth: l.dp as usize },
+        VariantCoverage::Bam(counts) => counts[&generate_variant_name(&link_variant(l))],
+    };
+    let hf = if counts.depth == 0 { 0.0 } else { counts.alt as f32 / counts.depth as f32 };
     format!(
         "chrM\t{}\t.\t{}\t{}\t.\tPASS\tDP={};LINK={},{:.2}\tGT:AD:HF\t1:{}:{}",
         l.pos + 1,
         l.ref_allele,
         l.alt_allele,
-        l.dp,
+        counts.depth,
         l.partner_name,
         l.log10p,
-        l.ac,
+        counts.alt,
         hf
     )
 }
 
 pub(crate) fn write_vcf(
     variants: &[Variant],
-    coverage: &HashMap<usize, usize>,
+    coverage: VariantCoverage<'_>,
     output_file: &PathBuf,
     sample_id: &str,
     referencename:&str,
@@ -657,7 +680,7 @@ pub(crate) fn write_vcf(
     if links.is_some() {
         writeln!(
             file,
-            "##INFO=<ID=LINK,Number=2,Type=String,Description=\"Read-linkage rescue: the most strongly linked partner allele and the log10 hypergeometric p of their co-occurrence on co-covering reads (DP/AD/HF from the raw BAM pileup)\">"
+            "##INFO=<ID=LINK,Number=2,Type=String,Description=\"Read-linkage rescue: the most strongly linked partner allele and the log10 hypergeometric p of their co-occurrence on co-covering reads\">"
         )?;
     }
     writeln!(
@@ -707,7 +730,7 @@ pub(crate) fn write_vcf(
     let mut li = 0;
     for variant in sorted_variants {
         while li < sorted_links.len() && sorted_links[li].pos + 1 < vcf_pos(&variant) {
-            writeln!(file, "{}", format_link_record(sorted_links[li]))?;
+            writeln!(file, "{}", format_link_record(sorted_links[li], coverage))?;
             li += 1;
         }
         let name = generate_variant_name(&variant);
@@ -715,11 +738,11 @@ pub(crate) fn write_vcf(
         writeln!(
             file,
             "{}",
-            format_vcf_record(&variant, coverage.clone(), indel_false_threshold, skip)
+            format_vcf_record(&variant, coverage.depth(&variant), indel_false_threshold, skip)
         )?;
     }
     for l in &sorted_links[li..] {
-        writeln!(file, "{}", format_link_record(l))?;
+        writeln!(file, "{}", format_link_record(l, coverage))?;
     }
 
     Ok(())
@@ -737,11 +760,14 @@ pub fn construct_matrix(
     read_record: &HashMap<String, Vec<serde_json::Value>>,
     cover_record: &HashMap<String, HashSet<String>>,
     variants: &[Variant],
+    include_uncalled_reads: bool,
 ) -> (Array2<f64>, Vec<Variant>, Vec<String>) {
-    let mut read_set: HashSet<String> = HashSet::new();
-    for reads in cover_record.values() {
-        read_set.extend(reads.iter().cloned());
-    }
+    let read_set: HashSet<String> = if include_uncalled_reads {
+        cover_record.values().flatten().cloned().collect()
+    } else {
+        variants.iter().filter_map(|v| cover_record.get(&generate_variant_name(v)))
+            .flatten().cloned().collect()
+    };
     let mut read_vec: Vec<String> = read_set.into_iter().collect();
     read_vec.sort();
 
@@ -772,10 +798,8 @@ pub fn construct_matrix(
         let name = generate_variant_name(var);
         let r_index = *var_record_dict.get(&name).unwrap();
         let alt = alt_reads(read_record, &name);
-        let cover_reads = cover_record.get(&name).cloned().unwrap_or_default();
-
-        for read in cover_reads {
-            if let Some(c_index) = read_set_dict.get(&read) {
+        for read in cover_record.get(&name).into_iter().flatten() {
+            if let Some(c_index) = read_set_dict.get(read) {
                 matrix[[r_index, *c_index]] = if alt.contains(read.as_str()) {
                     1.0
                 } else {
@@ -808,8 +832,9 @@ fn is_ont(data_type: &str) -> bool {
 }
 
 /// Reference window `[left, right)` of a site span `[start, end)`: widened by `GENOTYPE_FLANK`, pushed out of
-/// any homopolymer it ends in, then padded by 2. `None` when it leaves the reference (no wrap-around).
-fn genotype_window(refseq: &[u8], sites_span: (usize, usize)) -> Option<(usize, usize)> {
+/// any homopolymer it ends in, then padded by 2. ONT candidate genotyping can
+/// use a truncated flank at the ends of the linear BAM reference.
+fn genotype_window(refseq: &[u8], sites_span: (usize, usize), clip_ends: bool) -> Option<(usize, usize)> {
     let len = refseq.len() as isize;
     let mut left = sites_span.0 as isize - GENOTYPE_FLANK as isize;
     let mut right = sites_span.1 as isize + GENOTYPE_FLANK as isize;
@@ -820,10 +845,10 @@ fn genotype_window(refseq: &[u8], sites_span: (usize, usize)) -> Option<(usize, 
         right += 1;
     }
     let (left, right) = (left - 2, right + 2);
-    if left < 0 || right > len {
+    if sites_span.1 > refseq.len() || (!clip_ends && (left < 0 || right > len)) {
         None
     } else {
-        Some((left as usize, right as usize))
+        Some((left.max(0) as usize, right.min(len) as usize))
     }
 }
 
@@ -833,6 +858,9 @@ fn group_sites(variants: &[Variant]) -> Vec<Vec<usize>> {
     for want_indel in [false, true] {
         let mut idx: Vec<usize> = (0..variants.len())
             .filter(|&i| {
+                if variants[i].variant_type != "SNP" && variants[i].pos == 0 {
+                    return false;
+                }
                 let (_, r, a) = allele_span(&variants[i]);
                 (r.len() != a.len()) == want_indel
             })
@@ -928,14 +956,14 @@ struct SiteAcc {
     any_best: BTreeSet<usize>,
 }
 
-fn build_geno_sites(refseq: &[u8], variants: &[Variant]) -> Vec<GenoSite> {
+fn build_geno_sites(refseq: &[u8], variants: &[Variant], clip_ends: bool) -> Vec<GenoSite> {
     let mut sites = Vec::new();
     for members in group_sites(variants) {
         let spans: Vec<(usize, &str, &str)> =
             members.iter().map(|&i| allele_span(&variants[i])).collect();
         let lo = spans.iter().map(|s| s.0).min().unwrap();
         let hi = spans.iter().map(|s| s.0 + s.1.len()).max().unwrap();
-        let (left, right) = match genotype_window(refseq, (lo, hi)) {
+        let (left, right) = match genotype_window(refseq, (lo, hi), clip_ends) {
             Some(w) => w,
             None => continue, // crosses the circular origin: left NaN
         };
@@ -1000,9 +1028,10 @@ fn genotype_from_bam(
     ref_name: &str,
     variants: &[Variant],
     max_ed: u32,
+    clip_ends: bool,
 ) -> (HashMap<String, Vec<serde_json::Value>>, HashMap<String, HashSet<String>>) {
     const BATCH: usize = 4096;
-    let sites = build_geno_sites(refseq, variants);
+    let sites = build_geno_sites(refseq, variants, clip_ends);
     let lefts: Vec<usize> = sites.iter().map(|s| s.left).collect();
 
     let mut qname_ids: HashMap<String, u32> = HashMap::new();
@@ -1106,6 +1135,19 @@ fn genotype_from_bam(
         }
     }
     (read_record, cover_record)
+}
+
+/// Remove the synthetic reference column and count callable BAM molecules per allele.
+fn bam_allele_counts(
+    read_record: &HashMap<String, Vec<serde_json::Value>>,
+    cover_record: &mut HashMap<String, HashSet<String>>,
+    ref_name: &str,
+) -> HashMap<String, AlleleCounts> {
+    cover_record.iter_mut().map(|(name, reads)| {
+        reads.remove(ref_name);
+        let alt = alt_reads(read_record, name).into_iter().filter(|r| reads.contains(*r)).count();
+        (name.clone(), AlleleCounts { alt, depth: reads.len() })
+    }).collect()
 }
 
 
@@ -1293,7 +1335,7 @@ fn filter_strand_bias(
     read_record: &HashMap<String, Vec<serde_json::Value>>,
     strand_map: &HashMap<String, bool>,
     cover_record: &HashMap<String, HashSet<String>>,
-    coverage: &HashMap<usize, usize>,
+    coverage: VariantCoverage<'_>,
     library_frac: f64,
     p_threshold: f64,
     homoplasmic_frequency_threshold: f64,
@@ -1306,7 +1348,7 @@ fn filter_strand_bias(
         let mut variant = variant.clone();
         let name = generate_variant_name(&variant);
 
-        let depth = coverage.get(&variant.pos).copied().unwrap_or(0);
+        let depth = coverage.depth(&variant);
         let hf = if depth == 0 { 0.0 } else { variant.allele_count as f64 / depth as f64 };
         if hf < homoplasmic_frequency_threshold {
             let ev = StrandEvidence::new(&alt_reads(read_record, &name), cover_record.get(&name), strand_map, library_frac);
@@ -1396,7 +1438,7 @@ fn recount_flagged_variants_from_bam(
         return variants.to_vec();
     }
     // Ungated: the matrix noise gate must not move the VCF.
-    let (read_record, cover_record) = genotype_from_bam(bam, refseq, ref_name, &flagged, u32::MAX);
+    let (read_record, cover_record) = genotype_from_bam(bam, refseq, ref_name, &flagged, u32::MAX, false);
     println!(
         "Strand-bias BAM recount: {} flagged variant(s) from {} (forward fraction {:.3})",
         flagged.len(),
@@ -1506,7 +1548,7 @@ fn is_snp_variant(v: &Variant) -> bool {
 fn partners_of(
     tested: &[usize],
     variants: &[Variant],
-    coverage: &HashMap<usize, usize>,
+    coverage: VariantCoverage<'_>,
     data_type: &str,
 ) -> Vec<Vec<usize>> {
     let pacbio = data_type == "pacbio";
@@ -1516,7 +1558,7 @@ fn partners_of(
             !pacbio
                 || (is_snp_variant(v)
                     && v.filter.as_deref() != Some("Strand_bias")
-                    && v.allele_count >= pb_noise_threshold(coverage.get(&v.pos).copied().unwrap_or(0)))
+                    && v.allele_count >= pb_noise_threshold(coverage.depth(v)))
         })
         .collect();
     let min_dist = if pacbio { PB_PARTNER_MIN_DIST } else { 0 };
@@ -1710,7 +1752,7 @@ fn permutation_test(
     heteroplasmic_error_threshold: f64,
     permutation_round: usize,
     filtered_var: &[Variant],
-    coverage: &HashMap<usize, usize>,
+    coverage: VariantCoverage<'_>,
     permutation_frequency_threshold: f64,
     data_type: &str,
     indel_false_threshold: f64,
@@ -1719,7 +1761,7 @@ fn permutation_test(
     // Admission: which variants are candidates for the permutation test at all.
     let admitted = |current_variant: &Variant| -> bool {
         // A variant whose position carries no coverage entry cannot be scored.
-        let depth = coverage.get(&current_variant.pos).copied().unwrap_or(0);
+        let depth = coverage.depth(current_variant);
         let frequency = if depth == 0 {
             0.0
         } else {
@@ -1843,30 +1885,66 @@ pub fn start(
     let ref_header = reference_sequence[0].id().to_string();
 
     // read in graphical genome
-    let graph = agg::GraphicalGenome::load_graph(graph_file).unwrap();
+    let mut graph = agg::GraphicalGenome::load_graph(graph_file).unwrap();
 
-    let (variants, coverage, read_record, cover_record) =
+    let (variants, graph_coverage, graph_reads, graph_cover) =
         get_variant(
-            &mut graph.clone(),
+            &mut graph,
             k,
             &ref_header,
             ref_seq.len(),
             if left_align { Some(ref_seq.as_bytes()) } else { None },
         );
-    let collapsed_var = collapse_identical_records(variants, ref_seq.len());
-    let filtered_var = filter_vcf_record(&collapsed_var, &coverage, minimal_ac, hf_threshold);
-    // modified, exclude filtered data for FPs
+    drop(graph);
+    let mut candidates = collapse_identical_records(variants, ref_seq.len());
+    let ont_bam = bam.filter(|_| is_ont(data_type));
+    let mut link_calls = ont_bam.filter(|_| !no_linkage_rescue).and_then(|bam| {
+        match linkage::rescue(bam, ref_seq.as_bytes(), &ref_header) {
+            Ok((calls, _summary)) => Some(calls),
+            Err(e) => {
+                eprintln!("Warning: linkage rescue failed ({e:#}); continuing without it.");
+                None
+            }
+        }
+    });
 
-    // modified, exclude filtered data
+    let bam_counts;
+    let (read_record, cover_record, coverage) = if let Some(bam) = ont_bam {
+        // Score every discovered allele before applying the count or frequency floor.
+        // Include linkage-only alleles as competitors at their sites so the final
+        // matrix uses the same calls as the filtering and VCF stages.
+        let mut all = candidates.clone();
+        let mut names: HashSet<String> = all.iter().map(generate_variant_name).collect();
+        for link in link_calls.as_deref().unwrap_or(&[]) {
+            let variant = link_variant(link);
+            if names.insert(generate_variant_name(&variant)) {
+                all.push(variant);
+            }
+        }
+        let (reads, mut cover) = genotype_from_bam(
+            bam, ref_seq.as_bytes(), &ref_header, &all, GENOTYPE_MAX_ED_ONT, true,
+        );
+        bam_counts = bam_allele_counts(&reads, &mut cover, &ref_header);
+        for variant in &mut candidates {
+            variant.allele_count = bam_counts[&generate_variant_name(variant)].alt;
+        }
+        if let Some(links) = &mut link_calls {
+            links.retain(|link| bam_counts[&generate_variant_name(&link_variant(link))].alt > 0);
+        }
+        println!("Re-genotyped {} ONT candidates from {} before calling", all.len(), bam.display());
+        (reads, cover, VariantCoverage::Bam(&bam_counts))
+    } else {
+        (graph_reads, graph_cover, VariantCoverage::Graph(&graph_coverage))
+    };
+
+    let filtered_var = filter_vcf_record(&candidates, coverage, minimal_ac, hf_threshold);
     let (matrix, var_record, read_set) =
-        construct_matrix(&read_record, &cover_record, &filtered_var);
+        construct_matrix(&read_record, &cover_record, &filtered_var, ont_bam.is_none());
     let matrix_output_raw = output_file.with_extension("raw_matrix.csv");
     let _ = write_matrix_to_csv(&matrix, &var_record, &read_set, matrix_output_raw);
 
     // Strand-bias filtering runs before the permutation test so artifacts do not feed its null.
     let action = if data_type == "ont-denoised" { StrandBiasAction::Drop } else { StrandBiasAction::Flag };
-    // Linkage rescue runs on ONT only; PacBio is not evaluated.
-    let linkage_bam = bam.filter(|_| is_ont(data_type) && !no_linkage_rescue);
     let (sb_filtered_var, sb_matrix) = match bam {
         Some(bam) => {
             let (strand_map, fwd_frac) = build_strand_map(bam);
@@ -1878,21 +1956,20 @@ pub fn start(
                 &read_record,
                 &strand_map,
                 &cover_record,
-                &coverage,
+                coverage,
                 fwd_frac,
                 strand_bias_threshold,
                 permutation_frequency_threshold,
                 action,
             );
-            let sb_var = recount_flagged_variants_from_bam(
-                &sb_var,
-                bam,
-                &strand_map,
-                fwd_frac,
-                ref_seq.as_bytes(),
-                &ref_header,
-                strand_bias_threshold,
-            );
+            let sb_var = if ont_bam.is_some() {
+                sb_var
+            } else {
+                recount_flagged_variants_from_bam(
+                    &sb_var, bam, &strand_map, fwd_frac, ref_seq.as_bytes(), &ref_header,
+                    strand_bias_threshold,
+                )
+            };
             (sb_var, sb_matrix)
         }
         None => (var_record.clone(), matrix.clone()),
@@ -1904,22 +1981,13 @@ pub fn start(
         heteroplasmic_frequency_threshold,
         permutation_rounds,
         &sb_filtered_var,
-        &coverage,
+        coverage,
         permutation_frequency_threshold,
         data_type,
         indel_false_threshold,
         indel_linked_min_hf,
     );
 
-    let link_calls: Option<Vec<LinkCall>> = linkage_bam.and_then(|bam| {
-        match linkage::rescue(bam, ref_seq.as_bytes(), &ref_header) {
-            Ok((calls, _summary)) => Some(calls),
-            Err(e) => {
-                eprintln!("Warning: linkage rescue failed ({e:#}); continuing without it.");
-                None
-            }
-        }
-    });
     let (permu_filtered_var, new_links) = match &link_calls {
         Some(calls) => merge_link_calls(&permu_filtered_var, calls),
         None => (permu_filtered_var, Vec::new()),
@@ -1931,13 +1999,11 @@ pub fn start(
             l.partner_name, l.shared, l.enrich, l.log10p
         );
     }
-    let rescued_var: Vec<Variant> = new_links.iter().map(link_variant).collect();
-
     // Promoted PacBio indels that survived the test are PASS, not Potential_Artifact.
     let indel_artifact_exempt: HashSet<String> = permu_filtered_var
         .iter()
         .filter(|v| {
-            let depth = coverage.get(&v.pos).copied().unwrap_or(0);
+            let depth = coverage.depth(v);
             let hf = if depth == 0 { 0.0 } else { v.allele_count as f64 / depth as f64 };
             promoted_pb_indel(v, hf, data_type, indel_false_threshold, indel_linked_min_hf)
         })
@@ -1947,7 +2013,7 @@ pub fn start(
     // write filtered vcf
     let _ = write_vcf(
         &permu_filtered_var,
-        &coverage,
+        coverage,
         output_file,
         sample_id,
         &ref_header,
@@ -1957,18 +2023,26 @@ pub fn start(
         link_calls.as_ref().map(|_| new_links.as_slice()),
         &indel_artifact_exempt,
     );
-    // The VCF uses graph calls with BAM strand rechecks; the lineage matrix is BAM-genotyped.
+    if let Some(bam) = ont_bam {
+        let mut all = permu_filtered_var;
+        all.extend(new_links.iter().map(link_variant));
+        let (matrix, variants, reads) = construct_matrix(&read_record, &cover_record, &all, false);
+        println!("Genotyped {} variants x {} reads from {}", variants.len(), reads.len(), bam.display());
+        if let Err(e) = write_matrix_to_csv(&matrix, &variants, &reads, output_file.with_extension("matrix.csv")) {
+            eprintln!("Error writing matrix: {e}");
+        }
+        return;
+    }
+    // The legacy path uses BAM genotypes only for the final matrix when a BAM is available.
     let genotype_src = bam.map(|bam| GenotypeSource {
         bam,
         refseq: ref_seq.as_bytes(),
         ref_name: &ref_header,
-        max_ed: if is_ont(data_type) { GENOTYPE_MAX_ED_ONT } else { u32::MAX },
     });
     if let Err(e) = write_final_matrix(
         output_file,
         &filtered_matrix,
         &permu_filtered_var,
-        &rescued_var,
         &read_set,
         genotype_src.as_ref(),
     ) {
@@ -1981,7 +2055,6 @@ struct GenotypeSource<'a> {
     bam: &'a Path,
     refseq: &'a [u8],
     ref_name: &'a str,
-    max_ed: u32,
 }
 
 /// Writes `<output>.matrix.csv`: re-genotyped from the BAM when one is given, else the graph matrix.
@@ -1989,7 +2062,6 @@ fn write_final_matrix(
     output_file: &Path,
     graph_matrix: &Array2<f64>,
     variants: &[Variant],
-    rescued: &[Variant],
     graph_reads: &[String],
     genotype: Option<&GenotypeSource>,
 ) -> Result<(), Box<dyn Error>> {
@@ -2000,11 +2072,10 @@ fn write_final_matrix(
             write_matrix_to_csv(graph_matrix, variants, graph_reads, matrix_output)
         }
         Some(src) => {
-            let all: Vec<Variant> = variants.iter().chain(rescued).cloned().collect();
             let (read_record, cover_record) =
-                genotype_from_bam(src.bam, src.refseq, src.ref_name, &all, src.max_ed);
+                genotype_from_bam(src.bam, src.refseq, src.ref_name, variants, u32::MAX, false);
             let (matrix, var_record, read_set) =
-                construct_matrix(&read_record, &cover_record, &all);
+                construct_matrix(&read_record, &cover_record, variants, true);
             println!(
                 "Genotyped {} variants x {} reads from {}",
                 var_record.len(),
@@ -2156,7 +2227,7 @@ mod tests {
         let artifact = generate_variant_name(&variants[2]);
         // Denoising leaves systematic error behind, so ont-denoised tests SNPs; PacBio SNPs are exempt.
         for (data_type, artifact_kept) in [("ont-denoised", false), ("pacbio", true)] {
-            let (kept, _) = permutation_test(&matrix, 0.5, 0.9, 200, &variants, &coverage, 0.9, data_type, resolve_indel_false_threshold(data_type, None), None);
+            let (kept, _) = permutation_test(&matrix, 0.5, 0.9, 200, &variants, VariantCoverage::Graph(&coverage), 0.9, data_type, resolve_indel_false_threshold(data_type, None), None);
             let names: Vec<String> = kept.iter().map(generate_variant_name).collect();
             assert_eq!(names.contains(&artifact), artifact_kept, "{data_type}");
             assert_eq!(names.len(), 2 + artifact_kept as usize, "{data_type}: the lineage pair survives");
@@ -2171,7 +2242,7 @@ mod tests {
         let mut matrix = Array2::<f64>::zeros((2, 10));
         matrix.slice_mut(s![.., ..9]).fill(1.0);
         let coverage: HashMap<usize, usize> = [(100, 100), (200, 100)].into_iter().collect();
-        let (kept, _) = permutation_test(&matrix, 0.5, 0.5, 16, &variants, &coverage, 0.7, "ont-denoised", 0.015, None);
+        let (kept, _) = permutation_test(&matrix, 0.5, 0.5, 16, &variants, VariantCoverage::Graph(&coverage), 0.7, "ont-denoised", 0.015, None);
         assert_eq!(kept.len(), 2, "an untested variant must be kept, not dropped");
     }
 
@@ -2198,7 +2269,7 @@ mod tests {
             }
         }
         let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, n_reads)).collect();
-        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10", 0.015, None);
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, VariantCoverage::Graph(&coverage), 0.7, "ont-r10", 0.015, None);
         // A untested, B/C tested: all lineage markers survive.
         assert_eq!(kept.iter().filter(|v| v.pos >= 1000).count(), n_markers, "lineage markers must survive");
         kept.iter().map(generate_variant_name).collect()
@@ -2289,14 +2360,14 @@ mod tests {
         let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, n_reads)).collect();
 
         // 1000 rounds alone put the lineage rows at p = 1/1001, BH q = 0.013 > 0.01: stage 2 must lift that floor.
-        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, "ont-r10", 0.015, None);
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, VariantCoverage::Graph(&coverage), 0.7, "ont-r10", 0.015, None);
         let lineage = kept.iter().filter(|v| v.pos < 110).count();
         assert_eq!(lineage, 10, "every lineage row must be kept");
         assert!(kept.len() - lineage <= 1, "at most one noise row may survive, got {}", kept.len() - lineage);
 
         let tested: Vec<usize> = (0..130).collect();
         let names: Vec<String> = variants.iter().map(generate_variant_name).collect();
-        let partners = partners_of(&tested, &variants, &coverage, "ont-r10");
+        let partners = partners_of(&tested, &variants, VariantCoverage::Graph(&coverage), "ont-r10");
         let outcomes = adaptive_permutation(&matrix, &tested, &partners, &names, 1000, 0.01);
         let needed = (PERM_HEADROOM * 130.0 / (0.01 * 10.0)).ceil() as u32;
         let max_draws = outcomes.iter().map(|o| o.draws).max().unwrap();
@@ -2326,7 +2397,7 @@ mod tests {
     fn pb_kept(variants: &[Variant], alt_reads: &[Vec<usize>], n_reads: usize, depth: usize, min_hf: Option<f64>) -> Vec<usize> {
         let coverage: HashMap<usize, usize> = variants.iter().map(|v| (v.pos, depth)).collect();
         let matrix = alt_matrix(n_reads, alt_reads);
-        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 500, variants, &coverage, 0.7, "pacbio", 0.1, min_hf);
+        let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 500, variants, VariantCoverage::Graph(&coverage), 0.7, "pacbio", 0.1, min_hf);
         kept.iter().map(|v| v.pos).collect()
     }
 
@@ -2413,10 +2484,10 @@ mod tests {
         want_outcomes[7] = (100, 100);
         want_outcomes[9] = (100, 100);
         for dt in ["ont-r9", "ont-r10", "ont-denoised"] {
-            let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, &coverage, 0.7, dt, 0.015, None);
+            let (kept, _) = permutation_test(&matrix, 0.01, 0.2, 1000, &variants, VariantCoverage::Graph(&coverage), 0.7, dt, 0.015, None);
             let kept: Vec<usize> = kept.iter().map(|v| v.pos).collect();
             assert_eq!(kept, vec![1000, 3000, 5000, 7000, 9000, 11000, 11001, 15000], "{dt}");
-            let partners = partners_of(&tested, &variants, &coverage, dt);
+            let partners = partners_of(&tested, &variants, VariantCoverage::Graph(&coverage), dt);
             let outcomes = adaptive_permutation(&matrix, &tested, &partners, &names, 1000, 0.01);
             let got: Vec<(u32, u32)> = outcomes.iter().map(|o| (o.exceed, o.draws)).collect();
             assert_eq!(got, want_outcomes, "{dt}");
@@ -2463,7 +2534,8 @@ mod tests {
 
     fn run_sb(case: &SbCase, library_frac: f64, action: StrandBiasAction) -> (Vec<Variant>, Array2<f64>) {
         filter_strand_bias(
-            &case.variants, &case.matrix, &case.read_record, &case.strand_map, &case.cover_record, &case.coverage,
+            &case.variants, &case.matrix, &case.read_record, &case.strand_map, &case.cover_record,
+            VariantCoverage::Graph(&case.coverage),
             library_frac, 0.01, 0.7, action,
         )
     }
@@ -2628,7 +2700,7 @@ mod tests {
         for left_align in [true, false] {
             let path = std::env::temp_dir().join(format!("himito_left_align_{left_align}_{}.vcf", std::process::id()));
             let coverage: HashMap<usize, usize> = [(5, 30)].into_iter().collect();
-            write_vcf(&[del_at(HOMOPOLYMER_REF, 5, 1, 3)], &coverage, &path, "s1", "chrM", 10, 0.1, left_align, None, &HashSet::new()).unwrap();
+            write_vcf(&[del_at(HOMOPOLYMER_REF, 5, 1, 3)], VariantCoverage::Graph(&coverage), &path, "s1", "chrM", 10, 0.1, left_align, None, &HashSet::new()).unwrap();
             let vcf = std::fs::read_to_string(&path).unwrap();
             assert_eq!(vcf.contains("##HimitoNormalization=left-aligned"), left_align);
         }
@@ -2636,10 +2708,9 @@ mod tests {
 
     #[test]
     fn small_indel_at_ont_threshold_passes_above_and_is_artifact_below() {
-        let cov: HashMap<usize, usize> = [(100, 1000)].into_iter().collect();
-        let rec = format_vcf_record(&var(100, "GA", "G", 18), cov.clone(), 0.015, false);
+        let rec = format_vcf_record(&var(100, "GA", "G", 18), 1000, 0.015, false);
         assert!(rec.contains("\tPASS\t"), "HF 0.018 should pass at 0.015: {rec}");
-        let rec = format_vcf_record(&var(100, "GA", "G", 11), cov, 0.015, false);
+        let rec = format_vcf_record(&var(100, "GA", "G", 11), 1000, 0.015, false);
         assert!(rec.contains("Potential_Artifact"), "HF 0.011 should be flagged: {rec}");
     }
 
@@ -2670,15 +2741,15 @@ mod tests {
     fn genotype_window_flanks_pushes_out_of_homopolymers_and_pads() {
         let unique: Vec<u8> = b"ACGT".iter().cycle().take(40).copied().collect();
         // SNP at 20: [20 - 10, 21 + 10), then 2 more on each side.
-        assert_eq!(genotype_window(&unique, (20, 21)), Some((8, 33)));
+        assert_eq!(genotype_window(&unique, (20, 21), false), Some((8, 33)));
         // Leaving the reference on either side: no window.
-        assert_eq!(genotype_window(&unique, (3, 4)), None);
-        assert_eq!(genotype_window(&unique, (36, 37)), None);
+        assert_eq!(genotype_window(&unique, (3, 4), false), None);
+        assert_eq!(genotype_window(&unique, (36, 37), false), None);
         // Window ends inside A-runs are pushed out of them before padding.
         let mut hp = unique.clone();
         hp[8..12].fill(b'A');
         hp[30..34].fill(b'A');
-        assert_eq!(genotype_window(&hp, (20, 21)), Some((6, 36)));
+        assert_eq!(genotype_window(&hp, (20, 21), false), Some((6, 36)));
     }
 
     #[test]
@@ -2735,7 +2806,7 @@ mod tests {
         sam: &str,
         variants: &[Variant],
     ) -> (HashMap<String, Vec<serde_json::Value>>, HashMap<String, HashSet<String>>) {
-        genotype_from_bam(&geno_path(sam), GENO_REF.as_bytes(), "chrM", variants, u32::MAX)
+        genotype_from_bam(&geno_path(sam), GENO_REF.as_bytes(), "chrM", variants, u32::MAX, false)
     }
 
     #[test]
@@ -2756,6 +2827,41 @@ mod tests {
     }
 
     #[test]
+    fn ont_candidate_counts_and_matrix_use_the_same_physical_bam_reads() {
+        let mut v = geno_snp();
+        v.allele_count = 1;
+        let name = generate_variant_name(&v);
+        let graph_depth = HashMap::from([(v.pos, 50)]);
+        assert!(filter_vcf_record(&[v.clone()], VariantCoverage::Graph(&graph_depth), 1, 0.1).is_empty());
+
+        let (rr, mut cr) = genotype_from_bam(
+            &geno_path("reads.sam"), GENO_REF.as_bytes(), "chrM", &[v.clone()], GENOTYPE_MAX_ED_ONT, true,
+        );
+        let counts = bam_allele_counts(&rr, &mut cr, "chrM");
+        assert_eq!((counts[&name].alt, counts[&name].depth), (2, 3));
+        v.allele_count = counts[&name].alt;
+        let coverage = VariantCoverage::Bam(&counts);
+        let candidates = filter_vcf_record(&[v.clone()], coverage, 1, 0.1);
+        assert_eq!(candidates.len(), 1);
+        let (matrix, _, reads) = construct_matrix(&rr, &cr, &candidates, false);
+        assert_eq!(reads, ["r_alt", "r_ref", "r_split"]);
+        assert_eq!(matrix.row(0).to_vec(), [1.0, 0.0, 1.0]);
+        assert!(format_vcf_record(&v, coverage.depth(&v), 0.015, false)
+            .contains("\tDP=3\tGT:AD:HF\t1:2:"));
+    }
+
+    #[test]
+    fn ont_candidate_genotyping_uses_a_clipped_flank_at_the_reference_end() {
+        let v = var(3, "A", "T", 5);
+        let name = generate_variant_name(&v);
+        let (rr, cr) = genotype_from_bam(
+            &geno_path("reads.sam"), GENO_REF.as_bytes(), "chrM", &[v], GENOTYPE_MAX_ED_ONT, true,
+        );
+        assert!(cr[&name].contains("r_ref"));
+        assert!(!alt_reads(&rr, &name).contains("r_ref"));
+    }
+
+    #[test]
     fn genotype_from_bam_disagreeing_alignments_of_one_read_are_missing() {
         let name = "m.31A>T";
         let (rr, cr) = run_geno("split_disagree.sam", &[geno_snp()]);
@@ -2773,7 +2879,7 @@ mod tests {
         assert!(alt_reads(&rr, &dname).contains("r_del"));
         assert!(cr[&dname].contains("r_ref") && !alt_reads(&rr, &dname).contains("r_ref"));
 
-        let (m, vars, reads) = construct_matrix(&rr, &cr, &variants);
+        let (m, vars, reads) = construct_matrix(&rr, &cr, &variants, true);
         let col = |n: &str| reads.iter().position(|r| r == n).unwrap();
         let row = |n: &str| vars.iter().position(|v| generate_variant_name(v) == n).unwrap();
         assert_eq!(m[[row(sname), col("r_alt")]], 1.0);
@@ -2808,7 +2914,7 @@ mod tests {
     fn genotype_from_bam_unknown_ref_name_returns_ref_column_only() {
         let name = "m.31A>T";
         let (rr, cr) = genotype_from_bam(
-            &geno_path("reads_second_contig.sam"), GENO_REF.as_bytes(), "not_a_contig", &[geno_snp()], u32::MAX,
+            &geno_path("reads_second_contig.sam"), GENO_REF.as_bytes(), "not_a_contig", &[geno_snp()], u32::MAX, false,
         );
         assert!(alt_reads(&rr, name).is_empty());
         assert_eq!(sorted(cr[name].clone()), ["not_a_contig"]);
@@ -2823,12 +2929,12 @@ mod tests {
         let graph_reads = ["g1".to_string(), "g2".to_string()];
         let matrix_csv = || std::fs::read_to_string(out.with_extension("matrix.csv")).unwrap();
 
-        write_final_matrix(&out, &graph_matrix, &[geno_snp()], &[], &graph_reads, None).unwrap();
+        write_final_matrix(&out, &graph_matrix, &[geno_snp()], &graph_reads, None).unwrap();
         assert_eq!(matrix_csv(), "variant,g1,g2\nm.31A>T,1,\n");
 
         let bam = geno_path("reads.sam");
-        let src = GenotypeSource { bam: &bam, refseq: GENO_REF.as_bytes(), ref_name: "chrM", max_ed: u32::MAX };
-        write_final_matrix(&out, &graph_matrix, &[geno_snp()], &[], &graph_reads, Some(&src)).unwrap();
+        let src = GenotypeSource { bam: &bam, refseq: GENO_REF.as_bytes(), ref_name: "chrM" };
+        write_final_matrix(&out, &graph_matrix, &[geno_snp()], &graph_reads, Some(&src)).unwrap();
         // Reads sorted by name, the ref pseudo-read all 0, r_del (tie) and r_short (partial) missing.
         assert_eq!(matrix_csv(), "variant,chrM,r_alt,r_ref,r_split\nm.31A>T,0,1,0,1\n");
     }

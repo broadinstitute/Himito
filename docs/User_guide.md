@@ -138,9 +138,10 @@ Required Parameters:
 - -o, --output-file <FILE>: Output VCF file
 
 Optional:
-- -b, --bam <FILE>: raw (pre-denoise) BAM of the same reads. It drives the strand-bias filter,
-  ONT linkage rescue and `<output>.matrix.csv`. `--input-bam` is an alias. Without it the matrix
-  comes from the graph and the strand filter and linkage rescue are off.
+- -b, --bam <FILE>: raw (pre-denoise) BAM of the same reads. For ONT, graph candidates
+  are re-genotyped before filtering. BAM calls supply ALT counts, callable depth, strand
+  and permutation evidence, and the pre- and post-filter matrices. `--input-bam` is an
+  alias. Without a BAM, calling and matrices use graph evidence.
 
 Advanced options are hidden from `-h` and listed by `--help`: `-k`, `-m`, `-v`, `-p`, `-f`,
 `--strand-bias-threshold`, `--indel-false-threshold`, `--permutation-frequency-threshold`,
@@ -352,7 +353,7 @@ Many outputs share the same basename you pass with `-o` / `--output-prefix` (`qu
 | `.bed` | Methylation summary (`methyl` / `quick-start`) |
 | `.raw_matrix.csv`, `.matrix.csv` | Per-read variant support matrices written next to the VCF basename (`call` / `quick-start`) |
 
-The **matrix CSV** has header `variant`, then one column per read name. Each row is a variant identifier; cell values are non-negative counts of support in that read (see `call` in the codebase). `.raw_matrix.csv` is produced before permutation-based filtering; `.matrix.csv` matches the variants retained in the final VCF.
+The **matrix CSV** has header `variant`, then one column per read name. Each row is a variant identifier. A cell contains `1` for ALT, `0` for a callable non-ALT genotype, or is empty for a missing genotype. `.raw_matrix.csv` is produced before permutation-based filtering. `.matrix.csv` matches the variants retained in the final VCF. For ONT with a BAM, both files reuse the same physical read genotypes.
 
 ### Graph Files (.gfa)
 - Contains the mitochondrial genome graph structure

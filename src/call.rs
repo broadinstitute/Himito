@@ -1849,7 +1849,7 @@ pub fn resolve_thresholds(
 }
 
 pub fn resolve_indel_false_threshold(data_type: &str, explicit: Option<f64>) -> f64 {
-    explicit.unwrap_or(if is_ont(data_type) { 0.015 } else { 0.1 })
+    explicit.unwrap_or(if is_ont(data_type) { 0.15 } else { 0.1 })
 }
 
 /// Floor on heteroplasmic frequency for calling (`-v`). PacBio defaults to 0.002; others to 0.01.
@@ -2708,15 +2708,15 @@ mod tests {
 
     #[test]
     fn small_indel_at_ont_threshold_passes_above_and_is_artifact_below() {
-        let rec = format_vcf_record(&var(100, "GA", "G", 18), 1000, 0.015, false);
-        assert!(rec.contains("\tPASS\t"), "HF 0.018 should pass at 0.015: {rec}");
-        let rec = format_vcf_record(&var(100, "GA", "G", 11), 1000, 0.015, false);
-        assert!(rec.contains("Potential_Artifact"), "HF 0.011 should be flagged: {rec}");
+        let rec = format_vcf_record(&var(100, "GA", "G", 18), 100, 0.15, false);
+        assert!(rec.contains("\tPASS\t"), "HF 0.18 should pass at 0.15: {rec}");
+        let rec = format_vcf_record(&var(100, "GA", "G", 11), 100, 0.15, false);
+        assert!(rec.contains("Potential_Artifact"), "HF 0.11 should be flagged: {rec}");
     }
 
     #[test]
     fn indel_false_threshold_preset_by_data_type() {
-        for (dt, preset) in [("ont-r9", 0.015), ("ont-r10", 0.015), ("ont-denoised", 0.015), ("pacbio", 0.1)] {
+        for (dt, preset) in [("ont-r9", 0.15), ("ont-r10", 0.15), ("ont-denoised", 0.15), ("pacbio", 0.1)] {
             assert_eq!(resolve_indel_false_threshold(dt, None), preset, "{dt}");
             assert_eq!(resolve_indel_false_threshold(dt, Some(0.05)), 0.05, "{dt}: an explicit value wins");
         }

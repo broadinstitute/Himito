@@ -61,19 +61,23 @@ def _anc_pairs(anc: dict[str, set[str]], keep: set[str]) -> set[tuple[str, str]]
     return pairs
 
 
-def detected_variants_with_hf_from_vcf(path: str) -> dict[str, float | None]:
-    """Return PASS/. alleles and the first sample's per-ALT HF (or AF).
+def detected_variants_with_hf_from_vcf(
+    path: str, *, pass_only: bool = False,
+) -> dict[str, float | None]:
+    """Return accepted alleles and the first sample's per-ALT HF (or AF).
 
+    By default both PASS and unfiltered (.) records are accepted.
     Missing or invalid estimates do not remove alleles from detection scoring.
     """
     out: dict[str, float | None] = {}
+    accepted_filters = {"PASS"} if pass_only else {"PASS", "."}
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt") as fh:
         for line in fh:
             if line.startswith("#"):
                 continue
             f = line.rstrip("\n").split("\t")
-            if len(f) < 7 or f[6] not in ("PASS", "."):
+            if len(f) < 7 or f[6] not in accepted_filters:
                 continue
             pos, ref = f[1], f[3]
             sample = dict(zip(f[8].split(":"), f[9].split(":"))) if len(f) >= 10 else {}
@@ -851,7 +855,7 @@ def main() -> None:
         for l in open(args.truth_variants) if l.strip()
     }
     detected_hf: dict[str, float | None] = {}
-    for name, hf in detected_variants_with_hf_from_vcf(args.vcf).items():
+    for name, hf in detected_variants_with_hf_from_vcf(args.vcf, pass_only=True).items():
         detected_hf.setdefault(_canonical_variant(name, background_tokens), hf)
     detected = set(detected_hf)
     vcf_names = set(detected)
@@ -888,7 +892,9 @@ def main() -> None:
             args.recon_matrix, keep=keep, background=background_tokens,
         )
 
-    m = score(truth_pm, recon_pm, truth_vars, detected,
+    truth_snvs = {name for name in truth_vars if _is_snv(name)}
+    detected_snvs = {name for name in detected if _is_snv(name)}
+    m = score(truth_pm, recon_pm, truth_snvs, detected_snvs,
               truth_haps=truth_haps, recon_haps=recon_haps,
               background=background_tokens)
     row = {"profile": args.profile, "fp": args.fp, "fn": args.fn, **m,
@@ -983,8 +989,8 @@ def main() -> None:
         print("\t".join(FIELDS))
         print(line)
 
-    # False positives: PASS/. VCF calls not in the truth variant list.
-    fps = sorted(detected - truth_vars)
+    # Report false positives from the same PASS SNV set used for variant precision.
+    fps = sorted(detected_snvs - truth_snvs)
     print(f"false_positives\t{len(fps)}", file=sys.stderr)
     print("variant\tHF", file=sys.stderr)
     for vid in fps:
